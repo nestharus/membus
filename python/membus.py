@@ -1,5 +1,6 @@
 """stdlib membus.kv/1 client. One caller owns a connection; retries retain op_id."""
 import ctypes
+import contextlib
 import os
 import socket
 import struct
@@ -9,6 +10,7 @@ import uuid
 MAX_FRAME = 16 * 1024 * 1024
 MAX_VALUE = 4 * 1024 * 1024
 MAX_BATCH = 128
+DEFAULT_SCAN_BYTES = 256 * 1024
 CODES = {1: ('incompatible_version', False), 2: ('unsupported', False),
          3: ('malformed', False), 4: ('too_large', False), 5: ('deadline', True),
          6: ('busy', True), 7: ('capacity', False), 8: ('quota', False),
@@ -229,13 +231,14 @@ class Client:
         op_id = op_id or str(uuid.uuid4())
         deadline = deadline or deadline_ms(self.timeout)
         payload = struct.pack('<Q', deadline)+lp(op_id)+lp(ns)+suffix
+        creates_snapshot = opcode == 10 or (opcode in (11, 12, 14, 15) and suffix[:4] == b'\x00' * 4)
         for attempt in range(2):
             try:
                 if self.channel is None: self.connect(deadline)
                 return self.exchange(opcode, payload, deadline)
             except (OSError, ConnectionError):
                 self.close()
-                if attempt or int(time.time()*1000) >= deadline:
+                if creates_snapshot or attempt or int(time.time()*1000) >= deadline:
                     raise
                 self.connect(deadline)
         raise AssertionError('unreachable')
@@ -289,6 +292,19 @@ class Client:
             raise ValueError('invalid snapshot reply')
         return token
 
+    @contextlib.contextmanager
+    def snapshot(self, ns, **options):
+        """Release a shared snapshot when its with block ends, including errors."""
+        token = self.snapshot_open(ns, **options)
+        try:
+            yield token
+        finally:
+            try:
+                self.snapshot_release(ns, token, **options)
+            except Refusal as error:
+                if error.code != 20:
+                    raise
+
     def snapshot_release(self, ns, snapshot, **options):
         """Release retention. A released/expired token returns cursor_expired."""
         if self.call(13, ns, lp(snapshot), **options):
@@ -318,11 +334,11 @@ class Client:
         return dict(snapshot=token, cursor=next_cursor, done=bool(done), items=items)
 
     def scan_prefix(self, ns, prefix='', *, snapshot=None, cursor=None,
-                    limit=128, max_bytes=MAX_FRAME, keys_only=False, **options):
+                    limit=128, max_bytes=DEFAULT_SCAN_BYTES, keys_only=False, **options):
         """One bounded page. Reuse snapshot/cursor to retry or continue the query."""
         return self._scan(14 if keys_only else 11, ns, [prefix], snapshot, cursor, limit, max_bytes, options)
 
     def scan_range(self, ns, lower='', upper='', *, snapshot=None, cursor=None,
-                   limit=128, max_bytes=MAX_FRAME, keys_only=False, **options):
+                   limit=128, max_bytes=DEFAULT_SCAN_BYTES, keys_only=False, **options):
         """One page of [lower, upper) in UTF-8 order; empty upper means no bound."""
         return self._scan(15 if keys_only else 12, ns, [lower, upper], snapshot, cursor, limit, max_bytes, options)

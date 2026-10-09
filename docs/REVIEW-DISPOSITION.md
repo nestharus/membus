@@ -264,3 +264,37 @@ Return review-followup-return.json;10located observations F1-F10 in followup-obs
 **F9.** Fixed present-tense claim/produced question. Concrete staged result question with corrected bulk/witness limits is sent to lane83 before merge and its receipt appended. Merged binding is explicitly pending resource authorization, then verified from actual main; READY is produced only after these dispositions. Future sends are plans until recorded.
 
 **F10.** Added observed post-run marker state for earlier aborted attempt: entering file exists and returned absent; no replay or source/binary binding persisted for that attempt. It is one retained attempt with marker postconditions but unclassified full bracket/replay evidence, separate from source-bound final3of3.
+
+
+## F-E6-24 namespace scans review (e6)
+
+Observe return: `e6/act-work/F-E6-24/observe-return.json`; full quota choice
+`observe-quota.json`, filled helper-form `observe-brief.md`, located observations
+`observe-observations.md` (O1–O20) against `761cacb..0712325`.
+Evidence names below resolve in that same frontier artifact folder. Initial
+acceptance evidence remains versioned; reviewed acceptance is `acceptance.json`
+and `acceptance-reviewed.txt`. Source binding distinguishes unchanged Rust
+candidate from later Python/documentation fixes. Every observation is accounted.
+
+| Observation | Disposition and verification |
+|---|---|
+| O1 one-page retention | Fixed Python `Client.snapshot` context manager with finally release;20 frequent one-page contexts and exception cleanup pass (`acceptance.json`, `client-snapshot.txt`). Raw done retains its shared token intentionally; documented explicit release prevents slot exhaustion. |
+| O2 initial capture replay | Fixed: transport failure for snapshot_open or an implicit initial page propagates without automatic resend. Known-token pages retry the identical view; mock single-send/retry test passes. Explicit caller retries may leave the unknown view until bounded expiry; KV1 states it. |
+| O3 whole namespace budget | Retained conservative whole-namespace charging, including keys-only, for shared value/key consistency. Measured350k layout admits2 tokens at256MiB,3 at512MiB; RSS delta67,596,288 bytes for3. Actual values/layout determine provisioned capacity; owner estimates6–8keys/row are not allocation guarantees. Shadow1key/row and namespace-group caps are documented. `scale.json` includes cap refusal22 and reopening after release. |
+| O4 capture lock scope | Answered with explicit KV1 lock/reclamation scope and measurement. Global two-pass capture and purge may stall publication/other scan operations; pages/sorting run outside committed lock. At350k captures155–186ms, writer max95.7ms;591acks occur during full paging. No claim that capture is lock-free or917k-scale latency verified. |
+| O5 fixed lifetime | Retained bounded nonrenewing lifetime, configurable before capture.44,326-row transfer0.336s and350kkeys0.610s fit30s in this witness; arbitrary graph processing can exceed it and must provision fixed TTL or restart all related queries. Owner's real processing latency remains an adoption sizing question, not an unconditional promise. |
+| O6 transient egress | Fixed Python default from16MiB to256KiB and documented resident64connection finite bounds separate from snapshot/ingress accounting. Existing Rust16MiB maximum remains for4MiB values.12MiB value page measured additional33,554,432-byte peak RSS in acceptance; no additional file reads. No new global egress semaphore or64-way peak measurement claimed. |
+| O7 plan ack ordering | Fixed PLAN.md to publication before acknowledgement; correction sent to lane87 with row/receipt `plan-order-correction-receipt.txt`. Code/KV1/tests always publish first. |
+| O8 precedence/token edges | Fixed KV1 states cursor structure validation before token lookup (malformed+expired21); capture that outlasts TTL returns20 before issuing a token. Predictable tokens remain consistency handles, not credentials. |
+| O9 visibility/consistency/dedup | Accepted counterevidence: Rust shared-snapshot/visibility/tombstone/query-bound retry tests pass; publication-before-ack and bounded24h op_id horizon unchanged. |
+| O10 keys-only | Retained requested watermark transfer behavior; whole-namespace value retention is explicit under O3.5330-key contiguous watermark equals recorded rows and350001keys full scale scan has no value fields. |
+| O11 negotiated frames | Retained effective min(request budget, negotiated frame,16MiB) and128item bound;1024/60000byte tests pass. Smaller default fixed under O6; client still offers16MiB explicitly. |
+| O12 compatibility | Live new Python against preserved installed pre-scan executable accepts19codes, conditional absent put/get equal, scan unsupported2 (`compatibility.json`). Old Python to new server, baseline/opt-in hello tests pass. Other clients must opt in to scans; owner integration remains their adoption decision. Batch codes remain baseline1–19, so static mapping is currently equivalent. |
+| O13 serial burst | Fixed acceptance:3000 serial Python conditional_put(absent) calls, no batch substitution for that burst;0.389s measured, throughput not a grouped-flush performance claim. Remaining replay rows use conditional batch items. |
+| O14 envelopes/59KB | Fixed stored values embed op_id/id/source plus original row object; all5330 canonical envelope bytes equal and nested original rows equal recorded file objects. Synthetic59499-byte companion enters same namespace during serial burst and scans back equal; distinct from recorded max59037bytes. File whitespace is not asserted byte-identical. |
+| O15 client spool/timeout | Fixed refusal on tentative row key remains fsynced/unsequenced in acceptance client's spool, absent on server. Actual Python deadline timeout after admission now settles src/hash with same op_id/version, including retry outcome. Spooling remains client-runtime-owned rather than adding storage to transport library; this is a layout witness, not runtime migration. |
+| O16 concurrent captures | Fixed scale witness starts writer before3captures; views contain1/53/126 live rows, each dense and stable on repeated pages. Writer stays active through exact44326-row and350001-key scans,591acks during pages. Raw799latencies preserved in scale.json. |
+| O17 memory/read/release | Fixed restart before acceptance/scale scans, positive replay file-read counters, first/full/after-release process samples; zero additional scan file-read bytes. Scale includes350kkeys/44326rows and slot/charge reclamation via reopen. Logical Windows process file I/O is measured; physical device/cache bytes remain unmeasured. |
+| O18 opaque cursor | Fixed acceptance passes returned snapshot field, never extracts cursor bytes. All continuation cursors preserved opaquely. |
+| O19 stale docs | Fixed current shared-token table to implemented and old slice history to accurate merged group commit14f8366/current scans, with F-E6-20 lone-writer policy separately named. |
+| O20 sibling/delivery | Delivery follows parent READY/MERGE-AUTHORIZED gate. If F-E6-20 merges first, rebase and final source-bound tests precede merge. REPORT.md/installation/visibility/close records locate final merged PRIVATE delivery and stopped hash-verified resident swap; these are post-review checks rather than claimed reviewed events. |
