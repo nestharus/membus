@@ -368,6 +368,10 @@ fn start_owners(
     // Includes queued and currently syncing waiters. Classify at arrival,
     // not receipt: a notice queued during a sync must retain its gather policy.
     let outstanding = Arc::new(AtomicUsize::new(0));
+    // Keep arrival classification and channel order together across stripes.
+    // Without this, a preempted idle sender could be overtaken by a gathered
+    // sender and inherit that later sender's window.
+    let notice_gate = Arc::new(Mutex::new(()));
     let flush_outstanding = outstanding.clone();
     let flush_logs = logs.to_vec();
     let interval = config.flush_ms;
@@ -521,6 +525,7 @@ fn start_owners(
             let config = config.clone();
             let flush = flush_send.clone();
             let outstanding = outstanding.clone();
+            let notice_gate = notice_gate.clone();
             let (sender, receiver) = mpsc::channel::<Append>();
             let handle = std::thread::spawn(move || {
                 while let Ok(job) = receiver.recv() {
@@ -557,6 +562,7 @@ fn start_owners(
                         if config.flush_notice_delay_ms > 0 {
                             std::thread::sleep(Duration::from_millis(config.flush_notice_delay_ms));
                         }
+                        let _notice = notice_gate.lock().unwrap();
                         let wait = FlushWait {
                             stripe,
                             end,
