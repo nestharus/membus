@@ -13,10 +13,10 @@ CODES = {1: ('incompatible_version', False), 2: ('unsupported', False),
          3: ('malformed', False), 4: ('too_large', False), 5: ('deadline', True),
          6: ('busy', True), 7: ('capacity', False), 8: ('quota', False),
          9: ('index_cap', False), 10: ('read_only', True), 11: ('warming', True),
-         12: ('conflict', True), 13: ('retry_window_expired', False),
+         12: ('conflict', False), 13: ('retry_window_expired', False),
          14: ('op_id_mismatch', False), 15: ('mem_not_enabled', False),
          16: ('io_failed_uncertain',True),17: ('pending_timeout_uncertain',True),
-         18: ('dedup_full',True)}
+         18: ('dedup_full',True),19: ('pending_conflict',True)}
 
 class EpochChanged(Exception):
     def __init__(self, previous, current):

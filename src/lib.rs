@@ -23,13 +23,14 @@ pub const CODES: &[(u16, &str, bool)] = &[
     (9, "index_cap", false),
     (10, "read_only", true),
     (11, "warming", true),
-    (12, "conflict", true),
+    (12, "conflict", false),
     (13, "retry_window_expired", false),
     (14, "op_id_mismatch", false),
     (15, "mem_not_enabled", false),
     (16, "io_failed_uncertain", true),
     (17, "pending_timeout_uncertain", true),
     (18, "dedup_full", true),
+    (19, "pending_conflict", true),
 ];
 pub const HELLO: u8 = 1;
 pub const GET: u8 = 2;
@@ -216,6 +217,7 @@ pub struct Log {
     pub bytes: u64,
     pub flushes: u64,
     last_flush: u64,
+    poisoned: bool,
 }
 #[derive(Clone)]
 pub struct Config {
@@ -229,6 +231,7 @@ pub struct Config {
     pub allow_mem: bool,
     pub write_delay_ms: u64,
     pub fail_after_append: bool,
+    pub fail_partial_append: bool,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -243,6 +246,7 @@ impl Default for Config {
             allow_mem: false,
             write_delay_ms: 0,
             fail_after_append: false,
+            fail_partial_append: false,
         }
     }
 }
@@ -430,6 +434,7 @@ impl Store {
                 bytes: 0,
                 flushes: 0,
                 last_flush: 0,
+                poisoned: false,
             }));
         }
         if committed.len() > config.index_cap
@@ -604,6 +609,9 @@ impl Store {
         let old = state.metadata.get(&k).cloned();
         if let Some(expected) = m.expected {
             let pending = state.pending.get(&k);
+            if pending.is_some() {
+                return Outcome::error(19);
+            }
             let visible = pending.or(old.as_ref());
             let matches = if expected == 0 {
                 pending.is_none() && old.as_ref().map_or(true, |v| v.tombstone)
@@ -707,10 +715,27 @@ impl Store {
             record.extend(b);
             let log_index = stripe(&m.ns, &m.key);
             let mut log = self.logs[log_index].lock().unwrap();
-            let r = log.file.write_all(&record);
-            if r.is_ok() {
-                log.bytes += record.len() as u64;
-            }
+            // A failed append may leave a torn tail. Fence this file under its owner
+            // lock so an already-admitted writer cannot append a valid frame behind it.
+            let r = if log.poisoned {
+                Err(io::Error::other("stripe fenced after failed append"))
+            } else if self.config.fail_partial_append {
+                let n = record.len() / 2;
+                let r = log.file.write_all(&record[..n]);
+                if r.is_ok() {
+                    log.bytes += n as u64;
+                }
+                log.poisoned = true;
+                Err(io::Error::other("test injected partial append failure"))
+            } else {
+                let r = log.file.write_all(&record);
+                if r.is_ok() {
+                    log.bytes += record.len() as u64;
+                } else {
+                    log.poisoned = true;
+                }
+                r
+            };
             let r = if r.is_ok() && self.config.fail_after_append {
                 Err(io::Error::other("test injected post-admission I/O failure"))
             } else {

@@ -190,7 +190,7 @@ fn pending_conflict_duplicate_and_hot_read() {
     assert!(started.elapsed() < Duration::from_millis(100));
     let mut competing = m("key", "competing");
     competing.expected = Some(0);
-    assert_eq!(code(&s, &wire(&competing, CONDITIONAL_PUT)), 12);
+    assert_eq!(code(&s, &wire(&competing, CONDITIONAL_PUT)), 19);
     assert!(s.get("ledger", "key").is_none());
     let mut short = x.clone();
     short.deadline = now_ms() + 5;
@@ -198,7 +198,7 @@ fn pending_conflict_duplicate_and_hot_read() {
     let duplicate = s.mutate(x);
     assert_eq!(writer.join().unwrap(), duplicate);
     assert!(s.get("ledger", "key").is_some());
-    println!("pending absent conflict=12; duplicate waited for original outcome; hot get completed without writer/flush wait");
+    println!("pending absent conflict=19; committed conflict=12 separately; duplicate waited for original outcome; hot get completed without writer/flush wait");
 }
 
 #[test]
@@ -259,6 +259,71 @@ fn past_window_ring_restart_and_length_guard() {
     assert!(e.to_string().contains("length complement"));
     assert_eq!(fs::read(log).unwrap(), bytes);
     println!("expired retired id=13; after restart unknown id executes; interior length corruption reported without truncation");
+}
+
+#[test]
+fn partial_append_fences_admitted_followers_and_replays_prior_ack() {
+    let p = path("partial-fence");
+    let seed = m("seed", "seed");
+    {
+        let s = Store::open(&p, Config::default()).unwrap();
+        assert_eq!(s.mutate(seed).code, 0);
+    }
+    #[cfg(not(windows))]
+    fs::remove_file(p.join("owner.lock")).unwrap();
+    let keystripe = |k: &str| {
+        let mut b = b"ledger\0".to_vec();
+        b.extend(k.as_bytes());
+        crc32(&b) % 4
+    };
+    let wanted = keystripe("seed");
+    let keys: Vec<_> = (0..100)
+        .map(|n| format!("failed/{n}"))
+        .filter(|k| keystripe(k) == wanted)
+        .take(2)
+        .collect();
+    let stripe_path = p.join(format!("stripe-{wanted}.log"));
+    let prior = fs::metadata(&stripe_path).unwrap().len();
+    {
+        let s = Arc::new(
+            Store::open(
+                &p,
+                Config {
+                    fail_partial_append: true,
+                    write_delay_ms: 100,
+                    ..Config::default()
+                },
+            )
+            .unwrap(),
+        );
+        let a = s.clone();
+        let first = m(&keys[0], "first");
+        let t1 = std::thread::spawn(move || a.mutate(first));
+        while !s.pending("ledger", &keys[0]) {
+            std::thread::yield_now()
+        }
+        let a = s.clone();
+        let second = m(&keys[1], "second");
+        let t2 = std::thread::spawn(move || a.mutate(second));
+        while !s.pending("ledger", &keys[1]) {
+            std::thread::yield_now()
+        }
+        assert_eq!(t1.join().unwrap().code, 16);
+        assert_eq!(t2.join().unwrap().code, 16);
+        assert_eq!(s.get("ledger", "seed").unwrap().bytes, b"value");
+    }
+    #[cfg(not(windows))]
+    fs::remove_file(p.join("owner.lock")).unwrap();
+    let torn = fs::metadata(&stripe_path).unwrap().len();
+    assert!(torn > prior);
+    {
+        let s = Store::open(&p, Config::default()).unwrap();
+        assert_eq!(s.get("ledger", "seed").unwrap().bytes, b"value");
+        assert!(s.get("ledger", &keys[0]).is_none());
+        assert!(s.get("ledger", &keys[1]).is_none());
+        assert_eq!(fs::metadata(&stripe_path).unwrap().len(), prior);
+    }
+    println!("partial append fenced both admitted followers; torn bytes={} discarded; prior acknowledged key replayed",torn-prior);
 }
 #[test]
 fn crc_replay_tombstone_torn_and_corrupt() {

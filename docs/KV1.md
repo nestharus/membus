@@ -32,7 +32,7 @@ Every non-hello request carries `u64 deadline_unix_ms; string op_id; string name
 
 ## 3. Pending writes and duplicate identity (item 1)
 
-Admission reserves the key and its future version before log I/O. A competing conditional_put(absent) sees the admitted reservation and returns conflict, even before publication. A pending remove does not make absent true before that remove commits. Unconditional mutations of a pending key return busy. A duplicate op_id with the same payload joins the original's eventual outcome (waiting only until the duplicate's deadline); it does not create a new conflict. A later deadline lets the caller query the same outcome. Different payload under an existing id returns op_id_mismatch.
+Admission reserves the key and its future version before log I/O. A competing conditional_put sees the admitted reservation and returns **pending_conflict (19)**, even before publication; **conflict (12)** instead names a mismatching committed expected state. A pending remove does not make absent true before that remove commits. Unconditional mutations of a pending key return busy. A duplicate op_id with the same payload joins the original's eventual outcome (waiting only until the duplicate's deadline); it does not create a new conflict. A later deadline lets the caller query the same outcome. Different payload under an existing id returns op_id_mismatch.
 
 Committed reads use a distinct snapshot lock and never take an append, admission, or flush lock. They can see the previous committed value while a mutation is pending. The conditional operation checks pending reservations and a separate metadata map under admission coordination. Key/namespace/value/dedup counters and an expiry queue avoid full key-map scans during admission; no admission holds the committed read lock. Publication is a short update after OS append or flush completes. A pending conflict is transient: re-read/reselect, and fill a client seq hole if that pending winner later fails.
 
@@ -55,15 +55,16 @@ Closed list, published verbatim by hello:
 | 9 | index_cap | persistent until index capacity grows |
 | 10 | read_only | transient after storage repair; refused before admission |
 | 11 | warming | transient during replay/readiness |
-| 12 | conflict | transient for a pending reservation; re-read/reselect expected state |
+| 12 | conflict | persistent for the committed expected state; re-read/reselect |
 | 13 | retry_window_expired | persistent; reconcile by deterministic key |
 | 14 | op_id_mismatch | persistent |
 | 15 | mem_not_enabled | persistent until explicit opt-in configuration |
 | 16 | io_failed_uncertain | transient outcome after admission; reconcile deterministic key |
 | 17 | pending_timeout_uncertain | transient outcome of a pending duplicate; same op_id |
 | 18 | dedup_full | transient until retained outcomes expire or configured slots grow |
+| 19 | pending_conflict | transient: competing conditional reservation is unpublished |
 
-All 18 codes are tested through the dispatcher, including deterministic warming/read-only state and post-append failure fixtures. Before-admission refusals are safe to spool unsequenced. Codes 16/17 are uncertain outcomes, not evidence of non-admission; the client preserves op_id and reconciles its deterministic key. Busy/capacity/quota/index_cap/dedup_full remain distinct. A complete log record left by failed I/O may replay even when the same-lifetime outcome was uncertain; never mint a fresh id for it.
+All 19 codes are tested through the dispatcher, including deterministic warming/read-only state and post-append failure fixtures. Before-admission refusals are safe to spool unsequenced. Codes 16/17 are uncertain outcomes, not evidence of non-admission; the client preserves op_id and reconciles its deterministic key. Busy/capacity/quota/index_cap/dedup_full remain distinct. A complete log record left by failed I/O may replay even when the same-lifetime outcome was uncertain; never mint a fresh id for it. Partial append failure fences its stripe under the file's append-owner lock before already-admitted followers can append behind the torn tail.
 
 ## 5. Visibility and snapshots (items 4 and 5)
 
@@ -83,13 +84,15 @@ State defaults to the caller's chosen `D:/projects/membus/state/`, outside sourc
 
 Each namespace defaults to **500,000** keys, including tombstones, configurable with `--quota`, covering the located 270–350k ledger keys. Global key cap defaults to 917,000 (`--index-cap`), below the plan's approximate 256 MiB metadata ceiling; actual allocator overhead is not measured in this slice. Separate value/dedup-byte cap 256 MiB and queued-value budget 64 MiB are configurable. Reservations count toward admission, so competing new-key writes cannot exceed quotas. Read-only access to old keys remains available at a cap; new keys are refused with the precise code. Capacity reserves the replacement value while the old value remains visible; this intentionally can refuse an overwrite early rather than exceed peak memory. Missing-key remove persists a tombstone and consumes a key slot.
 
-Health reports global and requested-namespace keys, configured per-namespace quota/global cap, bytes written and flushes for this server lifetime, and 70% high-water flags for both namespace quota and global cap. Clients poll before the cap (signals later). Exact dedup payloads are charged to the value-byte capacity as well; CRC is only corruption detection, never the payload identity guard. The current workload has about 270–350k derived keys (44,326 rows/59 ledgers), already 30–40% of the global cap. Before growth reaches 70%, lane 83 should avoid derived link keys, raise provisioned quota/cap only after RAM accounting, or migrate namespaces to an additional membus instance. Forever namespaces cannot recover capacity by cache eviction. Cold indexing and capacity measured at allocator level are later commissions. At 100%, quarantine persistent refusals and raise an observation; do not let a forever spool loop silently.
+Health reports global and requested-namespace keys, configured per-namespace quota/global cap, bytes written and flushes for this server lifetime, and 70% high-water flags for both namespace quota and global cap. Clients poll before the cap (signals later). Exact dedup payloads are charged to the value-byte capacity as well; CRC is only corruption detection, never the payload identity guard. The current workload has about 270–350k derived keys (44,326 rows/59 ledgers), 30–40% of the global cap and **54–70% of one 500k namespace**. Lane83's late answer (eco seq402) correctly notes that the namespace warning can fire at adoption; actual allocator memory per key remains unmeasured. Before growth reaches 70%, lane 83 should avoid derived link keys, raise provisioned quota/cap only after RAM accounting, or migrate namespaces to an additional membus instance. Forever namespaces cannot recover capacity by cache eviction. Cold indexing and capacity measured at allocator level are later commissions. At 100%, quarantine persistent refusals and raise an observation; do not let a forever spool loop silently.
 
 ## 8. Client-owned refusal/outage path
 
 This replaces PLAN.md:13 and §13.5's seq90 journal/CAS-max proposal with lane 83 review §3. Runtime owns these changes; the membus slice does not implement its spool.
 
 Before first send mint stable row id and op_id; refused rows are fsynced into the existing spool **unsequenced**, and phase dispatch pauses. Do not run a seq-bearing file journal as a second writer or CAS max(seq) at drain. For timeout/reset after send persist `state: uncertain`. Reconcile `get(src/<source hash>)`: same op_id means done; absent means conditional_put(absent) with the same op_id; a different op_id means same-content dedup or a revision. Check an in-flight row/<seq>'s embedded op_id before choosing another seq. Deterministic keys retain idempotence beyond the dedup horizon. Source claim is the commit point; intent records let the client recover its five multi-key updates; contiguous watermark/hole filling remain client-owned.
+
+Lane83's **shadow proposal** (eco seq402) is separate from that primary-store outage path: the fsynced file ledger remains authoritative and is already the journal, so no extra shadow journal. Mirror with conditional_put(absent) on the file's own fixed-width seq key and explicit os ack; a client-owned mirror cursor catches up after an outage. Past-window safety requires all three invariants: authoritative mirror keys use only conditional puts; they are never removed (abandoned seqs get a value, not a remove); and a retry first reads the deterministic key and embedded op_id. Shadow choice belongs to lane83's Decide, with no primary migration. Grouped flushes and scans remain required before primary adoption.
 
 ## 9. Flush spacing and next slices
 

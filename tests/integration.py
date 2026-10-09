@@ -175,7 +175,7 @@ def run(args):
         started=time.monotonic();assert c.get('ledger','hot')['value']==b'hot'
         hot_seconds=time.monotonic()-started
         try: c.put('ledger','pending',b'competing',expected=0,op_id='competing')
-        except Refusal as error: assert error.code==12
+        except Refusal as error: assert error.code==19
         else: raise AssertionError('pending reservation did not conflict')
         duplicate=c.put('ledger','pending',b'pending',expected=0,ack=2,op_id='pending')
         task.join(timeout=5);pending.close();assert answer.get('outcome')==duplicate
@@ -187,7 +187,7 @@ def run(args):
         settled=c.put('ledger','uncertain',b'uncertain',expected=0,op_id='uncertain')
         assert uncertain.get('ledger','uncertain')['version']==settled['version']
         assert c.get('ledger','uncertain')['version']==settled['version']
-        results['pending']={'competing_absent_code':12,'duplicate':'original outcome','hot_read_seconds':hot_seconds,
+        results['pending']={'competing_absent_code':19,'duplicate':'original outcome','hot_read_seconds':hot_seconds,
                             'timeout_retry':'same op_id settled original outcome','stats':c.health()}
         server.stop()
         server=Server(args.binary,output/'mem-state',output/'mem-server.txt',flags=('--allow-mem',));servers.append(server)
