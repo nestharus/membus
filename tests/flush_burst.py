@@ -41,7 +41,8 @@ def run(args):
                 'largest_row_bytes':59499,'dense_seq':'1..3070','seconds':elapsed,'batch_seconds':latencies,
                 'metrics':metrics,'epoch_before':epoch,'epoch_after':server.client.epoch,
                 'startup_epoch_bytes':16,'startup_epoch_sync_calls':2,'physical_device_bytes':'unmeasured',
-                'grouped_flush':False,'all_tests_passed':True}
+                'grouped_flush':True,'pass_condition':'all3070ack2, exactvalueandidreplayafterkill, elapsedbelow158.0978shistoricalbaseline',
+                'time_condition_passed':elapsed<158.0978,'all_tests_passed':elapsed<158.0978}
         (output/'acknowledged-flush-ids.json').write_text(json.dumps(acknowledged),encoding='utf8')
         (output/'replayed-flush-ids.json').write_text(json.dumps(replayed),encoding='utf8')
         (output/'integration-flush.json').write_text(json.dumps(result,indent=2),encoding='utf8')

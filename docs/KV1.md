@@ -112,3 +112,8 @@ Lane83's **shadow proposal** (eco seq402) is separate from that primary-store ou
 ## 11. Run and verify
 
 `cargo test --offline --locked -- --nocapture`, then `python tests/integration.py --binary target/debug/membus.exe --output <ignored evidence dir>`. Queue both through lineup with cpu/mem and disk:d. Build outputs stay in ignored target; replay/burst states and captures in the commissioned act-work directory. No third-party crate or dependency execution. The Python test owns and stops every server it launches, compares acknowledged ids to replay, and reports record bytes/flush calls.
+
+### F-E6-20 implemented grouped write policy
+
+[GROUPED-FLUSH.md](GROUPED-FLUSH.md) defines the current group closing rule, actual cohort/admission bounds, --flush-ms meaning, batch concurrency and failure behavior. It supersedes section9's historical slice1 ungrouped behavior above; kv/1 remains minor0.
+
