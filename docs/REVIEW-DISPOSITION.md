@@ -202,3 +202,65 @@ Final dispositions (O-S0..O-S11):
 | O-S9 original dispositions | All original16 observations remain individually accounted above; final report locates tests and registered-service check. No new protocol/state format change. |
 | O-S10 obsolete registration paragraph | Fixed removed pre-answer paragraph; seq452's logon+minute policy is the single current shape. |
 | O-S11 KV1 capacity routing | Fixed section7 names persistent state byte cap, replay+inflight accounting, capacity7 for tombstones, and RESIDENT remedy/diagnostic warning. |
+
+## e6 F-E6-20 idle-immediate review
+
+Observe return: runs/e6/act-work/F-E6-20/review-return.json;17located observations in observations.md, quota output review-quota.json. Every observation below has a within-commission fix or a scoped answer; beyond-scope adoption/measurement choices remain with their owners.
+
+**O1.** Answered, completion reserved for merge. READY installation plan compares compiled source hashes/main release and remeasures any integrated or different binary. No staged measurement is called a merged one; MERGED-SOURCE-BINDING.json will record exact merged source/binary.
+
+**O2.** Answered. The report records real append_all versus bounded non-atomic batches; the journal wins the bulk transaction. The staged lane83 question includes this result; a final installed-result question is planned after verification and does not reuse the old serial-journal burst yes as a new adoption claim.
+
+**O3.** Fixed. final-window has501idle rows with fold sample500 and cadence initialized from499actual recorded tail rows with fold sample1. Runtime38c195f uses >500, not >=500. Boundary costs are in raw samples; cadence boundary average is not asserted as steady amortization.
+
+**O4.** Answered in GROUPED-FLUSH/KV1 and report. Concurrent low-rate writers retain gathering; serial workloads are the commissioned first-client shapes. No parallel latency distribution or general single-writer guarantee under another client is claimed.
+
+**O5.** Answered. One sync/row at93/min and brief501-row serial sample plus bytes/co-tenant counts account for measured load. No global20/s ceiling remains. Sustained serial/physical-device traffic is unmeasured, with no inferred optimum or drive-safety promise.
+
+**O6.** Fixed/qualified. policy-forms.json measures source-bound std-only worker prototypes at per-request50/0 and second-arrival closing, beside the chosen policy. New wire-negotiation/interface cost is explicitly excluded and unknown. Forms, timings and reasons are now in both policy docs and PLAN addendum.
+
+**O7.** Answered with explicit limits. Final between-mark kills and paired completed-call durations meet the commission's stated marker criterion. Kernel interruption/termination ordering, dirty-page state and power-loss behavior are not observed. Extent means32MiB complete OS-ack records with no earlier explicit sync, not proof every page remains dirty.
+
+**O8.** Answered. Killed attempts acknowledge OS records; trigger is uncertain and excluded. OS cache replay alone proves no flush durability. Completed witness attempts and every final-window flush-acked workload separately replay ack2 IDs/values. No power-cut or interrupted-kernel proof is inferred.
+
+**O9.** Fixed reporting. sync-kills.json lists one earlier unclassified join-aborted kill, three earlier verified c57b088 kills and final source859423d attempts. All artifacts remain; report separates verified-source denominators and total earlier attempts.
+
+**O10.** Fixed. The old timing test is accurately named delayed_flush_notification_preserves_acknowledgement. New owner-level late_notice_for_already_covered_extent_needs_no_second_sync asserts exactly one sync at the idle receipt branch using a same-extent owner seam; it does not cover every receive branch or wire admission.
+
+**O11.** Fixed. Actual enqueue helper is tested with a forced pause between first arrival classification and delivery; a second sender cannot overtake and is classified gathered behind the queued first. During-sync test waits for enqueue notification instead of20ms sleep.17Rust tests pass.
+
+**O12.** Answered. Full raw samples, p95/max/tail samples and co-tenant context are now in report. Serial-client ordering and decrement-before-ack remove intentional gather eligibility, but no server per-sample classification trace or attribution of slow calls is claimed.
+
+**O13.** Fixed. Failed entering/returned marker writes only log test diagnostics and never alter the sync result. Invalid marker parent yields two successful subsequent flush acknowledgements; marker_failure_preserves_sync_result is true. Ordinary release omits the lookup and remains unaffected.
+
+**O14.** Fixed. Both policy docs restored to LF, matching761cacb; substantive diff is separated from prior EOL churn.
+
+**O15.** Fixed. KV1§9 now says historical pre-grouping comparison basis, and current501/93/3065 source-bound evidence/ack boundaries are explicitly located.
+
+**O16.** Fixed. GROUPED-FLUSH calls ffe865f historical e4 and locates its evidence separately from current859423d. Different-build burst effect is not isolated or claimed.
+
+**O17.** Answered as outside this commission. Scans are F-E6-24; capacity/shadow growth concern is retained, with no new capacity measurement or primary-use choice. The staged lane83 question is the authorized lone-writer question and includes durability/bulk limits.
+
+## e6 follow-up observe dispositions
+
+Return review-followup-return.json;10located observations F1-F10 in followup-observations.md. Quota output review-followup-quota.json names nativeclaude7. No production source changed by these reporting answers.
+
+**F1.** Answered.128rows at50ms used13syncs/0.618s against zero-window prototype16syncs/0.015s: about19%fewer syncs for about40times elapsed. This is measured sync-count versus latency tradeoff, not physical traffic or a chosen optimum. Existing --flush-ms0 is available; its3065row burst is unmeasured. The commission keeps gathering; default tuning remains owner/Decide choice.
+
+**F2.** Qualified reporting. Fixed per-request subcases remeasure global-equivalent50/0 execution; no mixed per-request behavior or second-trigger activation is isolated. The serial subcase and inherited busy-path costs bound the forms, and interface/close-race costs remain unknown. Removed the claim that these are discriminating complete implementations. Added actual prototype source paths/hashes; no further source changes or production alternative claimed.
+
+**F3.** Answered. All final killed mark-to-termination intervals exceed the three completed-call durations. These intervals also include delivery/wait/polling and do not identify kernel completion ordering. Report now states the ordering explicitly. Only the commissioned between-mark criterion is met, with no interrupted-flush claim.
+
+**F4.** Qualified. Test forces first-sender preemption, but a late-scheduled second thread can let a lock-removal mutation pass. No mutation run is claimed. Removed deterministic wording for this test; actual enqueue critical-section construction, positive test and during-sync enqueue witness remain the evidence. No production race is located.
+
+**F5.** Answered. Owner seam tests the idle receipt branch using an empty append and cannot be generated by wire admission. Gather/try_recv reuse branches are not individually asserted by that seam. Grouped32writes coverage remains tested; no full branch-coverage claim. Documentation now names the exact seam scope.
+
+**F6.** Fixed/answered. Removed repeated blank lines. HEAD docs are LF and final baseline diff ignores intermediateCRLF; followup diff from an intermediateCRLF commit necessarily includes correction churn. Source tree itself matches baselineEOL, without claiming intermediate diffs have no churn.
+
+**F7.** Added measured rates.501flush calls divided by summed own call intervals=750.85/s; divided by mixed membus+journal wall interval=145.76/s. Neither is a sustained membus-only/device throughput limit; physical-device load remains unknown.
+
+**F8.** Added journal logical read totals/per-row values to report. These include runtime/index/tail reads around measured calls, exclude instrumentation/init, and do not identify physical reads or cache misses. HistoricalF-LP-33 figures are different workload/source/window and not directly substituted.
+
+**F9.** Fixed present-tense claim/produced question. Concrete staged result question with corrected bulk/witness limits is sent to lane83 before merge and its receipt appended. Merged binding is explicitly pending resource authorization, then verified from actual main; READY is produced only after these dispositions. Future sends are plans until recorded.
+
+**F10.** Added observed post-run marker state for earlier aborted attempt: entering file exists and returned absent; no replay or source/binary binding persisted for that attempt. It is one retained attempt with marker postconditions but unclassified full bracket/replay evidence, separate from source-bound final3of3.
