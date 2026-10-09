@@ -143,29 +143,33 @@ class Client:
 
     def connect(self, deadline):
         previous=getattr(self,'epoch',None)
-        if self.transport == 'tcp':
-            host, port = self.address.rsplit(':', 1)
-            self.channel = socket.create_connection((host, int(port)), max(.001, (deadline-int(time.time()*1000))/1000))
-            self.channel.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        else:
-            self.channel = Pipe(self.address, deadline)
-        response = self.exchange(1, struct.pack('<IB', MAX_FRAME, self.allow_mem)+lp('python-stdlib;scans=1'), deadline)
-        decoder = Decoder(response)
-        self.epoch, self.max_frame, self.max_value, self.max_batch, self.mem, self.retry_ms = decoder.unpack('<QIIHBQ')
-        count, = decoder.unpack('<H')
-        codes = {}
-        for _ in range(count):
-            code, transient = decoder.unpack('<HB')
-            if code in codes or code == 0 or transient not in (0, 1):
+        try:
+            if self.transport == 'tcp':
+                host, port = self.address.rsplit(':', 1)
+                self.channel = socket.create_connection((host, int(port)), max(.001, (deadline-int(time.time()*1000))/1000))
+                self.channel.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            else:
+                self.channel = Pipe(self.address, deadline)
+            response = self.exchange(1, struct.pack('<IB', MAX_FRAME, self.allow_mem)+lp('python-stdlib;scans=1'), deadline)
+            decoder = Decoder(response)
+            self.epoch, self.max_frame, self.max_value, self.max_batch, self.mem, self.retry_ms = decoder.unpack('<QIIHBQ')
+            count, = decoder.unpack('<H')
+            codes = {}
+            for _ in range(count):
+                code, transient = decoder.unpack('<HB')
+                if code in codes or code == 0 or transient not in (0, 1):
+                    self.close()
+                    raise ValueError('invalid refusal-code list')
+                codes[code] = (decoder.blob().decode(), bool(transient))
+            if (decoder.pos != len(response) or
+                    any(codes.get(code) != value for code, value in CODES.items() if code <= 19) or
+                    any(code in codes and codes[code] != value for code, value in CODES.items())):
                 self.close()
-                raise ValueError('invalid refusal-code list')
-            codes[code] = (decoder.blob().decode(), bool(transient))
-        if (decoder.pos != len(response) or
-                any(codes.get(code) != value for code, value in CODES.items() if code <= 19) or
-                any(code in codes and codes[code] != value for code, value in CODES.items())):
+                raise ValueError('incompatible refusal-code list')
+            self.codes = codes
+        except BaseException:
             self.close()
-            raise ValueError('incompatible refusal-code list')
-        self.codes = codes
+            raise
         if previous is not None and self.epoch!=previous:
             raise EpochChanged(previous,self.epoch)
 
