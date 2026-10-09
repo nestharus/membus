@@ -113,3 +113,31 @@ fn batch_same_key_order_and_reply_order() {
         .collect();
     assert!(versions[0] < versions[2]);
 }
+
+#[test]
+fn late_flush_notification_uses_covering_sync() {
+    let s = Arc::new(
+        Store::open(
+            &path("late-notice"),
+            Config {
+                flush_ms: 20,
+                flush_notice_delay_ms: 100,
+                ..Config::default()
+            },
+        )
+        .unwrap(),
+    );
+    // key1/key3 share a stripe. The first notice arrives around100ms; the
+    // owner then appends key3 but holds its notice until200ms. The first sync
+    // gathers until120ms, covering both complete records before key3's notice.
+    assert_eq!(crc32(b"ledger\0key1") % 4, crc32(b"ledger\0key3") % 4);
+    let first = s.clone();
+    let thread = std::thread::spawn(move || first.mutate(mutation(1)));
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let second = s.clone();
+    let other = std::thread::spawn(move || second.mutate(mutation(3)));
+    assert!(s.get("ledger", "key1").is_none());
+    assert_eq!(thread.join().unwrap().ack, 2);
+    assert_eq!(other.join().unwrap().ack, 2);
+    assert_eq!(s.io_metrics().2, 1);
+}

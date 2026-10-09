@@ -237,6 +237,8 @@ pub struct Config {
     pub flush_ms: u64,
     pub allow_mem: bool,
     pub write_delay_ms: u64,
+    /// Test seam for an append-complete notification arriving after a covering sync.
+    pub flush_notice_delay_ms: u64,
     pub fail_after_append: bool,
     pub fail_partial_append: bool,
 }
@@ -253,6 +255,7 @@ impl Default for Config {
             flush_ms: 50,
             allow_mem: false,
             write_delay_ms: 0,
+            flush_notice_delay_ms: 0,
             fail_after_append: false,
             fail_partial_append: false,
         }
@@ -319,9 +322,14 @@ fn start_owners(
     let flush_owner = std::thread::spawn(move || {
         let mut pending = VecDeque::new();
         let mut last = 0u64;
+        let mut covered = [0u64; 4];
         loop {
             if pending.is_empty() {
                 match flush_recv.recv() {
+                    Ok(w) if w.end <= covered[w.stripe] => {
+                        let _ = w.done.send(Ok(()));
+                        continue;
+                    }
                     Ok(w) => pending.push_back(w),
                     Err(_) => break,
                 }
@@ -330,13 +338,20 @@ fn start_owners(
                 let until = std::time::Instant::now() + Duration::from_millis(interval);
                 while let Some(left) = until.checked_duration_since(std::time::Instant::now()) {
                     match flush_recv.recv_timeout(left) {
+                        Ok(w) if w.end <= covered[w.stripe] => {
+                            let _ = w.done.send(Ok(()));
+                        }
                         Ok(w) => pending.push_back(w),
                         Err(_) => break,
                     }
                 }
             }
             while let Ok(w) = flush_recv.try_recv() {
-                pending.push_back(w);
+                if w.end <= covered[w.stripe] {
+                    let _ = w.done.send(Ok(()));
+                } else {
+                    pending.push_back(w);
+                }
             }
             let stripe = pending.front().unwrap().stripe;
             let mut group = Vec::new();
@@ -367,6 +382,9 @@ fn start_owners(
                 f.sync_all()
             });
             last = now_ms();
+            if result.is_ok() {
+                covered[stripe] = covered[stripe].max(through);
+            }
             {
                 let mut log = flush_logs[stripe].lock().unwrap();
                 log.flushes += 1;
@@ -434,6 +452,9 @@ fn start_owners(
                     };
                     drop(log);
                     if result.is_ok() && job.ack == 2 {
+                        if config.flush_notice_delay_ms > 0 {
+                            std::thread::sleep(Duration::from_millis(config.flush_notice_delay_ms));
+                        }
                         let wait = FlushWait {
                             stripe,
                             end,
