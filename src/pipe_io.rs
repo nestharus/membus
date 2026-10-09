@@ -74,20 +74,23 @@ impl Pipe {
                     h,
                     buffer,
                     count.min(65536) as u32,
-                    &mut done,
+                    std::ptr::null_mut(),
                     &mut operation,
                 ),
                 1 => WriteFile(
                     h,
                     buffer,
                     count.min(65536) as u32,
-                    &mut done,
+                    std::ptr::null_mut(),
                     &mut operation,
                 ),
                 _ => ConnectNamedPipe(h, &mut operation),
             }
         };
         if ok != 0 {
+            if kind != 2 && unsafe { GetOverlappedResult(h, &mut operation, &mut done, 0) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
             return Ok(done as usize);
         }
         let error = io::Error::last_os_error();
