@@ -51,6 +51,10 @@ no per-request log. stdout/stderr have just startup/fatal messages; lane88's
 launcher must rotate/cap captures at1MiB with one prior file. Health check:
 fresh heartbeat (age<90s), matching live pid and successful kv/1 hello/health;
 heartbeat freshness alone is not a proof the transport can serve.
+Native `membus.exe health PIPE [--state-dir PATH]` (state defaults to the resident
+state path above) exits0 only after kv/1 hello+health, with the pipe server pid
+queried through Windows, matching heartbeat pid and hello epoch, age<90s.
+It uses2s per-I/O timeouts and emits a single success line; failures exit nonzero.
 
 ## State growth and upgrades
 
@@ -71,6 +75,13 @@ slice retains MBK1 and kv/1.0, so replay uses existing state without migration.
 Service registration asks lane88 for logon startup, restart-on-failure and
 the exact services.toml/Task Scheduler definition; until its answer there is
 no claim fleet runs this instance.
+Lane88's eco seq452 answer selects task `Oulipoly membus`, xteam logon plus
+1-minute repeats, IgnoreNew, below-normal priority, unlimited duration. The
+minute repeat restarts after exit; Task Scheduler RestartOnFailure concerns
+start failures and is deliberately omitted. Lane88's pythonw resident launcher
+owns the1MiB+one-prior capture. Registration waits for verified installed binary
+hash+commit and the native health command; the final Act report records whether
+that registration and fleet restart test happened.
 
 ## Plan basis and verification
 

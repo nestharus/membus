@@ -39,6 +39,17 @@ def main():
             assert after['heartbeat_writes']==before['heartbeat_writes']+1
             assert after['heartbeat_bytes']-before['heartbeat_bytes']==after['object_bytes']
         result['heartbeat']=samples
+        check=[str(args.binary),'health',server.address,'--state-dir',str(out/'state')]
+        healthy=subprocess.run(check,capture_output=True,text=True)
+        assert healthy.returncode==0,(healthy.stdout,healthy.stderr)
+        heartbeat_path=out/'state'/'heartbeat.json'
+        # Keep a mismatch stable by using the other fixture directory, without
+        # racing the real server's bounded heartbeat writer.
+        wrong=out/'wrong-state';wrong.mkdir(exist_ok=True)
+        bad=dict(samples[-1],pid=0);(wrong/'heartbeat.json').write_text(json.dumps(bad,separators=(',',':')))
+        unhealthy=subprocess.run(check[:-1]+[str(wrong)],capture_output=True,text=True)
+        assert unhealthy.returncode!=0
+        result['native_health']={'matching_pid_epoch':healthy.stdout.strip(),'wrong_pid_exit':unhealthy.returncode}
         server.stop();server=None
         stripe=next((out/'state').glob('stripe-*.log'))
         with stripe.open('ab') as f:f.write(b'MBK')
