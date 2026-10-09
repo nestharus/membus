@@ -71,7 +71,7 @@ fn serve<S: Read + Write>(
             ))?;
             continue;
         }
-        let mut response = store.dispatch_for(&b, allow_mem);
+        let mut response = store.dispatch_for_limit(&b, allow_mem, max_frame);
         if response.len() - 4 > max_frame {
             response = membus::reply(
                 b[4],
@@ -289,7 +289,7 @@ fn main() -> io::Result<()> {
         return health_command(&args[2..]);
     }
     if args.len() < 4 {
-        return Err(io::Error::other("usage: membus STATE_DIR tcp|pipe ADDRESS [--idle-ms N] [--heartbeat-ms N] [--state-limit-bytes N] [--flush-ms N] [--retry-ms N] [--quota N] [--index-cap N] [--capacity N] [--queue-bytes N] [--dedup-cap N] [--delay-ms N] [--allow-mem]; membus health PIPE [--state-dir PATH]"));
+        return Err(io::Error::other("usage: membus STATE_DIR tcp|pipe ADDRESS [--idle-ms N] [--heartbeat-ms N] [--state-limit-bytes N] [--flush-ms N] [--retry-ms N] [--quota N] [--index-cap N] [--capacity N] [--queue-bytes N] [--dedup-cap N] [--delay-ms N] [--allow-mem] [--snapshot-bytes N] [--snapshot-max N] [--snapshot-ttl-ms N]; membus health PIPE [--state-dir PATH]"));
     }
     let path = PathBuf::from(&args[1]);
     let mut config = Config::default();
@@ -334,6 +334,13 @@ fn main() -> io::Result<()> {
             "--queue-bytes" => config.queue_bytes = n as usize,
             "--dedup-cap" => config.dedup_cap = n as usize,
             "--delay-ms" => config.write_delay_ms = n,
+            "--snapshot-bytes" => {
+                config.snapshot_bytes = usize::try_from(n).map_err(io::Error::other)?
+            }
+            "--snapshot-max" => {
+                config.snapshot_max = usize::try_from(n).map_err(io::Error::other)?
+            }
+            "--snapshot-ttl-ms" => config.snapshot_ttl_ms = n,
             _ => return Err(io::Error::other("unknown option")),
         }
         i += 2

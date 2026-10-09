@@ -264,3 +264,61 @@ Return review-followup-return.json;10located observations F1-F10 in followup-obs
 **F9.** Fixed present-tense claim/produced question. Concrete staged result question with corrected bulk/witness limits is sent to lane83 before merge and its receipt appended. Merged binding is explicitly pending resource authorization, then verified from actual main; READY is produced only after these dispositions. Future sends are plans until recorded.
 
 **F10.** Added observed post-run marker state for earlier aborted attempt: entering file exists and returned absent; no replay or source/binary binding persisted for that attempt. It is one retained attempt with marker postconditions but unclassified full bracket/replay evidence, separate from source-bound final3of3.
+
+
+## F-E6-24 namespace scans review (e6)
+
+Observe return: `e6/act-work/F-E6-24/observe-return.json`; full quota choice
+`observe-quota.json`, filled helper-form `observe-brief.md`, located observations
+`observe-observations.md` (O1–O20) against `761cacb..0712325`.
+Evidence names below resolve in that same frontier artifact folder. Initial
+acceptance evidence remains versioned; reviewed acceptance is `acceptance.json`
+and `acceptance-reviewed.txt`. Source binding distinguishes unchanged Rust
+candidate from later Python/documentation fixes. Every observation is accounted.
+
+| Observation | Disposition and verification |
+|---|---|
+| O1 one-page retention | Fixed Python `Client.snapshot` context manager with finally release;20 frequent one-page contexts and exception cleanup pass (`acceptance.json`, `client-snapshot.txt`). Raw done retains its shared token intentionally; documented explicit release prevents slot exhaustion. |
+| O2 initial capture replay | Fixed: transport failure for snapshot_open or an implicit initial page propagates without automatic resend. Known-token pages retry the identical view; mock single-send/retry test passes. Explicit caller retries may leave the unknown view until bounded expiry; KV1 states it. |
+| O3 whole namespace budget | Retained conservative whole-namespace charging, including keys-only, for shared value/key consistency. Measured350k layout admits2 tokens at256MiB,3 at512MiB; RSS delta67,596,288 bytes for3. Actual values/layout determine provisioned capacity; owner estimates6–8keys/row are not allocation guarantees. Shadow1key/row and namespace-group caps are documented. `scale.json` includes cap refusal22 and reopening after release. |
+| O4 capture lock scope | Answered with explicit KV1 lock/reclamation scope and measurement. Global two-pass capture and purge may stall publication/other scan operations; pages/sorting run outside committed lock. At350k captures155–186ms, writer max95.7ms;591acks occur during full paging. No claim that capture is lock-free or917k-scale latency verified. |
+| O5 fixed lifetime | Retained bounded nonrenewing lifetime, configurable before capture.44,326-row transfer0.336s and350kkeys0.610s fit30s in this witness; arbitrary graph processing can exceed it and must provision fixed TTL or restart all related queries. Owner's real processing latency remains an adoption sizing question, not an unconditional promise. |
+| O6 transient egress | Fixed Python default from16MiB to256KiB and documented resident64connection finite bounds separate from snapshot/ingress accounting. Existing Rust16MiB maximum remains for4MiB values.12MiB value page measured50,348,032-byte peak above pre-page RSS (33,554,432-byte increase of lifetime peak) in acceptance; no additional file reads. No new global egress semaphore or64-way peak measurement claimed. |
+| O7 plan ack ordering | Fixed PLAN.md to publication before acknowledgement; correction sent to lane87 with row/receipt `plan-order-correction-receipt.txt`. Code/KV1/tests always publish first. |
+| O8 precedence/token edges | Fixed KV1 states cursor structure validation before token lookup (malformed+expired21); capture that outlasts TTL returns20 before issuing a token. Predictable tokens remain consistency handles, not credentials. |
+| O9 visibility/consistency/dedup | Accepted counterevidence: Rust shared-snapshot/visibility/tombstone/query-bound retry tests pass; publication-before-ack and bounded24h op_id horizon unchanged. |
+| O10 keys-only | Retained requested watermark transfer behavior; whole-namespace value retention is explicit under O3.5330-key contiguous watermark equals recorded rows and350001keys full scale scan has no value fields. |
+| O11 negotiated frames | Retained effective min(request budget, negotiated frame,16MiB) and128item bound;1024/60000byte tests pass. Smaller default fixed under O6; client still offers16MiB explicitly. |
+| O12 compatibility | Live new Python against preserved installed pre-scan executable accepts19codes, conditional absent put/get equal, scan unsupported2 (`compatibility.json`). Old Python to new server, baseline/opt-in hello tests pass. Other clients must opt in to scans; owner integration remains their adoption decision. Batch codes remain baseline1–19, so static mapping is currently equivalent. |
+| O13 serial burst | Fixed acceptance:3000 serial Python conditional_put(absent) calls, no batch substitution for that burst;0.389s measured, throughput not a grouped-flush performance claim. Remaining replay rows use conditional batch items. |
+| O14 envelopes/59KB | Fixed stored values embed op_id/id/source plus original row object; all5330 canonical envelope bytes equal and nested original rows equal recorded file objects. Synthetic59499-byte companion enters same namespace during serial burst and scans back equal; distinct from recorded max59037bytes. File whitespace is not asserted byte-identical. |
+| O15 client spool/timeout | Fixed refusal on tentative row key remains fsynced/unsequenced in acceptance client's spool, absent on server. Actual Python deadline timeout after admission now settles src/hash with same op_id/version, including retry outcome. Spooling remains client-runtime-owned rather than adding storage to transport library; this is a layout witness, not runtime migration. |
+| O16 concurrent captures | Fixed scale witness starts writer before3captures; views contain1/53/126 live rows, each dense and stable on repeated pages. Writer stays active through exact44326-row and350001-key scans,591acks during pages. Raw799latencies preserved in scale.json. |
+| O17 memory/read/release | Fixed restart before acceptance/scale scans, positive replay file-read counters, first/full/after-release process samples; zero additional scan file-read bytes. Scale includes350kkeys/44326rows and slot/charge reclamation via reopen. Logical Windows process file I/O is measured; physical device/cache bytes remain unmeasured. |
+| O18 opaque cursor | Fixed acceptance passes returned snapshot field, never extracts cursor bytes. All continuation cursors preserved opaquely. |
+| O19 stale docs | Fixed current shared-token table to implemented and old slice history to accurate merged group commit14f8366/current scans, with F-E6-20 lone-writer policy separately named. |
+| O20 sibling/delivery | Delivery follows parent READY/MERGE-AUTHORIZED gate. If F-E6-20 merges first, rebase and final source-bound tests precede merge. REPORT.md/installation/visibility/close records locate final merged PRIVATE delivery and stopped hash-verified resident swap; these are post-review checks rather than claimed reviewed events. |
+
+
+### F-E6-24 supplemental observe S1-S15
+
+Return observe-supplement-return.json, observations observe-supplement-observations.md,
+filled helper form/quota choice retained in the frontier folder. All15 accounted:
+
+| Observation | Disposition |
+|---|---|
+| S1 stale release deadline | Fixed context release has fresh bounded per-call deadline/op_id independent of open options. Regression checks no inherited deadline/trace; live expired-open-deadline block release checked in final-client-live.json. |
+| S2 consumer exception masked | Fixed preserve original consumer exception, attach cleanup-failure note where supported; normal-exit failure surfaces. Mock error identity and notes tested. Cleanup remains an attempt, expiry bounds lost releases; KV1 guarantee corrected. |
+| S3 conservative pre-send retry | Answered: initial capture transport failures propagate even before send; safe caller explicit retry retained rather than an unreliable sent-byte inference. KV1 says conservative transport-error rule. |
+| S4 failed hello changes epoch | Fixed decode into locals, assign negotiated fields only after complete validation. Regression invalid new header/list keeps old epoch1; subsequent valid epoch2 raises EpochChanged(1,2). |
+| S5 release retry20 | Answered raw release contract explicitly returns20 for expired/released handles; context treats20 as successful reclamation, direct callers may do likewise after lost reply. |
+| S6 peak/egress bound | Corrected peak above pre-page RSS50,348,032 versus lifetime-peak increase33,554,432; KV1 states4GiB total payload-buffer peak includes returned1GiB. One12MiB page measured,64-way bound not measured. |
+| S7 charge versus RSS | Corrected provisioning advice: conservative per-token formula/admission count determines snapshot budget; actual process RAM separately verified. final-sizing.json computes replay allocation charge and tests exact boundary22/acceptance. No health charge field or RSS-equivalent admission claim. |
+| S8 non-default flags/warning | Fixed KV1 names1GiB capacity,800000dedup cap and350k namespace high-water warning at500kquota; details preserved in scale.py/json. |
+| S9 two processes | Fixed KV1 explicitly separates populated baseline from restarted512MiB process and its own462,209,024 pre-capture RSS; release does not promise allocator return. |
+| S10 capture attribution | Answered by later lane87seq744 control: fixed-key writer baselines before/after, timestamped raw calls/captures, capture-overlap max93.953ms versus1.302ms larger baseline. Added92.651ms excess, no exact critical-section/GIL isolation claim. Sequential captures alongside writer wording fixed. Lane87 accepts measured limit atseq750. |
+| S11 server-wide TTL | Fixed KV1 says operator server-wide startup flag, no per-open TTL; consumer must fit or restart entire related view. Retention impact remains bounded8slots/charged budget. |
+| S12 synthetic edge outside rows | Answered: recorded5330-row fixture itself contains a59037-byte JSON row (59190-byte stored envelope) at its fixed row/seq key, included in exact full replay. final-client-live.json identifies and scans neighbours around that recorded row.59499-byte raw companion is separately labelled synthetic budget edge, not the commission row witness. |
+| S13 object equality/spool | Retained explicitly specified canonical-envelope byte equality and original parsed file-row equality; no whitespace/numeric-spelling/duplicate-key byte preservation claim. Client acceptance harness owns fsynced spool per stated layout; moving runtime migration/spool ownership into transport is outside this slice. Actual Python timeout/src reconciliation verifies sameop_id/version. |
+| S14 assertion-backed booleans | Answered booleans describe successful assertions, not extra instrumentation; raw code/measurements accompany JSON, failures stop the run. |
+| S15 old client live evidence | Answered located python-check.log explicitly records live exact old strict client hello/get/get_many. final-client-live.json reruns actual761cacb client via git-extracted module against the new binary. Other clients adopt suffix/library under their owners. |
