@@ -154,3 +154,51 @@ Source: D:/projects/oulipoly/trunk/research/87_operations_representation/claude6
 | O32 read overlap | Fixed measurement generator: gets now continue until every writer's os/flush phases complete, with at least10000reads and observed maxreadtime. Counter scope remains pureStore WindowslogicalIO. Earlier file retained; final file records the stronger overlap. |
 | O33 source hashes | Answered: SOURCE-BINDING.json and REPORT.md bind finalffe865f server source/binarySHA/timestamps, separate from earlier source-unbound matrix. Observe did not independently read those out-of-brief records; that limit stays visible. |
 | O34 all observations | Fixed: this table now individually dispositions O1–O34. O26 explicitly identifies empty stdout plus actual JSON/lineup evidence, O25 supports older-server unsupported2. |
+
+## F-E6-21 resident review
+
+Actual observe-class return: e4/act-work/F-E6-21/review3-return.json;
+located observations: review-observations.md in the same folder, O-R0..O-R15.
+First two pool profiles returned API429 and supplied no observations (review-return.json,
+review2-return.json; ledger457). Dispositions apply to the resident review-fix
+commit and its later state-cap integration with F-E6-20 implementation2b75022.
+
+| Observation | Disposition |
+|---|---|
+| O-R0 working-tree base | Answered: initial observer read working files at aded603; resident files are now committed. Supplemental observer receives the final committed diff including health and state-cap integration. |
+| O-R1 overlap drain | Retained safe cancel+drain ordering. Fixed immediate-completion byte accounting: ReadFile/WriteFile get null done pointers and GetOverlappedResult supplies completion bytes. WAIT_FAILED remains a fatal pipe-creation/connection error; no recovery claim is made for a broken kernel event. |
+| O-R2 event per I/O | Answered: one bounded event per active I/O retained; no measured syscall-cost claim. Reusing events is a potential optimization with its own measurement, not a correctness fix. |
+| O-R3 ACL guards | Retained current-user/SY DACL, remote rejection, first-instance guard and64-client cap; service must use xteam's InteractiveToken. |
+| O-R4 idle witness | Fixed: read starts immediately, rejects client TimeoutError, records server BrokenPipeError109 and checks >=100ms and <1.2s at200ms idle. Drop releases slot and ingress reservation; exact release counters are not added. |
+| O-R5 trickle reservation | Answered explicitly in RESIDENT and KV1: trickling retains ingress as well as slot;64MiB aggregate budget stays bounded. Total-frame deadline remains an uncommissioned policy choice. |
+| O-R6 failed heartbeat writes | Fixed: attempts, requested bytes and failures count failed temp/replacement paths and appear on recovery. Witness denies delete sharing, observes failed replacements then successful recovery. Persistent failure becomes stale health; retries are interval-bounded. |
+| O-R7 rename/health | Fixed misleading premise and removed custom MoveFileExW FFI; std::fs::rename replaces the heartbeat. Native health checks hello+health+actual pipe-server pid against heartbeat pid/epoch/freshness, so heartbeat-only liveness is not service health. |
+| O-R8 object size | Fixed current doc bound:<512bytes per object,<1024 requested bytes/minute at30s. Historical91-byte object predates failure/state counters; final raw result records current sizes, physical bytes unmeasured. |
+| O-R9 restart | Fixed witness: reuse one LOCAL pipe name with an old client handle retained through kill/restart; append torn header after an acknowledged frame in a populated stripe and check exact size restoration+os/flush readback. Fleet restart of exact resident endpoint is recorded separately if registered. |
+| O-R10 state cap seam | Integrated F-E6-20 exact admission/replay counter through Config.state_limit_bytes and positive CLI option. Test capacity7 before acceptance+old reads; heartbeat state_bytes/limit and75% warning (default6GiB of8GiB) expose retained state across replay without drive reads. No release installed before these checks pass. |
+| O-R11 account/LOCAL | Answered by lane88 eco seq452: task runs per-user xteam InteractiveToken; RESIDENT states account requirement. Strengthened witness uses LOCAL pipe namespace; exact service endpoint is checked after owner registration. |
+| O-R12 install/logs | Answered: stopped next/previous replacement and hash record outside worktrees; lane88 owns1MiB+prior launcher logs and minute restart. Final Act report locates installation and fleet checks or states registration wait. |
+| O-R13 docs/usage | Fixed KV1 section6 cutoff statement and CLI usage, including idle, heartbeat, state limit and existing dedup controls. |
+| O-R14 validation | Retained positive bounded idle_ms and zero-or>=100 heartbeat interval; added positive state cap validation. |
+| O-R15 mirror reconnection | Answered in recorded lane83-shadow.md: idles reconnect and new epoch requires deterministic-key/op_id reconciliation. Shadow remains lane83 choice and file ledger primary. |
+
+### Final supplemental observe return
+
+e4/act-work/F-E6-21/review-supplement-return.json and
+review-supplement-observations.md read committed1c52fe8 and the2b75022 seam.
+Final dispositions (O-S0..O-S11):
+
+| Observation | Disposition |
+|---|---|
+| O-S0 reachable commit | Answered: rebasing changed preliminary health commit1e66fbe to0d38394; final installation message names the reachable merged source and binary hash. F-E6-20 merges first; resident rebases on its main before its separate merge. |
+| O-S1 line endings | Fixed KV1 back to LF; real final diff adds only the idle statement and state-cap paragraph rather than whole-file CRLF churn. |
+| O-S2 native health | Retained checked hello/health/pid/epoch/freshness. RESIDENT now says heartbeat must stay enabled for resident health; zero is a foreground-test option. Other invalid-file/refusal paths are code-read evidence rather than claimed runtime witnesses. |
+| O-S3 busy connection window | Fixed bounded retry for ERROR_PIPE_BUSY231 for up to2s,5ms sleeps, then normal2s I/O bounds. Witness holds64 idle pipe clients and health succeeds after slots clear rather than treating the instance-creation gap as permanent failure. |
+| O-S4 pressure consumer | Answered transparently: heartbeat exposes pressure but no automatic alert consumer exists yet. Routed the reporting-policy question to lane88 with the final installed-binary evidence; health availability remains independent of capacity so reads stay useful. This is open owner integration, not a wired alert claim. |
+| O-S5 conservative cap accounting | Fixed doc: uncertain failed append charges full attempted frame until replay recounts; heartbeat excludes pending reservations; persistent removes also refuse and cannot shrink logs. Mem remains explicit opt-in with its own independent memory cap. |
+| O-S6 maintenance reserve | Answered staging: current cap is8GiB unrotated stripe logs; PLAN's1GiB reserve/7GiB ordinary ceiling must be provisioned before a rotation/maintenance rollout. No snapshot/archive/maintenance tier is supplied by this commission. Operator/accounting choice remains open for that later scope. |
+| O-S7 heartbeat accounting | Retained successful replacement+attempted-byte/failure counters; raw witness shows attempts=writes+failures and recovery. heartbeat.tmp is never consumed as health; physical/metadata writes stay unmeasured. |
+| O-S8 stale client timing | Strengthened witness sends a partial header immediately before kill, records kill duration<200ms idle bound, then receives BrokenPipeError109 from that retained handle after restart. Same populated-stripe torn tail and os/flush readback remain. Exact registered endpoint is the separate fleet witness. |
+| O-S9 original dispositions | All original16 observations remain individually accounted above; final report locates tests and registered-service check. No new protocol/state format change. |
+| O-S10 obsolete registration paragraph | Fixed removed pre-answer paragraph; seq452's logon+minute policy is the single current shape. |
+| O-S11 KV1 capacity routing | Fixed section7 names persistent state byte cap, replay+inflight accounting, capacity7 for tombstones, and RESIDENT remedy/diagnostic warning. |

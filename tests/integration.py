@@ -28,8 +28,8 @@ def endpoint(transport):
         return '127.0.0.1:'+str(channel.getsockname()[1])
 
 class Server:
-    def __init__(self, binary, state, output, transport='tcp', flags=()):
-        self.address, self.transport = endpoint(transport), transport
+    def __init__(self, binary, state, output, transport='tcp', flags=(), address=None):
+        self.address, self.transport = address or endpoint(transport), transport
         self.log = open(output, 'ab', buffering=0)
         self.process = subprocess.Popen([str(binary),str(state),transport,self.address,*flags],stdout=self.log,stderr=self.log)
         for attempt in range(500):
