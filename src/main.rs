@@ -1,4 +1,6 @@
 use membus::{Config, Store};
+#[cfg(windows)]
+mod pipe_io;
 use std::{
     env, fs,
     io::{self, Read, Write},
@@ -95,12 +97,8 @@ fn serve<S: Read + Write>(
     }
 }
 #[cfg(windows)]
-fn pipes(address: &str, store: Arc<Store>) -> io::Result<()> {
-    use std::{
-        ffi::c_void,
-        fs::File,
-        os::windows::io::{AsRawHandle, FromRawHandle},
-    };
+fn pipes(address: &str, store: Arc<Store>, idle_ms: u32) -> io::Result<()> {
+    use std::{ffi::c_void, fs::File, os::windows::io::FromRawHandle};
     type Handle = *mut c_void;
     #[link(name = "kernel32")]
     extern "system" {
@@ -114,8 +112,6 @@ fn pipes(address: &str, store: Arc<Store>) -> io::Result<()> {
             timeout: u32,
             security: *mut c_void,
         ) -> Handle;
-        fn ConnectNamedPipe(h: Handle, o: *mut c_void) -> i32;
-        fn GetLastError() -> u32;
         fn GetCurrentProcess() -> Handle;
         fn CloseHandle(h: Handle) -> i32;
         fn LocalFree(p: *mut c_void) -> *mut c_void;
@@ -223,7 +219,11 @@ fn pipes(address: &str, store: Arc<Store>) -> io::Result<()> {
         let h = unsafe {
             CreateNamedPipeW(
                 wide.as_ptr(),
-                if first { 3 | 0x80000 } else { 3 },
+                if first {
+                    3 | 0x80000 | 0x40000000
+                } else {
+                    3 | 0x40000000
+                },
                 8,
                 255,
                 65536,
@@ -236,15 +236,12 @@ fn pipes(address: &str, store: Arc<Store>) -> io::Result<()> {
             return Err(io::Error::last_os_error());
         }
         first = false;
-        let f = unsafe { File::from_raw_handle(h) };
-        if unsafe { ConnectNamedPipe(f.as_raw_handle(), std::ptr::null_mut()) } == 0 {
-            let error = unsafe { GetLastError() };
-            if error == 232 {
+        let mut f = pipe_io::Pipe::new(unsafe { File::from_raw_handle(h) }, idle_ms);
+        if let Err(error) = f.connect() {
+            if error.raw_os_error() == Some(232) {
                 continue;
             }
-            if error != 535 {
-                return Err(io::Error::last_os_error());
-            }
+            return Err(error);
         }
         let s = store.clone();
         active.fetch_add(1, Ordering::AcqRel);
@@ -256,7 +253,7 @@ fn pipes(address: &str, store: Arc<Store>) -> io::Result<()> {
         });
     }
 }
-fn tcp(address: &str, store: Arc<Store>) -> io::Result<()> {
+fn tcp(address: &str, store: Arc<Store>, idle_ms: u32) -> io::Result<()> {
     let listener = TcpListener::bind(address)?;
     if !listener.local_addr()?.ip().is_loopback() {
         return Err(io::Error::other("TCP must bind loopback"));
@@ -273,8 +270,8 @@ fn tcp(address: &str, store: Arc<Store>) -> io::Result<()> {
             continue;
         }
         stream.set_nodelay(true)?;
-        stream.set_read_timeout(Some(std::time::Duration::from_secs(60)))?;
-        stream.set_write_timeout(Some(std::time::Duration::from_secs(60)))?;
+        stream.set_read_timeout(Some(std::time::Duration::from_millis(idle_ms as u64)))?;
+        stream.set_write_timeout(Some(std::time::Duration::from_millis(idle_ms as u64)))?;
         let s = store.clone();
         active.fetch_add(1, Ordering::AcqRel);
         let permit = Permit(active.clone());
@@ -293,6 +290,8 @@ fn main() -> io::Result<()> {
     }
     let path = PathBuf::from(&args[1]);
     let mut config = Config::default();
+    let mut idle_ms = 60000u32;
+    let mut heartbeat_ms = 30000u64;
     let mut i = 4;
     while i < args.len() {
         if args[i] == "--allow-mem" {
@@ -306,6 +305,18 @@ fn main() -> io::Result<()> {
             .parse::<u64>()
             .map_err(io::Error::other)?;
         match args[i].as_str() {
+            "--idle-ms" => {
+                idle_ms = u32::try_from(n)
+                    .ok()
+                    .filter(|n| *n > 0 && *n < u32::MAX)
+                    .ok_or_else(|| io::Error::other("idle-ms must be 1..4294967294"))?
+            }
+            "--heartbeat-ms" => {
+                if n != 0 && n < 100 {
+                    return Err(io::Error::other("heartbeat-ms must be zero or >=100"));
+                }
+                heartbeat_ms = n;
+            }
             "--flush-ms" => config.flush_ms = n,
             "--retry-ms" => config.retry_ms = n,
             "--quota" => config.quota = n as usize,
@@ -319,6 +330,9 @@ fn main() -> io::Result<()> {
         i += 2
     }
     let store = Arc::new(Store::open(&path, config)?);
+    if heartbeat_ms != 0 {
+        start_heartbeat(path.clone(), store.epoch, heartbeat_ms);
+    }
     eprintln!(
         "ready epoch={} pid={} state={}",
         store.epoch,
@@ -326,11 +340,65 @@ fn main() -> io::Result<()> {
         path.display()
     );
     let result = match args[2].as_str() {
-        "tcp" => tcp(&args[3], store),
+        "tcp" => tcp(&args[3], store, idle_ms),
         #[cfg(windows)]
-        "pipe" => pipes(&args[3], store),
+        "pipe" => pipes(&args[3], store, idle_ms),
         _ => Err(io::Error::other("unsupported transport")),
     };
     let _ = fs::remove_file(path.join("owner.lock"));
     result
+}
+
+fn start_heartbeat(path: PathBuf, epoch: u64, interval_ms: u64) {
+    thread::spawn(move || {
+        let mut writes = 0u64;
+        let mut bytes = 0u64;
+        loop {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            let mut content = format!("{{\"pid\":{},\"epoch\":{},\"unix_ms\":{},\"heartbeat_writes\":{},\"heartbeat_bytes\":0}}\n", std::process::id(), epoch, now, writes + 1);
+            // Byte counter includes the current object; converge across decimal widths.
+            loop {
+                let total = bytes + content.len() as u64;
+                let next = format!("{{\"pid\":{},\"epoch\":{},\"unix_ms\":{},\"heartbeat_writes\":{},\"heartbeat_bytes\":{}}}\n", std::process::id(), epoch, now, writes + 1, total);
+                if next.len() == content.len() {
+                    content = next;
+                    break;
+                }
+                content = next;
+            }
+            let temporary = path.join("heartbeat.tmp");
+            // Windows rename cannot replace an existing file. MoveFileExW is atomic
+            // replacement; no deliberate disk flush for this diagnostic heartbeat.
+            let result = fs::write(&temporary, content.as_bytes())
+                .and_then(|_| replace_heartbeat(&temporary, &path.join("heartbeat.json")));
+            if result.is_ok() {
+                writes += 1;
+                bytes += content.len() as u64;
+            }
+            thread::sleep(std::time::Duration::from_millis(interval_ms));
+        }
+    });
+}
+fn replace_heartbeat(from: &std::path::Path, to: &std::path::Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32;
+        }
+        use std::os::windows::ffi::OsStrExt;
+        let from: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+        let to: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+        if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 1) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(from, to)
+    }
 }
