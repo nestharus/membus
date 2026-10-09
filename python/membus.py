@@ -16,7 +16,9 @@ CODES = {1: ('incompatible_version', False), 2: ('unsupported', False),
          12: ('conflict', False), 13: ('retry_window_expired', False),
          14: ('op_id_mismatch', False), 15: ('mem_not_enabled', False),
          16: ('io_failed_uncertain',True),17: ('pending_timeout_uncertain',True),
-         18: ('dedup_full',True),19: ('pending_conflict',True)}
+         18: ('dedup_full',True),19: ('pending_conflict',True),
+         20: ('cursor_expired',False),21: ('invalid_cursor',False),
+         22: ('snapshot_full',True)}
 
 class EpochChanged(Exception):
     def __init__(self, previous, current):
@@ -24,9 +26,9 @@ class EpochChanged(Exception):
         super().__init__(f'server epoch changed {previous}->{current}; reconcile deterministic key before uncertain retry')
 
 class Refusal(Exception):
-    def __init__(self, code):
+    def __init__(self, code, codes=None):
         self.code = code
-        self.name, self.transient = CODES[code]
+        self.name, self.transient = (codes or CODES).get(code, ('unknown_refusal', False))
         super().__init__(self.name)
 
 def deadline_ms(seconds=10):
@@ -147,17 +149,23 @@ class Client:
             self.channel.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         else:
             self.channel = Pipe(self.address, deadline)
-        response = self.exchange(1, struct.pack('<IB', MAX_FRAME, self.allow_mem)+lp('python-stdlib'), deadline)
+        response = self.exchange(1, struct.pack('<IB', MAX_FRAME, self.allow_mem)+lp('python-stdlib;scans=1'), deadline)
         decoder = Decoder(response)
         self.epoch, self.max_frame, self.max_value, self.max_batch, self.mem, self.retry_ms = decoder.unpack('<QIIHBQ')
         count, = decoder.unpack('<H')
         codes = {}
         for _ in range(count):
             code, transient = decoder.unpack('<HB')
+            if code in codes or code == 0 or transient not in (0, 1):
+                self.close()
+                raise ValueError('invalid refusal-code list')
             codes[code] = (decoder.blob().decode(), bool(transient))
-        if codes != CODES:
+        if (decoder.pos != len(response) or
+                any(codes.get(code) != value for code, value in CODES.items() if code <= 19) or
+                any(code in codes and codes[code] != value for code, value in CODES.items())):
             self.close()
-            raise ValueError('unknown refusal-code list')
+            raise ValueError('incompatible refusal-code list')
+        self.codes = codes
         if previous is not None and self.epoch!=previous:
             raise EpochChanged(previous,self.epoch)
 
@@ -210,7 +218,7 @@ class Client:
             self.close()
             raise ValueError('reply association')
         if code:
-            raise Refusal(code)
+            raise Refusal(code, getattr(self, 'codes', CODES))
         return body[15:]
 
     def call(self, opcode, ns, suffix=b'', op_id=None, deadline=None):
@@ -268,3 +276,49 @@ class Client:
     def health(self, ns='ledger'):
         return dict(zip(('bytes_written','flush_calls','keys','namespace_keys','namespace_quota','index_cap','high_water','namespace_high_water'),
                         struct.unpack('<QQQQQQBB',self.call(8,ns))))
+
+    def snapshot_open(self, ns, **options):
+        """Capture one committed namespace view; release the returned bytes token."""
+        d = Decoder(self.call(10, ns, **options))
+        token = d.blob()
+        if len(token) != 16 or d.pos != len(d.data):
+            raise ValueError('invalid snapshot reply')
+        return token
+
+    def snapshot_release(self, ns, snapshot, **options):
+        """Release retention. A released/expired token returns cursor_expired."""
+        if self.call(13, ns, lp(snapshot), **options):
+            raise ValueError('invalid release reply')
+
+    def _scan(self, opcode, ns, bounds, snapshot, cursor, limit, max_bytes, options):
+        if not 1 <= limit <= MAX_BATCH or not 42 <= max_bytes <= MAX_FRAME:
+            raise ValueError('scan limit must be 1..128; max_bytes must be 42..MAX_FRAME')
+        suffix = lp(snapshot or b'') + lp(cursor or b'') + struct.pack('<HI', limit, max_bytes)
+        suffix += b''.join(lp(bound) for bound in bounds)
+        d = Decoder(self.call(opcode, ns, suffix, **options))
+        token, next_cursor = d.blob(), d.blob()
+        done, count = d.unpack('<BH')
+        items = []
+        for _ in range(count):
+            key = d.blob().decode('utf8')
+            if opcode in (14, 15):
+                items.append(dict(key=key))
+            else:
+                value = d.value()
+                if value is None:
+                    raise ValueError('scan returned tombstone')
+                items.append(dict(key=key, **value))
+        if (len(token) != 16 or done not in (0, 1) or bool(done) == bool(next_cursor)
+                or count > limit or d.pos != len(d.data)):
+            raise ValueError('invalid scan reply')
+        return dict(snapshot=token, cursor=next_cursor, done=bool(done), items=items)
+
+    def scan_prefix(self, ns, prefix='', *, snapshot=None, cursor=None,
+                    limit=128, max_bytes=MAX_FRAME, keys_only=False, **options):
+        """One bounded page. Reuse snapshot/cursor to retry or continue the query."""
+        return self._scan(14 if keys_only else 11, ns, [prefix], snapshot, cursor, limit, max_bytes, options)
+
+    def scan_range(self, ns, lower='', upper='', *, snapshot=None, cursor=None,
+                   limit=128, max_bytes=MAX_FRAME, keys_only=False, **options):
+        """One page of [lower, upper) in UTF-8 order; empty upper means no bound."""
+        return self._scan(15 if keys_only else 12, ns, [lower, upper], snapshot, cursor, limit, max_bytes, options)

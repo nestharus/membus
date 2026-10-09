@@ -1,14 +1,15 @@
 //! membus.kv/1 slice 1: bounded framing, independent committed reads, durable replay.
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{hash_map::RandomState, HashMap, HashSet, VecDeque},
     fs::{self, File, OpenOptions},
+    hash::BuildHasher,
     io::{self, Read, Write},
     path::Path,
     sync::{
         atomic::{AtomicUsize, Ordering},
         mpsc, Arc, Condvar, Mutex, RwLock,
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
 pub const MAX_VALUE: usize = 4 * 1024 * 1024;
@@ -34,6 +35,9 @@ pub const CODES: &[(u16, &str, bool)] = &[
     (17, "pending_timeout_uncertain", true),
     (18, "dedup_full", true),
     (19, "pending_conflict", true),
+    (20, "cursor_expired", false),
+    (21, "invalid_cursor", false),
+    (22, "snapshot_full", true),
 ];
 pub const HELLO: u8 = 1;
 pub const GET: u8 = 2;
@@ -45,6 +49,12 @@ pub const BATCH: u8 = 7;
 pub const HEALTH: u8 = 8;
 /// Additive kv/1 minor0 diagnostic operation; existing HEALTH layout is unchanged.
 pub const IO_METRICS: u8 = 9;
+pub const SNAPSHOT_OPEN: u8 = 10;
+pub const SCAN_PREFIX: u8 = 11;
+pub const SCAN_RANGE: u8 = 12;
+pub const SNAPSHOT_RELEASE: u8 = 13;
+pub const SCAN_KEYS_PREFIX: u8 = 14;
+pub const SCAN_KEYS_RANGE: u8 = 15;
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -102,12 +112,16 @@ impl<'a> Cursor<'a> {
         self.take(n)
     }
     pub fn text(&mut self) -> Result<String, u16> {
-        let b = self.bytes(MAX_ID)?;
-        let s = std::str::from_utf8(b).map_err(|_| 3u16)?;
+        let s = self.bound()?;
         if s.is_empty() {
             return Err(3);
         }
-        Ok(s.to_owned())
+        Ok(s)
+    }
+    /// Scan bounds may be empty; identifiers still use text().
+    pub fn bound(&mut self) -> Result<String, u16> {
+        let b = self.bytes(MAX_ID)?;
+        Ok(std::str::from_utf8(b).map_err(|_| 3u16)?.to_owned())
     }
     pub fn end(&self) -> Result<(), u16> {
         if self.p == self.b.len() {
@@ -230,6 +244,9 @@ pub struct Log {
 }
 #[derive(Clone)]
 pub struct Config {
+    pub snapshot_bytes: usize,
+    pub snapshot_max: usize,
+    pub snapshot_ttl_ms: u64,
     pub state_limit_bytes: u64,
     pub quota: usize,
     pub index_cap: usize,
@@ -253,6 +270,9 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            snapshot_bytes: 256 * 1024 * 1024,
+            snapshot_max: 8,
+            snapshot_ttl_ms: 30_000,
             state_limit_bytes: 8 * 1024 * 1024 * 1024,
             quota: 500_000,
             index_cap: 917_000,
@@ -275,7 +295,10 @@ impl Default for Config {
     }
 }
 pub struct Store {
-    committed: RwLock<HashMap<(String, String), Value>>,
+    committed: RwLock<HashMap<(String, String), Arc<Value>>>,
+    scans: Arc<Mutex<ScanState>>,
+    scan_usage: Arc<ScanUsage>,
+    scan_reaper: Option<(mpsc::Sender<()>, std::thread::JoinHandle<()>)>,
     state: Mutex<State>,
     done: Condvar,
     logs: Vec<Arc<Mutex<Log>>>,
@@ -285,6 +308,33 @@ pub struct Store {
     pub config: Config,
     pub epoch: u64,
     _owner: File,
+}
+#[derive(Default)]
+struct ScanUsage {
+    bytes: AtomicUsize,
+    count: AtomicUsize,
+}
+struct ScanCharge {
+    usage: Arc<ScanUsage>,
+    bytes: usize,
+}
+impl Drop for ScanCharge {
+    fn drop(&mut self) {
+        self.usage.bytes.fetch_sub(self.bytes, Ordering::AcqRel);
+        self.usage.count.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+struct Snapshot {
+    ns: String,
+    created: Instant,
+    rows: Vec<(String, Arc<Value>)>,
+    cursor_hash: RandomState,
+    // Charges survive release/expiry while a dispatcher still holds this Arc.
+    _charge: ScanCharge,
+}
+struct ScanState {
+    next: u64,
+    snapshots: HashMap<u64, Arc<Snapshot>>,
 }
 struct Append {
     record: Vec<u8>,
@@ -817,6 +867,10 @@ mod flush_policy_tests {
 }
 impl Drop for Store {
     fn drop(&mut self) {
+        if let Some((stop, worker)) = self.scan_reaper.take() {
+            let _ = stop.send(());
+            let _ = worker.join();
+        }
         for owner in &mut self.appenders {
             owner.sender.take();
         }
@@ -854,6 +908,9 @@ fn stripe(ns: &str, key: &str) -> usize {
 }
 impl Store {
     pub fn open(path: &Path, config: Config) -> io::Result<Self> {
+        if config.snapshot_ttl_ms == 0 {
+            return Err(io::Error::other("snapshot lifetime must be positive"));
+        }
         fs::create_dir_all(path)?;
         let mut options = OpenOptions::new();
         options.write(true).create(true).truncate(false);
@@ -870,7 +927,7 @@ impl Store {
         Self::open_owned(path, config, owner)
     }
     fn open_owned(path: &Path, config: Config, owner: File) -> io::Result<Self> {
-        let mut committed = HashMap::new();
+        let mut committed: HashMap<(String, String), Arc<Value>> = HashMap::new();
         let mut dedup = HashMap::new();
         let mut next = 1u64;
         let mut logs = Vec::new();
@@ -978,9 +1035,9 @@ impl Store {
                 };
                 if committed
                     .get(&k)
-                    .map_or(true, |old: &Value| old.version < v)
+                    .map_or(true, |old: &Arc<Value>| old.version < v)
                 {
-                    committed.insert(k, value);
+                    committed.insert(k, Arc::new(value));
                 }
                 if now.saturating_sub(at) <= config.retry_ms {
                     dedup.insert(
@@ -1066,8 +1123,31 @@ impl Store {
         let mut expiry: Vec<_> = dedup.iter().map(|(k, d)| (k.clone(), d.at)).collect();
         expiry.sort_by_key(|(_, at)| *at);
         let (appenders, flush_owner) = start_owners(&logs, &config);
+        let scans = Arc::new(Mutex::new(ScanState {
+            next: 1,
+            snapshots: HashMap::new(),
+        }));
+        let (stop, receiver) = mpsc::channel();
+        let reaper_scans = scans.clone();
+        let ttl = Duration::from_millis(config.snapshot_ttl_ms);
+        let interval = ttl.min(Duration::from_secs(1));
+        let reaper = std::thread::spawn(move || {
+            while matches!(
+                receiver.recv_timeout(interval),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ) {
+                reaper_scans
+                    .lock()
+                    .unwrap()
+                    .snapshots
+                    .retain(|_, s| s.created.elapsed() < ttl);
+            }
+        });
         Ok(Self {
             committed: RwLock::new(committed),
+            scans,
+            scan_usage: Arc::new(ScanUsage::default()),
+            scan_reaper: Some((stop, reaper)),
             state: Mutex::new(State {
                 pending: HashMap::new(),
                 metadata,
@@ -1099,12 +1179,229 @@ impl Store {
         })
     }
     pub fn get(&self, ns: &str, key: &str) -> Option<Value> {
+        self.get_handle(ns, key).map(|v| (*v).clone())
+    }
+    fn get_handle(&self, ns: &str, key: &str) -> Option<Arc<Value>> {
         self.committed
             .read()
             .unwrap()
             .get(&(ns.to_owned(), key.to_owned()))
             .filter(|v| !v.tombstone)
             .cloned()
+    }
+    fn purge_scans(&self, state: &mut ScanState) {
+        let ttl = Duration::from_millis(self.config.snapshot_ttl_ms);
+        state.snapshots.retain(|_, s| s.created.elapsed() < ttl);
+    }
+    fn snapshot_open(&self, ns: &str) -> Result<(Vec<u8>, Arc<Snapshot>), u16> {
+        let created = Instant::now();
+        let mut scans = self.scans.lock().unwrap();
+        self.purge_scans(&mut scans);
+        if self.scan_usage.count.load(Ordering::Acquire) >= self.config.snapshot_max {
+            return Err(22);
+        }
+        let committed = self.committed.read().unwrap();
+        let mut charge = 256usize.checked_add(ns.len()).ok_or(22u16)?;
+        let mut count = 0;
+        for ((namespace, key), value) in committed.iter() {
+            if namespace == ns && !value.tombstone {
+                // Full payload capacity is charged even when shared with the live
+                // index or another snapshot; 128 covers per-row handles/metadata.
+                charge = charge
+                    .checked_add(key.len())
+                    .and_then(|n| n.checked_add(128))
+                    .and_then(|n| n.checked_add(value.bytes.capacity()))
+                    .ok_or(22u16)?;
+                count += 1;
+            }
+        }
+        let total = self
+            .scan_usage
+            .bytes
+            .load(Ordering::Acquire)
+            .checked_add(charge)
+            .ok_or(22u16)?;
+        if total > self.config.snapshot_bytes {
+            return Err(22);
+        }
+        let id = scans.next;
+        scans.next = id.checked_add(1).ok_or(22u16)?;
+        // Reservation is serialized before any snapshot key/handle allocation.
+        self.scan_usage.bytes.fetch_add(charge, Ordering::AcqRel);
+        self.scan_usage.count.fetch_add(1, Ordering::AcqRel);
+        let reservation = ScanCharge {
+            usage: self.scan_usage.clone(),
+            bytes: charge,
+        };
+        let mut rows = Vec::with_capacity(count);
+        for ((namespace, key), value) in committed.iter() {
+            if namespace == ns && !value.tombstone {
+                rows.push((key.clone(), value.clone()));
+            }
+        }
+        drop(committed);
+        drop(scans);
+        rows.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let snapshot = Arc::new(Snapshot {
+            ns: ns.to_owned(),
+            created,
+            rows,
+            cursor_hash: RandomState::new(),
+            _charge: reservation,
+        });
+        if snapshot.created.elapsed() >= Duration::from_millis(self.config.snapshot_ttl_ms) {
+            return Err(20);
+        }
+        self.scans
+            .lock()
+            .unwrap()
+            .snapshots
+            .insert(id, snapshot.clone());
+        let mut token = self.epoch.to_le_bytes().to_vec();
+        token.extend(id.to_le_bytes());
+        Ok((token, snapshot))
+    }
+    fn snapshot_get(&self, ns: &str, token: &[u8]) -> Result<Arc<Snapshot>, u16> {
+        if token.len() != 16 {
+            return Err(21);
+        }
+        if u64::from_le_bytes(token[..8].try_into().unwrap()) != self.epoch {
+            return Err(20);
+        }
+        let id = u64::from_le_bytes(token[8..].try_into().unwrap());
+        let mut scans = self.scans.lock().unwrap();
+        self.purge_scans(&mut scans);
+        let snapshot = scans.snapshots.get(&id).ok_or(20u16)?;
+        if snapshot.ns != ns {
+            return Err(21);
+        }
+        Ok(snapshot.clone())
+    }
+    fn snapshot_release(&self, ns: &str, token: &[u8]) -> Result<(), u16> {
+        let snapshot = self.snapshot_get(ns, token)?;
+        let id = u64::from_le_bytes(token[8..].try_into().unwrap());
+        self.scans.lock().unwrap().snapshots.remove(&id);
+        drop(snapshot);
+        Ok(())
+    }
+    fn scan_page(
+        &self,
+        ns: &str,
+        c: &mut Cursor<'_>,
+        op: u8,
+        max_frame: usize,
+    ) -> Result<Vec<u8>, u16> {
+        let keys_only = matches!(op, SCAN_KEYS_PREFIX | SCAN_KEYS_RANGE);
+        let is_range = matches!(op, SCAN_RANGE | SCAN_KEYS_RANGE);
+        let supplied = c.bytes(16)?.to_vec();
+        let cursor = c.bytes(2 * MAX_ID + 48)?;
+        let limit = c.u16()? as usize;
+        let budget = (c.u32()? as usize).min(max_frame);
+        let lower = c.bound()?;
+        let upper = if is_range { c.bound()? } else { String::new() };
+        c.end()?;
+        if limit == 0
+            || limit > MAX_BATCH
+            || budget < 42
+            || (is_range && !upper.is_empty() && lower > upper)
+        {
+            return Err(3);
+        }
+        let mut query = vec![op];
+        lp(&mut query, lower.as_bytes());
+        if is_range {
+            lp(&mut query, upper.as_bytes());
+        }
+        // A cursor must be accompanied by its snapshot, and binds the full
+        // query plus an absolute index. Page size/budget can change on retry.
+        let position = if cursor.is_empty() {
+            None
+        } else {
+            if supplied.len() != 16
+                || cursor.len() != 32 + query.len()
+                || cursor[..16] != supplied
+                || cursor[24..cursor.len() - 8] != query
+            {
+                return Err(21);
+            }
+            Some(
+                usize::try_from(u64::from_le_bytes(cursor[16..24].try_into().unwrap()))
+                    .map_err(|_| 21u16)?,
+            )
+        };
+        let newly_opened = supplied.is_empty();
+        let (token, snapshot) = if newly_opened {
+            self.snapshot_open(ns)?
+        } else {
+            (supplied.clone(), self.snapshot_get(ns, &supplied)?)
+        };
+        let result = (|| {
+            if !cursor.is_empty() {
+                let split = cursor.len() - 8;
+                let tag = u64::from_le_bytes(cursor[split..].try_into().unwrap());
+                if snapshot.cursor_hash.hash_one(&cursor[..split]) != tag {
+                    return Err(21);
+                }
+            }
+            let rows = &snapshot.rows;
+            let start = rows.partition_point(|(k, _)| k < &lower);
+            let end = if !is_range {
+                // The matching block is contiguous under UTF-8 byte order.
+                start + rows[start..].partition_point(|(k, _)| k.starts_with(&lower))
+            } else if upper.is_empty() {
+                rows.len()
+            } else {
+                rows.partition_point(|(k, _)| k < &upper)
+            };
+            let at = position.unwrap_or(start);
+            if at < start || at > end {
+                return Err(21);
+            }
+            let mut next = at;
+            let mut item_bytes = 0;
+            while next < end && next - at < limit {
+                let (key, value) = &rows[next];
+                let bytes = 4 + key.len() + if keys_only { 0 } else { 14 + value.bytes.len() };
+                let continuation = if next + 1 < end { 32 + query.len() } else { 0 };
+                if 42 + item_bytes + bytes + continuation > budget {
+                    if next == at {
+                        return Err(4);
+                    }
+                    break;
+                }
+                item_bytes += bytes;
+                next += 1;
+            }
+            let mut continuation = Vec::new();
+            if next < end {
+                continuation.extend(&token);
+                continuation.extend((next as u64).to_le_bytes());
+                continuation.extend(&query);
+                let tag = snapshot.cursor_hash.hash_one(&continuation[..]);
+                continuation.extend(tag.to_le_bytes());
+            }
+            let mut p = Vec::with_capacity(27 + item_bytes + continuation.len());
+            lp(&mut p, &token);
+            lp(&mut p, &continuation);
+            p.push((next == end) as u8);
+            p.extend(((next - at) as u16).to_le_bytes());
+            for (key, value) in &rows[at..next] {
+                lp(&mut p, key.as_bytes());
+                if !keys_only {
+                    encode_value(&mut p, Some(value));
+                }
+            }
+            if snapshot.created.elapsed() >= Duration::from_millis(self.config.snapshot_ttl_ms) {
+                return Err(20);
+            }
+            Ok(p)
+        })();
+        if result.is_err() && newly_opened {
+            // Includes a first item too large for the negotiated frame/budget.
+            let id = u64::from_le_bytes(token[8..].try_into().unwrap());
+            self.scans.lock().unwrap().snapshots.remove(&id);
+        }
+        result
     }
     pub fn metrics(&self) -> (u64, u64, usize) {
         let mut b = 0;
@@ -1338,7 +1635,9 @@ impl Store {
         };
         // Publication precedes completion on every connection; readers never await log I/O.
         if result.is_ok() && m.ack != 0 {
-            self.committed.write().unwrap().insert(k.clone(), value);
+            let value = Arc::new(value);
+            let previous = self.committed.write().unwrap().insert(k.clone(), value);
+            drop(previous);
         }
         let outcome = if result.is_ok() {
             Outcome {
@@ -1386,6 +1685,20 @@ impl Store {
         self.dispatch_for(b, self.config.allow_mem)
     }
     pub fn dispatch_for(&self, b: &[u8], allow_mem: bool) -> Vec<u8> {
+        self.dispatch_for_limit(b, allow_mem, MAX_FRAME)
+    }
+    pub fn dispatch_for_limit(&self, b: &[u8], allow_mem: bool, max_frame: usize) -> Vec<u8> {
+        let max_frame = max_frame.min(MAX_FRAME);
+        if b.len() > max_frame {
+            return reply(
+                b.get(4).copied().unwrap_or(0),
+                b.get(5..13)
+                    .map(|v| u64::from_le_bytes(v.try_into().unwrap()))
+                    .unwrap_or(0),
+                4,
+                &[],
+            );
+        }
         let mut c = Cursor::new(b);
         let header = (|| -> Result<_, u16> { Ok((c.u16()?, c.u16()?, c.u8()?, c.u64()?)) })();
         let (major, minor, op, id) = match header {
@@ -1399,7 +1712,7 @@ impl Store {
             if op == HELLO {
                 let max = c.u32()? as usize;
                 let mem = c.u8()?;
-                let _client = c.text()?;
+                let client = c.text()?;
                 c.end()?;
                 if max < 1024 {
                     return Err(4);
@@ -1413,8 +1726,14 @@ impl Store {
                 p.extend((MAX_BATCH as u16).to_le_bytes());
                 p.push(self.config.allow_mem as u8);
                 p.extend(self.config.retry_ms.to_le_bytes());
-                p.extend((CODES.len() as u16).to_le_bytes());
-                for &(code, name, transient) in CODES {
+                // Legacy strict clients keep the exact original refusal list.
+                let codes = if client.ends_with(";scans=1") {
+                    CODES
+                } else {
+                    &CODES[..19]
+                };
+                p.extend((codes.len() as u16).to_le_bytes());
+                for &(code, name, transient) in codes {
                     p.extend(code.to_le_bytes());
                     p.push(transient as u8);
                     lp(&mut p, name.as_bytes());
@@ -1440,11 +1759,27 @@ impl Store {
                 return Err(5);
             }
             match op {
+                SNAPSHOT_OPEN => {
+                    c.end()?;
+                    let (token, _) = self.snapshot_open(&ns)?;
+                    let mut p = Vec::new();
+                    lp(&mut p, &token);
+                    Ok(p)
+                }
+                SNAPSHOT_RELEASE => {
+                    let token = c.bytes(16)?;
+                    c.end()?;
+                    self.snapshot_release(&ns, token)?;
+                    Ok(Vec::new())
+                }
+                SCAN_PREFIX | SCAN_RANGE | SCAN_KEYS_PREFIX | SCAN_KEYS_RANGE => {
+                    self.scan_page(&ns, &mut c, op, max_frame)
+                }
                 GET => {
                     let key = c.text()?;
                     c.end()?;
                     let mut p = Vec::new();
-                    encode_value(&mut p, self.get(&ns, &key));
+                    encode_value(&mut p, self.get_handle(&ns, &key).as_deref());
                     Ok(p)
                 }
                 GET_MANY => {
@@ -1459,13 +1794,13 @@ impl Store {
                     c.end()?;
                     let mut p = (n as u16).to_le_bytes().to_vec();
                     for key in keys {
-                        let value = self.get(&ns, &key);
+                        let value = self.get_handle(&ns, &key);
                         if p.len() + value.as_ref().map_or(1, |v| 14 + v.bytes.len()) + 15
-                            > MAX_FRAME
+                            > max_frame
                         {
                             return Err(4);
                         }
-                        encode_value(&mut p, value);
+                        encode_value(&mut p, value.as_deref());
                     }
                     Ok(p)
                 }
@@ -1564,7 +1899,8 @@ impl Store {
             }
         })();
         match result {
-            Ok(p) => reply(op, id, 0, &p),
+            Ok(p) if p.len() + 15 <= max_frame => reply(op, id, 0, &p),
+            Ok(_) => reply(op, id, 4, &[]),
             Err(code) => reply(op, id, code, &[]),
         }
     }
@@ -1599,7 +1935,7 @@ fn parse_mutation(
         remove: op == REMOVE,
     })
 }
-fn encode_value(p: &mut Vec<u8>, v: Option<Value>) {
+fn encode_value(p: &mut Vec<u8>, v: Option<&Value>) {
     match v {
         Some(v) => {
             p.push(1);
@@ -1614,4 +1950,87 @@ pub fn reply(op: u8, id: u64, code: u16, p: &[u8]) -> Vec<u8> {
     let mut b = code.to_le_bytes().to_vec();
     b.extend(p);
     frame(op | 0x80, id, &b)
+}
+
+#[cfg(test)]
+mod scan_retention_tests {
+    use super::*;
+    fn store(label: &str, ttl: u64) -> Store {
+        let path = std::path::PathBuf::from(
+            std::env::var("MEMBUS_TEST_OUTPUT").unwrap_or_else(|_| ".test-output".into()),
+        )
+        .join(format!(
+            "scan-retention-{label}-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        Store::open(
+            &path,
+            Config {
+                snapshot_max: 1,
+                snapshot_ttl_ms: ttl,
+                ..Config::default()
+            },
+        )
+        .unwrap()
+    }
+    #[test]
+    fn release_keeps_in_flight_snapshot_charged() {
+        let s = store("pinned", 30000);
+        let (token, pinned) = s.snapshot_open("ledger").unwrap();
+        s.snapshot_release("ledger", &token).unwrap();
+        assert_eq!(s.scan_usage.count.load(Ordering::Acquire), 1);
+        assert_eq!(s.snapshot_open("ledger").err(), Some(22));
+        drop(pinned);
+        assert_eq!(s.scan_usage.count.load(Ordering::Acquire), 0);
+        assert_eq!(s.scan_usage.bytes.load(Ordering::Acquire), 0);
+        assert!(s.snapshot_open("ledger").is_ok());
+    }
+    #[test]
+    fn idle_expiry_reclaims_without_another_request() {
+        let s = store("idle", 40);
+        let (_, pinned) = s.snapshot_open("ledger").unwrap();
+        drop(pinned);
+        let until = Instant::now() + Duration::from_secs(2);
+        while s.scan_usage.count.load(Ordering::Acquire) != 0 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(s.scan_usage.count.load(Ordering::Acquire), 0);
+        assert_eq!(s.scan_usage.bytes.load(Ordering::Acquire), 0);
+        println!("idle expiry reclaimed snapshot without dispatch");
+    }
+    #[test]
+    fn capture_shares_maximum_value_payload() {
+        let s = store("arc", 30000);
+        let mutation = Mutation {
+            ns: "ledger".into(),
+            key: "large".into(),
+            op_id: "max".into(),
+            deadline: now_ms() + 10000,
+            ack: 1,
+            expected: None,
+            bytes: vec![7; MAX_VALUE],
+            remove: false,
+        };
+        assert_eq!(s.mutate(mutation).code, 0);
+        let live = s.get_handle("ledger", "large").unwrap();
+        let (token, snapshot) = s.snapshot_open("ledger").unwrap();
+        assert!(Arc::ptr_eq(&live, &snapshot.rows[0].1));
+        assert_eq!(live.bytes.as_ptr(), snapshot.rows[0].1.bytes.as_ptr());
+        let mut suffix = Vec::new();
+        lp(&mut suffix, &token);
+        lp(&mut suffix, &[]);
+        suffix.extend(1u16.to_le_bytes());
+        suffix.extend((MAX_FRAME as u32).to_le_bytes());
+        lp(&mut suffix, b"");
+        let page = s
+            .scan_page("ledger", &mut Cursor::new(&suffix), SCAN_PREFIX, MAX_FRAME)
+            .unwrap();
+        assert_eq!(page.len(), 27 + 4 + 5 + 14 + MAX_VALUE);
+        assert_eq!(
+            s.scan_page("ledger", &mut Cursor::new(&suffix), SCAN_PREFIX, 1024)
+                .err(),
+            Some(4)
+        );
+    }
 }
