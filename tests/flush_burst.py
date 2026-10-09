@@ -3,8 +3,9 @@ import argparse
 import json
 from pathlib import Path
 import time
+import struct
 from integration import Server
-from membus import deadline_ms
+from membus import deadline_ms, Refusal
 
 def run(args):
     output=Path(args.output);output.mkdir(parents=True,exist_ok=True)
@@ -27,6 +28,11 @@ def run(args):
             for item in items: acknowledged.append(item['key']);values[item['key']]=item['value']
             print(f'flush-acked {len(acknowledged)}/3070 elapsed={time.monotonic()-started:.3f}s',flush=True)
         elapsed=time.monotonic()-started;metrics=client.health();epoch=client.epoch
+        try:
+            io_counters=dict(zip(('logical_append_bytes','append_write_calls','sync_attempts'),struct.unpack('<QQQ',client.call(9,'ledger'))))
+        except Refusal as error:
+            if error.code != 2: raise
+            io_counters={'available':False,'reason':'older minor0 server does not implement optional opcode9'}
         server.stop();server=Server(args.binary,output/'state',output/'restarted-server.txt',flags=('--flush-ms',str(args.flush_ms)))
         replayed=[]
         for offset in range(0,len(acknowledged),128):
@@ -39,9 +45,10 @@ def run(args):
         result={'method':'single Python client, conditional row seq keys, serial non-atomic batches <=128; every write flush-acked; subprocess.kill then actual committed get_many replay',
                 'configured_flush_ms':args.flush_ms,'acknowledged_flush_ids':len(acknowledged),'replayed_flush_ids':len(replayed),'missing_ids':missing,
                 'largest_row_bytes':59499,'dense_seq':'1..3070','seconds':elapsed,'batch_seconds':latencies,
-                'metrics':metrics,'epoch_before':epoch,'epoch_after':server.client.epoch,
+                'metrics':metrics,'io':io_counters,'epoch_before':epoch,'epoch_after':server.client.epoch,
                 'startup_epoch_bytes':16,'startup_epoch_sync_calls':2,'physical_device_bytes':'unmeasured',
-                'grouped_flush':False,'all_tests_passed':True}
+                'grouped_flush':True,'pass_condition':'all3070ack2, exactvalueandidreplayafterkill, elapsedbelow158.0978shistoricalbaseline',
+                'time_condition_passed':elapsed<158.0978,'all_tests_passed':elapsed<158.0978}
         (output/'acknowledged-flush-ids.json').write_text(json.dumps(acknowledged),encoding='utf8')
         (output/'replayed-flush-ids.json').write_text(json.dumps(replayed),encoding='utf8')
         (output/'integration-flush.json').write_text(json.dumps(result,indent=2),encoding='utf8')

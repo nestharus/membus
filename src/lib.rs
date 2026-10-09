@@ -4,7 +4,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::Path,
-    sync::{Condvar, Mutex, RwLock},
+    sync::{mpsc, Arc, Condvar, Mutex, RwLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
@@ -40,6 +40,8 @@ pub const CONDITIONAL_PUT: u8 = 5;
 pub const REMOVE: u8 = 6;
 pub const BATCH: u8 = 7;
 pub const HEALTH: u8 = 8;
+/// Additive kv/1 minor0 diagnostic operation; existing HEALTH layout is unchanged.
+pub const IO_METRICS: u8 = 9;
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -203,6 +205,10 @@ struct State {
     expiry: VecDeque<((String, String), u64)>,
     next: u64,
     reserved_bytes: usize,
+    stripe_reserved: [usize; 4],
+    stripe_items: [usize; 4],
+    persisted_bytes: u64,
+    pending_disk: u64,
     read_only: bool,
     warming: bool,
 }
@@ -216,11 +222,12 @@ pub struct Log {
     file: File,
     pub bytes: u64,
     pub flushes: u64,
-    last_flush: u64,
+    pub write_calls: u64,
     poisoned: bool,
 }
 #[derive(Clone)]
 pub struct Config {
+    pub state_limit_bytes: u64,
     pub quota: usize,
     pub index_cap: usize,
     pub capacity: usize,
@@ -230,12 +237,16 @@ pub struct Config {
     pub flush_ms: u64,
     pub allow_mem: bool,
     pub write_delay_ms: u64,
+    /// Test seam for an append-complete notification arriving after a covering sync.
+    pub flush_notice_delay_ms: u64,
     pub fail_after_append: bool,
     pub fail_partial_append: bool,
+    pub fail_sync: bool,
 }
 impl Default for Config {
     fn default() -> Self {
         Self {
+            state_limit_bytes: 8 * 1024 * 1024 * 1024,
             quota: 500_000,
             index_cap: 917_000,
             capacity: 256 * 1024 * 1024,
@@ -245,8 +256,10 @@ impl Default for Config {
             flush_ms: 50,
             allow_mem: false,
             write_delay_ms: 0,
+            flush_notice_delay_ms: 0,
             fail_after_append: false,
             fail_partial_append: false,
+            fail_sync: false,
         }
     }
 }
@@ -254,11 +267,257 @@ pub struct Store {
     committed: RwLock<HashMap<(String, String), Value>>,
     state: Mutex<State>,
     done: Condvar,
-    logs: Vec<Mutex<Log>>,
-    flush_gate: Mutex<u64>,
+    logs: Vec<Arc<Mutex<Log>>>,
+    appenders: Vec<AppendOwner>,
+    flush_owner: Option<std::thread::JoinHandle<()>>,
+    batch_gate: Mutex<()>,
     pub config: Config,
     pub epoch: u64,
     _owner: File,
+}
+struct Append {
+    record: Vec<u8>,
+    ack: u8,
+    done: mpsc::Sender<io::Result<()>>,
+}
+struct AppendOwner {
+    sender: Option<mpsc::Sender<Append>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+struct FlushWait {
+    stripe: usize,
+    end: u64,
+    bytes: usize,
+    done: mpsc::Sender<io::Result<()>>,
+}
+
+// Test-only kill checkpoints, enabled explicitly by a path-valued environment
+// variable. The marker proves the process reached the injection point.
+fn checkpoint(name: &str) {
+    if let Some(path) = std::env::var_os(name) {
+        let _ = fs::write(path, b"reached");
+        std::thread::sleep(Duration::from_secs(40));
+    }
+}
+fn write_record(log: &mut Log, mut bytes: &[u8]) -> io::Result<()> {
+    while !bytes.is_empty() {
+        log.write_calls += 1;
+        match log.file.write(bytes) {
+            Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "append")),
+            Ok(n) => {
+                log.bytes += n as u64;
+                bytes = &bytes[n..];
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+fn start_owners(
+    logs: &[Arc<Mutex<Log>>],
+    config: &Config,
+) -> (Vec<AppendOwner>, std::thread::JoinHandle<()>) {
+    let (flush_send, flush_recv) = mpsc::channel::<FlushWait>();
+    let flush_logs = logs.to_vec();
+    let interval = config.flush_ms;
+    let fail_sync = config.fail_sync;
+    let flush_owner = std::thread::spawn(move || {
+        let mut pending = VecDeque::new();
+        let mut last: Option<std::time::Instant> = None;
+        let mut covered = [0u64; 4];
+        let mut sync_failed = [false; 4];
+        loop {
+            if pending.is_empty() {
+                match flush_recv.recv() {
+                    Ok(w) if sync_failed[w.stripe] => {
+                        let _ = w
+                            .done
+                            .send(Err(io::Error::other("stripe fenced after failed sync")));
+                        continue;
+                    }
+                    Ok(w) if w.end <= covered[w.stripe] => {
+                        let _ = w.done.send(Ok(()));
+                        continue;
+                    }
+                    Ok(w) => pending.push_back(w),
+                    Err(_) => break,
+                }
+                // The gather window closes on elapsed time; bounds are enforced
+                // when selecting each handle's covering group below.
+                let until = std::time::Instant::now() + Duration::from_millis(interval);
+                while let Some(left) = until.checked_duration_since(std::time::Instant::now()) {
+                    match flush_recv.recv_timeout(left) {
+                        Ok(w) if sync_failed[w.stripe] => {
+                            let _ = w
+                                .done
+                                .send(Err(io::Error::other("stripe fenced after failed sync")));
+                        }
+                        Ok(w) if w.end <= covered[w.stripe] => {
+                            let _ = w.done.send(Ok(()));
+                        }
+                        Ok(w) => pending.push_back(w),
+                        Err(_) => break,
+                    }
+                }
+            }
+            while let Ok(w) = flush_recv.try_recv() {
+                if sync_failed[w.stripe] {
+                    let _ = w
+                        .done
+                        .send(Err(io::Error::other("stripe fenced after failed sync")));
+                } else if w.end <= covered[w.stripe] {
+                    let _ = w.done.send(Ok(()));
+                } else {
+                    pending.push_back(w);
+                }
+            }
+            let stripe = pending.front().unwrap().stripe;
+            let mut group = Vec::new();
+            let mut bytes = 0;
+            let mut retained = VecDeque::new();
+            while let Some(w) = pending.pop_front() {
+                if w.stripe == stripe
+                    && group.len() < 64
+                    && (group.is_empty() || bytes + w.bytes <= 144_192)
+                {
+                    bytes += w.bytes;
+                    group.push(w);
+                } else {
+                    retained.push_back(w);
+                }
+            }
+            pending = retained;
+            if let Some(previous) = last {
+                if let Some(delay) = Duration::from_millis(interval).checked_sub(previous.elapsed())
+                {
+                    std::thread::sleep(delay);
+                }
+            }
+            let (file, through) = {
+                let log = flush_logs[stripe].lock().unwrap();
+                (log.file.try_clone(), log.bytes)
+            };
+            let result = file.and_then(|f| {
+                checkpoint("MEMBUS_TEST_PAUSE_SYNC");
+                if fail_sync {
+                    Err(io::Error::other("test injected sync failure"))
+                } else {
+                    f.sync_all()
+                }
+            });
+            last = Some(std::time::Instant::now());
+            if result.is_ok() {
+                covered[stripe] = covered[stripe].max(through);
+            } else {
+                sync_failed[stripe] = true;
+            }
+            {
+                let mut log = flush_logs[stripe].lock().unwrap();
+                log.flushes += 1;
+                if result.is_err() {
+                    log.poisoned = true;
+                }
+            }
+            // A sync covers every earlier complete append on this handle,
+            // including queued waiters beyond the nominal selected group.
+            let mut extra = VecDeque::new();
+            while let Some(w) = pending.pop_front() {
+                if w.stripe == stripe && w.end <= through {
+                    group.push(w);
+                } else {
+                    extra.push_back(w);
+                }
+            }
+            pending = extra;
+            for w in group {
+                let r = match &result {
+                    Ok(()) => Ok(()),
+                    Err(e) => Err(io::Error::new(e.kind(), e.to_string())),
+                };
+                let _ = w.done.send(r);
+            }
+        }
+    });
+    let owners = logs
+        .iter()
+        .enumerate()
+        .map(|(stripe, log)| {
+            let log = log.clone();
+            let config = config.clone();
+            let flush = flush_send.clone();
+            let (sender, receiver) = mpsc::channel::<Append>();
+            let handle = std::thread::spawn(move || {
+                while let Ok(job) = receiver.recv() {
+                    if config.write_delay_ms > 0 {
+                        std::thread::sleep(Duration::from_millis(config.write_delay_ms));
+                    }
+                    let mut log = log.lock().unwrap();
+                    let result = if log.poisoned {
+                        Err(io::Error::other("stripe fenced after failed append"))
+                    } else if config.fail_partial_append
+                        || std::env::var_os("MEMBUS_TEST_PAUSE_PARTIAL").is_some()
+                    {
+                        let half = job.record.len() / 2;
+                        let r = write_record(&mut log, &job.record[..half]);
+                        checkpoint("MEMBUS_TEST_PAUSE_PARTIAL");
+                        log.poisoned = true;
+                        r.and(Err(io::Error::other(
+                            "test injected partial append failure",
+                        )))
+                    } else {
+                        write_record(&mut log, &job.record)
+                    };
+                    if result.is_err() {
+                        log.poisoned = true;
+                    }
+                    let end = log.bytes;
+                    let result = if result.is_ok() && config.fail_after_append {
+                        Err(io::Error::other("test injected post-admission I/O failure"))
+                    } else {
+                        result
+                    };
+                    drop(log);
+                    if result.is_ok() && job.ack == 2 {
+                        if config.flush_notice_delay_ms > 0 {
+                            std::thread::sleep(Duration::from_millis(config.flush_notice_delay_ms));
+                        }
+                        let wait = FlushWait {
+                            stripe,
+                            end,
+                            bytes: job.record.len(),
+                            done: job.done,
+                        };
+                        if let Err(e) = flush.send(wait) {
+                            let _ = e.0.done.send(Err(io::Error::other("flush owner stopped")));
+                        }
+                    } else {
+                        let _ = job.done.send(result);
+                    }
+                }
+            });
+            AppendOwner {
+                sender: Some(sender),
+                handle: Some(handle),
+            }
+        })
+        .collect();
+    (owners, flush_owner)
+}
+impl Drop for Store {
+    fn drop(&mut self) {
+        for owner in &mut self.appenders {
+            owner.sender.take();
+        }
+        for owner in &mut self.appenders {
+            if let Some(h) = owner.handle.take() {
+                let _ = h.join();
+            }
+        }
+        if let Some(h) = self.flush_owner.take() {
+            let _ = h.join();
+        }
+    }
 }
 fn mutation_bytes(m: &Mutation, version: u64, at: u64) -> Vec<u8> {
     let mut b = Vec::new();
@@ -305,6 +564,7 @@ impl Store {
         let mut next = 1u64;
         let mut logs = Vec::new();
         let mut torn = Vec::new();
+        let mut persisted_bytes = 0;
         let now = now_ms();
         for i in 0..4 {
             let p = path.join(format!("stripe-{i}.log"));
@@ -427,15 +687,16 @@ impl Store {
                 }
                 offset += 16 + n as u64;
             }
+            persisted_bytes += offset;
             drop(f);
             let file = OpenOptions::new().append(true).open(&p)?;
-            logs.push(Mutex::new(Log {
+            logs.push(Arc::new(Mutex::new(Log {
                 file,
                 bytes: 0,
                 flushes: 0,
-                last_flush: 0,
+                write_calls: 0,
                 poisoned: false,
-            }));
+            })));
         }
         if committed.len() > config.index_cap
             || committed.values().map(|v| v.bytes.len()).sum::<usize>()
@@ -493,6 +754,7 @@ impl Store {
         let dedup_bytes = dedup.values().map(|d| d.fingerprint.len()).sum();
         let mut expiry: Vec<_> = dedup.iter().map(|(k, d)| (k.clone(), d.at)).collect();
         expiry.sort_by_key(|(_, at)| *at);
+        let (appenders, flush_owner) = start_owners(&logs, &config);
         Ok(Self {
             committed: RwLock::new(committed),
             state: Mutex::new(State {
@@ -508,12 +770,18 @@ impl Store {
                 expiry: expiry.into(),
                 next,
                 reserved_bytes: 0,
+                stripe_reserved: [0; 4],
+                stripe_items: [0; 4],
+                persisted_bytes,
+                pending_disk: 0,
                 read_only: false,
                 warming: false,
             }),
             done: Condvar::new(),
             logs,
-            flush_gate: Mutex::new(0),
+            appenders,
+            flush_owner: Some(flush_owner),
+            batch_gate: Mutex::new(()),
             config,
             epoch,
             _owner: owner,
@@ -536,6 +804,19 @@ impl Store {
             f += l.flushes;
         }
         (b, f, self.committed.read().unwrap().len())
+    }
+    pub fn state_bytes(&self) -> u64 {
+        self.state.lock().unwrap().persisted_bytes
+    }
+    pub fn io_metrics(&self) -> (u64, u64, u64) {
+        let (mut bytes, mut writes, mut flushes) = (0, 0, 0);
+        for log in &self.logs {
+            let log = log.lock().unwrap();
+            bytes += log.bytes;
+            writes += log.write_calls;
+            flushes += log.flushes;
+        }
+        (bytes, writes, flushes)
     }
     pub fn set_read_only(&self, b: bool) {
         self.state.lock().unwrap().read_only = b
@@ -571,6 +852,15 @@ impl Store {
         let id = (m.ns.clone(), m.op_id.clone());
         let fp = fingerprint(&m);
         let at = now_ms();
+        let log_index = stripe(&m.ns, &m.key);
+        let disk_bytes = if m.ack == 0 {
+            0
+        } else {
+            (16 + mutation_bytes(&m, 0, 0).len()) as u64
+        };
+        // Charge complete queued representation, not just value payloads. Empty
+        // values still consume queue slots and framing/identifier memory.
+        let queue_charge = fp.len() + m.bytes.len() + 128;
         let mut state = self.state.lock().unwrap();
         if let Some(d) = state.dedup.get(&id) {
             if d.fingerprint != fp {
@@ -659,7 +949,13 @@ impl Store {
         {
             return Outcome::error(7);
         }
-        if state.reserved_bytes + m.bytes.len() > self.config.queue_bytes {
+        if state.persisted_bytes + state.pending_disk + disk_bytes > self.config.state_limit_bytes {
+            return Outcome::error(7);
+        }
+        if state.reserved_bytes + queue_charge > self.config.queue_bytes
+            || state.stripe_reserved[log_index] + queue_charge > self.config.queue_bytes / 4
+            || state.stripe_items[log_index] >= 1024
+        {
             return Outcome::error(6);
         }
         if state.dedup.len() >= self.config.dedup_cap {
@@ -689,7 +985,10 @@ impl Store {
             state.keys += 1;
             *state.namespace_counts.entry(m.ns.clone()).or_default() += 1;
         }
-        state.reserved_bytes += m.bytes.len();
+        state.reserved_bytes += queue_charge;
+        state.stripe_reserved[log_index] += queue_charge;
+        state.stripe_items[log_index] += 1;
+        state.pending_disk += disk_bytes;
         state.dedup_bytes += fp.len();
         state.expiry.push_back((id.clone(), at));
         state.dedup.insert(
@@ -701,9 +1000,6 @@ impl Store {
             },
         );
         drop(state);
-        if self.config.write_delay_ms > 0 {
-            std::thread::sleep(Duration::from_millis(self.config.write_delay_ms))
-        }
         let result = if m.ack == 0 {
             Ok(())
         } else {
@@ -713,56 +1009,20 @@ impl Store {
             record.extend((!(b.len() as u32)).to_le_bytes());
             record.extend(crc32(&b).to_le_bytes());
             record.extend(b);
-            let log_index = stripe(&m.ns, &m.key);
-            let mut log = self.logs[log_index].lock().unwrap();
-            // A failed append may leave a torn tail. Fence this file under its owner
-            // lock so an already-admitted writer cannot append a valid frame behind it.
-            let r = if log.poisoned {
-                Err(io::Error::other("stripe fenced after failed append"))
-            } else if self.config.fail_partial_append {
-                let n = record.len() / 2;
-                let r = log.file.write_all(&record[..n]);
-                if r.is_ok() {
-                    log.bytes += n as u64;
-                }
-                log.poisoned = true;
-                Err(io::Error::other("test injected partial append failure"))
-            } else {
-                let r = log.file.write_all(&record);
-                if r.is_ok() {
-                    log.bytes += record.len() as u64;
-                } else {
-                    log.poisoned = true;
-                }
-                r
-            };
-            let r = if r.is_ok() && self.config.fail_after_append {
-                Err(io::Error::other("test injected post-admission I/O failure"))
-            } else {
-                r
-            };
-            let sync_file = if r.is_ok() && m.ack == 2 {
-                Some(log.file.try_clone())
-            } else {
-                None
-            };
-            drop(log);
-            if r.is_ok() && m.ack == 2 {
-                let mut gate = self.flush_gate.lock().unwrap();
-                let delay = (*gate + self.config.flush_ms).saturating_sub(now_ms());
-                if delay > 0 {
-                    std::thread::sleep(Duration::from_millis(delay))
-                }
-                let r = sync_file.unwrap().and_then(|f| f.sync_all());
-                if r.is_ok() {
-                    let mut log = self.logs[log_index].lock().unwrap();
-                    log.flushes += 1;
-                    log.last_flush = now_ms();
-                    *gate = log.last_flush;
-                }
-                r
-            } else {
-                r
+            let (done, completion) = mpsc::channel();
+            match self.appenders[log_index]
+                .sender
+                .as_ref()
+                .unwrap()
+                .send(Append {
+                    record,
+                    ack: m.ack,
+                    done,
+                }) {
+                Ok(()) => completion
+                    .recv()
+                    .unwrap_or_else(|_| Err(io::Error::other("append owner stopped"))),
+                Err(_) => Err(io::Error::other("append owner stopped")),
             }
         };
         // Publication precedes completion on every connection; readers never await log I/O.
@@ -779,7 +1039,15 @@ impl Store {
             Outcome::error(16)
         };
         let mut state = self.state.lock().unwrap();
-        state.reserved_bytes -= m.bytes.len();
+        state.reserved_bytes -= queue_charge;
+        state.stripe_reserved[log_index] -= queue_charge;
+        state.stripe_items[log_index] -= 1;
+        state.pending_disk -= disk_bytes;
+        // Count append-complete uncertain sync results too; a conservative
+        // reservation after any failure avoids exceeding the disk cap.
+        if m.ack != 0 {
+            state.persisted_bytes += disk_bytes;
+        }
         state.pending.remove(&k);
         if result.is_ok() && m.ack != 0 {
             state.committed_bytes =
@@ -910,11 +1178,54 @@ impl Store {
                     }
                     c.end()?;
                     let mut p = (n as u16).to_le_bytes().to_vec();
-                    for m in items {
-                        let o = self.mutate(m);
+                    // Distinct keys overlap, including their flush waits. Same-key
+                    // operations retain input order; replies always retain input order.
+                    let mut keys: HashMap<String, Vec<(usize, Mutation)>> = HashMap::new();
+                    for (i, m) in items.into_iter().enumerate() {
+                        keys.entry(m.key.clone()).or_default().push((i, m));
+                    }
+                    // One executing batch per store, at most 32 scoped helpers.
+                    // Refuse before any item admission if another batch owns it.
+                    let _batch = self.batch_gate.try_lock().map_err(|_| 6u16)?;
+                    let helpers = keys.len().min(32);
+                    let work = Mutex::new(keys.into_values());
+                    let mut results = std::thread::scope(|scope| {
+                        let handles: Vec<_> = (0..helpers)
+                            .map(|_| {
+                                let work = &work;
+                                scope.spawn(move || {
+                                    let mut out = Vec::new();
+                                    loop {
+                                        let items = work.lock().unwrap().next();
+                                        let Some(items) = items else {
+                                            break;
+                                        };
+                                        out.extend(
+                                            items.into_iter().map(|(i, m)| (i, self.mutate(m))),
+                                        );
+                                    }
+                                    out
+                                })
+                            })
+                            .collect();
+                        handles
+                            .into_iter()
+                            .flat_map(|h| h.join().unwrap())
+                            .collect::<Vec<_>>()
+                    });
+                    results.sort_by_key(|(i, _)| *i);
+                    for (_, o) in results {
                         p.extend(o.code.to_le_bytes());
                         p.extend(o.bytes());
                     }
+                    Ok(p)
+                }
+                IO_METRICS => {
+                    c.end()?;
+                    let (bytes, writes, flushes) = self.io_metrics();
+                    let mut p = bytes.to_le_bytes().to_vec();
+                    p.extend(writes.to_le_bytes());
+                    p.extend(flushes.to_le_bytes());
                     Ok(p)
                 }
                 HEALTH => {
