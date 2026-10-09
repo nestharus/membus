@@ -35,3 +35,22 @@ try:
 except RuntimeError:pass
 assert c.released==[('ledger',b't'*16)]
 print('PASS: initial captures send once; known tokens retry same view; context releases on error')
+
+class ReleaseFailure(Scope):
+    def snapshot_open(self,*args,**kw):self.open_options=kw;return b't'*16
+    def snapshot_release(self,*args,**kw):
+        assert not kw, 'release inherited stale open deadline/op_id'
+        raise TimeoutError('injected release failure')
+c=ReleaseFailure();original=RuntimeError('original consumer error')
+try:
+    with c.snapshot('ledger',deadline=1,op_id='open-only'):
+        raise original
+except RuntimeError as error:
+    assert error is original and any('release failed' in x for x in error.__notes__)
+else:raise AssertionError('consumer error masked')
+assert c.open_options=={'deadline':1,'op_id':'open-only'}
+try:
+    with c.snapshot('ledger'):pass
+except TimeoutError:pass
+else:raise AssertionError('normal-exit release error hidden')
+print('PASS: fresh release options; consumer error retained with cleanup note; normal cleanup failure surfaced')

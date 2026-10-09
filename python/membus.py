@@ -154,7 +154,7 @@ class Client:
                 self.channel = Pipe(self.address, deadline)
             response = self.exchange(1, struct.pack('<IB', MAX_FRAME, self.allow_mem)+lp('python-stdlib;scans=1'), deadline)
             decoder = Decoder(response)
-            self.epoch, self.max_frame, self.max_value, self.max_batch, self.mem, self.retry_ms = decoder.unpack('<QIIHBQ')
+            epoch, max_frame, max_value, max_batch, mem, retry_ms = decoder.unpack('<QIIHBQ')
             count, = decoder.unpack('<H')
             codes = {}
             for _ in range(count):
@@ -168,6 +168,8 @@ class Client:
                     any(code in codes and codes[code] != value for code, value in CODES.items())):
                 self.close()
                 raise ValueError('incompatible refusal-code list')
+            self.epoch, self.max_frame, self.max_value = epoch, max_frame, max_value
+            self.max_batch, self.mem, self.retry_ms = max_batch, mem, retry_ms
             self.codes = codes
         except BaseException:
             self.close()
@@ -296,13 +298,23 @@ class Client:
     def snapshot(self, ns, **options):
         """Release a shared snapshot when its with block ends, including errors."""
         token = self.snapshot_open(ns, **options)
+        consumer_error = None
         try:
             yield token
+        except BaseException as error:
+            consumer_error = error
+            raise
         finally:
             try:
-                self.snapshot_release(ns, token, **options)
-            except Refusal as error:
-                if error.code != 20:
+                # Release is a separate bounded call, with fresh deadline/op_id.
+                self.snapshot_release(ns, token)
+            except BaseException as error:
+                if isinstance(error, Refusal) and error.code == 20:
+                    pass
+                elif consumer_error is not None:
+                    if hasattr(consumer_error, 'add_note'):
+                        consumer_error.add_note('snapshot release failed: ' + str(error))
+                else:
                     raise
 
     def snapshot_release(self, ns, snapshot, **options):
