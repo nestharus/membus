@@ -5,7 +5,7 @@ from pathlib import Path
 import time
 import struct
 from integration import Server
-from membus import deadline_ms
+from membus import deadline_ms, Refusal
 
 def run(args):
     output=Path(args.output);output.mkdir(parents=True,exist_ok=True)
@@ -28,7 +28,11 @@ def run(args):
             for item in items: acknowledged.append(item['key']);values[item['key']]=item['value']
             print(f'flush-acked {len(acknowledged)}/3070 elapsed={time.monotonic()-started:.3f}s',flush=True)
         elapsed=time.monotonic()-started;metrics=client.health();epoch=client.epoch
-        io_counters=dict(zip(('logical_append_bytes','append_write_calls','sync_attempts'),struct.unpack('<QQQ',client.call(9,'ledger'))))
+        try:
+            io_counters=dict(zip(('logical_append_bytes','append_write_calls','sync_attempts'),struct.unpack('<QQQ',client.call(9,'ledger'))))
+        except Refusal as error:
+            if error.code != 2: raise
+            io_counters={'available':False,'reason':'older minor0 server does not implement optional opcode9'}
         server.stop();server=Server(args.binary,output/'state',output/'restarted-server.txt',flags=('--flush-ms',str(args.flush_ms)))
         replayed=[]
         for offset in range(0,len(acknowledged),128):

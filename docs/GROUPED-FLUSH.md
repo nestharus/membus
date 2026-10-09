@@ -17,3 +17,6 @@ The8GiB cap counts stripe logs only, including overwrite/tombstone records. Resi
 Path-valued test environment variables MEMBUS_TEST_PAUSE_PARTIAL and MEMBUS_TEST_PAUSE_SYNC create a marker and pause at partial append or sync-worker entry. Leave unset in normal operation. The sync marker proves a worker boundary before the sync call, not residence within Windows FlushFileBuffers; actual kernel-in-flight kill coverage remains unverified.
 
 Measurement and located dispositions are under the F-E6-20 report and REVIEW-DISPOSITION.md. Same-key order and reply order, covering flush groups, complete-record state cap, empty-value queue bounds and previous protocol/replay behavior have Rust regression checks.
+
+Final source ffe865f measured3070flush rows in15.106s with294sync attempts and equal acknowledged/replayed sets; final batch times0.565–0.669s. This follows the explicitly initial timing above and is a separate measurement window. Full source/binary binding and raw outputs live in Act's REPORT.md/SOURCE-BINDING.json.
+

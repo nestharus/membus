@@ -105,7 +105,10 @@ fn main() {
 }
 
 fn concurrent_reads(root: &Path) {
-    use std::sync::Arc;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
     for writers in [1usize, 8, 32] {
         let s = Arc::new(
             Store::open(&root.join(format!("writers{writers}")), Config::default()).unwrap(),
@@ -123,11 +126,15 @@ fn concurrent_reads(root: &Path) {
         assert_eq!(s.mutate(make("seed".into(), "seed".into(), 1)).code, 0);
         let before = counters();
         let started = Instant::now();
+        let outstanding = AtomicUsize::new(writers);
+        let mut hot_reads = 0usize;
+        let mut max_read_seconds = 0f64;
         std::thread::scope(|scope| {
             let handles: Vec<_> = (0..writers)
                 .map(|i| {
                     let s = &s;
                     let make = &make;
+                    let outstanding = &outstanding;
                     scope.spawn(move || {
                         for k in 0..16 {
                             assert_eq!(
@@ -140,11 +147,18 @@ fn concurrent_reads(root: &Path) {
                                 0
                             );
                         }
+                        outstanding.fetch_sub(1, Ordering::Release);
                     })
                 })
                 .collect();
-            for _ in 0..10000 {
-                assert_eq!(s.get("ledger", "seed").unwrap().bytes.len(), 1039);
+            while outstanding.load(Ordering::Acquire) > 0 || hot_reads < 10000 {
+                for _ in 0..100 {
+                    let tick = Instant::now();
+                    assert_eq!(s.get("ledger", "seed").unwrap().bytes.len(), 1039);
+                    max_read_seconds = max_read_seconds.max(tick.elapsed().as_secs_f64());
+                    hot_reads += 1;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
             for h in handles {
                 h.join().unwrap();
@@ -154,6 +168,6 @@ fn concurrent_reads(root: &Path) {
         let io = s.io_metrics();
         assert_eq!(after.reads - before.reads, 0);
         assert_eq!(after.read_bytes - before.read_bytes, 0);
-        println!("{{\"writers\":{writers},\"hot_reads\":10000,\"read_operation_delta\":{},\"read_bytes_delta\":{},\"logical_append_bytes\":{},\"append_write_calls\":{},\"sync_attempts\":{},\"seconds\":{},\"scope\":\"WindowsprocesslogicalIO,pureStoregetsconcurrentwithourappendowners;startup/replayexcluded;notphysicaldriveIO\"}}",after.reads-before.reads,after.read_bytes-before.read_bytes,io.0,io.1,io.2,started.elapsed().as_secs_f64());
+        println!("{{\"writers\":{writers},\"hot_reads\":{hot_reads},\"max_read_seconds\":{max_read_seconds},\"reads_continue_until_all_writers_complete\":true,\"read_operation_delta\":{},\"read_bytes_delta\":{},\"logical_append_bytes\":{},\"append_write_calls\":{},\"sync_attempts\":{},\"seconds\":{},\"scope\":\"WindowsprocesslogicalIO,pureStoregetsconcurrentwithourappendowners;startup/replayexcluded;notphysicaldriveIO\"}}",after.reads-before.reads,after.read_bytes-before.read_bytes,io.0,io.1,io.2,started.elapsed().as_secs_f64());
     }
 }
