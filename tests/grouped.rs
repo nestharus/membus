@@ -127,7 +127,7 @@ fn batch_same_key_order_and_reply_order() {
 }
 
 #[test]
-fn late_flush_notification_uses_covering_sync() {
+fn delayed_flush_notification_preserves_acknowledgement() {
     let s = Arc::new(
         Store::open(
             &path("late-notice"),
