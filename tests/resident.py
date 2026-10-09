@@ -69,13 +69,33 @@ def main():
         assert recovered['heartbeat_attempts']>recovered['heartbeat_writes']
         assert recovered['heartbeat_bytes_attempted']>recovered['heartbeat_bytes']
         result['heartbeat_failure_recovery']=recovered
+        peers=[]
+        try:
+            for _ in range(64):peers.append(Pipe(server.address,deadline_ms()))
+            busy_started=time.monotonic()
+            health_busy=subprocess.run(check,capture_output=True,text=True)
+            busy_seconds=time.monotonic()-busy_started
+            assert health_busy.returncode==0,(health_busy.stdout,health_busy.stderr)
+            assert busy_seconds<2.5
+            result['native_health_busy']={'seconds':busy_seconds,'exit':health_busy.returncode,'slots_held':len(peers)}
+        finally:
+            for peer in peers:peer.close()
         stale=Pipe(server.address,deadline_ms())
+        stale.io(b'\x0d',1,deadline_ms(),True)
+        kill_started=time.monotonic()
         server.client.close()
         server.stop();server=None
+        kill_seconds=time.monotonic()-kill_started
+        assert kill_seconds<.2,'stale server IO could have idled out before kill'
         stripe=next(p for p in (out/'state').glob('stripe-*.log') if p.stat().st_size)
         before_tail=stripe.stat().st_size
         with stripe.open('ab') as f:f.write(b'MBK')
         server=Server(args.binary,out/'state',out/'server.txt','pipe',flags,address=address)
+        try:stale.io(None,1,deadline_ms(1),False)
+        except TimeoutError:raise AssertionError('stale client timed out instead of observing kill')
+        except OSError as error:
+            result['stale_client']={'winerror':getattr(error,'winerror',None),'kill_seconds':kill_seconds}
+        else:raise AssertionError('old pipe delivered data after kill')
         stale.close()
         assert stripe.stat().st_size==before_tail
         assert server.client.epoch!=epoch

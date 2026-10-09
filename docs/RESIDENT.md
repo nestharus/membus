@@ -65,6 +65,8 @@ Native `membus.exe health PIPE [--state-dir PATH]` (state defaults to the reside
 state path above) exits0 only after kv/1 hello+health, with the pipe server pid
 queried through Windows, matching heartbeat pid and hello epoch, age<90s.
 It uses2s per-I/O timeouts and emits a single success line; failures exit nonzero.
+Busy pipe instance creation retries for at most2s. Native health requires the
+heartbeat to be enabled; `--heartbeat-ms 0` is for foreground tests only.
 
 ## State growth and upgrades
 
@@ -82,14 +84,21 @@ Heartbeat also reads the in-memory replay+append counter `state_bytes`, names
 This causes no drive reads. These fields are diagnostic local health readings;
 the existing kv/1 health packet is unchanged and its lifetime write counter
 still excludes pre-restart bytes. Operators poll the heartbeat before the cap.
+`state_bytes` conservatively charges the complete attempted frame after an
+uncertain append until replay recounts actual valid bytes; pending reservations
+are excluded from the diagnostic value. At the cap, persistent removes also
+refuse since tombstones append and cannot reclaim log space. The8GiB cap applies
+to this unrotated stripe-log slice. PLAN's later1GiB maintenance reserve/7GiB
+ordinary ceiling must be provisioned before a maintenance/rotation rollout;
+this slice supplies neither snapshots nor a reserved maintenance tier.
+No automatic capacity-pressure alert consumer is wired yet; the heartbeat
+field is available to local operators and its reporting policy is an owner
+question recorded in the Act evidence. The cap itself is enforced immediately.
 
 A wire minor/major change needs hello negotiation and documented compatibility;
 an incompatible client receives incompatible_version. An on-disk format change
 requires an explicit migration/backup plan before replacing the binary. This
 slice retains MBK1 and kv/1.0, so replay uses existing state without migration.
-Service registration asks lane88 for logon startup, restart-on-failure and
-the exact services.toml/Task Scheduler definition; until its answer there is
-no claim fleet runs this instance.
 Lane88's eco seq452 answer selects task `Oulipoly membus`, xteam logon plus
 1-minute repeats, IgnoreNew, below-normal priority, unlimited duration. The
 minute repeat restarts after exit; Task Scheduler RestartOnFailure concerns

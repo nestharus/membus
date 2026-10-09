@@ -371,11 +371,24 @@ fn health_command(args: &[String]) -> io::Result<()> {
         .get(2)
         .map(String::as_str)
         .unwrap_or("D:/projects/membus/state");
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(0x40000000)
-        .open(&args[0])?;
+    let connect_until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let file = loop {
+        match fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(0x40000000)
+            .open(&args[0])
+        {
+            Ok(file) => break file,
+            Err(error)
+                if error.raw_os_error() == Some(231)
+                    && std::time::Instant::now() < connect_until =>
+            {
+                thread::sleep(std::time::Duration::from_millis(5))
+            }
+            Err(error) => return Err(error),
+        }
+    };
     #[link(name = "kernel32")]
     extern "system" {
         fn GetNamedPipeServerProcessId(h: *mut std::ffi::c_void, pid: *mut u32) -> i32;

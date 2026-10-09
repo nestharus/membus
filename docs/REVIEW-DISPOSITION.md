@@ -181,3 +181,24 @@ commit and its later state-cap integration with F-E6-20 implementation2b75022.
 | O-R13 docs/usage | Fixed KV1 section6 cutoff statement and CLI usage, including idle, heartbeat, state limit and existing dedup controls. |
 | O-R14 validation | Retained positive bounded idle_ms and zero-or>=100 heartbeat interval; added positive state cap validation. |
 | O-R15 mirror reconnection | Answered in recorded lane83-shadow.md: idles reconnect and new epoch requires deterministic-key/op_id reconciliation. Shadow remains lane83 choice and file ledger primary. |
+
+### Final supplemental observe return
+
+e4/act-work/F-E6-21/review-supplement-return.json and
+review-supplement-observations.md read committed1c52fe8 and the2b75022 seam.
+Final dispositions (O-S0..O-S11):
+
+| Observation | Disposition |
+|---|---|
+| O-S0 reachable commit | Answered: rebasing changed preliminary health commit1e66fbe to0d38394; final installation message names the reachable merged source and binary hash. F-E6-20 merges first; resident rebases on its main before its separate merge. |
+| O-S1 line endings | Fixed KV1 back to LF; real final diff adds only the idle statement and state-cap paragraph rather than whole-file CRLF churn. |
+| O-S2 native health | Retained checked hello/health/pid/epoch/freshness. RESIDENT now says heartbeat must stay enabled for resident health; zero is a foreground-test option. Other invalid-file/refusal paths are code-read evidence rather than claimed runtime witnesses. |
+| O-S3 busy connection window | Fixed bounded retry for ERROR_PIPE_BUSY231 for up to2s,5ms sleeps, then normal2s I/O bounds. Witness holds64 idle pipe clients and health succeeds after slots clear rather than treating the instance-creation gap as permanent failure. |
+| O-S4 pressure consumer | Answered transparently: heartbeat exposes pressure but no automatic alert consumer exists yet. Routed the reporting-policy question to lane88 with the final installed-binary evidence; health availability remains independent of capacity so reads stay useful. This is open owner integration, not a wired alert claim. |
+| O-S5 conservative cap accounting | Fixed doc: uncertain failed append charges full attempted frame until replay recounts; heartbeat excludes pending reservations; persistent removes also refuse and cannot shrink logs. Mem remains explicit opt-in with its own independent memory cap. |
+| O-S6 maintenance reserve | Answered staging: current cap is8GiB unrotated stripe logs; PLAN's1GiB reserve/7GiB ordinary ceiling must be provisioned before a rotation/maintenance rollout. No snapshot/archive/maintenance tier is supplied by this commission. Operator/accounting choice remains open for that later scope. |
+| O-S7 heartbeat accounting | Retained successful replacement+attempted-byte/failure counters; raw witness shows attempts=writes+failures and recovery. heartbeat.tmp is never consumed as health; physical/metadata writes stay unmeasured. |
+| O-S8 stale client timing | Strengthened witness sends a partial header immediately before kill, records kill duration<200ms idle bound, then receives BrokenPipeError109 from that retained handle after restart. Same populated-stripe torn tail and os/flush readback remain. Exact registered endpoint is the separate fleet witness. |
+| O-S9 original dispositions | All original16 observations remain individually accounted above; final report locates tests and registered-service check. No new protocol/state format change. |
+| O-S10 obsolete registration paragraph | Fixed removed pre-answer paragraph; seq452's logon+minute policy is the single current shape. |
+| O-S11 KV1 capacity routing | Fixed section7 names persistent state byte cap, replay+inflight accounting, capacity7 for tombstones, and RESIDENT remedy/diagnostic warning. |
