@@ -28,7 +28,12 @@ framing and refusal codes intact. `--idle-ms` is a positive per-I/O timeout
 including a client that sends only part of a frame. A continuing trickle can
 keep a connection live; this is an idle bound, not a whole-request deadline.
 Pipe I/O uses overlapped operations, cancellation and completion drainage.
+An incomplete trickling frame keeps its ingress reservation as well as its
+connection slot; the aggregate64MiB frame budget remains bounded and other
+clients can receive busy6. A total-frame deadline is a later policy choice.
 The current-user/LocalSystem ACL, local-only endpoint and 64-client cap remain.
+The service must run as xteam in the same user/logon session as its clients;
+running as SYSTEM changes the current-user SID and would exclude user clients.
 Python's existing reconnect and epoch reconciliation require no wire change.
 
 ## Startup, health and bounded output
@@ -42,10 +47,15 @@ server process kill; os is not a power-loss promise. mem requires explicit opt-i
 
 `heartbeat.json` is a single bounded JSON object in state, replaced every
 `--heartbeat-ms` milliseconds (default30000, minimum100; zero disables it).
-It contains pid, epoch, unix_ms, heartbeat_writes and heartbeat_bytes counters.
+It contains pid, epoch, unix_ms, heartbeat_writes and heartbeat_bytes counters,
+plus heartbeat_attempts, heartbeat_bytes_attempted and heartbeat_failures.
 `heartbeat.tmp` is bounded to one object too. Each successful replacement
-counts one logical file write; no sync is requested. With a roughly150-byte
-object this costs roughly300 logical bytes/minute at the default interval,
+counts one successful replacement; no sync is requested. Each attempted temp
+write is counted too, and failures appear in the next successful object. Bytes
+attempted bound the requested temp-write bytes, including failed/partial writes;
+they do not claim physical I/O. A persistent error retries once per interval,
+then becomes stale health. With an object below512bytes this costs below1024
+logical requested bytes/minute at the default interval during successful operation,
 plus filesystem metadata; physical-device bytes are not inferred. There is
 no per-request log. stdout/stderr have just startup/fatal messages; lane88's
 launcher must rotate/cap captures at1MiB with one prior file. Health check:
@@ -67,6 +77,11 @@ after disk accounting or migrate an instance; zero is invalid. This bound
 excludes fixed owner.lock and heartbeat files, filesystem metadata and logs
 owned by the launcher. Existing state above the cap remains readable and
 refuses further persistent appends. Memory caps remain independent.
+Heartbeat also reads the in-memory replay+append counter `state_bytes`, names
+`state_limit_bytes`, and warns `state_high_water` at75% (6GiB of the default8GiB).
+This causes no drive reads. These fields are diagnostic local health readings;
+the existing kv/1 health packet is unchanged and its lifetime write counter
+still excludes pre-restart bytes. Operators poll the heartbeat before the cap.
 
 A wire minor/major change needs hello negotiation and documented compatibility;
 an incompatible client receives incompatible_version. An on-disk format change
@@ -100,5 +115,7 @@ tolerance; os/flush-acknowledged keys replay equally after kill and a torn tail;
 epoch changes; heartbeat counter and bytes agree with bounded-file updates;
 state cap refuses before acceptance and preserves old reads. Raw small outputs
 and co-tenant lineup/process context go in the e4 act-work/F-E6-21 directory.
+The first91-byte-object witness predates the additive failure counters; the
+final report locates the current object's measured byte count.
 An observe-class reviewer reads the diff against the commission and named
 basis; every observation gets a disposition before merge and private push.

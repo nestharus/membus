@@ -289,7 +289,7 @@ fn main() -> io::Result<()> {
         return health_command(&args[2..]);
     }
     if args.len() < 4 {
-        return Err(io::Error::other("usage: membus STATE_DIR tcp|pipe ADDRESS [--flush-ms N] [--retry-ms N] [--quota N] [--index-cap N] [--capacity N] [--queue-bytes N] [--delay-ms N] [--allow-mem]"));
+        return Err(io::Error::other("usage: membus STATE_DIR tcp|pipe ADDRESS [--idle-ms N] [--heartbeat-ms N] [--state-limit-bytes N] [--flush-ms N] [--retry-ms N] [--quota N] [--index-cap N] [--capacity N] [--queue-bytes N] [--dedup-cap N] [--delay-ms N] [--allow-mem]; membus health PIPE [--state-dir PATH]"));
     }
     let path = PathBuf::from(&args[1]);
     let mut config = Config::default();
@@ -308,6 +308,12 @@ fn main() -> io::Result<()> {
             .parse::<u64>()
             .map_err(io::Error::other)?;
         match args[i].as_str() {
+            "--state-limit-bytes" => {
+                if n == 0 {
+                    return Err(io::Error::other("state-limit-bytes must be positive"));
+                }
+                config.state_limit_bytes = n;
+            }
             "--idle-ms" => {
                 idle_ms = u32::try_from(n)
                     .ok()
@@ -332,9 +338,10 @@ fn main() -> io::Result<()> {
         }
         i += 2
     }
+    let state_limit = config.state_limit_bytes;
     let store = Arc::new(Store::open(&path, config)?);
     if heartbeat_ms != 0 {
-        start_heartbeat(path.clone(), store.epoch, heartbeat_ms);
+        start_heartbeat(path.clone(), store.clone(), state_limit, heartbeat_ms);
     }
     eprintln!(
         "ready epoch={} pid={} state={}",
@@ -450,20 +457,31 @@ fn heartbeat_number(text: &str, key: &str) -> io::Result<u64> {
     digits.parse().map_err(io::Error::other)
 }
 
-fn start_heartbeat(path: PathBuf, epoch: u64, interval_ms: u64) {
+fn start_heartbeat(path: PathBuf, store: Arc<Store>, state_limit: u64, interval_ms: u64) {
     thread::spawn(move || {
         let mut writes = 0u64;
         let mut bytes = 0u64;
+        let mut attempts = 0u64;
+        let mut attempted_bytes = 0u64;
+        let mut failures = 0u64;
         loop {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis();
-            let mut content = format!("{{\"pid\":{},\"epoch\":{},\"unix_ms\":{},\"heartbeat_writes\":{},\"heartbeat_bytes\":0}}\n", std::process::id(), epoch, now, writes + 1);
+            attempts += 1;
+            let state_bytes = store.state_bytes();
+            let state_high_water = state_bytes >= state_limit - state_limit / 4;
+            let format = |successful_bytes, tried_bytes| {
+                format!("{{\"pid\":{},\"epoch\":{},\"unix_ms\":{},\"heartbeat_writes\":{},\"heartbeat_bytes\":{},\"heartbeat_attempts\":{},\"heartbeat_bytes_attempted\":{},\"heartbeat_failures\":{},\"state_bytes\":{},\"state_limit_bytes\":{},\"state_high_water\":{}}}\n", std::process::id(), store.epoch, now, writes + 1, successful_bytes, attempts, tried_bytes, failures,state_bytes,state_limit,state_high_water)
+            };
+            let mut content = format(0, 0);
             // Byte counter includes the current object; converge across decimal widths.
             loop {
-                let total = bytes + content.len() as u64;
-                let next = format!("{{\"pid\":{},\"epoch\":{},\"unix_ms\":{},\"heartbeat_writes\":{},\"heartbeat_bytes\":{}}}\n", std::process::id(), epoch, now, writes + 1, total);
+                let next = format(
+                    bytes + content.len() as u64,
+                    attempted_bytes + content.len() as u64,
+                );
                 if next.len() == content.len() {
                     content = next;
                     break;
@@ -471,35 +489,18 @@ fn start_heartbeat(path: PathBuf, epoch: u64, interval_ms: u64) {
                 content = next;
             }
             let temporary = path.join("heartbeat.tmp");
-            // Windows rename cannot replace an existing file. MoveFileExW is atomic
-            // replacement; no deliberate disk flush for this diagnostic heartbeat.
+            // Count write attempts too: failed replacements can still write a temp.
+            // Attempted bytes are a bound, not a claim of successful/physical I/O.
+            attempted_bytes += content.len() as u64;
             let result = fs::write(&temporary, content.as_bytes())
-                .and_then(|_| replace_heartbeat(&temporary, &path.join("heartbeat.json")));
+                .and_then(|_| fs::rename(&temporary, path.join("heartbeat.json")));
             if result.is_ok() {
                 writes += 1;
                 bytes += content.len() as u64;
+            } else {
+                failures += 1;
             }
             thread::sleep(std::time::Duration::from_millis(interval_ms));
         }
     });
-}
-fn replace_heartbeat(from: &std::path::Path, to: &std::path::Path) -> io::Result<()> {
-    #[cfg(windows)]
-    {
-        #[link(name = "kernel32")]
-        extern "system" {
-            fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32;
-        }
-        use std::os::windows::ffi::OsStrExt;
-        let from: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
-        let to: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
-        if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 1) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
-    #[cfg(not(windows))]
-    {
-        fs::rename(from, to)
-    }
 }

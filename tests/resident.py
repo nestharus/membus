@@ -1,5 +1,5 @@
 """Small Windows resident witnesses; every owned process stopped in finally."""
-import argparse, json, os, pathlib, struct, subprocess, sys, time
+import argparse, json, os, pathlib, struct, subprocess, sys, time, uuid
 ROOT=pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'python')); sys.path.insert(0,str(ROOT/'tests'))
 from integration import Server
@@ -12,16 +12,19 @@ def main():
     server=None
     try:
         flags=['--idle-ms','200','--heartbeat-ms','250','--flush-ms','0']
-        server=Server(args.binary,out/'state',out/'server.txt','pipe',flags)
+        address=r'\\.\pipe\LOCAL\membus-resident-test-'+str(uuid.uuid4())
+        server=Server(args.binary,out/'state',out/'server.txt','pipe',flags,address=address)
         for data in (b'\x0d',struct.pack('<I',13)+b'\x01\x00'):
             raw=Pipe(server.address,deadline_ms()); raw.io(data,len(data),deadline_ms(),True)
-            start=time.monotonic();time.sleep(.35)
+            start=time.monotonic()
             try: raw.io(None,1,deadline_ms(1),False)
-            except OSError: pass
+            except TimeoutError: raise AssertionError('client timed out instead of server closing')
+            except OSError as error:
+                result.setdefault('idle_errors',[]).append({'type':type(error).__name__,'winerror':getattr(error,'winerror',None)})
             else: raise AssertionError('idle partial frame stayed live')
             finally:raw.close()
             result.setdefault('idle_close_seconds',[]).append(time.monotonic()-start)
-            assert result['idle_close_seconds'][-1]<1.2
+            assert .1<=result['idle_close_seconds'][-1]<1.2
         c=server.client; expected={}
         for ack in (1,2):
             key='ack/'+str(ack); expected[key]=('value/'+str(ack)).encode(); assert c.put('resident',key,expected[key],ack=ack)['ack']==ack
@@ -30,7 +33,7 @@ def main():
         while time.monotonic()-start<1.1:
             try: item=json.loads((out/'state'/'heartbeat.json').read_text()); length=(out/'state'/'heartbeat.json').stat().st_size
             except (FileNotFoundError,json.JSONDecodeError):time.sleep(.01);continue
-            assert length<256
+            assert length<512
             if not samples or samples[-1]['heartbeat_writes']!=item['heartbeat_writes']:
                 item['object_bytes']=length;samples.append(item)
             time.sleep(.015)
@@ -50,23 +53,50 @@ def main():
         unhealthy=subprocess.run(check[:-1]+[str(wrong)],capture_output=True,text=True)
         assert unhealthy.returncode!=0
         result['native_health']={'matching_pid_epoch':healthy.stdout.strip(),'wrong_pid_exit':unhealthy.returncode}
+        # Force failed replacement with a Win32 handle denying delete sharing.
+        import ctypes
+        from ctypes import wintypes as w
+        kernel=ctypes.WinDLL('kernel32',use_last_error=True)
+        kernel.CreateFileW.argtypes=[w.LPCWSTR,w.DWORD,w.DWORD,w.LPVOID,w.DWORD,w.DWORD,w.HANDLE];kernel.CreateFileW.restype=w.HANDLE
+        kernel.CloseHandle.argtypes=[w.HANDLE]
+        locked=kernel.CreateFileW(str(heartbeat_path),0x80000000,3,None,3,0,None)
+        assert locked!=ctypes.c_void_p(-1).value
+        try: time.sleep(.6)
+        finally: kernel.CloseHandle(locked)
+        time.sleep(.4)
+        recovered=json.loads(heartbeat_path.read_text())
+        assert recovered['heartbeat_failures']>=1
+        assert recovered['heartbeat_attempts']>recovered['heartbeat_writes']
+        assert recovered['heartbeat_bytes_attempted']>recovered['heartbeat_bytes']
+        result['heartbeat_failure_recovery']=recovered
+        stale=Pipe(server.address,deadline_ms())
+        server.client.close()
         server.stop();server=None
-        stripe=next((out/'state').glob('stripe-*.log'))
+        stripe=next(p for p in (out/'state').glob('stripe-*.log') if p.stat().st_size)
+        before_tail=stripe.stat().st_size
         with stripe.open('ab') as f:f.write(b'MBK')
-        server=Server(args.binary,out/'state',out/'server.txt','pipe',flags)
+        server=Server(args.binary,out/'state',out/'server.txt','pipe',flags,address=address)
+        stale.close()
+        assert stripe.stat().st_size==before_tail
         assert server.client.epoch!=epoch
         observed={key:server.client.get('resident',key)['value'] for key in expected}
         assert observed==expected
-        result['replay']={'acknowledged_keys':sorted(expected),'replayed_keys':sorted(observed),'new_epoch':server.client.epoch,'torn_tail':'3-byte final header removed'}
+        result['replay']={'acknowledged_keys':sorted(expected),'replayed_keys':sorted(observed),'new_epoch':server.client.epoch,'pipe_reused_with_stale_client':address,'torn_tail':'3-byte final header removed after acknowledged record','torn_stripe':stripe.name}
         if args.state_cap:
             server.stop();server=None
             server=Server(args.binary,out/'cap-state',out/'cap-server.txt','pipe',flags+['--state-limit-bytes','250'])
-            server.client.put('resident','first',b'first',ack=1)
+            server.client.put('resident','first',b'x'*100,ack=1)
             try:server.client.put('resident','too-big',b'x'*300,ack=1)
             except Refusal as e:assert e.code==7
             else:raise AssertionError('cap accepted')
             assert server.client.get('resident','too-big') is None
-            assert server.client.get('resident','first')['value']==b'first'
+            assert server.client.get('resident','first')['value']==b'x'*100
+            time.sleep(.3)
+            pressure=json.loads((out/'cap-state'/'heartbeat.json').read_text())
+            assert pressure['state_high_water'] is True
+            assert 187<=pressure['state_bytes']<=250
+            assert pressure['state_limit_bytes']==250
+            result['state_pressure']=pressure
             result['state_cap']='capacity7 before acceptance; old read succeeds'
         result['passed']=True
     finally:
