@@ -50,6 +50,10 @@ fn counters() -> Io {
 }
 fn main() {
     let args: Vec<_> = std::env::args().collect();
+    if args[2] == "concurrent" {
+        concurrent_reads(Path::new(&args[1]));
+        return;
+    }
     let count: usize = args[2].parse().unwrap();
     let config = Config {
         capacity: 2 * 1024 * 1024 * 1024,
@@ -98,4 +102,58 @@ fn main() {
     assert_eq!(health[68], 1);
     assert_eq!(health[67], 0);
     println!("{{\"keys\":{count},\"seconds\":{},\"rss_before\":{},\"rss_after\":{},\"rss_delta_per_key\":{},\"private_bytes_after\":{},\"logical_bytes\":{},\"write_calls\":{},\"flush_calls\":{},\"read_operation_delta\":{},\"read_bytes_delta\":{},\"ten_thousand_read_seconds\":{},\"namespace_quota\":500000,\"global_cap\":917000,\"namespace_high_water\":true,\"global_high_water\":false,\"explicit_capacity_bytes\":2147483648,\"dedup_cap\":400000}}",start.elapsed().as_secs_f64(),base.working,loaded.working,(loaded.working as f64-base.working as f64)/count as f64,loaded.pagefile,io.0,io.1,io.2,reads.reads-before.reads,reads.read_bytes-before.read_bytes,read_start.elapsed().as_secs_f64());
+}
+
+fn concurrent_reads(root: &Path) {
+    use std::sync::Arc;
+    for writers in [1usize, 8, 32] {
+        let s = Arc::new(
+            Store::open(&root.join(format!("writers{writers}")), Config::default()).unwrap(),
+        );
+        let make = |key: String, id: String, ack: u8| Mutation {
+            ns: "ledger".into(),
+            key,
+            op_id: id,
+            deadline: now_ms() + 10000,
+            ack,
+            expected: Some(0),
+            bytes: vec![b'x'; 1039],
+            remove: false,
+        };
+        assert_eq!(s.mutate(make("seed".into(), "seed".into(), 1)).code, 0);
+        let before = counters();
+        let started = Instant::now();
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..writers)
+                .map(|i| {
+                    let s = &s;
+                    let make = &make;
+                    scope.spawn(move || {
+                        for k in 0..16 {
+                            assert_eq!(
+                                s.mutate(make(
+                                    format!("w{i}/{k}"),
+                                    format!("w{i}/{k}"),
+                                    if k < 8 { 1 } else { 2 }
+                                ))
+                                .code,
+                                0
+                            );
+                        }
+                    })
+                })
+                .collect();
+            for _ in 0..10000 {
+                assert_eq!(s.get("ledger", "seed").unwrap().bytes.len(), 1039);
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+        });
+        let after = counters();
+        let io = s.io_metrics();
+        assert_eq!(after.reads - before.reads, 0);
+        assert_eq!(after.read_bytes - before.read_bytes, 0);
+        println!("{{\"writers\":{writers},\"hot_reads\":10000,\"read_operation_delta\":{},\"read_bytes_delta\":{},\"logical_append_bytes\":{},\"append_write_calls\":{},\"sync_attempts\":{},\"seconds\":{},\"scope\":\"WindowsprocesslogicalIO,pureStoregetsconcurrentwithourappendowners;startup/replayexcluded;notphysicaldriveIO\"}}",after.reads-before.reads,after.read_bytes-before.read_bytes,io.0,io.1,io.2,started.elapsed().as_secs_f64());
+    }
 }

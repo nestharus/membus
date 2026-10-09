@@ -70,6 +70,18 @@ fn exact_disk_cap_and_empty_queue_refusal() {
     assert!(s.get("ledger", "key0").is_some());
     drop(s);
     let s = Store::open(
+        &dir,
+        Config {
+            state_limit_bytes: used * 2,
+            ..Config::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(s.mutate(mutation(1)).code, 0);
+    assert_eq!(s.state_bytes(), used * 2);
+    assert_eq!(s.mutate(mutation(2)).code, 7);
+    drop(s);
+    let s = Store::open(
         &path("emptyqueue"),
         Config {
             queue_bytes: 1,
@@ -140,4 +152,72 @@ fn late_flush_notification_uses_covering_sync() {
     assert_eq!(thread.join().unwrap().ack, 2);
     assert_eq!(other.join().unwrap().ack, 2);
     assert_eq!(s.io_metrics().2, 1);
+}
+
+#[test]
+fn failed_sync_fences_late_waiters_and_new_admission() {
+    let s = Arc::new(
+        Store::open(
+            &path("sync-failure"),
+            Config {
+                flush_ms: 20,
+                fail_sync: true,
+                flush_notice_delay_ms: 100,
+                ..Config::default()
+            },
+        )
+        .unwrap(),
+    );
+    let first = s.clone();
+    let a = std::thread::spawn(move || first.mutate(mutation(1)));
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let second = s.clone();
+    let b = std::thread::spawn(move || second.mutate(mutation(3)));
+    assert_eq!(a.join().unwrap().code, 16);
+    assert_eq!(b.join().unwrap().code, 16);
+    assert_eq!(s.io_metrics().2, 1);
+    assert_eq!(s.mutate(mutation(5)).code, 10);
+    assert!(s.get("ledger", "key1").is_none());
+    assert!(s.get("ledger", "key3").is_none());
+}
+
+#[test]
+fn simultaneous_batch_busy_precedes_any_item_admission() {
+    let s = Arc::new(
+        Store::open(
+            &path("batch-busy"),
+            Config {
+                write_delay_ms: 100,
+                ..Config::default()
+            },
+        )
+        .unwrap(),
+    );
+    fn batch(key: &str) -> Vec<u8> {
+        let mut p = (now_ms() + 10000).to_le_bytes().to_vec();
+        lp(&mut p, b"batch");
+        lp(&mut p, b"ledger");
+        p.extend(1u16.to_le_bytes());
+        p.push(PUT);
+        lp(&mut p, key.as_bytes());
+        lp(&mut p, key.as_bytes());
+        p.push(2);
+        lp(&mut p, b"x");
+        frame(BATCH, 1, &p)[4..].to_vec()
+    }
+    let first = s.clone();
+    let thread = std::thread::spawn(move || first.dispatch(&batch("accepted")));
+    let start = Instant::now();
+    while !s.pending("ledger", "accepted") {
+        assert!(start.elapsed().as_secs() < 2);
+        std::thread::yield_now();
+    }
+    let reply = s.dispatch(&batch("refused"));
+    assert_eq!(u16::from_le_bytes(reply[17..19].try_into().unwrap()), 6);
+    assert!(!s.pending("ledger", "refused"));
+    assert!(s.get("ledger", "refused").is_none());
+    assert_eq!(
+        u16::from_le_bytes(thread.join().unwrap()[17..19].try_into().unwrap()),
+        0
+    );
 }

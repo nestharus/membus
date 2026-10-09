@@ -241,6 +241,7 @@ pub struct Config {
     pub flush_notice_delay_ms: u64,
     pub fail_after_append: bool,
     pub fail_partial_append: bool,
+    pub fail_sync: bool,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -258,6 +259,7 @@ impl Default for Config {
             flush_notice_delay_ms: 0,
             fail_after_append: false,
             fail_partial_append: false,
+            fail_sync: false,
         }
     }
 }
@@ -319,13 +321,21 @@ fn start_owners(
     let (flush_send, flush_recv) = mpsc::channel::<FlushWait>();
     let flush_logs = logs.to_vec();
     let interval = config.flush_ms;
+    let fail_sync = config.fail_sync;
     let flush_owner = std::thread::spawn(move || {
         let mut pending = VecDeque::new();
-        let mut last = 0u64;
+        let mut last: Option<std::time::Instant> = None;
         let mut covered = [0u64; 4];
+        let mut sync_failed = [false; 4];
         loop {
             if pending.is_empty() {
                 match flush_recv.recv() {
+                    Ok(w) if sync_failed[w.stripe] => {
+                        let _ = w
+                            .done
+                            .send(Err(io::Error::other("stripe fenced after failed sync")));
+                        continue;
+                    }
                     Ok(w) if w.end <= covered[w.stripe] => {
                         let _ = w.done.send(Ok(()));
                         continue;
@@ -338,6 +348,11 @@ fn start_owners(
                 let until = std::time::Instant::now() + Duration::from_millis(interval);
                 while let Some(left) = until.checked_duration_since(std::time::Instant::now()) {
                     match flush_recv.recv_timeout(left) {
+                        Ok(w) if sync_failed[w.stripe] => {
+                            let _ = w
+                                .done
+                                .send(Err(io::Error::other("stripe fenced after failed sync")));
+                        }
                         Ok(w) if w.end <= covered[w.stripe] => {
                             let _ = w.done.send(Ok(()));
                         }
@@ -347,7 +362,11 @@ fn start_owners(
                 }
             }
             while let Ok(w) = flush_recv.try_recv() {
-                if w.end <= covered[w.stripe] {
+                if sync_failed[w.stripe] {
+                    let _ = w
+                        .done
+                        .send(Err(io::Error::other("stripe fenced after failed sync")));
+                } else if w.end <= covered[w.stripe] {
                     let _ = w.done.send(Ok(()));
                 } else {
                     pending.push_back(w);
@@ -369,9 +388,11 @@ fn start_owners(
                 }
             }
             pending = retained;
-            let delay = (last + interval).saturating_sub(now_ms());
-            if delay > 0 {
-                std::thread::sleep(Duration::from_millis(delay));
+            if let Some(previous) = last {
+                if let Some(delay) = Duration::from_millis(interval).checked_sub(previous.elapsed())
+                {
+                    std::thread::sleep(delay);
+                }
             }
             let (file, through) = {
                 let log = flush_logs[stripe].lock().unwrap();
@@ -379,11 +400,17 @@ fn start_owners(
             };
             let result = file.and_then(|f| {
                 checkpoint("MEMBUS_TEST_PAUSE_SYNC");
-                f.sync_all()
+                if fail_sync {
+                    Err(io::Error::other("test injected sync failure"))
+                } else {
+                    f.sync_all()
+                }
             });
-            last = now_ms();
+            last = Some(std::time::Instant::now());
             if result.is_ok() {
                 covered[stripe] = covered[stripe].max(through);
+            } else {
+                sync_failed[stripe] = true;
             }
             {
                 let mut log = flush_logs[stripe].lock().unwrap();
@@ -1160,9 +1187,10 @@ impl Store {
                     // One executing batch per store, at most 32 scoped helpers.
                     // Refuse before any item admission if another batch owns it.
                     let _batch = self.batch_gate.try_lock().map_err(|_| 6u16)?;
+                    let helpers = keys.len().min(32);
                     let work = Mutex::new(keys.into_values());
                     let mut results = std::thread::scope(|scope| {
-                        let handles: Vec<_> = (0..n.min(32))
+                        let handles: Vec<_> = (0..helpers)
                             .map(|_| {
                                 let work = &work;
                                 scope.spawn(move || {
