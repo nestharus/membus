@@ -4,3 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+
+[features]
+# Explicit test binary only; ordinary release has no sync markers.
+sync-witness = []

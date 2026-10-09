@@ -140,8 +140,9 @@ fn late_flush_notification_uses_covering_sync() {
         .unwrap(),
     );
     // key1/key3 share a stripe. The first notice arrives around100ms; the
-    // owner then appends key3 but holds its notice until200ms. The first sync
-    // gathers until120ms, covering both complete records before key3's notice.
+    // owner then appends key3 but holds its notice until200ms. Idle-immediate
+    // may capture before that append (two syncs) or after it (one covering
+    // sync); a delayed notice must produce the correct acknowledged outcome.
     assert_eq!(crc32(b"ledger\0key1") % 4, crc32(b"ledger\0key3") % 4);
     let first = s.clone();
     let thread = std::thread::spawn(move || first.mutate(mutation(1)));
@@ -151,7 +152,8 @@ fn late_flush_notification_uses_covering_sync() {
     assert!(s.get("ledger", "key1").is_none());
     assert_eq!(thread.join().unwrap().ack, 2);
     assert_eq!(other.join().unwrap().ack, 2);
-    assert_eq!(s.io_metrics().2, 1);
+    assert!(s.io_metrics().2 <= 2);
+    assert_eq!(s.get("ledger", "key3").unwrap().ack, 2);
 }
 
 #[test]

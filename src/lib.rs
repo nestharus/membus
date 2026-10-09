@@ -4,7 +4,10 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::Path,
-    sync::{mpsc, Arc, Condvar, Mutex, RwLock},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc, Arc, Condvar, Mutex, RwLock,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
@@ -242,6 +245,8 @@ pub struct Config {
     pub fail_after_append: bool,
     pub fail_partial_append: bool,
     pub fail_sync: bool,
+    #[cfg(test)]
+    pub sync_test_gate: Option<Arc<(Mutex<(bool, bool)>, Condvar)>>,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -260,6 +265,8 @@ impl Default for Config {
             fail_after_append: false,
             fail_partial_append: false,
             fail_sync: false,
+            #[cfg(test)]
+            sync_test_gate: None,
         }
     }
 }
@@ -289,6 +296,45 @@ struct FlushWait {
     end: u64,
     bytes: usize,
     done: mpsc::Sender<io::Result<()>>,
+    gathered: bool,
+}
+
+fn finish_flush(w: FlushWait, result: io::Result<()>, outstanding: &AtomicUsize) {
+    outstanding.fetch_sub(1, Ordering::SeqCst);
+    let _ = w.done.send(result);
+}
+
+// No marker code or environment lookup exists in the normal release build.
+#[cfg(all(windows, feature = "sync-witness"))]
+fn sync_file(file: &File) -> io::Result<()> {
+    use std::{ffi::c_void, os::windows::io::AsRawHandle};
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn FlushFileBuffers(handle: *mut c_void) -> i32;
+    }
+    let marks = std::env::var_os("MEMBUS_SYNC_WITNESS").map(std::path::PathBuf::from);
+    if let Some(path) = &marks {
+        fs::write(path.with_extension("entering"), b"entering")?;
+    }
+    let started = std::time::Instant::now();
+    let ok = unsafe { FlushFileBuffers(file.as_raw_handle()) };
+    let elapsed = started.elapsed().as_nanos();
+    let result = if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    };
+    if let Some(path) = &marks {
+        fs::write(
+            path.with_extension("returned"),
+            format!("{{\"call_ns\":{elapsed},\"ok\":{}}}", ok != 0),
+        )?;
+    }
+    result
+}
+#[cfg(not(all(windows, feature = "sync-witness")))]
+fn sync_file(file: &File) -> io::Result<()> {
+    file.sync_all()
 }
 
 // Test-only kill checkpoints, enabled explicitly by a path-valued environment
@@ -319,42 +365,57 @@ fn start_owners(
     config: &Config,
 ) -> (Vec<AppendOwner>, std::thread::JoinHandle<()>) {
     let (flush_send, flush_recv) = mpsc::channel::<FlushWait>();
+    // Includes queued and currently syncing waiters. Classify at arrival,
+    // not receipt: a notice queued during a sync must retain its gather policy.
+    let outstanding = Arc::new(AtomicUsize::new(0));
+    let flush_outstanding = outstanding.clone();
     let flush_logs = logs.to_vec();
     let interval = config.flush_ms;
     let fail_sync = config.fail_sync;
+    #[cfg(test)]
+    let sync_test_gate = config.sync_test_gate.clone();
     let flush_owner = std::thread::spawn(move || {
         let mut pending = VecDeque::new();
         let mut last: Option<std::time::Instant> = None;
         let mut covered = [0u64; 4];
         let mut sync_failed = [false; 4];
         loop {
+            let mut gather = true;
             if pending.is_empty() {
                 match flush_recv.recv() {
                     Ok(w) if sync_failed[w.stripe] => {
-                        let _ = w
-                            .done
-                            .send(Err(io::Error::other("stripe fenced after failed sync")));
+                        finish_flush(
+                            w,
+                            Err(io::Error::other("stripe fenced after failed sync")),
+                            &flush_outstanding,
+                        );
                         continue;
                     }
                     Ok(w) if w.end <= covered[w.stripe] => {
-                        let _ = w.done.send(Ok(()));
+                        finish_flush(w, Ok(()), &flush_outstanding);
                         continue;
                     }
-                    Ok(w) => pending.push_back(w),
+                    Ok(w) => {
+                        gather = w.gathered;
+                        pending.push_back(w);
+                    }
                     Err(_) => break,
                 }
                 // The gather window closes on elapsed time; bounds are enforced
                 // when selecting each handle's covering group below.
-                let until = std::time::Instant::now() + Duration::from_millis(interval);
+                let until = std::time::Instant::now()
+                    + Duration::from_millis(if gather { interval } else { 0 });
                 while let Some(left) = until.checked_duration_since(std::time::Instant::now()) {
                     match flush_recv.recv_timeout(left) {
                         Ok(w) if sync_failed[w.stripe] => {
-                            let _ = w
-                                .done
-                                .send(Err(io::Error::other("stripe fenced after failed sync")));
+                            finish_flush(
+                                w,
+                                Err(io::Error::other("stripe fenced after failed sync")),
+                                &flush_outstanding,
+                            );
                         }
                         Ok(w) if w.end <= covered[w.stripe] => {
-                            let _ = w.done.send(Ok(()));
+                            finish_flush(w, Ok(()), &flush_outstanding);
                         }
                         Ok(w) => pending.push_back(w),
                         Err(_) => break,
@@ -363,11 +424,13 @@ fn start_owners(
             }
             while let Ok(w) = flush_recv.try_recv() {
                 if sync_failed[w.stripe] {
-                    let _ = w
-                        .done
-                        .send(Err(io::Error::other("stripe fenced after failed sync")));
+                    finish_flush(
+                        w,
+                        Err(io::Error::other("stripe fenced after failed sync")),
+                        &flush_outstanding,
+                    );
                 } else if w.end <= covered[w.stripe] {
-                    let _ = w.done.send(Ok(()));
+                    finish_flush(w, Ok(()), &flush_outstanding);
                 } else {
                     pending.push_back(w);
                 }
@@ -388,7 +451,7 @@ fn start_owners(
                 }
             }
             pending = retained;
-            if let Some(previous) = last {
+            if let Some(previous) = last.filter(|_| gather) {
                 if let Some(delay) = Duration::from_millis(interval).checked_sub(previous.elapsed())
                 {
                     std::thread::sleep(delay);
@@ -400,10 +463,21 @@ fn start_owners(
             };
             let result = file.and_then(|f| {
                 checkpoint("MEMBUS_TEST_PAUSE_SYNC");
+                #[cfg(test)]
+                if let Some(gate) = &sync_test_gate {
+                    let mut state = gate.0.lock().unwrap();
+                    if !state.0 {
+                        state.0 = true;
+                        gate.1.notify_all();
+                        while !state.1 {
+                            state = gate.1.wait(state).unwrap();
+                        }
+                    }
+                }
                 if fail_sync {
                     Err(io::Error::other("test injected sync failure"))
                 } else {
-                    f.sync_all()
+                    sync_file(&f)
                 }
             });
             last = Some(std::time::Instant::now());
@@ -435,7 +509,7 @@ fn start_owners(
                     Ok(()) => Ok(()),
                     Err(e) => Err(io::Error::new(e.kind(), e.to_string())),
                 };
-                let _ = w.done.send(r);
+                finish_flush(w, r, &flush_outstanding);
             }
         }
     });
@@ -446,6 +520,7 @@ fn start_owners(
             let log = log.clone();
             let config = config.clone();
             let flush = flush_send.clone();
+            let outstanding = outstanding.clone();
             let (sender, receiver) = mpsc::channel::<Append>();
             let handle = std::thread::spawn(move || {
                 while let Ok(job) = receiver.recv() {
@@ -487,9 +562,14 @@ fn start_owners(
                             end,
                             bytes: job.record.len(),
                             done: job.done,
+                            gathered: outstanding.fetch_add(1, Ordering::SeqCst) != 0,
                         };
                         if let Err(e) = flush.send(wait) {
-                            let _ = e.0.done.send(Err(io::Error::other("flush owner stopped")));
+                            finish_flush(
+                                e.0,
+                                Err(io::Error::other("flush owner stopped")),
+                                &outstanding,
+                            );
                         }
                     } else {
                         let _ = job.done.send(result);
@@ -503,6 +583,96 @@ fn start_owners(
         })
         .collect();
     (owners, flush_owner)
+}
+
+#[cfg(test)]
+mod flush_policy_tests {
+    use super::*;
+    fn mutation(key: &str) -> Mutation {
+        Mutation {
+            ns: "ledger".into(),
+            key: key.into(),
+            op_id: key.into(),
+            deadline: now_ms() + 10000,
+            ack: 2,
+            expected: Some(0),
+            bytes: vec![1; 1039],
+            remove: false,
+        }
+    }
+    fn path(label: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(
+            std::env::var("MEMBUS_TEST_OUTPUT").unwrap_or_else(|_| ".test-output".into()),
+        )
+        .join(format!(
+            "policy-{label}-{}-{}",
+            std::process::id(),
+            now_ms()
+        ))
+    }
+    #[test]
+    fn consecutive_idle_flushes_bypass_gather_and_spacing() {
+        let store = Store::open(
+            &path("idle"),
+            Config {
+                flush_ms: 2000,
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        for key in ["key1", "key3", "key4"] {
+            let start = std::time::Instant::now();
+            assert_eq!(store.mutate(mutation(key)).ack, 2);
+            assert!(
+                start.elapsed() < Duration::from_millis(1000),
+                "idle flush waited gather interval"
+            );
+        }
+        assert_eq!(store.io_metrics().2, 3);
+    }
+    #[test]
+    fn notice_arriving_during_sync_keeps_its_gather_window() {
+        let gate = Arc::new((Mutex::new((false, false)), Condvar::new()));
+        let store = Arc::new(
+            Store::open(
+                &path("during"),
+                Config {
+                    flush_ms: 200,
+                    sync_test_gate: Some(gate.clone()),
+                    ..Config::default()
+                },
+            )
+            .unwrap(),
+        );
+        assert_eq!(crc32(b"ledger\0key1") % 4, crc32(b"ledger\0key3") % 4);
+        let a = store.clone();
+        let first = std::thread::spawn(move || a.mutate(mutation("key1")));
+        let mut state = gate.0.lock().unwrap();
+        while !state.0 {
+            state = gate
+                .1
+                .wait_timeout(state, Duration::from_secs(2))
+                .unwrap()
+                .0;
+        }
+        drop(state);
+        let b = store.clone();
+        let second = std::thread::spawn(move || b.mutate(mutation("key3")));
+        let timeout = std::time::Instant::now();
+        while store.io_metrics().1 < 2 {
+            assert!(timeout.elapsed() < Duration::from_secs(2));
+            std::thread::yield_now();
+        }
+        // append completes before its notice; give that sender a scheduling turn.
+        std::thread::sleep(Duration::from_millis(20));
+        let released = std::time::Instant::now();
+        gate.0.lock().unwrap().1 = true;
+        gate.1.notify_all();
+        assert_eq!(first.join().unwrap().ack, 2);
+        assert_eq!(second.join().unwrap().ack, 2);
+        assert!(released.elapsed() >= Duration::from_millis(190));
+        assert_eq!(store.io_metrics().2, 2);
+    }
 }
 impl Drop for Store {
     fn drop(&mut self) {
