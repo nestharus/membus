@@ -1,4 +1,7 @@
 //! membus.kv/1 slice 1: bounded framing, independent committed reads, durable replay.
+mod signals;
+#[cfg(windows)]
+pub mod pipe_io;
 use std::{
     collections::{hash_map::RandomState, HashMap, HashSet, VecDeque},
     fs::{self, File, OpenOptions},
@@ -6,7 +9,7 @@ use std::{
     io::{self, Read, Write},
     path::Path,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         mpsc, Arc, Condvar, Mutex, RwLock,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -38,6 +41,8 @@ pub const CODES: &[(u16, &str, bool)] = &[
     (20, "cursor_expired", false),
     (21, "invalid_cursor", false),
     (22, "snapshot_full", true),
+    (23, "resume_gap", false),
+    (24, "subscription_missing", false),
 ];
 pub const HELLO: u8 = 1;
 pub const GET: u8 = 2;
@@ -55,6 +60,11 @@ pub const SCAN_RANGE: u8 = 12;
 pub const SNAPSHOT_RELEASE: u8 = 13;
 pub const SCAN_KEYS_PREFIX: u8 = 14;
 pub const SCAN_KEYS_RANGE: u8 = 15;
+pub const SUBSCRIBE: u8 = 16;
+pub const UNSUBSCRIBE: u8 = 17;
+pub const SUBSCRIPTION_STATUS: u8 = 18;
+pub const SIGNAL_USAGE: u8 = 19;
+pub const CAPTURE_METRICS: u8 = 20;
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -244,6 +254,8 @@ pub struct Log {
 }
 #[derive(Clone)]
 pub struct Config {
+    pub signal_history: usize,
+    pub signal_bytes: usize,
     pub snapshot_bytes: usize,
     pub snapshot_max: usize,
     pub snapshot_ttl_ms: u64,
@@ -270,6 +282,8 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            signal_history: 4096,
+            signal_bytes: 16 * 1024 * 1024,
             snapshot_bytes: 256 * 1024 * 1024,
             snapshot_max: 8,
             snapshot_ttl_ms: 30_000,
@@ -295,6 +309,8 @@ impl Default for Config {
     }
 }
 pub struct Store {
+    signals: signals::Hub,
+    capture_metrics: [AtomicU64; 7],
     committed: RwLock<HashMap<(String, String), Arc<Value>>>,
     scans: Arc<Mutex<ScanState>>,
     scan_usage: Arc<ScanUsage>,
@@ -1144,6 +1160,8 @@ impl Store {
             }
         });
         Ok(Self {
+            signals: signals::Hub::new(epoch, &config),
+            capture_metrics: std::array::from_fn(|_| AtomicU64::new(0)),
             committed: RwLock::new(committed),
             scans,
             scan_usage: Arc::new(ScanUsage::default()),
@@ -1200,7 +1218,9 @@ impl Store {
         if self.scan_usage.count.load(Ordering::Acquire) >= self.config.snapshot_max {
             return Err(22);
         }
+        let lock_start = Instant::now();
         let committed = self.committed.read().unwrap();
+        let lock_acquired = Instant::now();
         let mut charge = 256usize.checked_add(ns.len()).ok_or(22u16)?;
         let mut count = 0;
         for ((namespace, key), value) in committed.iter() {
@@ -1215,6 +1235,7 @@ impl Store {
                 count += 1;
             }
         }
+        let charge_end = Instant::now();
         let total = self
             .scan_usage
             .bytes
@@ -1233,15 +1254,28 @@ impl Store {
             usage: self.scan_usage.clone(),
             bytes: charge,
         };
+        let selection_start = Instant::now();
+        // Separate the second global index walk from namespace-owned copying.
+        // These borrowed references stay under the same committed read lock.
+        // The temporary pointers fit inside the conservative 128-byte row charge.
+        let selected: Vec<_> = committed.iter()
+            .filter(|((namespace, _), value)| namespace == ns && !value.tombstone)
+            .collect();
+        let selection_end = Instant::now();
         let mut rows = Vec::with_capacity(count);
-        for ((namespace, key), value) in committed.iter() {
-            if namespace == ns && !value.tombstone {
-                rows.push((key.clone(), value.clone()));
-            }
-        }
+        for ((_, key), value) in selected { rows.push((key.clone(), value.clone())); }
+        let copy_end = Instant::now();
         drop(committed);
         drop(scans);
         rows.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let sort_end = Instant::now();
+        let times = [1, lock_acquired.duration_since(lock_start).as_nanos() as u64,
+            charge_end.duration_since(lock_acquired).as_nanos() as u64,
+            selection_end.duration_since(selection_start).as_nanos() as u64,
+            copy_end.duration_since(selection_end).as_nanos() as u64,
+            copy_end.duration_since(lock_acquired).as_nanos() as u64,
+            sort_end.duration_since(copy_end).as_nanos() as u64];
+        for (metric, n) in self.capture_metrics.iter().zip(times) { metric.fetch_add(n, Ordering::Relaxed); }
         let snapshot = Arc::new(Snapshot {
             ns: ns.to_owned(),
             created,
@@ -1636,7 +1670,10 @@ impl Store {
         // Publication precedes completion on every connection; readers never await log I/O.
         if result.is_ok() && m.ack != 0 {
             let value = Arc::new(value);
-            let previous = self.committed.write().unwrap().insert(k.clone(), value);
+            let mut committed = self.committed.write().unwrap();
+            let previous = committed.insert(k.clone(), value.clone());
+            self.signals.publish(&m.ns, &m.key, value);
+            drop(committed);
             drop(previous);
         }
         let outcome = if result.is_ok() {
@@ -1727,8 +1764,12 @@ impl Store {
                 p.push(self.config.allow_mem as u8);
                 p.extend(self.config.retry_ms.to_le_bytes());
                 // Legacy strict clients keep the exact original refusal list.
-                let codes = if client.ends_with(";scans=1") {
+                let subscribe = client.split(';').skip(1).any(|feature| feature == "subscribe=1");
+                let scans = client.ends_with(";scans=1");
+                let codes = if subscribe {
                     CODES
+                } else if scans {
+                    &CODES[..22]
                 } else {
                     &CODES[..19]
                 };
@@ -1738,6 +1779,7 @@ impl Store {
                     p.push(transient as u8);
                     lp(&mut p, name.as_bytes());
                 }
+                if subscribe { p.extend(self.signals.hello_limits()); }
                 return Ok(p);
             }
             let deadline = c.u64()?;
@@ -1759,6 +1801,32 @@ impl Store {
                 return Err(5);
             }
             match op {
+                SUBSCRIBE => {
+                    let prefix = c.bound()?;
+                    let endpoint = c.text()?;
+                    let values = c.u8()?;
+                    if values > 1 { return Err(3); }
+                    let cursor = c.bytes(16)?;
+                    let protocol = c.text()?;
+                    let frame_max = c.u32()? as usize;
+                    c.end()?;
+                    self.signals.subscribe(&ns, prefix, endpoint, values != 0, cursor, &protocol, frame_max)
+                }
+                UNSUBSCRIBE | SUBSCRIPTION_STATUS => {
+                    let token = c.bytes(16)?;
+                    c.end()?;
+                    if op == UNSUBSCRIBE {
+                        self.signals.unsubscribe(&ns, token)?;
+                        Ok(Vec::new())
+                    } else { self.signals.status(&ns, token) }
+                }
+                SIGNAL_USAGE => { c.end()?; Ok(self.signals.usage()) }
+                CAPTURE_METRICS => {
+                    c.end()?;
+                    let mut p = Vec::new();
+                    for metric in &self.capture_metrics { p.extend(metric.load(Ordering::Relaxed).to_le_bytes()); }
+                    Ok(p)
+                }
                 SNAPSHOT_OPEN => {
                     c.end()?;
                     let (token, _) = self.snapshot_open(&ns)?;

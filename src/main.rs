@@ -1,6 +1,6 @@
 use membus::{Config, Store};
 #[cfg(windows)]
-mod pipe_io;
+use membus::pipe_io;
 use std::{
     env, fs,
     io::{self, Read, Write},
@@ -32,6 +32,7 @@ fn serve<S: Read + Write>(
     let mut hello = false;
     let mut allow_mem = false;
     let mut max_frame = membus::MAX_FRAME;
+    let mut subscribe = false;
     loop {
         let mut head = [0u8; 4];
         stream.read_exact(&mut head)?;
@@ -71,7 +72,9 @@ fn serve<S: Read + Write>(
             ))?;
             continue;
         }
-        let mut response = store.dispatch_for_limit(&b, allow_mem, max_frame);
+        let mut response = if hello && (membus::SUBSCRIBE..=membus::SIGNAL_USAGE).contains(&b[4]) && !subscribe {
+            membus::reply(b[4], u64::from_le_bytes(b[5..13].try_into().unwrap()), 2, &[])
+        } else { store.dispatch_for_limit(&b, allow_mem, max_frame) };
         if response.len() - 4 > max_frame {
             response = membus::reply(
                 b[4],
@@ -92,7 +95,11 @@ fn serve<S: Read + Write>(
             allow_mem = b[17] != 0;
             max_frame =
                 (u32::from_le_bytes(b[13..17].try_into().unwrap()) as usize).min(membus::MAX_FRAME);
-            hello = true
+            hello = true;
+            let mut c = membus::Cursor::new(&b[13..]);
+            let _ = c.u32().unwrap(); // checked by successful hello above
+            let _ = c.u8().unwrap();
+            subscribe = c.text().unwrap().split(';').skip(1).any(|feature| feature == "subscribe=1");
         }
     }
 }
@@ -308,6 +315,8 @@ fn main() -> io::Result<()> {
             .parse::<u64>()
             .map_err(io::Error::other)?;
         match args[i].as_str() {
+            "--signal-history" => config.signal_history = usize::try_from(n).map_err(io::Error::other)?,
+            "--signal-bytes" => config.signal_bytes = usize::try_from(n).map_err(io::Error::other)?,
             "--state-limit-bytes" => {
                 if n == 0 {
                     return Err(io::Error::other("state-limit-bytes must be positive"));

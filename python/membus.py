@@ -20,7 +20,8 @@ CODES = {1: ('incompatible_version', False), 2: ('unsupported', False),
          16: ('io_failed_uncertain',True),17: ('pending_timeout_uncertain',True),
          18: ('dedup_full',True),19: ('pending_conflict',True),
          20: ('cursor_expired',False),21: ('invalid_cursor',False),
-         22: ('snapshot_full',True)}
+         22: ('snapshot_full',True),23: ('resume_gap',False),
+         24: ('subscription_missing',False)}
 
 class EpochChanged(Exception):
     def __init__(self, previous, current):
@@ -152,7 +153,7 @@ class Client:
                 self.channel.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             else:
                 self.channel = Pipe(self.address, deadline)
-            response = self.exchange(1, struct.pack('<IB', MAX_FRAME, self.allow_mem)+lp('python-stdlib;scans=1'), deadline)
+            response = self.exchange(1, struct.pack('<IB', MAX_FRAME, self.allow_mem)+lp('python-stdlib;subscribe=1;scans=1'), deadline)
             decoder = Decoder(response)
             epoch, max_frame, max_value, max_batch, mem, retry_ms = decoder.unpack('<QIIHBQ')
             count, = decoder.unpack('<H')
@@ -163,6 +164,11 @@ class Client:
                     self.close()
                     raise ValueError('invalid refusal-code list')
                 codes[code] = (decoder.blob().decode(), bool(transient))
+            self.signal_limits = None
+            if 23 in codes:
+                names=('protocol_version','max_frame','history_max','history_budget','subscriptions_max',
+                       'queued_max','subscriber_bytes','queue_bytes','write_deadline_ms')
+                self.signal_limits=dict(zip(names,decoder.unpack('<HIQQHHQQI')))
             if (decoder.pos != len(response) or
                     any(codes.get(code) != value for code, value in CODES.items() if code <= 19) or
                     any(code in codes and codes[code] != value for code, value in CODES.items())):
@@ -233,7 +239,7 @@ class Client:
         op_id = op_id or str(uuid.uuid4())
         deadline = deadline or deadline_ms(self.timeout)
         payload = struct.pack('<Q', deadline)+lp(op_id)+lp(ns)+suffix
-        creates_snapshot = opcode == 10 or (opcode in (11, 12, 14, 15) and suffix[:4] == b'\x00' * 4)
+        creates_snapshot = opcode in (10, 16) or (opcode in (11, 12, 14, 15) and suffix[:4] == b'\x00' * 4)
         for attempt in range(2):
             try:
                 if self.channel is None: self.connect(deadline)
@@ -285,6 +291,41 @@ class Client:
     def health(self, ns='ledger'):
         return dict(zip(('bytes_written','flush_calls','keys','namespace_keys','namespace_quota','index_cap','high_water','namespace_high_water'),
                         struct.unpack('<QQQQQQBB',self.call(8,ns))))
+
+    def subscribe(self, ns, endpoint, prefix='', *, include_value=False, cursor=None,
+                  protocol='membus.change/1', max_frame=MAX_FRAME, **options):
+        """Register live or resume retained changes. A lost reply is not auto-retried."""
+        if 23 not in self.codes:
+            raise Refusal(2, self.codes)
+        d = Decoder(self.call(16, ns, lp(prefix)+lp(endpoint)+bytes([bool(include_value)])+lp(cursor or b'')+lp(protocol)+struct.pack('<I',max_frame), **options))
+        sub, start = d.blob(), d.blob()
+        if len(sub) != 16 or len(start) != 16 or d.pos != len(d.data):
+            raise ValueError('invalid subscription reply')
+        return dict(subscription=sub, cursor=start)
+
+    def unsubscribe(self, ns, subscription, **options):
+        if self.call(17, ns, lp(subscription), **options):
+            raise ValueError('invalid unsubscribe reply')
+
+    def subscription_status(self, ns, subscription, **options):
+        d = Decoder(self.call(18, ns, lp(subscription), **options))
+        active, status, queued, charged_bytes, written, failed, dropped = d.unpack('<BBIQQQQ')
+        cursor = d.blob()
+        if active > 1 or status > 4 or len(cursor) != 16 or d.pos != len(d.data):
+            raise ValueError('invalid subscription status')
+        return dict(active=bool(active), status=('queued','written','failed','dropped','cancelled')[status],
+                    queued=queued, charged_bytes=charged_bytes, written=written,
+                    failed=failed, dropped=dropped, cursor=cursor)
+
+    def signal_usage(self, ns='quota'):
+        names = ('head','floor','history_count','history_bytes','queue_bytes','subscriptions',
+                 'history_max','history_budget','queue_budget')
+        return dict(zip(names, struct.unpack('<9Q',self.call(19,ns))))
+
+    def capture_metrics(self, ns='ledger'):
+        names = ('captures','lock_wait_ns','charge_walk_ns','selection_walk_ns','namespace_copy_ns',
+                 'lock_held_ns','sort_and_release_ns')
+        return dict(zip(names, struct.unpack('<7Q',self.call(20,ns))))
 
     def snapshot_open(self, ns, **options):
         """Capture one committed namespace view; release the returned bytes token."""
