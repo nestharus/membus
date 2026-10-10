@@ -274,7 +274,7 @@ mod tests {
             let usage=store.signals.usage();assert_eq!(u64::from_le_bytes(usage[..8].try_into().unwrap()),1);
             assert!(store.get_handle(NS,&format!("p/{}",identity(&s.ns,&s.id).unwrap())).is_none());
         }
-        let store=Store::open(&path,Default::default()).unwrap();
+        let store=Arc::new(Store::open(&path,Default::default()).unwrap());
         {
             let state=store.timers.0.lock().unwrap();let timer=state.timers.values().next().unwrap();
             assert_eq!((timer.generation,timer.next),(generation,0));assert_eq!(timer.schedule.latest(timer.next,s.anchor),Some(0));
@@ -295,7 +295,7 @@ mod tests {
         let m=schedule_mutation(&s,"set");let limit=crate::mutation_bytes(&m,1,now_ms()).len() as u64;
         let generation;
         {
-            let store=Store::open(&path,crate::Config {state_limit_bytes:limit,..Default::default()}).unwrap();
+            let store=Arc::new(Store::open(&path,crate::Config {state_limit_bytes:limit,..Default::default()}).unwrap());
             let out=store.mutate(m);assert_eq!(out.code,0);generation=out.version;
             let owner=store.start_timers().unwrap();let until=std::time::Instant::now()+Duration::from_secs(2);
             loop {
@@ -307,7 +307,7 @@ mod tests {
             assert!(store.get_handle(NS,&format!("p/{}",identity(&s.ns,&s.id).unwrap())).is_none());drop(owner);
         }
         // A larger configured budget is the deliberate recovery action; no hidden retry.
-        let store=Store::open(&path,Default::default()).unwrap();let owner=store.start_timers().unwrap();
+        let store=Arc::new(Store::open(&path,Default::default()).unwrap());let owner=store.start_timers().unwrap();
         let until=std::time::Instant::now()+Duration::from_secs(2);
         loop {
             if !store.timers.0.lock().unwrap().timers.values().next().unwrap().active {break;}
