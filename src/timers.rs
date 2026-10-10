@@ -295,8 +295,12 @@ mod tests {
         let m=schedule_mutation(&s,"set");let limit=(16+crate::mutation_bytes(&m,1,now_ms()).len()) as u64;
         let generation;
         {
-            let store=Arc::new(Store::open(&path,crate::Config {state_limit_bytes:limit,..Default::default()}).unwrap());
+            let store=Store::open(&path,crate::Config {state_limit_bytes:limit,..Default::default()}).unwrap();
             let out=store.mutate(m);assert_eq!(out.code,0);generation=out.version;
+        }
+        {
+            // Direct internal mutation writes the schedule; reopening restores its timer map.
+            let store=Arc::new(Store::open(&path,crate::Config {state_limit_bytes:limit,..Default::default()}).unwrap());
             let owner=store.start_timers().unwrap();let until=std::time::Instant::now()+Duration::from_secs(2);
             loop {
                 let state=store.timers.0.lock().unwrap();let t=state.timers.values().next().unwrap();
