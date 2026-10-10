@@ -1,7 +1,7 @@
 //! membus.kv/1 slice 1: bounded framing, independent committed reads, durable replay.
 mod signals;
 #[cfg(windows)]
-mod pipe_io;
+pub mod pipe_io;
 use std::{
     collections::{hash_map::RandomState, HashMap, HashSet, VecDeque},
     fs::{self, File, OpenOptions},
@@ -1764,8 +1764,8 @@ impl Store {
                 p.push(self.config.allow_mem as u8);
                 p.extend(self.config.retry_ms.to_le_bytes());
                 // Legacy strict clients keep the exact original refusal list.
-                let subscribe = client.split(';').any(|feature| feature == "subscribe=1");
-                let scans = client.split(';').any(|feature| feature == "scans=1");
+                let subscribe = client.split(';').skip(1).any(|feature| feature == "subscribe=1");
+                let scans = client.ends_with(";scans=1");
                 let codes = if subscribe {
                     CODES
                 } else if scans {
@@ -1779,6 +1779,7 @@ impl Store {
                     p.push(transient as u8);
                     lp(&mut p, name.as_bytes());
                 }
+                if subscribe { p.extend(self.signals.hello_limits()); }
                 return Ok(p);
             }
             let deadline = c.u64()?;
@@ -1806,8 +1807,10 @@ impl Store {
                     let values = c.u8()?;
                     if values > 1 { return Err(3); }
                     let cursor = c.bytes(16)?;
+                    let protocol = c.text()?;
+                    let frame_max = c.u32()? as usize;
                     c.end()?;
-                    self.signals.subscribe(&ns, prefix, endpoint, values != 0, cursor)
+                    self.signals.subscribe(&ns, prefix, endpoint, values != 0, cursor, &protocol, frame_max)
                 }
                 UNSUBSCRIBE | SUBSCRIPTION_STATUS => {
                     let token = c.bytes(16)?;

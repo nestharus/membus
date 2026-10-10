@@ -153,7 +153,7 @@ class Client:
                 self.channel.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             else:
                 self.channel = Pipe(self.address, deadline)
-            response = self.exchange(1, struct.pack('<IB', MAX_FRAME, self.allow_mem)+lp('python-stdlib;scans=1;subscribe=1'), deadline)
+            response = self.exchange(1, struct.pack('<IB', MAX_FRAME, self.allow_mem)+lp('python-stdlib;subscribe=1;scans=1'), deadline)
             decoder = Decoder(response)
             epoch, max_frame, max_value, max_batch, mem, retry_ms = decoder.unpack('<QIIHBQ')
             count, = decoder.unpack('<H')
@@ -164,6 +164,11 @@ class Client:
                     self.close()
                     raise ValueError('invalid refusal-code list')
                 codes[code] = (decoder.blob().decode(), bool(transient))
+            self.signal_limits = None
+            if 23 in codes:
+                names=('protocol_version','max_frame','history_max','history_budget','subscriptions_max',
+                       'queued_max','subscriber_bytes','queue_bytes','write_deadline_ms')
+                self.signal_limits=dict(zip(names,decoder.unpack('<HIQQHHQQI')))
             if (decoder.pos != len(response) or
                     any(codes.get(code) != value for code, value in CODES.items() if code <= 19) or
                     any(code in codes and codes[code] != value for code, value in CODES.items())):
@@ -287,11 +292,12 @@ class Client:
         return dict(zip(('bytes_written','flush_calls','keys','namespace_keys','namespace_quota','index_cap','high_water','namespace_high_water'),
                         struct.unpack('<QQQQQQBB',self.call(8,ns))))
 
-    def subscribe(self, ns, endpoint, prefix='', *, include_value=False, cursor=None, **options):
+    def subscribe(self, ns, endpoint, prefix='', *, include_value=False, cursor=None,
+                  protocol='membus.change/1', max_frame=MAX_FRAME, **options):
         """Register live or resume retained changes. A lost reply is not auto-retried."""
         if 23 not in self.codes:
             raise Refusal(2, self.codes)
-        d = Decoder(self.call(16, ns, lp(prefix)+lp(endpoint)+bytes([bool(include_value)])+lp(cursor or b''), **options))
+        d = Decoder(self.call(16, ns, lp(prefix)+lp(endpoint)+bytes([bool(include_value)])+lp(cursor or b'')+lp(protocol)+struct.pack('<I',max_frame), **options))
         sub, start = d.blob(), d.blob()
         if len(sub) != 16 or len(start) != 16 or d.pos != len(d.data):
             raise ValueError('invalid subscription reply')

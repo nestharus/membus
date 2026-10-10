@@ -2,7 +2,7 @@
 import argparse, ctypes, hashlib, json, pathlib, statistics, struct, sys, threading, time
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT/'python'), str(ROOT/'tests')]
-from membus import Client, Refusal, frame, lp, deadline_ms
+from membus import Client, Refusal, EpochChanged, frame, lp, deadline_ms
 from membus_signals import Listener
 from integration import Server
 
@@ -69,6 +69,20 @@ def run(args):
         c.put('quota','event/1791590000000-1',event['value'],op_id='reopen-1')
         assert status(c,sub,{'written'})['written']==1
         result['tests'].append(dict(name='filtered reopening under one second; mem/other-prefix/other-namespace/duplicate excluded',pass_condition='matching event only, unchanged write id not signalled twice, latency<1000ms',latency_ms=latency))
+        # The application can handle an event while the persistent pipe buffers
+        # small followups, then remain quiet without losing its subscription.
+        c.put('quota','event/handling-1',b'queued-1')
+        c.put('quota','event/handling-2',b'queued-2')
+        time.sleep(.2)
+        handled=[l.receive(),l.receive()]
+        assert [e['key'] for e in handled]==['event/handling-1','event/handling-2']
+        assert status(c,sub,{'written'})['active']
+        try:l.receive(timeout=.02)
+        except TimeoutError:pass
+        else:raise AssertionError('quiet listener did not time out')
+        c.put('quota','event/after-quiet',b'quiet-survived');event=l.receive()
+        assert event['key']=='event/after-quiet'
+        result['tests'].append(dict(name='processing pause and quiet timeout',pass_condition='200msapplicationpausebuffers2smallchanges;quiettimeoutkeepsconnection;nextsignalarrives'))
         cursor=event['cursor']; name=l.endpoint;l.close()
         c.put('quota','event/disconnected-1',b'missed-1')
         c.put('quota','event/disconnected-2',b'missed-2')
@@ -125,11 +139,14 @@ def run(args):
             history=signal_after,accounting='Charged retained representation, not allocator-exact memory. Global ring is already full; delta includes eviction. Payload5, identifiers and256byte overhead are charged.')
         c.unsubscribe('quota',ms);meter.close()
         # Restart is deliberately a visible epoch gap, followed by fresh delivery.
-        old_epoch=c.epoch;old_cursor=cursor
+        old_epoch=c.epoch;old_cursor=cursor;old_client=c;old_address=server.address
         server.stop();result['processes'][-1]['stopped']=True
-        server=Server(args.binary,out/'state',out/'restart-server.txt',transport='pipe',flags=('--heartbeat-ms','0','--signal-history','32'))
+        server=Server(args.binary,out/'state',out/'restart-server.txt',transport='pipe',flags=('--heartbeat-ms','0','--signal-history','32'),address=old_address)
         result['processes'].append(dict(pid=server.process.pid,state=str(out/'state'),pipe=server.address))
-        c=server.client;assert c.epoch!=old_epoch
+        try:old_client.connect(deadline_ms())
+        except EpochChanged as e:assert e.previous==old_epoch and e.current==server.client.epoch
+        else:raise AssertionError('existing client missed epoch change')
+        c=old_client;peers.append(c);assert c.epoch!=old_epoch
         fresh=listener()
         try:c.subscribe('quota',fresh.endpoint,'event/',cursor=old_cursor)
         except Refusal as e:assert e.code==23

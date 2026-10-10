@@ -1,6 +1,6 @@
 //! Epoch-scoped change retention and one bounded, independent delivery owner.
 use crate::{lp, Config, Value, MAX_ID};
-use std::{collections::VecDeque, io, sync::{Arc, Condvar, Mutex}, thread, time::Duration};
+use std::{collections::{HashMap, VecDeque}, io, sync::{Arc, Condvar, Mutex}, thread, time::Duration};
 
 const SUB_MAX: usize = 64;
 const SUB_ITEMS: usize = 256;
@@ -26,6 +26,7 @@ struct Subscription {
     prefix: String,
     endpoint: String,
     values: bool,
+    frame_max: usize,
     active: bool,
     status: u8,
     queue: VecDeque<Arc<Change>>,
@@ -46,7 +47,11 @@ struct State {
     turn: usize,
     stop: bool,
 }
-type Sink = fn(&str, &[u8], u32) -> io::Result<()>;
+#[cfg(windows)]
+type Connection = crate::pipe_io::Pipe;
+#[cfg(not(windows))]
+type Connection = ();
+type Sink = fn(&str, &[u8], u32, &mut Option<Connection>) -> io::Result<()>;
 pub struct Hub {
     epoch: u64,
     ring_max: usize,
@@ -98,11 +103,13 @@ impl Hub {
             subs: Vec::new(), turn: 0, stop: false }), Condvar::new()));
         let owner = state.clone();
         let worker = thread::spawn(move || {
+            let mut connections: HashMap<u64, Option<Connection>> = HashMap::new();
             loop {
                 let job = {
                     let (lock, wake) = &*owner;
                     let mut s = lock.lock().unwrap();
                     loop {
+                        connections.retain(|id, _| s.subs.iter().any(|sub| sub.id == *id && sub.active));
                         if s.stop { return; }
                         let mut job = None;
                         let count = s.subs.len();
@@ -121,7 +128,8 @@ impl Hub {
                 };
                 let (id, endpoint, values, change) = job;
                 // Encoding and all endpoint I/O are outside the publication/hub lock.
-                let result = sink(&endpoint, &encode(epoch, id, &change, values), WRITE_MS);
+                let result = sink(&endpoint, &encode(epoch, id, &change, values), WRITE_MS,
+                    connections.entry(id).or_default());
                 let mut s = owner.0.lock().unwrap();
                 s.queue_bytes -= change.charge;
                 if let Some(sub) = s.subs.iter_mut().find(|sub| sub.id == id) {
@@ -163,7 +171,7 @@ impl Hub {
         let mut total = s.queue_bytes;
         for sub in &mut s.subs {
             if sub.active && sub.ns == ns && key.starts_with(&sub.prefix) {
-                if sub.queue.len() >= SUB_ITEMS || sub.bytes + charge > SUB_BYTES || total + charge > QUEUE_BYTES {
+                if wire_size(&change, sub.values) > sub.frame_max || sub.queue.len() >= SUB_ITEMS || sub.bytes + charge > SUB_BYTES || total + charge > QUEUE_BYTES {
                     sub.active = false;
                     sub.status = DROPPED;
                     total -= clear(sub);
@@ -179,13 +187,16 @@ impl Hub {
         s.queue_bytes = total;
         self.state.1.notify_one();
     }
-    pub fn subscribe(&self, ns: &str, prefix: String, endpoint: String, values: bool, cursor: &[u8]) -> Result<Vec<u8>, u16> {
+    pub fn subscribe(&self, ns: &str, prefix: String, endpoint: String, values: bool, cursor: &[u8], protocol: &str, frame_max: usize) -> Result<Vec<u8>, u16> {
+        if protocol != "membus.change/1" { return Err(2); }
+        if !(1024..=crate::MAX_FRAME).contains(&frame_max) { return Err(4); }
         if !valid_endpoint(&endpoint) || prefix.len() > MAX_ID { return Err(3); }
         let mut s = self.state.0.lock().unwrap();
         let start = if cursor.is_empty() { s.head } else { parse_token(self.epoch, cursor, 23)? };
         if start < s.floor || start > s.head { return Err(23); }
         let queue: VecDeque<_> = s.ring.iter().filter(|c| c.seq > start && c.ns == ns && c.key.starts_with(&prefix)).cloned().collect();
         let bytes: usize = queue.iter().map(|c| c.charge).sum();
+        if queue.iter().any(|c| wire_size(c, values) > frame_max) { return Err(4); }
         // Refuse oversize catch-up instead of returning a silently partial stream.
         if queue.len() > SUB_ITEMS || bytes > SUB_BYTES || s.queue_bytes + bytes > QUEUE_BYTES { return Err(6); }
         if s.subs.len() == SUB_MAX {
@@ -195,7 +206,7 @@ impl Hub {
         let id = s.next;
         s.next = id.checked_add(1).ok_or(7u16)?;
         let status = if queue.is_empty() { WRITTEN } else { QUEUED };
-        s.subs.push(Subscription { id, ns: ns.into(), prefix, endpoint, values,
+        s.subs.push(Subscription { id, ns: ns.into(), prefix, endpoint, values, frame_max,
             active: true, status, queue, bytes, written: 0, failed: 0, dropped: 0, last: start });
         s.queue_bytes += bytes;
         let mut reply = Vec::new();
@@ -212,6 +223,7 @@ impl Hub {
         sub.status = CANCELLED;
         let freed = clear(sub);
         s.queue_bytes -= freed;
+        self.state.1.notify_one();
         Ok(())
     }
     pub fn status(&self, ns: &str, b: &[u8]) -> Result<Vec<u8>, u16> {
@@ -232,6 +244,18 @@ impl Hub {
             self.ring_budget as u64, QUEUE_BYTES as u64] { p.extend(n.to_le_bytes()); }
         p
     }
+    pub fn hello_limits(&self) -> Vec<u8> {
+        let mut p = 1u16.to_le_bytes().to_vec(); // membus.change/1
+        p.extend((crate::MAX_FRAME as u32).to_le_bytes());
+        p.extend((self.ring_max as u64).to_le_bytes());
+        p.extend((self.ring_budget as u64).to_le_bytes());
+        p.extend((SUB_MAX as u16).to_le_bytes());
+        p.extend((SUB_ITEMS as u16).to_le_bytes());
+        p.extend((SUB_BYTES as u64).to_le_bytes());
+        p.extend((QUEUE_BYTES as u64).to_le_bytes());
+        p.extend(WRITE_MS.to_le_bytes());
+        p
+    }
 }
 impl Drop for Hub {
     fn drop(&mut self) {
@@ -244,34 +268,43 @@ fn valid_endpoint(s: &str) -> bool {
     let lower = s.to_ascii_lowercase();
     lower.starts_with(r"\\.\pipe\") && s.len() > 9 && s.len() <= MAX_ID && !s.contains('\0')
         && !s[9..].contains(['/', ':'])
+        && s[9..].split('\\').all(|part| !part.is_empty() && part != "." && part != ".." && !part.ends_with(['.', ' ']))
+}
+fn wire_size(c: &Change, values: bool) -> usize {
+    57 + c.ns.len() + c.key.len() + if values { 4 + c.value.bytes.len() } else { 0 }
 }
 #[cfg(windows)]
-fn deliver(endpoint: &str, payload: &[u8], timeout: u32) -> io::Result<()> {
+fn deliver(endpoint: &str, payload: &[u8], timeout: u32, connection: &mut Option<Connection>) -> io::Result<()> {
     use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt};
     // CreateFile never waits for a missing/busy pipe. Overlapped writes share
     // one absolute deadline, including all partial chunks and cancellation.
     let deadline = std::time::Instant::now() + Duration::from_millis(timeout as u64);
-    let file = loop {
-        match OpenOptions::new().write(true).custom_flags(0x40000000).open(endpoint) {
+    if connection.is_none() {
+      let file = loop {
+        match OpenOptions::new().write(true).custom_flags(0x40000000)
+            .security_qos_flags(0x100000 | 0x10000).open(endpoint) {
             Ok(file) => break file,
             Err(error) if error.raw_os_error() == Some(231) && std::time::Instant::now() < deadline => {
                 thread::sleep(Duration::from_millis(1));
             }
             Err(error) => return Err(error),
         }
-    };
-    let mut pipe = crate::pipe_io::Pipe::new(file, timeout);
-    pipe.write_until(payload, deadline)
+      };
+      *connection = Some(crate::pipe_io::Pipe::new(file, timeout));
+    }
+    let result = connection.as_mut().unwrap().write_until(payload, deadline);
+    if result.is_err() { *connection = None; }
+    result
 }
 #[cfg(not(windows))]
-fn deliver(_: &str, _: &[u8], _: u32) -> io::Result<()> {
+fn deliver(_: &str, _: &[u8], _: u32, _: &mut Option<Connection>) -> io::Result<()> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "signals require Windows pipes"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn ok(_: &str, _: &[u8], _: u32) -> io::Result<()> { Ok(()) }
+    fn ok(_: &str, _: &[u8], _: u32, _: &mut Option<Connection>) -> io::Result<()> { Ok(()) }
     fn value(n: u64) -> Arc<Value> { Arc::new(Value { version: n, ack: 1, bytes: vec![42], tombstone: false }) }
     #[test]
     fn retention_gap_and_filter_resume() {
@@ -279,9 +312,9 @@ mod tests {
         h.publish("quota", "event/1", value(1));
         h.publish("other", "event/2", value(2));
         h.publish("quota", "state/3", value(3));
-        assert_eq!(h.subscribe("quota", "event/".into(), r"\\.\pipe\test".into(), false, &token(7, 0)).err(), Some(23));
-        assert_eq!(h.subscribe("quota", "".into(), r"\\.\pipe\test".into(), false, &token(6, 3)).err(), Some(23));
-        let r = h.subscribe("quota", "state/".into(), r"\\.\pipe\test".into(), true, &token(7, 1)).unwrap();
+        assert_eq!(h.subscribe("quota", "event/".into(), r"\\.\pipe\test".into(), false, &token(7, 0), "membus.change/1", crate::MAX_FRAME).err(), Some(23));
+        assert_eq!(h.subscribe("quota", "".into(), r"\\.\pipe\test".into(), false, &token(6, 3), "membus.change/1", crate::MAX_FRAME).err(), Some(23));
+        let r = h.subscribe("quota", "state/".into(), r"\\.\pipe\test".into(), true, &token(7, 1), "membus.change/1", crate::MAX_FRAME).unwrap();
         let sub = &r[4..20];
         let until = std::time::Instant::now() + Duration::from_secs(1);
         while h.status("quota", sub).unwrap()[1] != WRITTEN && std::time::Instant::now() < until { thread::yield_now(); }
@@ -296,7 +329,9 @@ mod tests {
     fn oversized_replay_is_explicit_and_endpoints_are_local() {
         let h = Hub::with_sink(7, &Config::default(), ok);
         for n in 1..=257 { h.publish("quota", "event/x", value(n)); }
-        assert_eq!(h.subscribe("quota", "".into(), r"\\.\pipe\test".into(), false, &token(7, 0)).err(), Some(6));
-        assert_eq!(h.subscribe("quota", "".into(), r"\\remote\pipe\x".into(), false, &[]).err(), Some(3));
+        assert_eq!(h.subscribe("quota", "".into(), r"\\.\pipe\test".into(), false, &token(7, 0), "membus.change/1", crate::MAX_FRAME).err(), Some(6));
+        assert_eq!(h.subscribe("quota", "".into(), r"\\remote\pipe\x".into(), false, &[], "membus.change/1", crate::MAX_FRAME).err(), Some(3));
+        assert_eq!(h.subscribe("quota", "".into(), r"\\.\pipe\..\GLOBALROOT\x".into(), false, &[], "membus.change/1", crate::MAX_FRAME).err(), Some(3));
+        assert_eq!(h.subscribe("quota", "".into(), r"\\.\pipe\test".into(), false, &[], "other/1", crate::MAX_FRAME).err(), Some(2));
     }
 }

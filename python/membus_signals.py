@@ -22,7 +22,7 @@ def decode_change(body):
                 version=version, ack=ack, removed=bool(removed), value=value)
 
 class Listener:
-    """One pipe instance, reused after each complete signal; close in a finally/with.
+    """One persistent pipe connection per subscription; close in a finally/with.
 
     Create before subscribe, then receive(timeout). No background thread or poller.
     By default LOCAL belongs to this user's logon session. A unique name and
@@ -68,6 +68,8 @@ class Listener:
         pipe.k.WaitForSingleObject.argtypes = [w.HANDLE,w.DWORD]
 
     def accept(self, deadline):
+        if self.connected:
+            return
         event = self.pipe.k.CreateEventW(None, True, False, None)
         if not event:
             raise ctypes.WinError(ctypes.get_last_error())
@@ -85,7 +87,10 @@ class Listener:
                 wait = max(0, deadline - int(time.time()*1000))
                 if self.pipe.k.WaitForSingleObject(event, min(wait, 0xfffffffe)) != 0:
                     self.pipe.k.CancelIoEx(self.pipe.handle, ctypes.byref(operation))
-                    self.pipe.k.GetOverlappedResult(self.pipe.handle, ctypes.byref(operation), ctypes.byref(done), True)
+                    completed=self.pipe.k.GetOverlappedResult(self.pipe.handle, ctypes.byref(operation), ctypes.byref(done), True)
+                    if completed:
+                        self.connected=True
+                        return
                     raise TimeoutError('signal accept deadline')
                 if not self.pipe.k.GetOverlappedResult(self.pipe.handle, ctypes.byref(operation), ctypes.byref(done), False):
                     raise ctypes.WinError(ctypes.get_last_error())
@@ -95,13 +100,16 @@ class Listener:
 
     def receive(self, timeout=10):
         deadline = deadline_ms(timeout)
+        consumed = 0
         def exact(n):
+            nonlocal consumed
             out = bytearray()
             while len(out) < n:
                 chunk = self.pipe.io(None, n-len(out), deadline, False)
                 if not chunk:
                     raise ConnectionError('signal truncated')
                 out.extend(chunk)
+                consumed += len(chunk)
             return bytes(out)
         try:
             self.accept(deadline)
@@ -109,10 +117,18 @@ class Listener:
             if not 57 <= n <= MAX_FRAME:
                 raise ValueError('signal frame size')
             return decode_change(exact(n))
-        finally:
+        except TimeoutError as error:
+            if consumed:
+                if self.connected:
+                    self.k.DisconnectNamedPipe(self.pipe.handle)
+                    self.connected=False
+                raise ConnectionError('partial signal timed out; resume from last handled cursor') from error
+            raise
+        except (OSError, ValueError, ConnectionError):
             if self.connected:
                 self.k.DisconnectNamedPipe(self.pipe.handle)
                 self.connected = False
+            raise
 
     def close(self):
         if self.connected:
