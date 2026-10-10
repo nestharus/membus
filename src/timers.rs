@@ -274,9 +274,48 @@ mod tests {
             let usage=store.signals.usage();assert_eq!(u64::from_le_bytes(usage[..8].try_into().unwrap()),1);
             assert!(store.get_handle(NS,&format!("p/{}",identity(&s.ns,&s.id).unwrap())).is_none());
         }
-        let store=Store::open(&path,Default::default()).unwrap();let state=store.timers.0.lock().unwrap();
-        let timer=state.timers.values().next().unwrap();assert_eq!((timer.generation,timer.next),(generation,0));
-        assert_eq!(timer.schedule.latest(timer.next,s.anchor),Some(0));
+        let store=Store::open(&path,Default::default()).unwrap();
+        {
+            let state=store.timers.0.lock().unwrap();let timer=state.timers.values().next().unwrap();
+            assert_eq!((timer.generation,timer.next),(generation,0));assert_eq!(timer.schedule.latest(timer.next,s.anchor),Some(0));
+        }
+        let owner=store.start_timers().unwrap();
+        let until=std::time::Instant::now()+Duration::from_secs(2);
+        loop {
+            let completed=!store.timers.0.lock().unwrap().timers.values().next().unwrap().active;
+            if completed {break;} assert!(std::time::Instant::now()<until);thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(u64::from_le_bytes(store.signals.usage()[..8].try_into().unwrap()),1);
+        let value=store.get_handle(NS,&format!("p/{}",identity(&s.ns,&s.id).unwrap())).unwrap();
+        let p=Progress::decode(&value.bytes).unwrap();assert_eq!((p.generation,p.index,p.missed),(generation,0,1));
+        drop(owner);
+    }
+    #[test] fn real_checkpoint_capacity_refusal_stops_owner_then_repeats_after_reopen() {
+        let path=path("capacity-refusal");let mut s=schedule();s.period=0;s.low=0;s.high=0;
+        let m=schedule_mutation(&s,"set");let limit=crate::mutation_bytes(&m,1,now_ms()).len() as u64;
+        let generation;
+        {
+            let store=Store::open(&path,crate::Config {state_limit_bytes:limit,..Default::default()}).unwrap();
+            let out=store.mutate(m);assert_eq!(out.code,0);generation=out.version;
+            let owner=store.start_timers().unwrap();let until=std::time::Instant::now()+Duration::from_secs(2);
+            loop {
+                let state=store.timers.0.lock().unwrap();let t=state.timers.values().next().unwrap();
+                if !t.active {assert_eq!(t.error,7);assert_eq!((t.last.unwrap().generation,t.last.unwrap().index),(generation,0));break;}
+                drop(state);assert!(std::time::Instant::now()<until);thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(u64::from_le_bytes(store.signals.usage()[..8].try_into().unwrap()),1);
+            assert!(store.get_handle(NS,&format!("p/{}",identity(&s.ns,&s.id).unwrap())).is_none());drop(owner);
+        }
+        // A larger configured budget is the deliberate recovery action; no hidden retry.
+        let store=Store::open(&path,Default::default()).unwrap();let owner=store.start_timers().unwrap();
+        let until=std::time::Instant::now()+Duration::from_secs(2);
+        loop {
+            if !store.timers.0.lock().unwrap().timers.values().next().unwrap().active {break;}
+            assert!(std::time::Instant::now()<until);thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(u64::from_le_bytes(store.signals.usage()[..8].try_into().unwrap()),1);
+        let value=store.get_handle(NS,&format!("p/{}",identity(&s.ns,&s.id).unwrap())).unwrap();
+        let p=Progress::decode(&value.bytes).unwrap();assert_eq!((p.generation,p.index),(generation,0));drop(owner);
     }
     #[test] fn restore_filters_old_generation_progress_completed_oneoff_and_cancel_charge() {
         let mut s=schedule();s.period=0;s.low=0;s.high=0;let id=identity(&s.ns,&s.id).unwrap();

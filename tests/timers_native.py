@@ -52,21 +52,25 @@ def run(args):
         server=start('main');c=server.client
         check('timer limits behind hello',c.timer_limits['identities_max']==4096 and c.timer_limits['min_period_ms']==100,limits=c.timer_limits)
         # Strict old hello variants keep their original refusal counts and extension sizes.
-        for identity,count,extension in [('python',19,0),('python;scans=1',22,0),('python;subscribe=1;scans=1',24,46),('python;timers=1',23,34)]:
+        for identity,count,extension in [('python',19,0),('python;scans=1',22,0),('python;subscribe=1;scans=1',24,46),('python;timers=1',23,34),('python;timers=1;subscribe=1;scans=1',25,80)]:
             legacy=Client.__new__(Client);legacy.transport='pipe';legacy.channel=Pipe(server.address,deadline_ms());legacy.request_id=0;legacy.timeout=10
             try:
                 d=Decoder(legacy.exchange(1,struct.pack('<IB',16*1024*1024,0)+lp(identity),deadline_ms()));d.read(27);n,=d.unpack('<H')
-                for _ in range(n):d.read(3);d.blob()
-                check('legacy exact hello '+identity,n==count and len(d.data)-d.pos==extension,count=n,extension_bytes=len(d.data)-d.pos)
+                codes=[]
+                for _ in range(n):
+                    code,transient=d.unpack('<HB');d.blob();codes.append(code)
+                expected=list(range(1,count+1)) if identity!='python;timers=1' else list(range(1,23))+[25]
+                check('legacy exact hello '+identity,n==count and codes==expected and len(d.data)-d.pos==extension,count=n,codes=codes,extension_bytes=len(d.data)-d.pos)
                 if 'timers=1' not in identity:
                     try:legacy.call(23,'quota',lp('absent'))
                     except Refusal as error:assert error.code==2
                     else:raise AssertionError('unnegotiated timer accepted')
                 else:
                     assert legacy.call(23,'quota',lp('absent'))==b'\x00'
-                    try:legacy.call(19,'quota')
-                    except Refusal as error:assert error.code==2
-                    else:raise AssertionError('timers-only subscription access')
+                    if 'subscribe=1' not in identity:
+                        try:legacy.call(19,'quota')
+                        except Refusal as error:assert error.code==2
+                        else:raise AssertionError('timers-only subscription access')
             finally:legacy.close()
         l=listener();sub=c.subscribe('quota',l.endpoint,'timer/',include_value=True)['subscription']
         before=sum(p.stat().st_size for p in (out/'main-state').glob('stripe-*.log'))

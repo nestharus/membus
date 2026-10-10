@@ -22,6 +22,8 @@ Lost set/cancel replies are uncertain: Python does not automatically retry; reco
 
 Schedule/control dedup uses the existing configured retry horizon (default24h), retained-id ring and refusal13 policy. The no-rewind statement applies within retained dedup history; after that history is gone, unconditional reuse can create a new generation. Reconcile status and use expected generation; reuse fixed timer ids such as reopen/pass, while using a new op_id for each intentional replacement.
 
+Control op_ids share the reserved internal namespace's dedup scope across all client namespaces. Unlike ordinary KV's per-namespace ids, timer set/cancel op_ids must be globally unique in the store (Python defaults to UUID4). Reusing one with a different namespace/id or request returns14 op_id_mismatch, never a wrong cached success. Deterministic caller ids must include their namespace and timer identity.
+
 ## Time, draw and recovery
 
 Index i has nominal=`anchor+period*i`, due=`nominal+draw(i)`. Integer draw is inclusive[low,high], deterministic rejection sampling over seeded SplitMix64; seed derives from namespace/id and op_id. This is scheduling jitter, not cryptographic randomness. Each index has its own draw, carried in the wake and recorded in progress; replay reproduces it. Repeat range width is strictly less than period, giving increasing dues. First due cannot overflow; future overflow completes the timer. Minute+/-15% uses[-9000,9000]ms. Exact quota reset uses[0,0]; waiter delay0–5minutes (spokesperson0–1) and exponential full-jitter retries remain caller policy.
@@ -42,6 +44,10 @@ missed_count means due indices covered since the last successful checkpoint, inc
 
 Progress failure stops this timer with active=false/error even for a transient refusal, as specified in the slice plan. There is no automatic retry policy or failure wake; a central consumer reconciles timer_status alongside subscription status or its existing fallback and replaces an errored schedule. Lane88 retains its quota task for a week. No per-agent polling process is required. This explicit limitation avoids retry storms during storage failure; health currently reports general store state, not aggregate timer failures.
 
+After a refused checkpoint, in-memory status last names the published attempt although it was not persisted. On restart, last returns to the previous successful checkpoint (or none); the recovered owner can publish that same attempted due identity again. Do not treat last or an increasing index across epochs as a durable effect receipt; retain application due-id/lease results outside this status.
+
+Embedding Store::open alone does not run timers. Library callers must keep the Store::start_timers guard alive and drop it before the Store. The guard is per Store, not a cross-process lock. Drop may wait for the current progress deadline (up to10s). Existing lock-poison handling treats an unexpected owner panic as fatal rather than repairing state; callers must supervise the service.
+
 ## Bytes, limits and growth
 
 Reserved internal namespace __membus_timers_v1 is denied through public operations. Schedule s/<namespace>NUL<id> holds MTS1, three length-prefixed texts(namespace,id,key), five64-bit fields(anchor,period,low,high,seed), and bytes payload. Progress p/<namespace>NUL<id> is exactly48bytes (six envelope fields). Replace ignores older-generation progress. Internal writes emit no ordinary KV change. Timer wakes create no log record or event key.
@@ -54,6 +60,10 @@ Charge: retained identity256+identity length plus present schedule768+3*(namespa
 
 Internal progress is never retained in the client retry dedup table, on admission or replay. Its single owner makes one append attempt with an epoch/generation/index op_id and stops on failure. It still obeys pending-key, queue, disk, index, namespace and value limits and the same writer/publication boundary. This prevents the24h client dedup table from growing per fire. Schedule set/cancel and every ordinary client mutation retain existing retry dedup behavior.
 
+The unique progress op_id remains in MBK1 even though the current owner does not retry it: older binaries replay all records with dedup and a constant id would produce fingerprint mismatches. Keeping the shared MBK1 format and distinct ids preserves that replay property; it does not remove the older build's capacity limits. Compact progress is the selected compatible form, not a claim of a theoretical minimum encoding.
+
 Tombstones/rewrites reclaim neither logs nor KV index slots. Reuse timer ids to avoid new identities;4096different cancelled ids fill admission. At100ms,864000fires/day create substantial growth. Rotation/retirement remains separate work; capacity refusal stops that timer with explicit error. No hidden rewrite, separate timer WAL, downloader, command execution or dependency.
+
+The existing state_limit_bytes is shared by timers and every ordinary writer. At its default8GiB, one100ms timer at about144bytes/fire consumes about124MB/day; the theoretical4096-timer maximum can exhaust it in about24minutes if storage sustains that rate. Other records and longer ids reduce that time. Once full, all persisted writes return7 capacity until explicit maintenance or an increased budget; a timer memory limit is not a log-rate budget. There is no aggregate fire-rate admission bound in this slice. The commissioned minute/reset consumers use about207–213KB per minute-timer-day; monitor total persisted bytes and adopt rotation before approaching the shared limit.
 
 Verification: tests/timers_native.py, timers.rs units and unchanged Rust/protocol/native regressions; artifacts at D:/projects/oulipoly/trunk/research/87_operations_representation/claude6-eco/runs/e9/act-work/F-E6-41, bulk in ignored .test-output. Faults kill owned private processes only. Resident swap waits for F-E6-48 endpoint marker and lane88 source/hash notice.
