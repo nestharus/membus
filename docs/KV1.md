@@ -153,10 +153,12 @@ Lane83's **shadow proposal** (eco seq402) is separate from that primary-store ou
 | tag co-location + atomic conditional batch | Deferred; slice batch remains non-atomic, so client intent/source recovery remains necessary. Atomicity would change the commit/recovery surface. |
 | shared scan snapshot token | Implemented in F-E6-24; namespace scope, release and lifetime are stated in §5. |
 | bulk value streaming | Deferred; bounded get_many paging is available; startup reconstruction measurements precede streaming. |
-| key/version write signals | Taken as later signal-slice requirement, not implemented; client currently polls. |
+| key/version write signals | Implemented F-E6-33, optional exact values, bounded epoch-scoped resume and explicit gaps; see SUBSCRIPTIONS.md. |
 | shadow adoption | Recommended to lane 83 as its adoption choice: file ledger primary, membus put-if-absent mirror, compare/reconcile under kills before primary migration. This does not make membus a provider or runtime adapter. |
 
 ## 11. Run and verify
+
+F-E6-33 adds hello `subscribe=1` and operations16subscribe,17unsubscribe,18subscription_status,19signal_usage and20capture_metrics; [SUBSCRIPTIONS.md](SUBSCRIPTIONS.md) specifies all fields, limits and the Python named-pipe listener. A pipe write is not a receipt. Resume retention covers only the latest4096changes/16MiBglobally in the current epoch; old/restarted cursors return resume_gap23without silent truncation, and catch-up beyond256queueitems/8MiBreturns busy6. No signal log or persistent subscription is implemented. `scans=1` clients retain22codes, older clients19.
 
 `cargo test --offline --locked -- --nocapture`, then `python tests/integration.py --binary target/debug/membus.exe --output <ignored evidence dir>`. Queue both through lineup with cpu/mem and disk:d. Build outputs stay in ignored target; replay/burst states and captures in the commissioned act-work directory. No third-party crate or dependency execution. The Python test owns and stops every server it launches, compares acknowledged ids to replay, and reports record bytes/flush calls.
 

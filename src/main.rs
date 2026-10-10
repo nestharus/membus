@@ -308,6 +308,8 @@ fn main() -> io::Result<()> {
             .parse::<u64>()
             .map_err(io::Error::other)?;
         match args[i].as_str() {
+            "--signal-history" => config.signal_history = usize::try_from(n).map_err(io::Error::other)?,
+            "--signal-bytes" => config.signal_bytes = usize::try_from(n).map_err(io::Error::other)?,
             "--state-limit-bytes" => {
                 if n == 0 {
                     return Err(io::Error::other("state-limit-bytes must be positive"));

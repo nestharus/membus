@@ -119,6 +119,19 @@ impl Pipe {
     pub fn connect(&mut self) -> io::Result<()> {
         self.operation(std::ptr::null_mut(), 0, 2).map(|_| ())
     }
+    pub fn write_until(&mut self, mut bytes: &[u8], deadline: std::time::Instant) -> io::Result<()> {
+        while !bytes.is_empty() {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "signal deadline"));
+            }
+            self.idle_ms = remaining.as_millis().clamp(1, u32::MAX as u128 - 1) as u32;
+            let n = self.write(bytes)?;
+            if n == 0 { return Err(io::Error::new(io::ErrorKind::WriteZero, "signal zero write")); }
+            bytes = &bytes[n..];
+        }
+        Ok(())
+    }
 }
 impl Read for Pipe {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
