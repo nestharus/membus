@@ -121,7 +121,7 @@ def main():
             limits='Cumulative raw deltas cover sampling gaps unless device counters reset; queue means/maxima apply only to sampled instants. Disk is shared; no causal attribution of physical bytes to membus. Host collector gives1-minute queue counterevidence inside missing sample interval.'),
         publisher=dict(rows_per_hour=rates['total_rows_per_hour'],upper_bytes_per_hour=added,share_of_combined_rate=added/(current_rate+added)),
         publisher_change_eras=eras,last_slots_all_record_at=utc(max(row['at_ms'] for row in flat(end) if row['namespace']=='slots' and row['key']=='all')/1000),
-        first_slots_resource_record_at=utc(min(row['at_ms'] for row in flat(end) if row['namespace']=='slots' and row['key'].startswith('slots/'))/1000),
+        first_slots_resource_record_at=utc(min(row['at_ms'] for row in flat(end) if row['namespace']=='slots' and row['key']!='all' and not row['key'].startswith('event/') and row['at_ms']/1000>=change_at)/1000),
         capacity_projections=projections,replay_fits=fits,
         limits='One resident hour is not a forecast of future load. File-stat/health/heartbeat capture intervals are not atomic; exact MBK1 complete-record accounting retained. Flush counter reports fsync calls, not logical puts; record writes come from logs, file write-call9 is a different metric. Publisher scenario assumes36-byte UUID op_ids,199-byte values and all located operational ledgers. Linear replay is a two-point extrapolation of startup-to-ready under warm uncontrolled cache, different live-key shapes and shared load; neither6GiB nor8GiB replay was measured.')
     save('projection.json',result)
