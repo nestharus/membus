@@ -71,8 +71,23 @@ def main():
     save('host-metrics-supplement.json',dict(source=str(hostpath),rows=supplemental,method='read-only host collector queue/busy samples over window; no write counters in this source; queue values remain instantaneous'))
     rates=read('ledger-rates.json')
     own_rate=growth/hours;added=rates['publisher_upper_bytes_per_hour']
+    change_at=stamp('2026-10-10T01:35:00+00:00')
+    eras=[]
+    for label,lower,upper in [('before-slots-publisher-change',start['unix_time'],change_at),('after-slots-publisher-change',change_at,end['unix_time'])]:
+        era_rows=[row for row in tail if (row['at_ms']/1000<upper if label.startswith('before') else row['at_ms']/1000>=lower)]
+        duration_hours=(upper-lower)/3600
+        era_groups=collections.defaultdict(lambda:dict(bytes=0,records=0))
+        for row in era_rows:
+            group=era_groups[(row['namespace'],row['family'])];group['bytes']+=row['bytes'];group['records']+=1
+        total=sum(row['bytes'] for row in era_rows)
+        eras.append(dict(label=label,start_at=utc(lower),end_at=utc(upper),hours=duration_hours,bytes=total,
+            records=len(era_rows),bytes_per_hour=total/duration_hours,
+            families=[dict(namespace=ns,family=family,**group,bytes_per_hour=group['bytes']/duration_hours) for (ns,family),group in sorted(era_groups.items())],
+            basis='Lane88 seq1164 reports slots/all stopped at01:35Z pass after975af1d landed01:34:27Z; split at owner-reported effective minute. Record timestamps retain observed last all and first resource writes.'))
+    current_rate=eras[1]['bytes_per_hour']
     projections=[]
-    for label,rate in [('today-measured',own_rate),('today-plus-proposed-publisher-upper-scenario',own_rate+added)]:
+    for label,rate in [('full-window-mixture',own_rate),('full-window-mixture-plus-proposed-publisher',own_rate+added),
+                       ('current-post-change',current_rate),('current-post-change-plus-proposed-publisher',current_rate+added)]:
         for target in (6*1024**3,8*1024**3):
             remain=max(0,target-sizes_end);time_hours=remain/rate if rate else None
             future=datetime.datetime.fromtimestamp(end['unix_time'],datetime.timezone.utc)+datetime.timedelta(hours=time_hours) if time_hours is not None else None
@@ -104,7 +119,9 @@ def main():
             mean_writes_per_second=writes/seconds,samples=len(valid),sampled_queue_mean=statistics.mean(queues),
             sampled_queue_max=max(queues),sampled_queue_nonzero=sum(queue>0 for queue in queues),sampling_gaps=gaps,
             limits='Cumulative raw deltas cover sampling gaps unless device counters reset; queue means/maxima apply only to sampled instants. Disk is shared; no causal attribution of physical bytes to membus. Host collector gives1-minute queue counterevidence inside missing sample interval.'),
-        publisher=dict(rows_per_hour=rates['total_rows_per_hour'],upper_bytes_per_hour=added,share_of_combined_rate=added/(own_rate+added)),
+        publisher=dict(rows_per_hour=rates['total_rows_per_hour'],upper_bytes_per_hour=added,share_of_combined_rate=added/(current_rate+added)),
+        publisher_change_eras=eras,last_slots_all_record_at=utc(max(row['at_ms'] for row in flat(end) if row['namespace']=='slots' and row['key']=='all')/1000),
+        first_slots_resource_record_at=utc(min(row['at_ms'] for row in flat(end) if row['namespace']=='slots' and row['key'].startswith('slots/'))/1000),
         capacity_projections=projections,replay_fits=fits,
         limits='One resident hour is not a forecast of future load. File-stat/health/heartbeat capture intervals are not atomic; exact MBK1 complete-record accounting retained. Flush counter reports fsync calls, not logical puts; record writes come from logs, file write-call9 is a different metric. Publisher scenario assumes36-byte UUID op_ids,199-byte values and all located operational ledgers. Linear replay is a two-point extrapolation of startup-to-ready under warm uncontrolled cache, different live-key shapes and shared load; neither6GiB nor8GiB replay was measured.')
     save('projection.json',result)
@@ -118,7 +135,11 @@ def main():
     for row in families:
         text.append(f'| {row["namespace"]}/{row["family"]} | {row["bytes"]:,} | {row["bytes_per_hour"]:,.2f} | {row["bytes_per_record"]:.2f} | {row["records_per_hour"]:.2f} | {row["live_keys_start"]}/{row["live_keys_end"]} |')
     text.extend(['',f'Physical D: {write_bytes:,} cumulative write bytes/{seconds:.3f}s = {write_bytes/seconds:,.2f} bytes/s; {writes:,} writes/{seconds:.3f}s = {writes/seconds:.2f} writes/s. {len(valid)} queue samples, mean {statistics.mean(queues):.3f}, max {max(queues)}; {len(gaps)} gaps longer than25s. Raw counters include writes across gaps; queue values there are only witnessed by1-minute host samples (host-metrics-supplement.json). No membus attribution follows from device counters.',
-        '',f'Proposed publisher: {rates["total_rows_last_24h"]:,} rows/24h = {rates["total_rows_per_hour"]:.6f} rows/h. MBK1 record =58fixed bytes +9namespace bytes + resolved key bytes +36assumed UUID bytes +199value bytes. Sum each loop rate times its record size = **{added:,.2f} bytes/hour**, {100*added/(own_rate+added):.2f}% of combined rate. See ledger-rates.json for every located ledger, its read hash and row counts. Under200value bytes is not an upper bound on full record size.',
+        '', 'Publisher changed inside the window: lane88 seq1164 reports975af1d live at01:35Z, stopping full slots/all rewrites and writing changed slots/<resource> values; token/fit writers also publish on bounded changes. Full-window mixture is retained as history, and the post-change period is the current-load basis.',
+        f'Observed last slots/all record {result["last_slots_all_record_at"]}; first slots/<resource> record {result["first_slots_resource_record_at"]}.'])
+    for era in eras:
+        text.append(f'- {era["label"]}: {era["bytes"]:,} bytes/{era["hours"]:.6f} hours = **{era["bytes_per_hour"]:,.2f} bytes/hour** ({era["records"]} records). Per-family era arithmetic is in projection.json.')
+    text.extend(['',f'Proposed publisher: {rates["total_rows_last_24h"]:,} rows/24h = {rates["total_rows_per_hour"]:.6f} rows/h. MBK1 record =58fixed bytes +9namespace bytes + resolved key bytes +36assumed UUID bytes +199value bytes. Sum each loop rate times its record size = **{added:,.2f} bytes/hour**, {100*added/(current_rate+added):.2f}% of post-change combined rate. See ledger-rates.json for every located ledger, its read hash and row counts. Under200value bytes is not an upper bound on full record size.',
         '', '| Scenario | Target | Remaining bytes / bytes per hour | Days from endpoint | Projected UTC |','|---|---|---|---:|---|'])
     for row in projections:
         text.append(f'| {row["scenario"]} | {row["target_bytes"]/1024**3:g}GiB | {row["remaining_bytes"]:,} / {row["rate_bytes_per_hour"]:,.2f} | {row["days"]:.2f} | {row["projected_at"]} |')
