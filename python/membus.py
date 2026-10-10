@@ -10,6 +10,10 @@ import uuid
 MAX_FRAME = 16 * 1024 * 1024
 MAX_VALUE = 4 * 1024 * 1024
 MAX_BATCH = 128
+def decode_timer(body):
+    # Lazy import keeps existing client import paths intact.
+    from membus_timers import decode_timer as decode
+    return decode(body)
 DEFAULT_SCAN_BYTES = 256 * 1024
 CODES = {1: ('incompatible_version', False), 2: ('unsupported', False),
          3: ('malformed', False), 4: ('too_large', False), 5: ('deadline', True),
@@ -21,7 +25,7 @@ CODES = {1: ('incompatible_version', False), 2: ('unsupported', False),
          18: ('dedup_full',True),19: ('pending_conflict',True),
          20: ('cursor_expired',False),21: ('invalid_cursor',False),
          22: ('snapshot_full',True),23: ('resume_gap',False),
-         24: ('subscription_missing',False)}
+         24: ('subscription_missing',False),25: ('timer_missing',False)}
 
 class EpochChanged(Exception):
     def __init__(self, previous, current):
@@ -153,7 +157,7 @@ class Client:
                 self.channel.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             else:
                 self.channel = Pipe(self.address, deadline)
-            response = self.exchange(1, struct.pack('<IB', MAX_FRAME, self.allow_mem)+lp('python-stdlib;subscribe=1;scans=1'), deadline)
+            response = self.exchange(1, struct.pack('<IB', MAX_FRAME, self.allow_mem)+lp('python-stdlib;timers=1;subscribe=1;scans=1'), deadline)
             decoder = Decoder(response)
             epoch, max_frame, max_value, max_batch, mem, retry_ms = decoder.unpack('<QIIHBQ')
             count, = decoder.unpack('<H')
@@ -169,6 +173,10 @@ class Client:
                 names=('protocol_version','max_frame','history_max','history_budget','subscriptions_max',
                        'queued_max','subscriber_bytes','queue_bytes','write_deadline_ms')
                 self.signal_limits=dict(zip(names,decoder.unpack('<HIQQHHQQI')))
+            self.timer_limits = None
+            if 25 in codes:
+                names=('protocol_version','identities_max','timer_bytes','payload_max','min_period_ms','jitter_max_ms')
+                self.timer_limits=dict(zip(names,decoder.unpack('<HIQIQQ')))
             if (decoder.pos != len(response) or
                     any(codes.get(code) != value for code, value in CODES.items() if code <= 19) or
                     any(code in codes and codes[code] != value for code, value in CODES.items())):
@@ -239,7 +247,7 @@ class Client:
         op_id = op_id or str(uuid.uuid4())
         deadline = deadline or deadline_ms(self.timeout)
         payload = struct.pack('<Q', deadline)+lp(op_id)+lp(ns)+suffix
-        creates_snapshot = opcode in (10, 16) or (opcode in (11, 12, 14, 15) and suffix[:4] == b'\x00' * 4)
+        creates_snapshot = opcode in (10, 16, 21, 22) or (opcode in (11, 12, 14, 15) and suffix[:4] == b'\x00' * 4)
         for attempt in range(2):
             try:
                 if self.channel is None: self.connect(deadline)
@@ -253,6 +261,39 @@ class Client:
 
     def get(self, ns, key, **options):
         return Decoder(self.call(2, ns, lp(key), **options)).value()
+
+    def timer_set(self, ns, timer_id, key, at_ms, *, period_ms=0, jitter_ms=(0,0),
+                  payload=b'', expected=None, ack=1, **options):
+        """Persist/replace a schedule. Lost reply requires status reconciliation before retry."""
+        if self.timer_limits is None: raise Refusal(2,self.codes)
+        low,high=jitter_ms
+        suffix=lp(timer_id)+struct.pack('<Q',2**64-1 if expected is None else expected)+lp(key)
+        suffix+=struct.pack('<QQqq',at_ms,period_ms,low,high)+lp(payload)+bytes([ack])
+        result=self.call(21,ns,suffix,**options)
+        if len(result)!=8:raise ValueError('invalid timer set reply')
+        return struct.unpack('<Q',result)[0]
+
+    def timer_cancel(self, ns, timer_id, generation, **options):
+        if self.timer_limits is None: raise Refusal(2,self.codes)
+        if self.call(22,ns,lp(timer_id)+struct.pack('<Q',generation),**options):
+            raise ValueError('invalid timer cancel reply')
+
+    def timer_status(self, ns, timer_id, **options):
+        if self.timer_limits is None: raise Refusal(2,self.codes)
+        d=Decoder(self.call(23,ns,lp(timer_id),**options));present,=d.unpack('<B')
+        if present==0:
+            if d.pos!=len(d.data):raise ValueError('invalid absent timer status')
+            return None
+        if present!=1:raise ValueError('invalid timer status')
+        generation,active,error,next_index,next_due=d.unpack('<QBHQQ')
+        record=Decoder(d.blob())
+        if record.read(4)!=b'MTS1':raise ValueError('invalid schedule record')
+        names=('namespace','timer_id','key');schedule=dict(zip(names,(record.blob().decode('utf8') for _ in names)))
+        schedule.update(zip(('at_ms','period_ms','jitter_low_ms','jitter_high_ms','seed'),record.unpack('<QQqqQ')))
+        schedule['payload']=record.blob();last=d.blob()
+        if active>1 or d.pos!=len(d.data) or record.pos!=len(record.data):raise ValueError('invalid timer status length')
+        return dict(generation=generation,active=bool(active),error=error,next_index=next_index,
+                    next_due_ms=next_due,schedule=schedule,last=decode_timer(last) if last else None)
 
     def get_many(self, ns, keys, **options):
         d = Decoder(self.call(3, ns, struct.pack('<H',len(keys))+b''.join(lp(k) for k in keys), **options))

@@ -1,5 +1,6 @@
 //! membus.kv/1 slice 1: bounded framing, independent committed reads, durable replay.
 mod signals;
+mod timers;
 #[cfg(windows)]
 pub mod pipe_io;
 use std::{
@@ -43,6 +44,7 @@ pub const CODES: &[(u16, &str, bool)] = &[
     (22, "snapshot_full", true),
     (23, "resume_gap", false),
     (24, "subscription_missing", false),
+    (25, "timer_missing", false),
 ];
 pub const HELLO: u8 = 1;
 pub const GET: u8 = 2;
@@ -65,6 +67,9 @@ pub const UNSUBSCRIBE: u8 = 17;
 pub const SUBSCRIPTION_STATUS: u8 = 18;
 pub const SIGNAL_USAGE: u8 = 19;
 pub const CAPTURE_METRICS: u8 = 20;
+pub const TIMER_SET: u8 = 21;
+pub const TIMER_CANCEL: u8 = 22;
+pub const TIMER_STATUS: u8 = 23;
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -309,6 +314,7 @@ impl Default for Config {
     }
 }
 pub struct Store {
+    timers: timers::Shared,
     signals: signals::Hub,
     capture_metrics: [AtomicU64; 7],
     committed: RwLock<HashMap<(String, String), Arc<Value>>>,
@@ -1055,7 +1061,7 @@ impl Store {
                 {
                     committed.insert(k, Arc::new(value));
                 }
-                if now.saturating_sub(at) <= config.retry_ms {
+                if now.saturating_sub(at) <= config.retry_ms && !timers::is_progress(&m.ns,&m.key) {
                     dedup.insert(
                         (m.ns.clone(), m.op_id.clone()),
                         Dedup {
@@ -1138,6 +1144,7 @@ impl Store {
         let dedup_bytes = dedup.values().map(|d| d.fingerprint.len()).sum();
         let mut expiry: Vec<_> = dedup.iter().map(|(k, d)| (k.clone(), d.at)).collect();
         expiry.sort_by_key(|(_, at)| *at);
+        let timers = timers::State::restore(&committed)?;
         let (appenders, flush_owner) = start_owners(&logs, &config);
         let scans = Arc::new(Mutex::new(ScanState {
             next: 1,
@@ -1160,6 +1167,7 @@ impl Store {
             }
         });
         Ok(Self {
+            timers,
             signals: signals::Hub::new(epoch, &config),
             capture_metrics: std::array::from_fn(|_| AtomicU64::new(0)),
             committed: RwLock::new(committed),
@@ -1474,6 +1482,13 @@ impl Store {
             .contains_key(&(ns.into(), key.into()))
     }
     pub fn mutate(&self, m: Mutation) -> Outcome {
+        self.mutate_mode(m,true)
+    }
+    fn mutate_progress(&self, m: Mutation) -> Outcome {
+        debug_assert!(timers::is_progress(&m.ns,&m.key));
+        self.mutate_mode(m,false)
+    }
+    fn mutate_mode(&self, m: Mutation, deduplicate: bool) -> Outcome {
         if m.ns.is_empty() || m.key.is_empty() || m.op_id.is_empty() {
             return Outcome::error(3);
         }
@@ -1504,7 +1519,7 @@ impl Store {
         // values still consume queue slots and framing/identifier memory.
         let queue_charge = fp.len() + m.bytes.len() + 128;
         let mut state = self.state.lock().unwrap();
-        if let Some(d) = state.dedup.get(&id) {
+        if let Some(d) = state.dedup.get(&id).filter(|_|deduplicate) {
             if d.fingerprint != fp {
                 return Outcome::error(14);
             }
@@ -1526,7 +1541,7 @@ impl Store {
                 state = s;
             }
         }
-        if state.retired_set.contains(&id) {
+        if deduplicate && state.retired_set.contains(&id) {
             return Outcome::error(13);
         }
         if now_ms() >= m.deadline {
@@ -1586,7 +1601,7 @@ impl Store {
             + state.dedup_bytes
             + state.reserved_bytes
             + m.bytes.len()
-            + fp.len()
+            + if deduplicate {fp.len()} else {0}
             > self.config.capacity
         {
             return Outcome::error(7);
@@ -1600,7 +1615,7 @@ impl Store {
         {
             return Outcome::error(6);
         }
-        if state.dedup.len() >= self.config.dedup_cap {
+        if deduplicate && state.dedup.len() >= self.config.dedup_cap {
             return Outcome::error(18);
         }
         // The clock check immediately precedes insertion: this is the admission point.
@@ -1631,6 +1646,7 @@ impl Store {
         state.stripe_reserved[log_index] += queue_charge;
         state.stripe_items[log_index] += 1;
         state.pending_disk += disk_bytes;
+        if deduplicate {
         state.dedup_bytes += fp.len();
         state.expiry.push_back((id.clone(), at));
         state.dedup.insert(
@@ -1641,6 +1657,7 @@ impl Store {
                 outcome: None,
             },
         );
+        }
         drop(state);
         let result = if m.ack == 0 {
             Ok(())
@@ -1672,7 +1689,7 @@ impl Store {
             let value = Arc::new(value);
             let mut committed = self.committed.write().unwrap();
             let previous = committed.insert(k.clone(), value.clone());
-            self.signals.publish(&m.ns, &m.key, value);
+            if m.ns != timers::NS { self.signals.publish(&m.ns, &m.key, value); }
             drop(committed);
             drop(previous);
         }
@@ -1714,7 +1731,7 @@ impl Store {
         if result.is_err() {
             state.read_only = true
         }
-        state.dedup.get_mut(&id).unwrap().outcome = Some(outcome.clone());
+        if deduplicate { state.dedup.get_mut(&id).unwrap().outcome = Some(outcome.clone()); }
         self.done.notify_all();
         outcome
     }
@@ -1766,8 +1783,15 @@ impl Store {
                 // Legacy strict clients keep the exact original refusal list.
                 let subscribe = client.split(';').skip(1).any(|feature| feature == "subscribe=1");
                 let scans = client.ends_with(";scans=1");
-                let codes = if subscribe {
+                let timers = client.split(';').skip(1).any(|feature| feature == "timers=1");
+                let mut timer_only_codes=CODES[..22].to_vec();
+                timer_only_codes.push(CODES[24]);
+                let codes = if timers && !subscribe {
+                    timer_only_codes.as_slice()
+                } else if timers {
                     CODES
+                } else if subscribe {
+                    &CODES[..24]
                 } else if scans {
                     &CODES[..22]
                 } else {
@@ -1780,11 +1804,14 @@ impl Store {
                     lp(&mut p, name.as_bytes());
                 }
                 if subscribe { p.extend(self.signals.hello_limits()); }
+                if timers { p.extend(timers::hello_limits()); }
                 return Ok(p);
             }
             let deadline = c.u64()?;
             let _op_id = c.text()?;
             let ns = c.text()?;
+            // Internal schedule/progress records are not a public KV namespace.
+            if ns == timers::NS { return Err(3); }
             if op == PUT || op == CONDITIONAL_PUT || op == REMOVE {
                 let m = parse_mutation(&mut c, op, deadline, _op_id, ns)?;
                 c.end()?;
@@ -1801,6 +1828,7 @@ impl Store {
                 return Err(5);
             }
             match op {
+                TIMER_SET | TIMER_CANCEL | TIMER_STATUS => self.timer_call(op,ns,_op_id,deadline,&mut c),
                 SUBSCRIBE => {
                     let prefix = c.bound()?;
                     let endpoint = c.text()?;

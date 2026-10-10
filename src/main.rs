@@ -33,6 +33,7 @@ fn serve<S: Read + Write>(
     let mut allow_mem = false;
     let mut max_frame = membus::MAX_FRAME;
     let mut subscribe = false;
+    let mut timers = false;
     loop {
         let mut head = [0u8; 4];
         stream.read_exact(&mut head)?;
@@ -74,6 +75,8 @@ fn serve<S: Read + Write>(
         }
         let mut response = if hello && (membus::SUBSCRIBE..=membus::SIGNAL_USAGE).contains(&b[4]) && !subscribe {
             membus::reply(b[4], u64::from_le_bytes(b[5..13].try_into().unwrap()), 2, &[])
+        } else if hello && (membus::TIMER_SET..=membus::TIMER_STATUS).contains(&b[4]) && !timers {
+            membus::reply(b[4], u64::from_le_bytes(b[5..13].try_into().unwrap()), 2, &[])
         } else { store.dispatch_for_limit(&b, allow_mem, max_frame) };
         if response.len() - 4 > max_frame {
             response = membus::reply(
@@ -99,7 +102,9 @@ fn serve<S: Read + Write>(
             let mut c = membus::Cursor::new(&b[13..]);
             let _ = c.u32().unwrap(); // checked by successful hello above
             let _ = c.u8().unwrap();
-            subscribe = c.text().unwrap().split(';').skip(1).any(|feature| feature == "subscribe=1");
+            let client = c.text().unwrap();
+            subscribe = client.split(';').skip(1).any(|feature| feature == "subscribe=1");
+            timers = client.split(';').skip(1).any(|feature| feature == "timers=1");
         }
     }
 }
@@ -356,6 +361,7 @@ fn main() -> io::Result<()> {
     }
     let state_limit = config.state_limit_bytes;
     let store = Arc::new(Store::open(&path, config)?);
+    let _timers = store.start_timers()?;
     if heartbeat_ms != 0 {
         start_heartbeat(path.clone(), store.clone(), state_limit, heartbeat_ms);
     }

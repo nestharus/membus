@@ -39,6 +39,8 @@ try:
     else:raise AssertionError('invalid hello accepted')
     assert client.epoch==1 and client.channel is None
     offered=header+struct.pack('<H',len(membus.CODES))+b''.join(struct.pack('<HB',n,int(t))+membus.lp(name) for n,(name,t) in membus.CODES.items())
+    offered+=struct.pack('<HIQQHHQQI',1,membus.MAX_FRAME,4096,16*1024*1024,64,256,8*1024*1024,16*1024*1024,100)
+    offered+=struct.pack('<HIQIQQ',1,4096,8*1024*1024,65536,100,86400000)
     membus.Client.exchange=lambda *args:offered
     try:client.connect(membus.deadline_ms())
     except membus.EpochChanged as e:assert (e.previous,e.current)==(1,2)
