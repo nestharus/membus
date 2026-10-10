@@ -44,6 +44,18 @@ cannot be attributed to membus. Two-point replay extrapolation is an estimate,
 not a test at6GiB/8GiB. `account.py` retains sends/results and merges late use
 records into the parent run's file.
 
+`metric_scenario.py` provides explicit unknown-rate three-day-retirement
+thresholds, including whole-chunk granularity/pins/metadata limitations.
+`review_supplement.py` recomputes token-rate counterevidence, earlier key-slot
+limits and ledger deployment sensitivity from the saved evidence only.
+Actual File::write/sync-attempt counters were not captured at the endpoints.
+The retained monitor is commission-specific: it hardcodes this resident PID,
+and its prospective collector-reuse path has not been exercised. A future
+run needs new start files/identity and coverage validation if a collector
+dies; selecting the earliest collector alone could under-cover that run.
+The actual completed window has continuous primary disk coverage; its
+135.324-second gap is only in heartbeat instrumentation.
+
 No third-party dependency is added. Python is measurement instrumentation,
 not a production ecosystem tool. Output, target and synthetic data stay out
 of git; only the experiment source is retained here.
