@@ -292,7 +292,7 @@ mod tests {
     }
     #[test] fn real_checkpoint_capacity_refusal_stops_owner_then_repeats_after_reopen() {
         let path=path("capacity-refusal");let mut s=schedule();s.period=0;s.low=0;s.high=0;
-        let m=schedule_mutation(&s,"set");let limit=crate::mutation_bytes(&m,1,now_ms()).len() as u64;
+        let m=schedule_mutation(&s,"set");let limit=(16+crate::mutation_bytes(&m,1,now_ms()).len()) as u64;
         let generation;
         {
             let store=Arc::new(Store::open(&path,crate::Config {state_limit_bytes:limit,..Default::default()}).unwrap());
