@@ -18,7 +18,10 @@ and captures the endpoint after 3600 seconds. `disk.ps1` samples raw and
 formatted physical disk **2 D:** counters. This is this machine's mapping,
 not a portable assumption. `--resume` preserves the original endpoint and
 records an interrupted instrumentation interval. Use a tracked execution
-session; an untracked background process disappeared during this experiment.
+session; runtime observation E-ba0cb2bddcd744a08565a14a2ba215d3 (seq1103)
+records that its judge ended the detached original monitor because it could
+not link it to the seat or locate its outputs. The tracked resume preserved
+the original start/end and the continuously running disk collector.
 Same resident PID/epoch at endpoints and sampled heartbeats demonstrate the
 retained service identity; queue samples do not fill unobserved intervals.
 
