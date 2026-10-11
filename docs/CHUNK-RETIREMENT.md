@@ -3,7 +3,8 @@
 **Status:** plan for lane 87, written by claude6-eco's e17 Act on 2026-10-11. No code yet. The build follows in a
 later Act after lane 87's answers (section 12). Account: claude6-eco's ledger
 (`D:/projects/oulipoly/trunk/research/87_operations_representation/claude6-eco/ledger.json`), frontier F-E6-52.
-Working records are in that loop's `runs/e17/act-work/F-E6-52/`. Measurement scripts and their outputs are in
+Working records are in that loop's `runs/e17/act-work/F-E6-52/`. This version takes the dispositions of the plan's observe-class read
+(`runs/e17/act-work/F-E6-52/review/DISPOSITIONS.md`, O1-O21). Measurement scripts and their outputs are in
 `measurements/f_e6_52/`.
 
 **Basis.** This plan builds on these sources:
@@ -43,10 +44,12 @@ Also from the design record:
 - The tier passage: "we don't have to use all of the tiers".
 
 claude2's reading in the design record adds that nothing is rewritten or compacted. PLAN.md section 5 holds the same:
-"No rewriting or compaction of retained records". The recommended form (section 4) keeps that rule. The one departure
-is the one-time legacy import (section 5.6). PLAN.md section 12 O9 asks for exactly that kind of import: "a separately
-commissioned offline rewrite/import into a new directory with owner-visible cost". That import is question (c) to
-lane 87.
+"No rewriting or compaction of retained records". The recommended form (section 4) keeps that rule. It departs from that
+rule once, for the one-time legacy import (section 5.6). An on-disk format change "requires an explicit migration/backup
+plan" (RESIDENT.md, "State growth and upgrades"), and PLAN.md section 5 applies policy changes to new chunks "unless an
+explicit migration is commissioned". That import is question (c) to lane 87. The plan names its other departures where
+they arise: the `latest` class's reading of "expired" (5.1), the 1 h rotation age (5.2), the narrower anti-resurrection
+record (5.3) and the reserve's use (5.5).
 
 ## 2. Measurements the plan rests on
 
@@ -62,14 +65,17 @@ All of these were read from records with no new load on 2026-10-11. The working 
 | Stripe records, all four logs | 8,255,306 B, 10,886 records, first record 2026-10-09T19:19:32.595Z | `stripe_split.py`, read 08:59:25.765Z (`stripe-split.json`) |
 | Appended in the last 24 h | 4,703,508 B, 195,979.5 B/h, 278.6 records/h, 0 removes | same read |
 | Appended in the last 6 h / since 07:21Z | 326,167.8 B/h / 397,806.7 B/h | same read |
-| Distinct op_ids appended in 24 h (dedup table occupancy, lower bound) | 6,687 of 262,144 (2.55%) | same read; refused and deduplicated puts leave no record, so the table also holds op_ids this count cannot see |
+| Dedup table entries backed by records appended in 24 h | 5,581 of 262,144 (2.1%): 6,687 distinct op_ids less the 1,106 timer progress puts, which skip dedup (src/lib.rs:1064, :1488-1489) | same read; a refusal before admission and a deduplicated retry add no entry (src/lib.rs:1561-1660), so the entries this count cannot see are mem-ack and failed-append outcomes only |
 | Distinct keys ever written | 1,567 (quota 711, slots 636, capacity 195, lease-claims 9, timers 4, lease-control 1, test namespaces 11) | same read |
 | Quota probes in 24 h | 174 probes, 7 skipped, 732 `probe-held` events | `C:/Users/xteam/.pillars/quota/events.jsonl`, read 08:59:35Z (`probe-count.txt`) |
-| Lease service writes in 24 h | lease-claims 269 records (71,811 B), lease-control 137 records (20,139 B), about 2.3 records and 530 B a probe | `stripe-split.json` |
+| quotafwd | writes no membus records: it subscribes to and scans quota `event/`, and its hourly prune is off (`D:/projects/machine-tools/trunk/quotafwd.py`:1-27, :49-51 at fd17a58); its timer watches arm the membus timers counted under `__membus_timers_v1` | read 09:40Z |
+| Lease service writes in 24 h | lease-claims 269 records (71,811 B), lease-control 137 records (20,139 B), about 2.3 records and 530 B a probe, counting the 3 `inference/` claim records and every lease-control write | `stripe-split.json` |
 | Metric day files (all series, `D:/projects/metrics/data/raw`) | 2,953,667 B on 2026-10-10 (123,069 B/h); 2,064,032 B on 2026-10-11 to 08:59Z (about 229 kB/h) | read 08:59:42Z (`metric-day-files.txt`) |
 | F-E6-48's metric-namespace thresholds (8 GiB within 30 days) | 10,741,670 B/h with nothing retired; 107,416,701 B/h under 72 h retirement | `runs/e9/act-work/F-E6-48/METRIC-RETENTION.md` (seq 1228) |
 
-The writers in the last 24 h, by namespace and key family (`stripe-split.json`, `last_24h`):
+The writers in the last 24 h, by namespace and key family (`stripe-split.json`, `last_24h`). Each family is mapped to its
+writer by lane 88's description of its writers' keys (claude6-eco seq 1164). The split is read from membus's own
+records, where every record carries its namespace and key; the writers' own logs were read only for the probe count.
 
 | Writer | Records | Bytes | B/h | Class proposed (section 5.1) |
 |---|---|---|---|---|
@@ -103,7 +109,7 @@ choose otherwise (seq 1235). This plan only notes that such a namespace fits the
 | expire 24 h (E1) | 72,345 B | 2,406 B | 9 |
 | other, kept (F: test namespaces) | 21,984 B | 11,135 B | 12 (10 tombstones) |
 
-So 93% of the bytes are superseded versions of 45 state keys. The live set is 558,444 B, or 6.7% of what is stored.
+So 92% of the bytes (7,662,200 of 8,301,432) are superseded versions of 45 state keys. The live set is 558,444 B, or 6.7% of what is stored.
 The kept bytes under each form are in section 4.
 
 ## 3. The problem points this plan settles
@@ -115,7 +121,9 @@ The kept bytes under each form are in section 4.
 2. **Key slots are never reclaimed.** Every quota, slots and capacity `event/` key is new, at about 764 a day. Each
    takes a slot in its namespace's 500,000 quota for good.
 3. **Health cannot see the limits that refuse puts.** read_only is sticky after any client's failed append
-   (src/lib.rs:1731-1732). The 24 h dedup table fills at about 182 continuously renewing names. Only state bytes are
+   (src/lib.rs:1731-1732). The 24 h dedup table fills at about 182 continuously renewing names (1,440 op_ids a day each at a 60 s
+   renewal). At today's base of 5,581 entries the ceiling is (262,144 - 5,581) / 1,440 = 178 such names, or a sustained
+   10,690 new op_ids an hour on top of today's 233. Only state bytes are
    watched, through fleet's heartbeat_warn `state_high_water` (fleet-manager `config/services.toml`:210 at 67ff2b9).
    The decider asked for heartbeat flags for read_only and dedup occupancy (claude6-eco e14 REPORT.md row 11).
 4. **Replay leaves no record.** What replay found after the 14:14:52Z bugcheck is recorded nowhere (seq 1606).
@@ -128,17 +136,17 @@ rotation age, with chunks also cut at 8 MiB.
 
 | Form | How a chunk holding a rarely rewritten key's latest version is retired | Kept bytes, latest class, 60 s / 1 h | Added writes | Fits the founder's words |
 |---|---|---|---|---|
-| **W, wait** (named; first dismissed for pinning) | When that key is next rewritten or removed. Until then the chunk stays. | 101,348 / 1,823,830 (37 / 20 pinned chunks, the largest 10,425 / 253,645 B) | none | yes: a chunk retires only once all its records are superseded |
-| **W24, wait with the retry window** | As W, and a superseded chunk also waits until close + 24 h | 4,390,154 / 5,120,317 | none | yes |
-| **C, carry** (named; first dismissed as rewriting) | At carry age, membus re-appends the latest versions still in the oldest chunk to the open chunk, then retires the old one | carry 1 h: 401,746 / 678,139, adding 17,059 B/h; carry 24 h: 4,380,960 / 4,553,637, adding 502 B/h | the carried copies | no: it copies retained records |
-| **K, checkpoint** (named; first dismissed as a new format) | A snapshot file of every live latest version (30,604 B now), after which every earlier latest-class chunk retires | snapshot plus open chunks | the whole live set at each checkpoint | no: it rewrites the live set into a new file |
+| **W, wait** (the commission's whole-chunk expiry; first dismissed for pinning) | When that key is next rewritten or removed. Until then the chunk stays. | 101,348 / 1,823,830 (37 / 20 pinned chunks, the largest 10,425 / 253,645 B) | none | a reading: "expired" read as superseded (5.1) |
+| **W24, wait with the retry window** | As W, and a superseded chunk also waits until close + 24 h | 4,390,154 / 5,120,317 | none | a reading: "expired" read as superseded and past close + 24 h (5.1) |
+| **C, carry** (not named in the commission; first dismissed as rewriting) | At carry age, membus re-appends the latest versions still in the oldest chunk to the open chunk, then retires the old one | carry 1 h: 401,204 / 689,992, adding 17,059 B/h; carry 24 h: 4,380,960 / 4,553,637, adding 502 B/h | the carried copies | no: it copies retained records |
+| **K, checkpoint** (PLAN.md section 12 O4's checkpoint extended to values; not named in the commission; first dismissed as a new format) | A snapshot file of every live latest version (30,604 B now), after which every earlier latest-class chunk retires | snapshot plus open chunks | the whole live set at each checkpoint | no: it rewrites the live set into a new file |
 | **O, owner refresh** (not named in the commission) | membus signals `pinned` (section 6 signals) for a key whose latest version holds a chunk past a pin age. The key's owner re-puts it, which moves the copy decision to the writer. | as W, until owners act | owners' re-puts | yes for membus; writers change |
 | **N, nothing** (the null form) | Never. The logs grow and the state limit refuses. | all 7,692,804, growing 196 to 398 kB/h | none | n/a |
 
-**Pairwise:**
+**Pairwise, first without the retry window** (as `retire_sim.py` computes C and K):
 - **W against N.** N reaches 8 GiB in about 903 days at 395,969 B/h. It keeps every event key's slot, and replay time
   grows with the logs. W holds the store near its live set. W wins.
-- **W against C.** At current rates W keeps less than carry at 1 h (101 kB against 402 kB with 60 s rotation) and
+- **W against C.** At current rates W keeps less than carry at 1 h (101 kB against 401 kB with 60 s rotation) and
   copies nothing. C's only gain is a hard bound when pinned chunks are large. The measured largest pinned chunk is
   10 KB at 60 s and 254 KB at 1 h. W wins. C stays the fallback when `pinned_bytes` crosses its bound (section 6).
 - **W against K.** K's snapshot (30,604 B) is the smallest form. But it adds a file format, a rewrite and a second
@@ -154,11 +162,33 @@ rotation age, with chunks also cut at 8 MiB.
   from retained records only (src/lib.rs:1064), so a client's retry of a put whose record was retired would apply
   again. An unconditional retry could then overwrite a newer value with an older one. W24 keeps superseded latest-class
   chunks for the 24 h retry window, which matches the dedup table's own horizon (PLAN.md section 4). It costs about
-  4.3 MB more. **W24 is chosen.** A persisted dedup record would let W retire sooner, as a later slice weighs.
+  4.3 MB more. A persisted dedup record would let W retire sooner, as a later slice weighs.
 
-**Chosen: W24 with 1 h rotation for finite classes.** At 60 s rotation W24 keeps 4.39 MB, but in about 2,650 chunk files
-(about 110 latest-class chunks an hour, each waiting 24 h). At 1 h it keeps 5.12 MB in about 120 files. Forever
-namespaces rotate by size only (PLAN.md section 12 O3).
+**Pairwise again, with the retry window on every form.** C and K lose dedup across a restart exactly as W does if they
+retire a superseded chunk inside 24 h. So each form keeps every latest-class chunk closed in the last 24 h (4,541,584 B
+at 1 h rotation: `S_carry_24h_kept_bytes` 4,553,637 less the 12,053 B of stale latest versions it adds), and the forms
+differ only in the chunks older than that:
+- **W24 against C24** (carry at 24 h): W24 keeps 5,120,317 B. C24 keeps 4,553,637 B and copies 502 B/h. C24 saves
+  566,680 B (11%) at today's rates, at the cost of a rewrite path and a departure from "nothing is rewritten". W24
+  wins while pinned bytes stay small. C24 is the fallback when `pinned_high_water` fires.
+- **W24 against K24** (checkpoint at 24 h): K24 keeps about 4,572,188 B (the young chunks plus a 30,604 B snapshot). It
+  saves about 548 kB, but adds a second replay path and a new file format. W24 wins for the same reason.
+- **W24 against O24:** O24 keeps what W24 keeps until owners re-put, and it adds subscriptions to every writer. W24
+  wins. O24 is the fallback with no membus rewrite.
+- **W24 against N:** N keeps all 7,692,804 B, growing, with every event slot held. W24 wins.
+- **C24 against K24:** C24 copies 6 keys a day, while K24 copies all 45, so C24 is the better rewriting fallback.
+
+**W24 is chosen.**
+
+**Chosen: W24 with 1 h rotation for finite classes.** File counts follow from `chunks_by_class` over the 37.78 h the
+records span:
+- **60 s rotation:** W24 keeps 4.39 MB in about 5,360 files: about 2,690 latest-class files (110.6 an hour for 24 h,
+  plus 37 pinned), about 2,580 expire 3 d (35.3 an hour for 73 h) and about 89 expire 24 h.
+- **1 h rotation:** W24 keeps 5.12 MB in about 360 files: about 94 latest-class (3.07 an hour for 24 h, plus 20 pinned),
+  about 232 expire 3 d, about 28 expire 24 h and 7 forever.
+
+This departs from PLAN.md section 4's initial age of 60 s, for the file count. Forever namespaces rotate by size only
+(PLAN.md section 12 O3).
 
 ## 5. Design
 
@@ -172,10 +202,18 @@ Each namespace, or key prefix within one, takes one class. Longest prefix wins. 
 | `latest` | a closed chunk retires once it holds no key's latest version and close + 24 h retry window has passed | quota `state/`, `open`, `resets`, `tokens/`, `fit/`; slots `<resource>`; lease-control; membus timers (membus's own policy, built in) |
 | `forever` | never | everything else, ledgers included (PLAN.md section 5: retention=forever for authoritative ledgers and artifacts) |
 
+**The `latest` class is a reading of the founder's words.** The founder bases expiry on close time: "we only retire a
+chunk if its newest record has expired ... the chunk close time ... is what we base expiration time off of" (design
+record :243). `latest` reads "expired" as "superseded by a committed newer version", with close + 24 h as the time
+floor. That is lane 88's class (seq 1164 (2)), and F-E6-48 located it as the open difference from whole-chunk expiry.
+It is named to lane 87 as question (d).
+
 **Setting policies.** A policy is a record in a gated namespace `__membus_policy_v1`. Client puts and removes there are
 refused, as the timers namespace refuses them (src/lib.rs:1814). A new opcode `POLICY_SET` (24) writes it and
-`POLICY_GET` (25) reads it, and `membus policy` exposes both as a CLI. A policy applies to chunks opened after it
-commits. A closed chunk stores its policy and close time unchanged (PLAN.md section 5). eco's own test namespaces left
+`POLICY_GET` (25) reads it, and `membus policy` exposes both as a CLI. A class is its kind and retention, for example
+`expire(3 d)`. Each distinct class has its own folder and its own open chunk per stripe, and at most 64 classes exist
+(PLAN.md section 12 O5); `POLICY_SET` refuses a 65th. A policy change moves a prefix's later writes to another class's
+open chunk. No chunk's class or close time ever changes (PLAN.md section 5). eco's own test namespaces left
 on the production bus (`e6-resident-restart-*`, `e6-install-proof`, `F-E6-33-health`) take `expire(1 d)`, set by eco at
 install. `quota-test` is lane 88's.
 
@@ -187,7 +225,7 @@ stripe and class:
 - Chunk numbering: `chunk-seq` is monotonic per stripe across classes.
 
 A chunk closes in two cases. It closes at append when its bytes would pass 8 MiB or it is older than its rotation age
-(1 h for finite classes). A 1 s maintenance tick also closes idle chunks past their age. A chunk opens only when a
+(1 h for finite classes, a departure from PLAN.md section 4's 60 s; section 4 gives the file counts). A 1 s maintenance tick also closes idle chunks past their age. A chunk opens only when a
 record arrives, so no empty chunks are made (PLAN.md section 12 O3).
 
 The catalogue is `state/chunks/catalogue.log`. It holds append-only records, flushed before they take effect:
@@ -196,10 +234,15 @@ The catalogue is `state/chunks/catalogue.log`. It holds append-only records, flu
 - `retiring(seq, horizons)`
 - `retired(seq)`
 
+The `open` record is flushed before the chunk file is created. So a crash leaves at most a record with no file, which
+replay closes as an empty chunk. A chunk file with no `open` record is not produced by any crash. Replay treats it as a
+storage error (5.5).
+
 When the catalogue passes 1 MiB, it is rewritten atomically (tmp, flush, rename) to the live list. That rewrite is
 metadata only and never copies records.
 
-At most 16 open handles exist (4 stripes by 4 classes). The flush budget counts one flush per touched handle (PLAN.md
+Open handles are 4 per class with an open chunk. The first policies make 5 classes (`expire(3 d)`, `expire(24 h)`,
+`expire(1 d)`, `latest`, `forever`), so 20 handles. The flush budget counts one flush per touched handle (PLAN.md
 section 12 O5). The build measures the flushes a gather adds, against today's ones.
 
 ### 5.3 Index, key slots and anti-resurrection
@@ -210,10 +253,26 @@ set of keys it holds.
 **Replay order.** Replay resolves each key by its version, which is membus's global `next` sequence, not by file order.
 A key moved to another class by a policy change can have records in two open chunks, and versions still order them.
 
-**Key slots:**
-- A remove decrements the namespace's key count when it commits. This changes KV1.md section 7's "Missing-key remove
-  persists a tombstone and consumes a key slot". The tombstone stays as index metadata charged to `index_cap`, not to
-  the namespace quota.
+**The version high-water.** Today replay rebuilds `next` as the highest retained version plus one (src/lib.rs:1050),
+and nothing else persists it. Once retirement removes the record that held the highest version, a restart would lower
+`next` and reuse version numbers:
+- an old client's conditional put expecting a retired version could succeed;
+- a new version could land at or below a horizon and be dropped by the next replay.
+
+So every `close` and `retiring` catalogue record carries the current `next`. Replay sets `next` to the larger of the
+retained versions plus one and the catalogue's highest recorded `next`. A retirement whose `retiring` record cannot be
+flushed with it does not proceed.
+
+**Key slots.** Two counts are kept apart. `state.keys` counts index entries, tombstones and expiry summaries included,
+against `index_cap`. `namespace_counts` counts live (non-tombstone) keys against the namespace quota. Today admission
+counts a key as new only when it has no index entry (src/lib.rs:1571), and commit raises both counts together
+(:1641-1644). The build splits that:
+- **Put.** A put to a key with no entry is new to both counts. A put to a tombstoned key is new to the namespace count
+  only, and it is checked against the quota at admission (:1575).
+- **Remove of a live key.** The namespace count falls when the remove commits. The tombstone stays as an index entry,
+  charged to `index_cap`.
+- **Remove of a missing key.** It persists a tombstone charged to `index_cap` alone. This changes KV1.md section 7's
+  "Missing-key remove persists a tombstone and consumes a key slot", and that section is updated with the build.
 - A tombstone's index entry is dropped once no retained chunk holds an older record of its key. Its chunk's latest count
   then falls.
 - When an expire-class chunk retires, each key whose latest version it held leaves the index, and its slot is freed.
@@ -228,6 +287,13 @@ of one of its keys. That happens only after a policy change. In that case its `r
 (namespace, key, version) horizon. Replay ignores versions at or below a horizon. A horizon is dropped when the older
 chunks retire. If the horizon cannot be persisted, retirement waits.
 
+O8 asks for every key's latest horizon to be persisted before any chunk retires. This plan persists a horizon only where
+an older version stays retained, which is a narrower record. It suffices because:
+- a key with no older retained version has nothing to resurrect;
+- versions are never reused (the high-water above).
+
+The narrowing is a departure from O8's wording, named here; T4 tests it.
+
 ### 5.4 Retirement
 
 A maintenance pass runs every 10 s on the bounded I/O pool. For each closed chunk that is eligible by its class:
@@ -236,9 +302,15 @@ A maintenance pass runs every 10 s on the bounded I/O pool. For each closed chun
 3. Delete the file.
 4. Flush `retired(seq)`.
 
-Values are served from memory (src/lib.rs:1207-1216), and snapshots and scans read memory, so no reader holds a chunk
-file in this build. Deletion therefore needs no reader count. A warm tier would need one, but warm is not in this
+Values are served from memory (src/lib.rs:1207-1216), and snapshots and scans read memory, so no membus reader holds a
+chunk file in this build. Deletion therefore needs no reader count. A warm tier would need one, but warm is not in this
 slice.
+
+A process outside membus can still hold a chunk open: a measurement script, an indexer, or a backup. REPORT.md item 14
+names the same case for MoveFileExW under a delete-sharing reader. When the delete fails:
+- the chunk stays `retiring`, its bytes stay counted, and each later pass retries it;
+- HEALTH2 counts it as `retire_blocked` with the oldest such chunk's age;
+- `pinned_high_water` does not cover it, so `retire_blocked_high_water` (any chunk blocked over 1 h) is added as a flag.
 
 **Clock** (PLAN.md section 5). Eligibility uses UTC close time cross-checked against monotonic elapsed time within a
 run, and never retires earlier than both allow. After a restart, retirement pauses and health reports
@@ -255,13 +327,19 @@ harness against the new membus before lease-claims takes `expire(24 h)`. Until t
 
 - **A crash between `retiring` and `retired`** is finished at start: the delete is idempotent. The replay record lists
   each one.
-- **A file missing with no `retiring` record** is a storage error, not an expiry (PLAN.md section 5). membus starts
-  read_only with `storage_error` set, and the replay record names the chunk.
-- **Torn tails** are truncated only in chunks that were open at the crash: a short final header, an incomplete final
-  body, or a final-frame CRC failure. A torn tail in a closed chunk counts as interior corruption.
+- **A file missing with no `retiring` record** is a storage error, not an expiry (PLAN.md section 5). So is a chunk file
+  with no `open` record (5.2). In both cases membus starts read_only with `storage_error` set, and the replay record
+  names the file.
+- **Torn tails** are truncated only in chunks that were open at the crash, and only as today: a short final header or
+  an incomplete final body (src/lib.rs:971-973, :994-996). A CRC failure in any complete frame, a final one included,
+  still refuses start (src/lib.rs:1001-1006; KV1.md section 6: "A checksum-failed complete final frame is not silently
+  discarded"). A torn tail in a closed chunk counts as interior corruption.
 - **Interior corruption** still refuses start, as today (replay in src/lib.rs:951-1105). The replay record is written before exit
   and names the file and offset.
 - **The state limit** (8 GiB) counts retained chunk bytes. Retired bytes leave the count at `retired`.
+  RESIDENT.md requires PLAN.md's 1 GiB maintenance reserve and 7 GiB ordinary ceiling before a rotation rollout
+  ("State growth and upgrades"). So ordinary admissions refuse with 7 at 7 GiB, and catalogue, retirement and import
+  writes may use the last 1 GiB. `state_high_water` stays at 75% of the 8 GiB limit.
 - **read_only** stays sticky after a failed append, as today. It becomes visible (section 6), and a restart clears it.
   Repairing it is the later slice's (5.8).
 
@@ -274,7 +352,10 @@ would never retire. Read as a mixed chunk closed at install, any of the six rare
 So the first start of the new build, during the stopped swap, imports the live set:
 - It replays the legacy logs as today and appends each key's latest version (558,444 B now), at its original version
   and timestamp, into new chunks by class.
-- It also writes the 24 h dedup entries' records it needs to keep retries recognised.
+- Retries stay recognised without copying more. For 24 h after the import, each start also replays the legacy logs for
+  their dedup entries alone, never for values. After that it stops, and the legacy logs are left only for rollback.
+  Copying instead would mean every record of the last 24 h (4,703,508 B), since replay builds the table from every
+  record in the window (src/lib.rs:1064).
 - It flushes the catalogue, records `import(legacy_sha256 per stripe, keys, bytes)`, and then moves the legacy files to
   `state/legacy-<epoch>/`, unmodified.
 
@@ -282,8 +363,9 @@ The legacy files stay for rollback until lane 87 or lane 88 asks for their remov
 means restoring them, so the old binary never sees writes made after the swap. Whether lane 88's writers re-put them
 from their files is not located (seq 1932). It is asked in F-E6-74's post to lane 88.
 
-This is PLAN.md section 12 O9's "offline rewrite/import into a new directory with owner-visible cost". The cost is
-about 0.56 MB written once, plus 8.26 MB kept until removal. It is question (c) to lane 87.
+It is the explicit migration RESIDENT.md asks for an on-disk format change and PLAN.md section 5 for a policy applied to
+existing records. Its owner-visible cost is about 0.56 MB written once, plus 8.26 MB kept until removal. It is question
+(c) to lane 87.
 
 ### 5.7 Expected footprint
 
@@ -310,12 +392,15 @@ live set or lane 83's adoption moves it.
   - a put cut mid-write with replay after a failed sync;
   - a cold restart near the state cap.
 - **In a later hardening slice:**
-  - the lease-control write gate. The e14 decider put it "before any fenced adopter", and none is live: quota uses its
-    token only for release (claude6-eco `runs/e17/act-work/F-E6-74/reads-helper/return.md` (d));
+  - the lease-control write gate, with a documented repair for the persistent-refusal states (e14 REPORT.md row 10).
+    The decider put it "before any fenced adopter". The fenced adopters it names are lane 88's reopen-timer replace and
+    the pillar successor write (REPORT.md:122). Quota uses its token only for release (claude6-eco
+    `runs/e17/act-work/F-E6-74/reads-helper/return.md` (d)). Whether those two adopters are live is not read here; it is
+    asked of lane 88, and the slice moves ahead of any adoption it reports;
   - a 2000 ms reconcile put cut under a flush stall;
-  - "boundary 14". That name is located only in this commission. I read it as e14 REPORT.md's item 14 boundaries (the
-    MoveFileExW under a delete-sharing reader, and a SYSTEM or session 0 open of the LOCAL pipe). Lane 87 can correct
-    that reading.
+  - boundary 14's remaining entries: e14 REPORT.md item 14, "Not tied to a decision" (:185-196), lists five. The first
+    two are in this slice's tests, the reconcile is above, and this plan carries the MoveFileExW case into retirement
+    (5.4). The SYSTEM or session 0 open of the LOCAL pipe goes to the later slice.
 
 **Tiers** (warm, cold, shadows; PLAN.md section 5) stay later slices, as PLAN.md's "first slice" orders them.
 
@@ -326,19 +411,22 @@ key=value list:
 - `state_bytes`, `state_limit_bytes`, `state_high_water` (75%);
 - `read_only`, `storage_error`, `expiry_degraded`;
 - `dedup_entries`, `dedup_cap`, `dedup_high_water` (70%);
-- `keys`, `index_cap`, and `namespace_high_water`, which names each namespace at or above 70% of its quota with its
-  count;
+- `keys`, `index_cap`; each namespace's live key count against its quota (11 namespaces today); and
+  `namespace_high_water`, set when any namespace is at or above 70%;
 - `chunks_open`, `chunks_closed`;
 - `retained_bytes` per class, `pinned_bytes`, `pinned_high_water` (64 MiB, configurable);
-- `retired_chunks`, `retired_bytes` for the server's lifetime.
+- `retired_chunks`, `retired_bytes` for the server's lifetime; `retire_blocked` with the oldest blocked chunk's age.
 
-The Python client gains `health2()` and `get_status()`.
+**Wire version.** Opcodes 24-27 are additive under kv/1 minor 0, as IO_METRICS (opcode 9) is (KV1.md, "F-E6-20
+implemented grouped write policy"). HELLO and HEALTH keep their layouts, and the server still accepts kv/1.0
+(src/lib.rs:1762). A client learns of the new opcodes by calling them: an older server returns `unsupported` (2). The
+Python client gains `health2()` and `get_status()`, which map `unsupported` to "not available on this server".
 
 **The heartbeat** (src/main.rs:495-541) adds the flags `read_only`, `storage_error`, `expiry_degraded`,
-`dedup_high_water`, `namespace_high_water` and `pinned_high_water`, and the numbers `dedup_entries`, `retained_bytes`
-and `retired_bytes`. Fleet flags a heartbeat count above 0 (fleet-manager 67ff2b9). So only the flags are meant for
+`dedup_high_water`, `namespace_high_water`, `pinned_high_water` and `retire_blocked_high_water`, and the numbers `dedup_entries`, `retained_bytes`
+and `retired_bytes`. Fleet flags a heartbeat count above 0 (fleet-manager 67ff2b9, lane 88's answer in claude6-eco row 1924, watch 7). So only the flags are meant for
 `heartbeat_warn`, and which ones lane 88 wires is its question. A beat grows from about 257 B (402,249 B over 1,565
-beats) to about 480 B. That is about 1.4 MB a day of D: writes at the 30 s beat.
+beats) to an estimated 480 B (about 22 B a field for ten fields; T9 measures it). That is about 1.4 MB a day of D: writes at the 30 s beat.
 
 **Replay record.** At ready, membus writes `state/replay.json` (tmp, rename) and appends one line to `state/replay.log`,
 which is rewritten to its last 256 lines at 1 MiB. Each record holds:
@@ -360,16 +448,16 @@ Every base test passes unchanged except where KV1.md's slot rule changes, and th
 | T1 | Rotation by size (8 MiB) and age, idle close by the tick | each close has a catalogue `close` within 1 s of its boundary; no empty chunk exists |
 | T2 | Expire class with a mocked clock | the file is deleted at the first tick at or after close + retention and never before; records in an open chunk wait; GET returns absent and GET_STATUS `expired`; after the summary's 30 days GET_STATUS returns `missing` |
 | T3 | Latest class | a superseded chunk retires only after close + 24 h; a chunk holding one latest version stays until that key is rewritten, then retires on the next tick past its window |
-| T4 | Removes, tombstones and anti-resurrection | a remove frees its quota slot at commit; the tombstone's index entry drops once no older record is retained; after a policy change that retires a newer chunk first, a restart never returns the older value |
+| T4 | Removes, tombstones, versions and anti-resurrection | a remove frees its quota slot at commit; a put to the removed key takes the slot back and is refused at the quota when the namespace is full; a missing-key remove charges `index_cap` alone; the tombstone's index entry drops once no older record is retained; after the highest-versioned record retires, a restart's `next` is above every version ever issued; after a policy change that retires a newer chunk first, a restart never returns the older value |
 | T5 | F-E6-48's 1,000-key run repeated (put, overwrite, remove) | slots return to 0 after removes; after retirement the retained bytes fall below the 680,000 B F-E6-48 recorded, to the chunks still within their windows |
 | T6 | Kill at each retirement step (before `retiring`, after it before delete, after delete before `retired`) | restart finishes or keeps the file; every latest value and version is unchanged; the replay record lists each completion |
-| T7 | Replay record | a torn tail in an open chunk is listed with chunk, offset, bytes and reason; interior corruption in a closed chunk refuses start with the record written; a missing uncatalogued-retired file starts read_only with `storage_error` |
+| T7 | Replay record and storage errors | a short header or short body in an open chunk is truncated and listed with chunk, offset, bytes and reason; a CRC failure in a complete final frame refuses start, as today; interior corruption in a closed chunk refuses start with the record written; a file missing with no `retiring` record, or a chunk file with no `open` record, starts read_only with `storage_error`; a delete held by an outside reader leaves the chunk `retiring`, counted and retried, with `retire_blocked` set |
 | T8 | Dedup across retirement and restart | a retry of a put within 24 h, after a restart, returns its original outcome and writes nothing |
 | T9 | HEALTH2 and the heartbeat | each field equals the store's state; `read_only` turns true after a failed append (test seam `fail_partial_append`); `dedup_high_water` at 70% of a small `--dedup-cap`; `namespace_high_water` at 70% of a small `--quota`; the beat stays under 512 B |
 | T10 | Clock jumps | a forward UTC jump of 1 day mid-run retires nothing early; a backward jump across a restart sets `expiry_degraded` and pauses retirement |
-| T11 | Legacy import on a copy of production state | every key's latest value, version and namespace count equal before and after; the legacy files' sha256 is unchanged in `legacy-<epoch>/`; the previous binary serves the restored copy |
-| T12 | Fault: replay after a failed sync (`fail_sync`) with a put cut mid-write | replay truncates only the open chunk's tail; the acknowledged os and flush puts survive the process kill |
-| T13 | Fault: cold restart near the cap | with retained bytes within one record of `--state-limit-bytes` and retirement due, start succeeds, retires, and admits new puts |
+| T11 | Legacy import on a copy of production state | every key's latest value, version and namespace count equal before and after; a retry of a put made within 24 h before the import returns its original outcome after the import and after a further restart; past 24 h the legacy logs are no longer replayed; the legacy files' sha256 is unchanged in `legacy-<epoch>/`; the previous binary serves the restored copy |
+| T12 | Fault: replay after a failed sync (`fail_sync`) with a put cut mid-write | replay truncates only the open chunk's short tail; the acknowledged os and flush puts survive the process kill |
+| T13 | Fault: cold restart near the cap | with retained bytes within one record of the 7 GiB ordinary ceiling (scaled down by flags) and retirement due, start succeeds, the catalogue and retirement writes use the reserve, and new puts are admitted once retirement brings bytes under the ceiling |
 | T14 | Python client | `health2()` and `get_status()` parse; existing calls are unchanged |
 | T15 | Production-shaped replay (private pipe, a copy of the state, through lineup with `disk:d`) | after import and a simulated 73 h of the measured mixture, retained bytes are within 10% of section 5.7's estimate; flushes per gather are reported beside today's |
 | T16 | Lease harness against the new membus (combined qualification) | membus-leases' qualification passes with lease-claims `latest` and again with `expire(24 h)`, including a vacant read after a retired claim |
@@ -412,7 +500,9 @@ Every base test passes unchanged except where KV1.md's slot rule changes, and th
 1. **CR1:** the catalogue, chunks, rotation and replay by version, with the replay record (T1, T6, T7, T12).
 2. **CR2:** policies and the gated policy namespace; expire and latest retirement; key slots; anti-resurrection; clock
    (T2-T5, T8, T10, T13).
-3. **CR3:** HEALTH2, the heartbeat fields and the Python client (T9, T14).
+3. **CR3:** HEALTH2, the heartbeat fields and the Python client (T9, T14). Update RESIDENT.md's line that "No automatic
+   capacity-pressure alert consumer is wired yet", since fleet's heartbeat_warn reads `state_high_water`
+   (`services.toml`:210).
 4. **CR4:** the legacy import and the production-shaped replay (T11, T15).
 5. **CR5:** review (section 9), with fixes by its decider's report.
 6. **CR6:** the combined qualification (T16), release, the swap window and readback, and the policies set by their
@@ -431,13 +521,17 @@ The build itself is one Act's work under lane 87's one build at a time (seq 1083
 
 **To lane 87 (exec):**
 - (a) May chunk retirement's build start while the leases repair's re-gate waits for room? The repair's code and unit
-  tests are done (membus-leases branch F-E6-74-repair, 02c5ae7) and its runbook run has not started.
+  tests are done (membus-leases branch F-E6-74-repair, head bf043ea) and its runbook run has not started.
 - (b) Should the re-gate and this slice's own runbook run be one run on the combined release (runbook :104-107)? That
   is about 90 seats instead of about 180, with one stopped window for both installs.
-- (c) Will you commission the one-time legacy import (5.6) as PLAN.md section 12 O9 asks? It writes about 0.56 MB once
-  and keeps the 8.26 MB legacy logs until their removal is asked for.
+- (c) Will you commission the one-time legacy import (5.6) as the explicit migration RESIDENT.md and PLAN.md section 5
+  ask for? It writes about 0.56 MB once and keeps the 8.26 MB legacy logs until their removal is asked for.
+- (d) The `latest` class reads the founder's "expired" as superseded and past close + 24 h (5.1). Does lane 87 accept
+  that reading, or put it to the founder?
 
 **To lane 88 (tooling):**
 - Which class each key family takes (section 5.1's table), including capacity `event/` and `quota-test`.
-- Whether any reader of `event/` keys needs them past 3 days.
+- Whether any reader of `event/` keys needs them past 3 days. quotafwd's prune, when turned on, removes them after 7
+  days (`quotafwd.py`:49).
+- Whether lane 88's reopen-timer replace and the pillar successor write are live as fenced lease adopters (5.8).
 - Which of section 6's heartbeat flags its watchers read, and whether HEALTH2's fields are the ones it needs.

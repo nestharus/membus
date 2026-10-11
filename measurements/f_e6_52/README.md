@@ -10,8 +10,10 @@ Working records are in that loop's `runs/e17/act-work/F-E6-52/`, including the h
 and the metric day-file sizes.
 
 - `stripe_split.py STATE_DIR OUT.json` splits the records by namespace and key family over four windows: since 00:44Z,
-  since 07:21Z, the last 24 h and the last 6 h. It also counts the 24 h distinct op_ids (a lower bound of the dedup
-  table's occupancy) and the distinct keys. The output is `stripe-split.json`, read 2026-10-11T08:59:25.765Z.
+  since 07:21Z, the last 24 h and the last 6 h. It also counts the 24 h distinct op_ids and the distinct keys. The
+  output's `dedup.note` calls the op_id count a lower bound of the dedup table's occupancy. That note is corrected in
+  the plan (section 2): timer progress puts skip dedup (1,106 of the 6,687), and refusals and deduplicated retries add
+  no entry, so 5,581 entries are record-backed, plus any mem-ack and failed-append outcomes. The output is `stripe-split.json`, read 2026-10-11T08:59:25.765Z.
 - `retire_sim.py STATE_DIR OUT.json` replays the records under the plan's classes and its candidate retirement forms
   (wait, wait with the 24 h retry window, carry, checkpoint), with 60 s and 1 h rotation. The output is
   `retire-sim.json`, read 2026-10-11T09:06:03.640Z.
