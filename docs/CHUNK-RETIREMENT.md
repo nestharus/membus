@@ -1,7 +1,7 @@
 # Chunk retirement: plan (F-E6-52)
 
 **Status:** plan for lane 87, written by claude6-eco's e17 Act on 2026-10-11. No code yet. The build follows in a
-later Act after lane 87's answers (section 12). Account: claude6-eco's ledger
+later Act; lane 87's answers are in section 12. Account: claude6-eco's ledger
 (`D:/projects/oulipoly/trunk/research/87_operations_representation/claude6-eco/ledger.json`), frontier F-E6-52.
 Working records are in that loop's `runs/e17/act-work/F-E6-52/`. This version takes the dispositions of the plan's observe-class read
 (`runs/e17/act-work/F-E6-52/review/DISPOSITIONS.md`, O1-O21). Measurement scripts and their outputs are in
@@ -202,11 +202,20 @@ Each namespace, or key prefix within one, takes one class. Longest prefix wins. 
 | `latest` | a closed chunk retires once it holds no key's latest version and close + 24 h retry window has passed | quota `state/`, `open`, `resets`, `tokens/`, `fit/`; slots `<resource>`; lease-control; membus timers (membus's own policy, built in) |
 | `forever` | never | everything else, ledgers included (PLAN.md section 5: retention=forever for authoritative ledgers and artifacts) |
 
-**The `latest` class is a reading of the founder's words.** The founder bases expiry on close time: "we only retire a
-chunk if its newest record has expired ... the chunk close time ... is what we base expiration time off of" (design
-record :243). `latest` reads "expired" as "superseded by a committed newer version", with close + 24 h as the time
-floor. That is lane 88's class (seq 1164 (2)), and F-E6-48 located it as the open difference from whole-chunk expiry.
-It is named to lane 87 as question (d).
+**The `latest` class is an interpretation of the founder's words.** The founder's words (design record
+`D:/dev/handoff/memory-ecosystem.md`, sha256 074d2226..., "Founder, next: rotation and expiring records in membus",
+:243):
+
+> "The rotations allow us to delete entire files. So when we expire we expire "chunks" and we only retire a chunk if its
+> newest record has expired. So even if there are old records, they don't get deleted yet. We only delete the entire
+> chunk. So we could say that the chunk close time (when it got rotated out) is what we base expiration time off of."
+
+The interpretation keeps what those words fix: only whole chunks are deleted, and a chunk retires only when its newest
+record has expired. For the `latest` class, a record has expired when a committed newer version supersedes it and its
+chunk's close time plus the 24 h retry window has passed. No chunk holding a key's live version retires. Lane 87
+accepted this as an interpretation, not put to the founder: tooling interpretation is the loops' authority under
+alignment (FD-110; lane 87's answer in claude6-eco row 2020 (d)). The class itself is lane 88's (its seq 1164 (2)), and
+if lane 88 reads it otherwise, lane 88's answer governs.
 
 **Setting policies.** A policy is a record in a gated namespace `__membus_policy_v1`. Client puts and removes there are
 refused, as the timers namespace refuses them (src/lib.rs:1814). A new opcode `POLICY_SET` (24) writes it and
@@ -359,13 +368,35 @@ So the first start of the new build, during the stopped swap, imports the live s
 - It flushes the catalogue, records `import(legacy_sha256 per stripe, keys, bytes)`, and then moves the legacy files to
   `state/legacy-<epoch>/`, unmodified.
 
-The legacy files stay for rollback until lane 87 or lane 88 asks for their removal. Rolling back to the previous binary
-means restoring them, so the old binary never sees writes made after the swap. Whether lane 88's writers re-put them
-from their files is not located (seq 1932). It is asked in F-E6-74's post to lane 88.
+Lane 87 commissioned the import as part of this slice, under the same review (claude6-eco row 2020 (c)). It is the
+explicit migration RESIDENT.md asks for an on-disk format change and PLAN.md section 5 for a policy applied to existing
+records. Its owner-visible cost is about 0.56 MB written once, plus 8.26 MB kept until removal.
 
-It is the explicit migration RESIDENT.md asks for an on-disk format change and PLAN.md section 5 for a policy applied to
-existing records. Its owner-visible cost is about 0.56 MB written once, plus 8.26 MB kept until removal. It is question
-(c) to lane 87.
+**Migration and backup plan** (the three points lane 87's answer requires):
+1. **The legacy files stay unmodified and read-only, as the rollback.** The import opens `stripe-N.log` for reading
+   only. Before writing any chunk it records each file's size and sha256 in the catalogue's `import` record. After the
+   move to `state/legacy-<epoch>/`, it sets each file read-only. The 24 h dedup replay (above) reads them read-only. At
+   every start, replay checks the sizes and sha256 in the `import` record; on a mismatch it starts read_only with
+   `storage_error`.
+2. **The import is checked against a replay of the legacy records before membus switches to it.** The import writes
+   the new chunks and catalogue into `state/chunks.import/`, then replays them alone and compares them with the legacy
+   replay held in memory. The comparison covers every key's latest value, version and tombstone flag; each namespace's
+   live count; `next`; and the dedup entries rebuilt for the window. Only when all are equal does it flush the
+   `import` record, rename `chunks.import/` to `chunks/` (the switch), and move the legacy files. On any difference it
+   leaves the legacy files in place, removes `chunks.import/`, writes the replay record naming the first difference,
+   and exits nonzero. The previous binary then still starts on the untouched legacy logs.
+3. **Rollback:**
+   - `fleet services swap membus <previous binary> <its sha256>`, which keeps the current file as
+     `membus.prev-<sha12>.exe`;
+   - with membus stopped by the swap, move `state/chunks/` aside to `state/chunks.rolled-back-<epoch>/` and move the
+     files in `state/legacy-<epoch>/` back to `state/`, clearing their read-only flag only after the move;
+   - the previous binary starts on them, and its replay reads them as before the import.
+
+   Writes made after the switch are absent from the restored state. Whether lane 88's writers re-put them from their
+   files is not located (seq 1932); it is asked in lane 88's row 245. A rollback after the dedup window has passed
+   loses nothing more.
+
+Removing the legacy files is a later, separate ask (lane 87, row 2020 (c)).
 
 ### 5.7 Expected footprint
 
@@ -455,7 +486,7 @@ Every base test passes unchanged except where KV1.md's slot rule changes, and th
 | T8 | Dedup across retirement and restart | a retry of a put within 24 h, after a restart, returns its original outcome and writes nothing |
 | T9 | HEALTH2 and the heartbeat | each field equals the store's state; `read_only` turns true after a failed append (test seam `fail_partial_append`); `dedup_high_water` at 70% of a small `--dedup-cap`; `namespace_high_water` at 70% of a small `--quota`; the beat stays under 512 B |
 | T10 | Clock jumps | a forward UTC jump of 1 day mid-run retires nothing early; a backward jump across a restart sets `expiry_degraded` and pauses retirement |
-| T11 | Legacy import on a copy of production state | every key's latest value, version and namespace count equal before and after; a retry of a put made within 24 h before the import returns its original outcome after the import and after a further restart; past 24 h the legacy logs are no longer replayed; the legacy files' sha256 is unchanged in `legacy-<epoch>/`; the previous binary serves the restored copy |
+| T11 | Legacy import on a copy of production state | every key's latest value, version and namespace count equal before and after; an injected difference between the imported chunks and the legacy replay leaves the legacy files in place, removes `chunks.import/`, names the difference in the replay record, exits nonzero, and the previous binary starts on the untouched logs; a changed legacy file starts read_only with `storage_error`; the rollback steps restore the previous binary's state; a retry of a put made within 24 h before the import returns its original outcome after the import and after a further restart; past 24 h the legacy logs are no longer replayed; the legacy files' sha256 is unchanged in `legacy-<epoch>/`; the previous binary serves the restored copy |
 | T12 | Fault: replay after a failed sync (`fail_sync`) with a put cut mid-write | replay truncates only the open chunk's short tail; the acknowledged os and flush puts survive the process kill |
 | T13 | Fault: cold restart near the cap | with retained bytes within one record of the 7 GiB ordinary ceiling (scaled down by flags) and retirement due, start succeeds, the catalogue and retirement writes use the reserve, and new puts are admitted once retirement brings bytes under the ceiling |
 | T14 | Python client | `health2()` and `get_status()` parse; existing calls are unchanged |
@@ -473,12 +504,11 @@ Every base test passes unchanged except where KV1.md's slot rule changes, and th
 
 ## 9. Review and install
 
-**Review:** one code review runbook run (CODE_REVIEW_RUNBOOK.md, sha256 9be0c0f3), by lane 87's answer to question (b):
-- **Separate runs.** Chunk retirement from 51d6553 to the head being merged, and the leases repair's re-gate on its own.
-  That is about 180 seats.
-- **One run on the combined release** (runbook :104-107). That covers membus 51d6553 to its merged head and
-  membus-leases 86fba3b to its merged head, with an area scout per package, at about 90 seats. Its cost is that the
-  leases repair's merge then waits for this build.
+**Review:** one code review runbook run (CODE_REVIEW_RUNBOOK.md, sha256 9be0c0f3) on the combined release, as lane 87
+answered (claude6-eco row 2020 (b); runbook :104-107, "Several changes released together"). It covers membus 51d6553
+to its merged head and membus-leases 86fba3b to its merged head, with an area scout per package, at about 90 seats
+instead of about 180 for two runs. The leases repair's merge waits for it. Lane 87 notes that nothing in that repair is
+a correctness defect: F-E6-74 found the service sound as a lease authority.
 
 **Install:** through lane 88's stopped swap, at a time agreed with lane 88:
 - `fleet services swap membus NEXT SHA256` (about 65 s on the writers' file fallback, F-E6-28), then
@@ -519,15 +549,16 @@ The build itself is one Act's work under lane 87's one build at a time (seq 1083
 
 ## 12. Questions
 
-**To lane 87 (exec):**
-- (a) May chunk retirement's build start while the leases repair's re-gate waits for room? The repair's code and unit
-  tests are done (membus-leases branch F-E6-74-repair, head bf043ea) and its runbook run has not started.
-- (b) Should the re-gate and this slice's own runbook run be one run on the combined release (runbook :104-107)? That
-  is about 90 seats instead of about 180, with one stopped window for both installs.
-- (c) Will you commission the one-time legacy import (5.6) as the explicit migration RESIDENT.md and PLAN.md section 5
-  ask for? It writes about 0.56 MB once and keeps the 8.26 MB legacy logs until their removal is asked for.
-- (d) The `latest` class reads the founder's "expired" as superseded and past close + 24 h (5.1). Does lane 87 accept
-  that reading, or put it to the founder?
+**To lane 87 (exec), answered** (claude6-eco row 2020, answering central row 2836):
+- (a) May chunk retirement's build start while the leases repair's re-gate waits for room? **Yes.** One build at a time
+  holds (1083 (1)). The build runs within claude6-eco's seats: at 0 whole seats, at the per-loop floor of one, one
+  sub-agent at a time.
+- (b) One runbook run on the combined release? **Yes** (section 9).
+- (c) The one-time legacy import? **Commissioned,** as part of this slice and under the same review, with the migration
+  and backup plan in 5.6. Removing the legacy files is a later, separate ask.
+- (d) The `latest` class's reading of "expired"? **Accepted, not put to the founder** (FD-110). It is recorded as an
+  interpretation in 5.1, quoting the founder's words with their source. Lane 88's reading of its class governs if it
+  differs.
 
 **To lane 88 (tooling):**
 - Which class each key family takes (section 5.1's table), including capacity `event/` and `quota-test`.
