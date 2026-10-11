@@ -10,6 +10,35 @@ fn path(label: &str) -> PathBuf {
     let p = std::env::var("MEMBUS_TEST_OUTPUT").unwrap_or_else(|_| ".test-output".into());
     PathBuf::from(p).join(format!("{label}-{}-{}", std::process::id(), now_ms()))
 }
+/// Chunk files under the state's chunks/ (CHUNK-RETIREMENT.md 5.2: chunks/<class>/<stripe>-<seq>.log).
+fn chunk_files(p: &std::path::Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for class in fs::read_dir(p.join("chunks")).into_iter().flatten().flatten() {
+        if class.path().is_dir() {
+            for f in fs::read_dir(class.path()).unwrap().flatten() {
+                if f.path().extension().is_some_and(|x| x == "log") {
+                    out.push(f.path());
+                }
+            }
+        }
+    }
+    out.sort_by_key(|f| chunk_name(f));
+    out
+}
+/// (stripe, seq) from a chunk file name.
+fn chunk_name(f: &std::path::Path) -> (u32, u64) {
+    let stem = f.file_stem().unwrap().to_str().unwrap();
+    let (stripe, seq) = stem.split_once('-').unwrap();
+    (stripe.parse().unwrap(), seq.parse().unwrap())
+}
+/// A stripe's persisted bytes: its chunk files together (the pre-chunk `stripe-{i}.log` length).
+fn stripe_bytes(p: &std::path::Path, stripe: u32) -> u64 {
+    chunk_files(p)
+        .iter()
+        .filter(|f| chunk_name(f).0 == stripe)
+        .map(|f| fs::metadata(f).unwrap().len())
+        .sum()
+}
 fn m(key: &str, id: &str) -> Mutation {
     Mutation {
         ns: "ledger".into(),
@@ -248,8 +277,8 @@ fn past_window_ring_restart_and_length_guard() {
     }
     #[cfg(not(windows))]
     fs::remove_file(p.join("owner.lock")).unwrap();
-    let log = (0..4)
-        .map(|i| p.join(format!("stripe-{i}.log")))
+    let log = chunk_files(&p)
+        .into_iter()
         .find(|p| fs::metadata(p).unwrap().len() > 16)
         .unwrap();
     let mut bytes = fs::read(&log).unwrap();
@@ -282,8 +311,7 @@ fn partial_append_fences_admitted_followers_and_replays_prior_ack() {
         .filter(|k| keystripe(k) == wanted)
         .take(2)
         .collect();
-    let stripe_path = p.join(format!("stripe-{wanted}.log"));
-    let prior = fs::metadata(&stripe_path).unwrap().len();
+    let prior = stripe_bytes(&p, wanted);
     {
         let s = Arc::new(
             Store::open(
@@ -314,14 +342,14 @@ fn partial_append_fences_admitted_followers_and_replays_prior_ack() {
     }
     #[cfg(not(windows))]
     fs::remove_file(p.join("owner.lock")).unwrap();
-    let torn = fs::metadata(&stripe_path).unwrap().len();
+    let torn = stripe_bytes(&p, wanted);
     assert!(torn > prior);
     {
         let s = Store::open(&p, Config::default()).unwrap();
         assert_eq!(s.get("ledger", "seed").unwrap().bytes, b"value");
         assert!(s.get("ledger", &keys[0]).is_none());
         assert!(s.get("ledger", &keys[1]).is_none());
-        assert_eq!(fs::metadata(&stripe_path).unwrap().len(), prior);
+        assert_eq!(stripe_bytes(&p, wanted), prior);
     }
     println!("partial append fenced both admitted followers; torn bytes={} discarded; prior acknowledged key replayed",torn-prior);
 }
@@ -353,9 +381,11 @@ fn crc_replay_tombstone_torn_and_corrupt() {
     fs::remove_file(p.join("owner.lock")).unwrap();
     {
         use std::io::Write;
+        // The newest chunk was open when the store stopped: its torn tail is truncated at replay.
+        let newest = chunk_files(&p).into_iter().max_by_key(|f| chunk_name(f).1).unwrap();
         let mut f = fs::OpenOptions::new()
             .append(true)
-            .open(p.join("stripe-0.log"))
+            .open(newest)
             .unwrap();
         f.write_all(b"MBK1\x20\x00").unwrap();
     }
@@ -370,8 +400,8 @@ fn crc_replay_tombstone_torn_and_corrupt() {
     }
     #[cfg(not(windows))]
     fs::remove_file(p.join("owner.lock")).unwrap();
-    let log = (0..4)
-        .map(|i| p.join(format!("stripe-{i}.log")))
+    let log = chunk_files(&p)
+        .into_iter()
         .find(|p| fs::metadata(p).unwrap().len() > 12)
         .unwrap();
     let mut b = fs::read(&log).unwrap();

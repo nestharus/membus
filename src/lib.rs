@@ -1,6 +1,9 @@
 //! membus.kv/1 slice 1: bounded framing, independent committed reads, durable replay.
+//! Chunk retirement (docs/CHUNK-RETIREMENT.md): chunk files by class, their catalogue, replay by version.
+pub mod chunks;
 mod signals;
 mod timers;
+pub use chunks::{Class, ManualClock, POLICY_NS};
 #[cfg(windows)]
 pub mod pipe_io;
 use std::{
@@ -8,9 +11,9 @@ use std::{
     fs::{self, File, OpenOptions},
     hash::BuildHasher,
     io::{self, Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc, Arc, Condvar, Mutex, RwLock,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -70,6 +73,11 @@ pub const CAPTURE_METRICS: u8 = 20;
 pub const TIMER_SET: u8 = 21;
 pub const TIMER_CANCEL: u8 = 22;
 pub const TIMER_STATUS: u8 = 23;
+/// Chunk retirement, additive under kv/1 minor 0 (CHUNK-RETIREMENT.md section 6).
+pub const POLICY_SET: u8 = 24;
+pub const POLICY_GET: u8 = 25;
+pub const GET_STATUS: u8 = 26;
+pub const HEALTH2: u8 = 27;
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -249,6 +257,8 @@ struct Meta {
     version: u64,
     tombstone: bool,
     bytes: usize,
+    /// The chunk holding this key's latest persisted record (0: the legacy logs, or none).
+    chunk: u64,
 }
 pub struct Log {
     file: File,
@@ -279,6 +289,24 @@ pub struct Config {
     pub fail_after_append: bool,
     pub fail_partial_append: bool,
     pub fail_sync: bool,
+    /// Chunk rotation (CHUNK-RETIREMENT.md 5.2): a chunk closes past `chunk_bytes`, and a finite class's chunk
+    /// also past `rotation_ms`; the idle tick runs every `tick_ms`.
+    pub chunk_bytes: u64,
+    pub rotation_ms: u64,
+    pub tick_ms: u64,
+    /// The retirement pass (5.4).
+    pub retire_ms: u64,
+    pub catalogue_rewrite_bytes: u64,
+    /// Expiry summaries are kept this long (5.3; PLAN.md section 5: 30 days).
+    pub summary_ms: u64,
+    /// Ordinary admissions refuse with 7 at state_limit_bytes less this reserve; catalogue, retirement and
+    /// import writes may use it (5.5). The library default is 0; the server sets 1 GiB.
+    pub maintenance_reserve_bytes: u64,
+    pub pinned_high_water_bytes: u64,
+    /// A clock a test moves by hand; None is the system clock.
+    pub clock: Option<Arc<chunks::ManualClock>>,
+    /// Test seam: stop a retirement after step N (1: after `retiring`, 2: after the delete).
+    pub retire_stop_after: u8,
     #[cfg(test)]
     pub sync_test_gate: Option<Arc<(Mutex<(bool, bool)>, Condvar)>>,
     #[cfg(test)]
@@ -306,6 +334,16 @@ impl Default for Config {
             fail_after_append: false,
             fail_partial_append: false,
             fail_sync: false,
+            chunk_bytes: 8 * 1024 * 1024,
+            rotation_ms: 3_600_000,
+            tick_ms: 1000,
+            retire_ms: 10_000,
+            catalogue_rewrite_bytes: 1024 * 1024,
+            summary_ms: 30 * 86_400_000,
+            maintenance_reserve_bytes: 0,
+            pinned_high_water_bytes: 64 * 1024 * 1024,
+            clock: None,
+            retire_stop_after: 0,
             #[cfg(test)]
             sync_test_gate: None,
             #[cfg(test)]
@@ -321,9 +359,19 @@ pub struct Store {
     scans: Arc<Mutex<ScanState>>,
     scan_usage: Arc<ScanUsage>,
     scan_reaper: Option<(mpsc::Sender<()>, std::thread::JoinHandle<()>)>,
+    /// The idle tick (5.2): closes finite-class chunks past their age and rewrites a large catalogue.
+    ticker: Option<(mpsc::Sender<()>, std::thread::JoinHandle<()>)>,
     state: Mutex<State>,
     done: Condvar,
-    logs: Vec<Arc<Mutex<Log>>>,
+    router: Arc<ChunkRouter>,
+    chunks: Arc<Mutex<chunks::ChunkStore>>,
+    policies: Arc<RwLock<chunks::Policies>>,
+    /// The version high-water the catalogue records at each open and close.
+    next_issued: Arc<AtomicU64>,
+    flags: Arc<Flags>,
+    clock: chunks::Clock,
+    path: PathBuf,
+    report: Mutex<chunks::ReplayReport>,
     appenders: Vec<AppendOwner>,
     flush_owner: Option<std::thread::JoinHandle<()>>,
     batch_gate: Mutex<()>,
@@ -361,23 +409,26 @@ struct ScanState {
 struct Append {
     record: Vec<u8>,
     ack: u8,
-    done: mpsc::Sender<io::Result<()>>,
+    /// Ok carries the sink (chunk) the record went to.
+    done: mpsc::Sender<io::Result<u64>>,
 }
 struct AppendOwner {
     sender: Option<mpsc::Sender<Append>>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 struct FlushWait {
+    /// The sink to sync: a stripe's log, or a chunk id under the chunk route.
     stripe: usize,
     end: u64,
     bytes: usize,
-    done: mpsc::Sender<io::Result<()>>,
+    done: mpsc::Sender<io::Result<u64>>,
     gathered: bool,
 }
 
 fn finish_flush(w: FlushWait, result: io::Result<()>, outstanding: &AtomicUsize) {
     outstanding.fetch_sub(1, Ordering::SeqCst);
-    let _ = w.done.send(result);
+    let sink = w.stripe as u64;
+    let _ = w.done.send(result.map(|_| sink));
 }
 
 fn enqueue_flush(
@@ -459,8 +510,59 @@ fn write_record(log: &mut Log, mut bytes: &[u8]) -> io::Result<()> {
     }
     Ok(())
 }
+/// One stripe log's append with the test seams; a failed append fences the log.
+fn append_to(log: &mut Log, record: &[u8], config: &Config) -> io::Result<()> {
+    let result = if log.poisoned {
+        Err(io::Error::other("stripe fenced after failed append"))
+    } else if config.fail_partial_append || std::env::var_os("MEMBUS_TEST_PAUSE_PARTIAL").is_some() {
+        let half = record.len() / 2;
+        let r = write_record(log, &record[..half]);
+        checkpoint("MEMBUS_TEST_PAUSE_PARTIAL");
+        log.poisoned = true;
+        r.and(Err(io::Error::other("test injected partial append failure")))
+    } else {
+        write_record(log, record)
+    };
+    if result.is_err() {
+        log.poisoned = true;
+    }
+    result
+}
+/// Where a stripe's records go. The append owner writes through it; the flush owner syncs what it names.
+trait Route: Send + Sync + 'static {
+    /// Append one record for `stripe`: the result, the sink written (its flush identity) and the sink's end.
+    fn write(&self, stripe: usize, record: &[u8], config: &Config) -> (io::Result<()>, usize, u64);
+    /// A sink's stripe, its log while open, and the extent its close synced.
+    fn sink(&self, id: usize) -> Option<(usize, Option<Arc<Mutex<Log>>>, u64)>;
+    fn fence(&self, stripe: usize);
+}
+/// One fixed log per stripe (the pre-chunk shape, kept for the owner-level tests).
+#[cfg(test)]
+struct FixedRoute(Vec<Arc<Mutex<Log>>>);
+#[cfg(test)]
+impl Route for FixedRoute {
+    fn write(&self, stripe: usize, record: &[u8], config: &Config) -> (io::Result<()>, usize, u64) {
+        let mut log = self.0[stripe].lock().unwrap();
+        let result = append_to(&mut log, record, config);
+        (result, stripe, log.bytes)
+    }
+    fn sink(&self, id: usize) -> Option<(usize, Option<Arc<Mutex<Log>>>, u64)> {
+        self.0.get(id).map(|log| (id, Some(log.clone()), 0))
+    }
+    fn fence(&self, stripe: usize) {
+        self.0[stripe].lock().unwrap().poisoned = true;
+    }
+}
+#[cfg(test)]
 fn start_owners(
     logs: &[Arc<Mutex<Log>>],
+    config: &Config,
+) -> (Vec<AppendOwner>, std::thread::JoinHandle<()>) {
+    start_routed_owners(Arc::new(FixedRoute(logs.to_vec())), logs.len(), config)
+}
+fn start_routed_owners(
+    route: Arc<dyn Route>,
+    stripes: usize,
     config: &Config,
 ) -> (Vec<AppendOwner>, std::thread::JoinHandle<()>) {
     let (flush_send, flush_recv) = mpsc::channel::<FlushWait>();
@@ -472,7 +574,7 @@ fn start_owners(
     // sender and inherit that later sender's window.
     let notice_gate = Arc::new(Mutex::new(()));
     let flush_outstanding = outstanding.clone();
-    let flush_logs = logs.to_vec();
+    let flush_route = route.clone();
     let interval = config.flush_ms;
     let fail_sync = config.fail_sync;
     #[cfg(test)]
@@ -480,28 +582,43 @@ fn start_owners(
     let flush_owner = std::thread::spawn(move || {
         let mut pending = VecDeque::new();
         let mut last: Option<std::time::Instant> = None;
-        let mut covered = [0u64; 4];
+        // Keyed by sink: a sync covers the earlier complete appends of its own file.
+        let mut covered: HashMap<usize, u64> = HashMap::new();
         let mut sync_failed = [false; 4];
+        // A sink whose close already synced it, or a stripe fenced by a failed sync, needs no sync here.
+        let settle = |w: &FlushWait, covered: &HashMap<usize, u64>, sync_failed: &[bool; 4]| -> Option<io::Result<()>> {
+            let Some((stripe, log, synced)) = flush_route.sink(w.stripe) else {
+                return Some(Err(io::Error::other("flush sink missing")));
+            };
+            if sync_failed[stripe] {
+                return Some(Err(io::Error::other("stripe fenced after failed sync")));
+            }
+            if w.end <= covered.get(&w.stripe).copied().unwrap_or(0) {
+                return Some(Ok(()));
+            }
+            if log.is_none() {
+                return Some(if w.end <= synced {
+                    Ok(())
+                } else {
+                    Err(io::Error::other("stripe fenced after failed sync"))
+                });
+            }
+            None
+        };
         loop {
             let mut gather = true;
             if pending.is_empty() {
                 match flush_recv.recv() {
-                    Ok(w) if sync_failed[w.stripe] => {
-                        finish_flush(
-                            w,
-                            Err(io::Error::other("stripe fenced after failed sync")),
-                            &flush_outstanding,
-                        );
-                        continue;
-                    }
-                    Ok(w) if w.end <= covered[w.stripe] => {
-                        finish_flush(w, Ok(()), &flush_outstanding);
-                        continue;
-                    }
-                    Ok(w) => {
-                        gather = w.gathered;
-                        pending.push_back(w);
-                    }
+                    Ok(w) => match settle(&w, &covered, &sync_failed) {
+                        Some(r) => {
+                            finish_flush(w, r, &flush_outstanding);
+                            continue;
+                        }
+                        None => {
+                            gather = w.gathered;
+                            pending.push_back(w);
+                        }
+                    },
                     Err(_) => break,
                 }
                 // The gather window closes on elapsed time; bounds are enforced
@@ -510,40 +627,36 @@ fn start_owners(
                     + Duration::from_millis(if gather { interval } else { 0 });
                 while let Some(left) = until.checked_duration_since(std::time::Instant::now()) {
                     match flush_recv.recv_timeout(left) {
-                        Ok(w) if sync_failed[w.stripe] => {
-                            finish_flush(
-                                w,
-                                Err(io::Error::other("stripe fenced after failed sync")),
-                                &flush_outstanding,
-                            );
-                        }
-                        Ok(w) if w.end <= covered[w.stripe] => {
-                            finish_flush(w, Ok(()), &flush_outstanding);
-                        }
-                        Ok(w) => pending.push_back(w),
+                        Ok(w) => match settle(&w, &covered, &sync_failed) {
+                            Some(r) => finish_flush(w, r, &flush_outstanding),
+                            None => pending.push_back(w),
+                        },
                         Err(_) => break,
                     }
                 }
             }
             while let Ok(w) = flush_recv.try_recv() {
-                if sync_failed[w.stripe] {
-                    finish_flush(
-                        w,
-                        Err(io::Error::other("stripe fenced after failed sync")),
-                        &flush_outstanding,
-                    );
-                } else if w.end <= covered[w.stripe] {
-                    finish_flush(w, Ok(()), &flush_outstanding);
-                } else {
-                    pending.push_back(w);
+                match settle(&w, &covered, &sync_failed) {
+                    Some(r) => finish_flush(w, r, &flush_outstanding),
+                    None => pending.push_back(w),
                 }
             }
-            let stripe = pending.front().unwrap().stripe;
+            // Waiters settled while queued (a close's sync, a fence) need no sync.
+            let mut waiting = VecDeque::new();
+            while let Some(w) = pending.pop_front() {
+                match settle(&w, &covered, &sync_failed) {
+                    Some(r) => finish_flush(w, r, &flush_outstanding),
+                    None => waiting.push_back(w),
+                }
+            }
+            pending = waiting;
+            let Some(front) = pending.front() else { continue };
+            let sink = front.stripe;
             let mut group = Vec::new();
             let mut bytes = 0;
             let mut retained = VecDeque::new();
             while let Some(w) = pending.pop_front() {
-                if w.stripe == stripe
+                if w.stripe == sink
                     && group.len() < 64
                     && (group.is_empty() || bytes + w.bytes <= 144_192)
                 {
@@ -560,8 +673,20 @@ fn start_owners(
                     std::thread::sleep(delay);
                 }
             }
+            let (stripe, log) = match flush_route.sink(sink) {
+                Some((stripe, Some(log), _)) => (stripe, log),
+                _ => {
+                    // Closed (and synced) between selection and here: settle each by the close's extent.
+                    for w in group {
+                        let r = settle(&w, &covered, &sync_failed)
+                            .unwrap_or_else(|| Err(io::Error::other("flush sink closed")));
+                        finish_flush(w, r, &flush_outstanding);
+                    }
+                    continue;
+                }
+            };
             let (file, through) = {
-                let log = flush_logs[stripe].lock().unwrap();
+                let log = log.lock().unwrap();
                 (log.file.try_clone(), log.bytes)
             };
             let result = file.and_then(|f| {
@@ -585,22 +710,26 @@ fn start_owners(
             });
             last = Some(std::time::Instant::now());
             if result.is_ok() {
-                covered[stripe] = covered[stripe].max(through);
+                let c = covered.entry(sink).or_insert(0);
+                *c = (*c).max(through);
             } else {
                 sync_failed[stripe] = true;
             }
             {
-                let mut log = flush_logs[stripe].lock().unwrap();
+                let mut log = log.lock().unwrap();
                 log.flushes += 1;
                 if result.is_err() {
                     log.poisoned = true;
                 }
             }
+            if result.is_err() {
+                flush_route.fence(stripe);
+            }
             // A sync covers every earlier complete append on this handle,
             // including queued waiters beyond the nominal selected group.
             let mut extra = VecDeque::new();
             while let Some(w) = pending.pop_front() {
-                if w.stripe == stripe && w.end <= through {
+                if w.stripe == sink && w.end <= through {
                     group.push(w);
                 } else {
                     extra.push_back(w);
@@ -616,11 +745,9 @@ fn start_owners(
             }
         }
     });
-    let owners = logs
-        .iter()
-        .enumerate()
-        .map(|(stripe, log)| {
-            let log = log.clone();
+    let owners = (0..stripes)
+        .map(|stripe| {
+            let route = route.clone();
             let config = config.clone();
             let flush = flush_send.clone();
             let outstanding = outstanding.clone();
@@ -631,38 +758,18 @@ fn start_owners(
                     if config.write_delay_ms > 0 {
                         std::thread::sleep(Duration::from_millis(config.write_delay_ms));
                     }
-                    let mut log = log.lock().unwrap();
-                    let result = if log.poisoned {
-                        Err(io::Error::other("stripe fenced after failed append"))
-                    } else if config.fail_partial_append
-                        || std::env::var_os("MEMBUS_TEST_PAUSE_PARTIAL").is_some()
-                    {
-                        let half = job.record.len() / 2;
-                        let r = write_record(&mut log, &job.record[..half]);
-                        checkpoint("MEMBUS_TEST_PAUSE_PARTIAL");
-                        log.poisoned = true;
-                        r.and(Err(io::Error::other(
-                            "test injected partial append failure",
-                        )))
-                    } else {
-                        write_record(&mut log, &job.record)
-                    };
-                    if result.is_err() {
-                        log.poisoned = true;
-                    }
-                    let end = log.bytes;
+                    let (result, sink, end) = route.write(stripe, &job.record, &config);
                     let result = if result.is_ok() && config.fail_after_append {
                         Err(io::Error::other("test injected post-admission I/O failure"))
                     } else {
                         result
                     };
-                    drop(log);
                     if result.is_ok() && job.ack == 2 {
                         if config.flush_notice_delay_ms > 0 {
                             std::thread::sleep(Duration::from_millis(config.flush_notice_delay_ms));
                         }
                         let wait = FlushWait {
-                            stripe,
+                            stripe: sink,
                             end,
                             bytes: job.record.len(),
                             done: job.done,
@@ -674,7 +781,7 @@ fn start_owners(
                             let _ = notice.send(());
                         }
                     } else {
-                        let _ = job.done.send(result);
+                        let _ = job.done.send(result.map(|_| sink as u64));
                     }
                 }
             });
@@ -893,6 +1000,10 @@ impl Drop for Store {
             let _ = stop.send(());
             let _ = worker.join();
         }
+        if let Some((stop, worker)) = self.ticker.take() {
+            let _ = stop.send(());
+            let _ = worker.join();
+        }
         for owner in &mut self.appenders {
             owner.sender.take();
         }
@@ -905,6 +1016,509 @@ impl Drop for Store {
             let _ = h.join();
         }
     }
+}
+/// Flags health reads beside read_only.
+#[derive(Default)]
+struct Flags {
+    storage_error: AtomicBool,
+    expiry_degraded: AtomicBool,
+}
+struct OpenChunk {
+    id: u64,
+    log: Arc<Mutex<Log>>,
+    opened_mono: u64,
+}
+struct SinkEntry {
+    stripe: usize,
+    log: Option<Arc<Mutex<Log>>>,
+    synced: u64,
+}
+/// Chunk files by stripe and class (CHUNK-RETIREMENT.md 5.2). Each stripe's open chunks are held under that
+/// stripe's lock while a record is written, so a close never meets a half-written record.
+struct ChunkRouter {
+    sinks: Vec<Mutex<HashMap<Class, OpenChunk>>>,
+    table: RwLock<HashMap<usize, SinkEntry>>,
+    fenced: [AtomicBool; 4],
+    closed_io: Mutex<[u64; 3]>,
+    policies: Arc<RwLock<chunks::Policies>>,
+    chunks: Arc<Mutex<chunks::ChunkStore>>,
+    clock: chunks::Clock,
+    next: Arc<AtomicU64>,
+    flags: Arc<Flags>,
+    chunk_bytes: u64,
+    rotation_ms: u64,
+    fail_sync: bool,
+}
+impl ChunkRouter {
+    fn open_chunk(&self, stripe: usize, class: Class, policy: String) -> io::Result<OpenChunk> {
+        let mut cs = self.chunks.lock().unwrap();
+        let id = cs.next_id;
+        let path = chunks::chunk_path(&cs.dir, class, stripe, id);
+        let now = self.clock.utc_ms();
+        // The open record is flushed before the file exists, so a crash leaves at most a record with no file.
+        cs.log(
+            now,
+            chunks::Rec::Open { seq: id, stripe: stripe as u8, class, policy: policy.clone(), next: self.next.load(Ordering::SeqCst) },
+        )?;
+        cs.next_id += 1;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        cs.table.insert(
+            id,
+            chunks::ChunkInfo {
+                id,
+                stripe,
+                class,
+                policy,
+                open_ms: now,
+                close_ms: None,
+                close_mono: None,
+                bytes: 0,
+                path,
+                state: chunks::ChunkState::Open,
+                keys: HashMap::new(),
+                blocked_since: None,
+                horizons: Vec::new(),
+                expired: Vec::new(),
+            },
+        );
+        drop(cs);
+        let log = Arc::new(Mutex::new(Log { file, bytes: 0, flushes: 0, write_calls: 0, poisoned: false }));
+        self.table
+            .write()
+            .unwrap()
+            .insert(id as usize, SinkEntry { stripe, log: Some(log.clone()), synced: 0 });
+        Ok(OpenChunk { id, log, opened_mono: self.clock.mono_ms() })
+    }
+    /// Sync the chunk, then record its close. A close that cannot be recorded leaves the chunk open.
+    fn close_chunk(&self, stripe: usize, c: &OpenChunk) -> io::Result<()> {
+        let (file, bytes, writes, flushes) = {
+            let l = c.log.lock().unwrap();
+            if l.poisoned {
+                return Err(io::Error::other("poisoned chunk stays open for replay"));
+            }
+            (l.file.try_clone()?, l.bytes, l.write_calls, l.flushes)
+        };
+        let synced = if self.fail_sync { Err(io::Error::other("test injected sync failure")) } else { sync_file(&file) };
+        if let Err(e) = synced {
+            c.log.lock().unwrap().poisoned = true;
+            self.fence(stripe);
+            return Err(e);
+        }
+        let now = self.clock.utc_ms();
+        {
+            let mut cs = self.chunks.lock().unwrap();
+            if let Err(e) = cs.log(now, chunks::Rec::Close { seq: c.id, bytes, next: self.next.load(Ordering::SeqCst) }) {
+                self.flags.storage_error.store(true, Ordering::SeqCst);
+                return Err(e);
+            }
+            if let Some(info) = cs.table.get_mut(&c.id) {
+                info.state = chunks::ChunkState::Closed;
+                info.close_ms = Some(now);
+                info.close_mono = Some(self.clock.mono_ms());
+                info.bytes = bytes;
+            }
+        }
+        if let Some(e) = self.table.write().unwrap().get_mut(&(c.id as usize)) {
+            e.log = None;
+            e.synced = bytes;
+        }
+        let mut io = self.closed_io.lock().unwrap();
+        io[0] += bytes;
+        io[1] += writes;
+        io[2] += flushes + 1;
+        Ok(())
+    }
+    /// The idle tick: close finite-class chunks past their rotation age.
+    fn idle_close(&self) {
+        for stripe in 0..self.sinks.len() {
+            let mut open = self.sinks[stripe].lock().unwrap();
+            let now = self.clock.mono_ms();
+            let due: Vec<Class> = open
+                .iter()
+                .filter(|(class, c)| class.finite() && now.saturating_sub(c.opened_mono) >= self.rotation_ms)
+                .map(|(class, _)| *class)
+                .collect();
+            for class in due {
+                if self.close_chunk(stripe, &open[&class]).is_ok() {
+                    open.remove(&class);
+                }
+            }
+        }
+    }
+    fn io(&self) -> (u64, u64, u64) {
+        let closed = *self.closed_io.lock().unwrap();
+        let (mut bytes, mut writes, mut flushes) = (closed[0], closed[1], closed[2]);
+        for stripe in &self.sinks {
+            for c in stripe.lock().unwrap().values() {
+                let l = c.log.lock().unwrap();
+                bytes += l.bytes;
+                writes += l.write_calls;
+                flushes += l.flushes;
+            }
+        }
+        (bytes, writes, flushes)
+    }
+    fn open_chunks(&self) -> usize {
+        self.sinks.iter().map(|s| s.lock().unwrap().len()).sum()
+    }
+}
+impl Route for ChunkRouter {
+    fn write(&self, stripe: usize, record: &[u8], config: &Config) -> (io::Result<()>, usize, u64) {
+        let Some((ns, key, version)) = record.get(16..).and_then(chunks::record_key) else {
+            return (Err(io::Error::other("unroutable record")), 0, 0);
+        };
+        let (class, policy) = self.policies.read().unwrap().resolve(&ns, &key);
+        let mut open = self.sinks[stripe].lock().unwrap();
+        if self.fenced[stripe].load(Ordering::SeqCst) {
+            return (Err(io::Error::other("stripe fenced after failed append")), 0, 0);
+        }
+        let now = self.clock.mono_ms();
+        let rotate = open.get(&class).is_some_and(|c| {
+            let b = c.log.lock().unwrap().bytes;
+            (b > 0 && b + record.len() as u64 > self.chunk_bytes)
+                || (class.finite() && now.saturating_sub(c.opened_mono) >= self.rotation_ms)
+        });
+        if rotate {
+            if let Err(e) = self.close_chunk(stripe, &open[&class]) {
+                self.fence(stripe);
+                return (Err(e), 0, 0);
+            }
+            open.remove(&class);
+        }
+        if !open.contains_key(&class) {
+            match self.open_chunk(stripe, class, policy) {
+                Ok(c) => {
+                    open.insert(class, c);
+                }
+                Err(e) => {
+                    self.fence(stripe);
+                    return (Err(e), 0, 0);
+                }
+            }
+        }
+        let c = &open[&class];
+        let mut log = c.log.lock().unwrap();
+        let result = append_to(&mut log, record, config);
+        let end = log.bytes;
+        drop(log);
+        if result.is_err() {
+            self.fence(stripe);
+        } else {
+            let mut cs = self.chunks.lock().unwrap();
+            cs.register(c.id, &(ns, key), version);
+            if let Some(info) = cs.table.get_mut(&c.id) {
+                info.bytes = end;
+            }
+        }
+        (result, c.id as usize, end)
+    }
+    fn sink(&self, id: usize) -> Option<(usize, Option<Arc<Mutex<Log>>>, u64)> {
+        self.table.read().unwrap().get(&id).map(|e| (e.stripe, e.log.clone(), e.synced))
+    }
+    fn fence(&self, stripe: usize) {
+        self.fenced[stripe].store(true, Ordering::SeqCst);
+    }
+}
+
+/// One MBK1 payload as (mutation, version, record time).
+fn parse_record(b: &[u8]) -> Result<(Mutation, u64, u64), u16> {
+    let mut c = Cursor::new(b);
+    let at = c.u64()?;
+    let version = c.u64()?;
+    let ack = c.u8()?;
+    let remove = c.u8()? != 0;
+    let ns = c.text()?;
+    let key = c.text()?;
+    let op_id = c.text()?;
+    let expected = c.u64()?;
+    let bytes = c.bytes(MAX_VALUE)?.to_vec();
+    c.end()?;
+    if !matches!(ack, 1 | 2) {
+        return Err(3);
+    }
+    Ok((
+        Mutation {
+            ns,
+            key,
+            op_id,
+            deadline: 0,
+            ack,
+            expected: if expected == u64::MAX { None } else { Some(expected) },
+            bytes,
+            remove,
+        },
+        version,
+        at,
+    ))
+}
+fn corrupt(text: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, text)
+}
+/// What replay rebuilt, before any file is changed.
+struct Replayed {
+    committed: HashMap<(String, String), Arc<Value>>,
+    chunk_of: HashMap<(String, String), u64>,
+    dedup: HashMap<(String, String), Dedup>,
+    next: u64,
+    persisted: u64,
+    chunks: chunks::ChunkStore,
+    truncate: Vec<(PathBuf, u64)>,
+    report: chunks::ReplayReport,
+    storage_errors: Vec<String>,
+    cat_last_ms: u64,
+}
+impl Replayed {
+    fn apply(&mut self, m: Mutation, v: u64, at: u64, chunk: u64, now: u64, config: &Config) {
+        self.next = self.next.max(v + 1);
+        let k = (m.ns.clone(), m.key.clone());
+        if self.committed.get(&k).map_or(true, |old| old.version < v) {
+            self.committed.insert(
+                k.clone(),
+                Arc::new(Value { version: v, ack: m.ack, bytes: m.bytes.clone(), tombstone: m.remove }),
+            );
+            self.chunk_of.insert(k, chunk);
+        }
+        if now.saturating_sub(at) <= config.retry_ms && !timers::is_progress(&m.ns, &m.key) {
+            self.dedup.insert(
+                (m.ns.clone(), m.op_id.clone()),
+                Dedup {
+                    fingerprint: fingerprint(&m),
+                    at,
+                    outcome: Some(Outcome { code: 0, version: v, ack: m.ack }),
+                },
+            );
+        }
+    }
+    /// Replay one log file. `open_at_crash` allows a torn tail to be truncated; otherwise it refuses start.
+    fn replay_file(
+        &mut self,
+        p: &Path,
+        si: usize,
+        chunk: u64,
+        open_at_crash: bool,
+        horizons: &HashMap<(String, String), u64>,
+        config: &Config,
+        now: u64,
+    ) -> io::Result<u64> {
+        let mut f = File::open(p)?;
+        let len = f.metadata()?.len();
+        let name = p.display().to_string();
+        let mut offset = 0u64;
+        while offset < len {
+            match chunks::read_frame_at(&mut f, b"MBK1", offset, len, &name)? {
+                chunks::Frame::Torn(reason) => {
+                    if !open_at_crash {
+                        return Err(corrupt(format!("interior-corrupt {name} offset {offset}: torn tail in a closed chunk")));
+                    }
+                    self.truncate.push((p.to_owned(), offset));
+                    self.report.stripes[si].truncations.push((name.clone(), offset, len - offset, reason.into()));
+                    break;
+                }
+                chunks::Frame::Whole(b, n) => {
+                    let (m, v, at) = parse_record(&b)
+                        .map_err(|_| corrupt(format!("interior-corrupt {name} offset {offset}: payload")))?;
+                    if stripe(&m.ns, &m.key) != si {
+                        return Err(corrupt(format!("interior-corrupt {name} offset {offset}: wrong stripe")));
+                    }
+                    let k = (m.ns.clone(), m.key.clone());
+                    self.chunks.register(chunk, &k, v);
+                    self.report.stripes[si].records += 1;
+                    self.report.stripes[si].bytes += n;
+                    if horizons.get(&k).is_some_and(|h| v <= *h) {
+                        // Anti-resurrection: a retired newer version's horizon hides this older one.
+                        self.report.stripes[si].horizons_applied += 1;
+                        self.next = self.next.max(v + 1);
+                    } else {
+                        self.apply(m, v, at, chunk, now, config);
+                    }
+                    offset += n;
+                }
+            }
+        }
+        Ok(offset)
+    }
+}
+fn replay(path: &Path, config: &Config, clock: &chunks::Clock) -> Result<Replayed, (io::Error, chunks::ReplayReport)> {
+    let mut rp = Replayed {
+        committed: HashMap::new(),
+        chunk_of: HashMap::new(),
+        dedup: HashMap::new(),
+        next: 1,
+        persisted: 0,
+        chunks: chunks::ChunkStore::new(path.join("chunks")),
+        truncate: Vec::new(),
+        report: chunks::ReplayReport::default(),
+        storage_errors: Vec::new(),
+        cat_last_ms: 0,
+    };
+    match replay_into(&mut rp, path, config, clock) {
+        Ok(()) => Ok(rp),
+        Err(e) => Err((e, rp.report)),
+    }
+}
+fn replay_into(rp: &mut Replayed, path: &Path, config: &Config, clock: &chunks::Clock) -> io::Result<()> {
+    use chunks::{ChunkState, Rec};
+    let now = now_ms();
+    let dir = path.join("chunks");
+    fs::create_dir_all(&dir)?;
+    let (records, torn) = chunks::read_catalogue(&dir.join("catalogue.log"))?;
+    rp.report.catalogue_truncation = torn.map(|(o, b, r)| (o, b, r.to_string()));
+    let mut next_hw = 0u64;
+    let mut horizons: Vec<(String, String, u64)> = Vec::new();
+    for r in &records {
+        rp.cat_last_ms = rp.cat_last_ms.max(r.at_ms);
+        match &r.rec {
+            Rec::Open { seq, stripe, class, policy, next } => {
+                next_hw = next_hw.max(*next);
+                rp.chunks.next_id = rp.chunks.next_id.max(seq + 1);
+                rp.chunks.table.insert(
+                    *seq,
+                    chunks::ChunkInfo {
+                        id: *seq,
+                        stripe: *stripe as usize,
+                        class: *class,
+                        policy: policy.clone(),
+                        open_ms: r.at_ms,
+                        close_ms: None,
+                        close_mono: None,
+                        bytes: 0,
+                        path: chunks::chunk_path(&dir, *class, *stripe as usize, *seq),
+                        state: ChunkState::Open,
+                        keys: HashMap::new(),
+                        blocked_since: None,
+                        horizons: Vec::new(),
+                        expired: Vec::new(),
+                    },
+                );
+            }
+            Rec::Close { seq, bytes, next } => {
+                next_hw = next_hw.max(*next);
+                if let Some(c) = rp.chunks.table.get_mut(seq) {
+                    c.state = ChunkState::Closed;
+                    c.close_ms = Some(r.at_ms);
+                    c.bytes = *bytes;
+                }
+            }
+            Rec::Retiring { seq, next, horizons: h, expired } => {
+                next_hw = next_hw.max(*next);
+                horizons.extend(h.iter().cloned());
+                if let Some(c) = rp.chunks.table.get_mut(seq) {
+                    c.state = ChunkState::Retiring;
+                    c.horizons = h.clone();
+                    c.expired = expired.clone();
+                }
+                if !expired.is_empty() {
+                    rp.chunks.summaries.add(r.at_ms, expired.clone());
+                }
+            }
+            Rec::Retired { seq } => {
+                if let Some(c) = rp.chunks.table.get_mut(seq) {
+                    c.state = ChunkState::Retired;
+                }
+            }
+            Rec::Horizons(h) => horizons.extend(h.iter().cloned()),
+            Rec::Summary { retired_ms, keys } => {
+                rp.chunks.summaries.add(*retired_ms, keys.clone());
+            }
+            Rec::Next(n) => next_hw = next_hw.max(*n),
+            Rec::Resume => {}
+            Rec::Import(i) => rp.chunks.import = Some(i.clone()),
+        }
+    }
+    let horizon_map = chunks::horizon_set(&horizons);
+    rp.chunks.horizons = horizon_map.clone();
+    rp.report.horizons = horizon_map.len();
+    // Chunk files on disk must each have an open record that is not retired.
+    for (_, _, seq, p) in chunks::list_chunk_files(&dir)? {
+        let known = rp.chunks.table.get(&seq).is_some_and(|c| c.state != ChunkState::Retired && c.path == p);
+        if !known {
+            rp.storage_errors.push(format!("chunk file with no open record: {}", p.display()));
+        }
+    }
+    // Legacy stripe logs (before the import): read as one forever chunk that never retires.
+    let legacy: Vec<PathBuf> = (0..4).map(|i| path.join(format!("stripe-{i}.log"))).collect();
+    if legacy.iter().any(|p| p.exists()) && rp.chunks.import.is_none() {
+        rp.chunks.table.insert(
+            chunks::LEGACY_CHUNK,
+            chunks::ChunkInfo {
+                id: chunks::LEGACY_CHUNK,
+                stripe: 0,
+                class: Class::FOREVER,
+                policy: "(legacy stripe logs)".into(),
+                open_ms: 0,
+                close_ms: Some(0),
+                close_mono: None,
+                bytes: 0,
+                path: path.to_owned(),
+                state: ChunkState::Closed,
+                keys: HashMap::new(),
+                blocked_since: None,
+                horizons: Vec::new(),
+                expired: Vec::new(),
+            },
+        );
+        let mut total = 0;
+        for (i, p) in legacy.iter().enumerate() {
+            if !p.exists() {
+                continue;
+            }
+            // The legacy logs were open at any crash, so a torn tail is truncated as before.
+            let n = rp.replay_file(p, i, chunks::LEGACY_CHUNK, true, &horizon_map, config, now)?;
+            rp.report.stripes[i].legacy_logs += 1;
+            rp.report.legacy.push(p.display().to_string());
+            total += n;
+        }
+        rp.persisted += total;
+        if let Some(c) = rp.chunks.table.get_mut(&chunks::LEGACY_CHUNK) {
+            c.bytes = total;
+        }
+    }
+    let ids: Vec<u64> = rp.chunks.table.keys().copied().filter(|id| *id != chunks::LEGACY_CHUNK).collect();
+    for id in ids {
+        let c = rp.chunks.table[&id].clone();
+        match c.state {
+            ChunkState::Retired => rp.report.stripes[c.stripe].retired_skipped += 1,
+            ChunkState::Retiring => {
+                // Finished at start; its records were already out of the index when it began retiring.
+                let len = fs::metadata(&c.path).map(|m| m.len()).unwrap_or(0);
+                rp.persisted += len;
+                if let Some(info) = rp.chunks.table.get_mut(&id) {
+                    info.bytes = len;
+                }
+            }
+            ChunkState::Open | ChunkState::Closed => {
+                if !c.path.exists() {
+                    if c.state == ChunkState::Open {
+                        // The open record was flushed and the crash came before the file: an empty chunk.
+                        rp.report.empty_closed.push(id);
+                        continue;
+                    }
+                    rp.storage_errors.push(format!("chunk file missing with no retiring record: {}", c.path.display()));
+                    continue;
+                }
+                let open_at_crash = c.state == ChunkState::Open;
+                let n = rp.replay_file(&c.path, c.stripe, id, open_at_crash, &horizon_map, config, now)?;
+                rp.report.stripes[c.stripe].chunks += 1;
+                if !open_at_crash && n != c.bytes {
+                    return Err(corrupt(format!(
+                        "interior-corrupt {}: closed chunk holds {n} bytes, its close recorded {}",
+                        c.path.display(),
+                        c.bytes
+                    )));
+                }
+                rp.persisted += n;
+                if let Some(info) = rp.chunks.table.get_mut(&id) {
+                    info.bytes = n;
+                }
+            }
+        }
+    }
+    rp.next = rp.next.max(next_hw);
+    let _ = clock;
+    Ok(())
 }
 fn mutation_bytes(m: &Mutation, version: u64, at: u64) -> Vec<u8> {
     let mut b = Vec::new();
@@ -949,159 +1563,121 @@ impl Store {
         Self::open_owned(path, config, owner)
     }
     fn open_owned(path: &Path, config: Config, owner: File) -> io::Result<Self> {
-        let mut committed: HashMap<(String, String), Arc<Value>> = HashMap::new();
-        let mut dedup = HashMap::new();
-        let mut next = 1u64;
-        let mut logs = Vec::new();
-        let mut torn = Vec::new();
-        let mut persisted_bytes = 0;
-        let now = now_ms();
-        for i in 0..4 {
-            let p = path.join(format!("stripe-{i}.log"));
-            let mut f = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&p)?;
-            let mut offset = 0u64;
-            let len = f.metadata()?.len();
-            while offset < len {
-                let mut head = [0; 16];
-                if len - offset < 16 {
-                    torn.push((p.clone(), offset));
-                    break;
-                }
-                f.read_exact(&mut head)?;
-                if &head[0..4] != b"MBK1" {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("interior-corrupt {} offset {}: magic", p.display(), offset),
-                    ));
-                }
-                let n = u32::from_le_bytes(head[4..8].try_into().unwrap()) as usize;
-                if u32::from_le_bytes(head[8..12].try_into().unwrap()) != !(n as u32) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "interior-corrupt: length complement",
-                    ));
-                }
-                if n > MAX_FRAME {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "interior-corrupt: invalid chunk length",
-                    ));
-                }
-                if len - offset - 16 < n as u64 {
-                    torn.push((p.clone(), offset));
-                    break;
-                }
-                let mut b = vec![0; n];
-                f.read_exact(&mut b)?;
-                if crc32(&b) != u32::from_le_bytes(head[12..16].try_into().unwrap()) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("interior-corrupt {} offset {}: CRC", p.display(), offset),
-                    ));
-                }
-                let parsed = (|| -> Result<_, u16> {
-                    let mut c = Cursor::new(&b);
-                    let at = c.u64()?;
-                    let version = c.u64()?;
-                    let ack = c.u8()?;
-                    let remove = c.u8()? != 0;
-                    let ns = c.text()?;
-                    let key = c.text()?;
-                    let op_id = c.text()?;
-                    let expected = c.u64()?;
-                    let bytes = c.bytes(MAX_VALUE)?.to_vec();
-                    c.end()?;
-                    if !matches!(ack, 1 | 2) {
-                        return Err(3);
-                    }
-                    Ok((
-                        Mutation {
-                            ns,
-                            key,
-                            op_id,
-                            deadline: 0,
-                            ack,
-                            expected: if expected == u64::MAX {
-                                None
-                            } else {
-                                Some(expected)
-                            },
-                            bytes,
-                            remove,
-                        },
-                        version,
-                        at,
-                    ))
-                })();
-                let (m, v, at) = parsed.map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "interior-corrupt: payload")
-                })?;
-                if stripe(&m.ns, &m.key) != i {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "interior-corrupt: wrong stripe",
-                    ));
-                }
-                next = next.max(v + 1);
-                let k = (m.ns.clone(), m.key.clone());
-                let value = Value {
-                    version: v,
-                    ack: m.ack,
-                    bytes: m.bytes.clone(),
-                    tombstone: m.remove,
-                };
-                if committed
-                    .get(&k)
-                    .map_or(true, |old: &Arc<Value>| old.version < v)
-                {
-                    committed.insert(k, Arc::new(value));
-                }
-                if now.saturating_sub(at) <= config.retry_ms && !timers::is_progress(&m.ns,&m.key) {
-                    dedup.insert(
-                        (m.ns.clone(), m.op_id.clone()),
-                        Dedup {
-                            fingerprint: fingerprint(&m),
-                            at,
-                            outcome: Some(Outcome {
-                                code: 0,
-                                version: v,
-                                ack: m.ack,
-                            }),
-                        },
-                    );
-                }
-                offset += 16 + n as u64;
-            }
-            persisted_bytes += offset;
-            drop(f);
-            let file = OpenOptions::new().append(true).open(&p)?;
-            logs.push(Arc::new(Mutex::new(Log {
-                file,
-                bytes: 0,
-                flushes: 0,
-                write_calls: 0,
-                poisoned: false,
-            })));
-        }
-        if committed.len() > config.index_cap
-            || committed.values().map(|v| v.bytes.len()).sum::<usize>()
-                + dedup
+        let clock = chunks::Clock::new(config.clock.clone());
+        let start_ms = now_ms();
+        let refuse = |e: io::Error, mut report: chunks::ReplayReport| -> io::Error {
+            report.start_ms = start_ms;
+            report.ready_ms = now_ms();
+            report.refusal = Some(e.to_string());
+            // The replay record is written before exit; its own failure does not hide the refusal.
+            let _ = report.write(path);
+            e
+        };
+        let mut rp = match replay(path, &config, &clock) {
+            Ok(rp) => rp,
+            Err((e, report)) => return Err(refuse(e, report)),
+        };
+        if rp.committed.len() > config.index_cap
+            || rp.committed.values().map(|v| v.bytes.len()).sum::<usize>()
+                + rp.dedup
                     .values()
                     .map(|d: &Dedup| d.fingerprint.len())
                     .sum::<usize>()
                 > config.capacity
-            || dedup.len() > config.dedup_cap
+            || rp.dedup.len() > config.dedup_cap
         {
-            return Err(io::Error::other("replayed state exceeds configured limits"));
+            let report = rp.report.clone();
+            return Err(refuse(io::Error::other("replayed state exceeds configured limits"), report));
         }
-        for (p, offset) in torn {
-            OpenOptions::new().write(true).open(p)?.set_len(offset)?;
+        for (p, offset) in &rp.truncate {
+            OpenOptions::new().write(true).open(p)?.set_len(*offset)?;
         }
+        let cat_path = path.join("chunks").join("catalogue.log");
+        if let Some((offset, _, _)) = &rp.report.catalogue_truncation {
+            OpenOptions::new().write(true).open(&cat_path)?.set_len(*offset)?;
+        }
+        let mut cs = std::mem::replace(&mut rp.chunks, chunks::ChunkStore::new(path.join("chunks")));
+        let mut catalogue = chunks::Catalogue::open(&cat_path)?;
+        catalogue.last_ms = rp.cat_last_ms;
+        cs.cat = Some(catalogue);
+        let utc = clock.utc_ms();
+        let mono = clock.mono_ms();
+        let next = rp.next;
+        let mut persisted_bytes = rp.persisted;
+        // A crash between `retiring` and `retired` is finished here; the delete is idempotent.
+        let retiring: Vec<u64> = cs
+            .table
+            .values()
+            .filter(|c| c.state == chunks::ChunkState::Retiring)
+            .map(|c| c.id)
+            .collect();
+        for id in retiring {
+            let (p, bytes) = (cs.table[&id].path.clone(), cs.table[&id].bytes);
+            match fs::remove_file(&p) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(_) => {
+                    cs.table.get_mut(&id).unwrap().blocked_since = Some(utc);
+                    continue;
+                }
+            }
+            cs.log(utc, chunks::Rec::Retired { seq: id })?;
+            let c = cs.table.get_mut(&id).unwrap();
+            c.state = chunks::ChunkState::Retired;
+            c.keys.clear();
+            cs.retired_chunks += 1;
+            cs.retired_bytes += bytes;
+            persisted_bytes -= bytes;
+            rp.report.retirements_finished.push(id);
+        }
+        // An open record whose file was never made retires at once: it holds nothing.
+        for id in rp.report.empty_closed.clone() {
+            cs.log(utc, chunks::Rec::Retired { seq: id })?;
+            if let Some(c) = cs.table.get_mut(&id) {
+                c.state = chunks::ChunkState::Retired;
+            }
+        }
+        // Chunks open at the crash close now, at their replayed (and truncated) length.
+        let open: Vec<u64> = cs
+            .table
+            .values()
+            .filter(|c| c.state == chunks::ChunkState::Open)
+            .map(|c| c.id)
+            .collect();
+        for id in open {
+            let bytes = cs.table[&id].bytes;
+            if bytes == 0 {
+                // Nothing whole was written (or its torn tail went): the empty file retires, so no empty chunk stays.
+                fs::remove_file(&cs.table[&id].path).or_else(|e| if e.kind() == io::ErrorKind::NotFound { Ok(()) } else { Err(e) })?;
+                cs.log(utc, chunks::Rec::Retired { seq: id })?;
+                cs.table.get_mut(&id).unwrap().state = chunks::ChunkState::Retired;
+                rp.report.empty_closed.push(id);
+                continue;
+            }
+            cs.log(utc, chunks::Rec::Close { seq: id, bytes, next })?;
+            let c = cs.table.get_mut(&id).unwrap();
+            c.state = chunks::ChunkState::Closed;
+            c.close_ms = Some(utc);
+            c.close_mono = Some(mono);
+            rp.report.closed_at_start.push((id, bytes));
+        }
+        // Retirement pauses when the clock is in doubt (5.4).
+        let beat = fs::read_to_string(path.join("heartbeat.json"))
+            .ok()
+            .and_then(|t| t.split_once("\"unix_ms\":").map(|(_, r)| r.chars().take_while(char::is_ascii_digit).collect::<String>()))
+            .and_then(|d| d.parse::<u64>().ok());
+        if utc < rp.cat_last_ms {
+            cs.degraded = Some(format!("UTC {utc} is earlier than the catalogue's last record {}", rp.cat_last_ms));
+        } else if beat.is_some_and(|b| utc > b + 86_400_000) {
+            cs.degraded = Some(format!("UTC {utc} is more than 24 h past the heartbeat's last beat {}", beat.unwrap()));
+        }
+        rp.report.expiry_degraded = cs.degraded.clone();
+        let flags = Arc::new(Flags::default());
+        flags.expiry_degraded.store(cs.degraded.is_some(), Ordering::SeqCst);
+        if !rp.storage_errors.is_empty() {
+            flags.storage_error.store(true, Ordering::SeqCst);
+        }
+        rp.report.storage_errors = rp.storage_errors.clone();
         let epoch_path = path.join("epoch");
         let previous = if epoch_path.exists() {
             let b = fs::read(&epoch_path)?;
@@ -1122,6 +1698,7 @@ impl Store {
             f.sync_all()?;
         }
         fs::rename(epoch_tmp, epoch_path)?;
+        let committed = rp.committed;
         let metadata: HashMap<_, _> = committed
             .iter()
             .map(|(k, v)| {
@@ -1131,6 +1708,7 @@ impl Store {
                         version: v.version,
                         tombstone: v.tombstone,
                         bytes: v.bytes.len(),
+                        chunk: rp.chunk_of.get(k).copied().unwrap_or(0),
                     },
                 )
             })
@@ -1139,13 +1717,64 @@ impl Store {
         for (ns, _) in metadata.keys() {
             *namespace_counts.entry(ns.clone()).or_insert(0) += 1;
         }
-        let keys = metadata.len();
+        let keys = metadata.len() + cs.summaries.charged;
         let committed_bytes = metadata.values().map(|m| m.bytes).sum();
+        let dedup = rp.dedup;
         let dedup_bytes = dedup.values().map(|d| d.fingerprint.len()).sum();
         let mut expiry: Vec<_> = dedup.iter().map(|(k, d)| (k.clone(), d.at)).collect();
         expiry.sort_by_key(|(_, at)| *at);
         let timers = timers::State::restore(&committed)?;
-        let (appenders, flush_owner) = start_owners(&logs, &config);
+        let mut policies = chunks::Policies::default();
+        for ((ns, key), v) in committed.iter() {
+            if ns == chunks::POLICY_NS && !v.tombstone {
+                if let Some((pns, prefix, class)) = chunks::parse_policy(key, &v.bytes) {
+                    policies.set(&pns, &prefix, Some(class));
+                }
+            }
+        }
+        let policies = Arc::new(RwLock::new(policies));
+        let next_issued = Arc::new(AtomicU64::new(next));
+        let chunks = Arc::new(Mutex::new(cs));
+        let router = Arc::new(ChunkRouter {
+            sinks: (0..4).map(|_| Mutex::new(HashMap::new())).collect(),
+            table: RwLock::new(HashMap::new()),
+            fenced: std::array::from_fn(|_| AtomicBool::new(false)),
+            closed_io: Mutex::new([0; 3]),
+            policies: policies.clone(),
+            chunks: chunks.clone(),
+            clock: clock.clone(),
+            next: next_issued.clone(),
+            flags: flags.clone(),
+            chunk_bytes: config.chunk_bytes,
+            rotation_ms: config.rotation_ms,
+            fail_sync: config.fail_sync,
+        });
+        let (appenders, flush_owner) = start_routed_owners(router.clone(), 4, &config);
+        let (tick_stop, tick_receiver) = mpsc::channel();
+        let tick_router = router.clone();
+        let tick_chunks = chunks.clone();
+        let tick_flags = flags.clone();
+        let tick_every = Duration::from_millis(config.tick_ms.max(1));
+        let rewrite_at = config.catalogue_rewrite_bytes;
+        let tick_clock = clock.clone();
+        let tick_next = next_issued.clone();
+        let ticker = std::thread::spawn(move || {
+            while matches!(
+                tick_receiver.recv_timeout(tick_every),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ) {
+                tick_router.idle_close();
+                let mut cs = tick_chunks.lock().unwrap();
+                if rewrite_at > 0 && cs.cat_bytes() > rewrite_at {
+                    let live = cs.live_list(tick_clock.utc_ms(), tick_next.load(Ordering::SeqCst));
+                    if let Some(cat) = cs.cat.as_mut() {
+                        if cat.rewrite(&live).is_err() {
+                            tick_flags.storage_error.store(true, Ordering::SeqCst);
+                        }
+                    }
+                }
+            }
+        });
         let scans = Arc::new(Mutex::new(ScanState {
             next: 1,
             snapshots: HashMap::new(),
@@ -1166,6 +1795,15 @@ impl Store {
                     .retain(|_, s| s.created.elapsed() < ttl);
             }
         });
+        let mut report = rp.report;
+        report.epoch = epoch;
+        report.start_ms = start_ms;
+        report.dedup_entries = dedup.len();
+        report.keys = keys;
+        report.namespace_counts = namespace_counts.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        report.ready_ms = now_ms();
+        report.write(path)?;
+        let read_only = flags.storage_error.load(Ordering::SeqCst);
         Ok(Self {
             timers,
             signals: signals::Hub::new(epoch, &config),
@@ -1174,6 +1812,7 @@ impl Store {
             scans,
             scan_usage: Arc::new(ScanUsage::default()),
             scan_reaper: Some((stop, reaper)),
+            ticker: Some((tick_stop, ticker)),
             state: Mutex::new(State {
                 pending: HashMap::new(),
                 metadata,
@@ -1191,11 +1830,18 @@ impl Store {
                 stripe_items: [0; 4],
                 persisted_bytes,
                 pending_disk: 0,
-                read_only: false,
+                read_only,
                 warming: false,
             }),
             done: Condvar::new(),
-            logs,
+            router,
+            chunks,
+            policies,
+            next_issued,
+            flags,
+            clock,
+            path: path.to_owned(),
+            report: Mutex::new(report),
             appenders,
             flush_owner: Some(flush_owner),
             batch_gate: Mutex::new(()),
@@ -1446,27 +2092,178 @@ impl Store {
         result
     }
     pub fn metrics(&self) -> (u64, u64, usize) {
-        let mut b = 0;
-        let mut f = 0;
-        for l in &self.logs {
-            let l = l.lock().unwrap();
-            b += l.bytes;
-            f += l.flushes;
-        }
+        let (b, _, f) = self.router.io();
         (b, f, self.committed.read().unwrap().len())
     }
     pub fn state_bytes(&self) -> u64 {
         self.state.lock().unwrap().persisted_bytes
     }
     pub fn io_metrics(&self) -> (u64, u64, u64) {
-        let (mut bytes, mut writes, mut flushes) = (0, 0, 0);
-        for log in &self.logs {
-            let log = log.lock().unwrap();
-            bytes += log.bytes;
-            writes += log.write_calls;
-            flushes += log.flushes;
+        self.router.io()
+    }
+    /// The last replay record (state/replay.json holds the same).
+    pub fn replay_report(&self) -> chunks::ReplayReport {
+        self.report.lock().unwrap().clone()
+    }
+    /// Chunk table rows as (id, stripe, class label, state, bytes), for tests and status.
+    pub fn chunk_rows(&self) -> Vec<(u64, usize, String, String, u64)> {
+        self.chunks
+            .lock()
+            .unwrap()
+            .table
+            .values()
+            .map(|c| (c.id, c.stripe, c.class.label(), format!("{:?}", c.state), c.bytes))
+            .collect()
+    }
+    pub fn open_chunks(&self) -> usize {
+        self.router.open_chunks()
+    }
+    pub fn storage_error(&self) -> bool {
+        self.flags.storage_error.load(Ordering::SeqCst)
+    }
+    pub fn expiry_degraded(&self) -> bool {
+        self.flags.expiry_degraded.load(Ordering::SeqCst)
+    }
+    /// Retire one closed chunk by the steps of 5.4: `retiring` (with horizons), drop it from the holders,
+    /// delete the file, `retired`. A chunk still holding a key's latest record, or a pending key, stays.
+    /// Ok(true) when retired; Ok(false) when kept, blocked or stopped at the test seam.
+    pub fn retire_chunk(&self, id: u64) -> io::Result<bool> {
+        let state = self.state.lock().unwrap();
+        let mut cs = self.chunks.lock().unwrap();
+        let Some(c) = cs.table.get(&id).cloned() else {
+            return Ok(false);
+        };
+        if id == chunks::LEGACY_CHUNK || c.state != chunks::ChunkState::Closed {
+            return Ok(false);
         }
-        (bytes, writes, flushes)
+        if c.keys.keys().any(|k| state.pending.contains_key(k) || state.metadata.get(k).is_some_and(|m| m.chunk == id)) {
+            return Ok(false);
+        }
+        drop(state);
+        let horizons: Vec<(String, String, u64)> = c
+            .keys
+            .iter()
+            .filter(|(k, _)| cs.holders.others(k, id).next().is_some())
+            .map(|((ns, key), (_, max))| (ns.clone(), key.clone(), *max))
+            .collect();
+        let now = self.clock.utc_ms();
+        let next = self.next_issued.load(Ordering::SeqCst);
+        cs.log(now, chunks::Rec::Retiring { seq: id, next, horizons: horizons.clone(), expired: Vec::new() })?;
+        for (ns, key, v) in &horizons {
+            let h = cs.horizons.entry((ns.clone(), key.clone())).or_insert(0);
+            *h = (*h).max(*v);
+        }
+        if let Some(info) = cs.table.get_mut(&id) {
+            info.state = chunks::ChunkState::Retiring;
+            info.horizons = horizons;
+        }
+        if self.config.retire_stop_after == 1 {
+            return Ok(false);
+        }
+        for k in c.keys.keys() {
+            cs.holders.remove(k, id);
+        }
+        match fs::remove_file(&c.path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => {
+                if let Some(info) = cs.table.get_mut(&id) {
+                    info.blocked_since.get_or_insert(now);
+                }
+                return Ok(false);
+            }
+        }
+        if self.config.retire_stop_after == 2 {
+            return Ok(false);
+        }
+        cs.log(now, chunks::Rec::Retired { seq: id })?;
+        if let Some(info) = cs.table.get_mut(&id) {
+            info.state = chunks::ChunkState::Retired;
+            info.keys.clear();
+            info.blocked_since = None;
+        }
+        cs.retired_chunks += 1;
+        cs.retired_bytes += c.bytes;
+        drop(cs);
+        let mut state = self.state.lock().unwrap();
+        state.persisted_bytes = state.persisted_bytes.saturating_sub(c.bytes);
+        Ok(true)
+    }
+    /// Chunks whose delete is held (retiring, retried by the next pass).
+    pub fn retire_blocked(&self) -> usize {
+        self.chunks.lock().unwrap().table.values().filter(|c| c.blocked_since.is_some()).count()
+    }
+    /// Retry the held deletes; a retiring chunk's horizons are already recorded.
+    pub fn retry_retiring(&self) -> io::Result<usize> {
+        let mut cs = self.chunks.lock().unwrap();
+        let ids: Vec<u64> = cs.table.values().filter(|c| c.state == chunks::ChunkState::Retiring).map(|c| c.id).collect();
+        let mut done = 0;
+        let mut freed = 0;
+        for id in ids {
+            let (p, bytes) = (cs.table[&id].path.clone(), cs.table[&id].bytes);
+            match fs::remove_file(&p) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(_) => continue,
+            }
+            let now = self.clock.utc_ms();
+            cs.log(now, chunks::Rec::Retired { seq: id })?;
+            let info = cs.table.get_mut(&id).unwrap();
+            info.state = chunks::ChunkState::Retired;
+            info.keys.clear();
+            info.blocked_since = None;
+            cs.retired_chunks += 1;
+            cs.retired_bytes += bytes;
+            freed += bytes;
+            done += 1;
+        }
+        drop(cs);
+        let mut state = self.state.lock().unwrap();
+        state.persisted_bytes = state.persisted_bytes.saturating_sub(freed);
+        Ok(done)
+    }
+    /// Set (Some) or clear (None) a namespace prefix's class: written durably to POLICY_NS, then used by
+    /// writes that follow (5.1). Records already written keep their chunk's class.
+    pub fn set_policy(&self, ns: &str, prefix: &str, class: Option<Class>, deadline: u64) -> Outcome {
+        let key = match chunks::policy_key(ns, prefix) {
+            Ok(k) => k,
+            Err(code) => return Outcome::error(code),
+        };
+        if let Some(c) = class {
+            if self.policies.read().unwrap().would_exceed(ns, prefix, c) {
+                return Outcome::error(9);
+            }
+        }
+        let m = Mutation {
+            ns: POLICY_NS.into(),
+            key: key.clone(),
+            op_id: {
+                static SEQ: AtomicU64 = AtomicU64::new(0);
+                format!("policy/{}/{}/{}", self.epoch, now_ms(), SEQ.fetch_add(1, Ordering::SeqCst))
+            },
+            deadline,
+            ack: 2,
+            expected: None,
+            bytes: class.map(chunks::policy_value).unwrap_or_default(),
+            remove: class.is_none(),
+        };
+        let outcome = self.mutate(m);
+        if outcome.code == 0 {
+            self.policies.write().unwrap().set(ns, prefix, class);
+        }
+        outcome
+    }
+    /// Policy rows as (namespace, prefix, class).
+    pub fn policies(&self) -> Vec<(String, String, Class)> {
+        self.policies.read().unwrap().rows()
+    }
+    /// The idle tick's work, run now (tests use it with a manual clock).
+    pub fn tick(&self) {
+        self.router.idle_close();
+    }
+    #[allow(dead_code)]
+    fn state_path(&self) -> &Path {
+        &self.path
     }
     pub fn set_read_only(&self, b: bool) {
         self.state.lock().unwrap().read_only = b
@@ -1624,6 +2421,7 @@ impl Store {
         }
         let version = state.next;
         state.next += 1;
+        self.next_issued.fetch_max(state.next, Ordering::SeqCst);
         let value = Value {
             version,
             ack: m.ack,
@@ -1636,6 +2434,7 @@ impl Store {
                 version,
                 tombstone: m.remove,
                 bytes: m.bytes.len(),
+                chunk: 0,
             },
         );
         if new {
@@ -1660,7 +2459,7 @@ impl Store {
         }
         drop(state);
         let result = if m.ack == 0 {
-            Ok(())
+            Ok(0)
         } else {
             let b = mutation_bytes(&m, version, at);
             let mut record = b"MBK1".to_vec();
@@ -1713,7 +2512,7 @@ impl Store {
             state.persisted_bytes += disk_bytes;
         }
         state.pending.remove(&k);
-        if result.is_ok() && m.ack != 0 {
+        if let (Ok(chunk), true) = (&result, m.ack != 0) {
             state.committed_bytes =
                 state.committed_bytes - old.as_ref().map_or(0, |v| v.bytes) + m.bytes.len();
             state.metadata.insert(
@@ -1722,6 +2521,7 @@ impl Store {
                     version,
                     tombstone: m.remove,
                     bytes: m.bytes.len(),
+                    chunk: *chunk,
                 },
             );
         } else if new {
