@@ -382,11 +382,12 @@ fn main() -> io::Result<()> {
     if config.maintenance_reserve_bytes >= config.state_limit_bytes {
         return Err(io::Error::other("maintenance-reserve-bytes must be below state-limit-bytes"));
     }
-    let state_limit = config.state_limit_bytes;
     let store = Arc::new(Store::open(&path, config)?);
+    // membus.log's one-line replay summary; state/replay.json holds the whole record (CHUNK-RETIREMENT.md 6).
+    eprintln!("{}", store.replay_report().summary());
     let _timers = store.start_timers()?;
     if heartbeat_ms != 0 {
-        start_heartbeat(path.clone(), store.clone(), state_limit, heartbeat_ms);
+        start_heartbeat(path.clone(), store.clone(), heartbeat_ms);
     }
     eprintln!(
         "ready epoch={} pid={} state={}",
@@ -594,7 +595,7 @@ fn heartbeat_number(text: &str, key: &str) -> io::Result<u64> {
     digits.parse().map_err(io::Error::other)
 }
 
-fn start_heartbeat(path: PathBuf, store: Arc<Store>, state_limit: u64, interval_ms: u64) {
+fn start_heartbeat(path: PathBuf, store: Arc<Store>, interval_ms: u64) {
     thread::spawn(move || {
         let mut writes = 0u64;
         let mut bytes = 0u64;
@@ -607,10 +608,19 @@ fn start_heartbeat(path: PathBuf, store: Arc<Store>, state_limit: u64, interval_
                 .unwrap_or_default()
                 .as_millis();
             attempts += 1;
-            let state_bytes = store.state_bytes();
-            let state_high_water = state_bytes >= state_limit - state_limit / 4;
+            let health = store.health2();
             let format = |successful_bytes, tried_bytes| {
-                format!("{{\"pid\":{},\"epoch\":{},\"unix_ms\":{},\"heartbeat_writes\":{},\"heartbeat_bytes\":{},\"heartbeat_attempts\":{},\"heartbeat_bytes_attempted\":{},\"heartbeat_failures\":{},\"state_bytes\":{},\"state_limit_bytes\":{},\"state_high_water\":{}}}\n", std::process::id(), store.epoch, now, writes + 1, successful_bytes, attempts, tried_bytes, failures,state_bytes,state_limit,state_high_water)
+                membus::heartbeat_json(
+                    std::process::id(),
+                    store.epoch,
+                    now,
+                    writes + 1,
+                    successful_bytes,
+                    attempts,
+                    tried_bytes,
+                    failures,
+                    &health,
+                )
             };
             let mut content = format(0, 0);
             // Byte counter includes the current object; converge across decimal widths.

@@ -87,13 +87,18 @@ still excludes pre-restart bytes. Operators poll the heartbeat before the cap.
 `state_bytes` conservatively charges the complete attempted frame after an
 uncertain append until replay recounts actual valid bytes; pending reservations
 are excluded from the diagnostic value. At the cap, persistent removes also
-refuse since tombstones append and cannot reclaim log space. The8GiB cap applies
-to this unrotated stripe-log slice. PLAN's later1GiB maintenance reserve/7GiB
-ordinary ceiling must be provisioned before a maintenance/rotation rollout;
-this slice supplies neither snapshots nor a reserved maintenance tier.
-No automatic capacity-pressure alert consumer is wired yet; the heartbeat
-field is available to local operators and its reporting policy is an owner
-question recorded in the Act evidence. The cap itself is enforced immediately.
+refuse since tombstones append and cannot reclaim log space. Since chunk
+retirement (docs/CHUNK-RETIREMENT.md 5.5) the 8 GiB cap counts retained chunk
+bytes, retired bytes leave it at `retired`, and ordinary admissions refuse with
+7 at the cap less a 1 GiB maintenance reserve (7 GiB; an eighth of a smaller
+`--state-limit-bytes`, or `--maintenance-reserve-bytes`), which catalogue,
+retirement and import writes may use. Snapshots are still not supplied.
+Fleet's `heartbeat_warn` reads the heartbeat's `state_high_water` and the chunk
+retirement flags (fleet-manager 669bcc0 config/services.toml:209-214; CHUNK-RETIREMENT.md
+section 6): `read_only`, `storage_error`, `expiry_degraded`, `dedup_high_water`,
+`namespace_high_water`, `pinned_high_water` and `retire_blocked_high_water`,
+written 0 or 1 beside `state_high_water`'s true or false. HEALTH2 (opcode 27)
+returns the full reading. The cap itself is enforced immediately.
 
 A wire minor/major change needs hello negotiation and documented compatibility;
 an incompatible client receives incompatible_version. An on-disk format change

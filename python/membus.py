@@ -32,6 +32,11 @@ class EpochChanged(Exception):
         self.previous,self.current=previous,current
         super().__init__(f'server epoch changed {previous}->{current}; reconcile deterministic key before uncertain retry')
 
+class NotAvailable(Exception):
+    """The server predates the call (it answered `unsupported`)."""
+    def __init__(self, call):
+        super().__init__(f'{call} is not available on this server')
+
 class Refusal(Exception):
     def __init__(self, code, codes=None):
         self.code = code
@@ -332,6 +337,40 @@ class Client:
     def health(self, ns='ledger'):
         return dict(zip(('bytes_written','flush_calls','keys','namespace_keys','namespace_quota','index_cap','high_water','namespace_high_water'),
                         struct.unpack('<QQQQQQBB',self.call(8,ns))))
+
+    def health2(self, ns='ledger'):
+        """HEALTH2 (opcode 27): the store's state, limits and chunk retirement as a dict of strings.
+        Raises NotAvailable on a server without it."""
+        try:
+            d = Decoder(self.call(27, ns))
+        except Refusal as error:
+            if error.code == 2:
+                raise NotAvailable('health2') from error
+            raise
+        count, = d.unpack('<H')
+        fields = {}
+        for _ in range(count):
+            key, sep, value = d.blob().decode('utf8').partition('=')
+            if not sep or key in fields:
+                raise ValueError('invalid health2 field')
+            fields[key] = value
+        if d.pos != len(d.data):
+            raise ValueError('invalid health2 reply')
+        return fields
+
+    def get_status(self, ns, key, **options):
+        """GET_STATUS (opcode 26): {'status': 'live'|'expired'|'missing', 'version': n}. 'expired' holds for 30 days
+        after an expire class retires the key. Raises NotAvailable on a server without it."""
+        try:
+            d = Decoder(self.call(26, ns, lp(key), **options))
+        except Refusal as error:
+            if error.code == 2:
+                raise NotAvailable('get_status') from error
+            raise
+        status, version = d.unpack('<BQ')
+        if status > 2 or d.pos != len(d.data):
+            raise ValueError('invalid status reply')
+        return {'status': ('live', 'expired', 'missing')[status], 'version': version}
 
     def subscribe(self, ns, endpoint, prefix='', *, include_value=False, cursor=None,
                   protocol='membus.change/1', max_frame=MAX_FRAME, **options):

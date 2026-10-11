@@ -1522,6 +1522,107 @@ fn replay_into(rp: &mut Replayed, path: &Path, config: &Config, clock: &chunks::
     let _ = clock;
     Ok(())
 }
+/// HEALTH2 (opcode 27; CHUNK-RETIREMENT.md section 6): the store's state, limits and chunk retirement in one read.
+#[derive(Clone, Debug, Default)]
+pub struct Health2 {
+    pub state_bytes: u64,
+    pub state_limit_bytes: u64,
+    pub state_high_water: bool,
+    pub read_only: bool,
+    pub storage_error: bool,
+    pub expiry_degraded: bool,
+    pub dedup_entries: usize,
+    pub dedup_cap: usize,
+    pub dedup_high_water: bool,
+    pub keys: usize,
+    pub index_cap: usize,
+    /// Live keys by namespace, against `quota`.
+    pub namespaces: Vec<(String, usize)>,
+    pub quota: usize,
+    pub namespace_high_water: bool,
+    pub chunks_open: usize,
+    pub chunks_closed: usize,
+    /// Retained bytes by class label (the legacy logs as `legacy`).
+    pub retained_bytes: Vec<(String, u64)>,
+    pub retained_total: u64,
+    /// Latest-class bytes past their window, held because they still carry a key's latest record.
+    pub pinned_bytes: u64,
+    pub pinned_high_water: bool,
+    pub retired_chunks: u64,
+    pub retired_bytes: u64,
+    pub retire_blocked: usize,
+    pub retire_blocked_oldest_ms: u64,
+    pub retire_blocked_high_water: bool,
+}
+impl Health2 {
+    /// The key=value list HEALTH2 returns.
+    pub fn fields(&self) -> Vec<(String, String)> {
+        let mut f: Vec<(String, String)> = vec![
+            ("state_bytes".into(), self.state_bytes.to_string()),
+            ("state_limit_bytes".into(), self.state_limit_bytes.to_string()),
+            ("state_high_water".into(), self.state_high_water.to_string()),
+            ("read_only".into(), self.read_only.to_string()),
+            ("storage_error".into(), self.storage_error.to_string()),
+            ("expiry_degraded".into(), self.expiry_degraded.to_string()),
+            ("dedup_entries".into(), self.dedup_entries.to_string()),
+            ("dedup_cap".into(), self.dedup_cap.to_string()),
+            ("dedup_high_water".into(), self.dedup_high_water.to_string()),
+            ("keys".into(), self.keys.to_string()),
+            ("index_cap".into(), self.index_cap.to_string()),
+            ("quota".into(), self.quota.to_string()),
+            ("namespace_high_water".into(), self.namespace_high_water.to_string()),
+            ("chunks_open".into(), self.chunks_open.to_string()),
+            ("chunks_closed".into(), self.chunks_closed.to_string()),
+            ("retained_bytes".into(), self.retained_total.to_string()),
+            ("pinned_bytes".into(), self.pinned_bytes.to_string()),
+            ("pinned_high_water".into(), self.pinned_high_water.to_string()),
+            ("retired_chunks".into(), self.retired_chunks.to_string()),
+            ("retired_bytes".into(), self.retired_bytes.to_string()),
+            ("retire_blocked".into(), self.retire_blocked.to_string()),
+            ("retire_blocked_oldest_ms".into(), self.retire_blocked_oldest_ms.to_string()),
+            ("retire_blocked_high_water".into(), self.retire_blocked_high_water.to_string()),
+        ];
+        for (ns, n) in &self.namespaces {
+            f.push((format!("namespace.{ns}"), n.to_string()));
+        }
+        for (class, b) in &self.retained_bytes {
+            f.push((format!("retained_bytes.{class}"), b.to_string()));
+        }
+        f
+    }
+}
+/// The resident heartbeat line (src/main.rs writes it every beat): the fields fleet's check reads, then the chunk
+/// retirement flags `heartbeat_warn` may name and three counts (CHUNK-RETIREMENT.md section 6). The new flags are
+/// written 0 or 1, which fleet reads as a count (above 0 flags), so a beat stays under 512 B.
+#[allow(clippy::too_many_arguments)]
+pub fn heartbeat_json(
+    pid: u32,
+    epoch: u64,
+    unix_ms: u128,
+    writes: u64,
+    bytes: u64,
+    attempts: u64,
+    attempted: u64,
+    failures: u64,
+    h: &Health2,
+) -> String {
+    format!(
+        "{{\"pid\":{pid},\"epoch\":{epoch},\"unix_ms\":{unix_ms},\"heartbeat_writes\":{writes},\"heartbeat_bytes\":{bytes},\"heartbeat_attempts\":{attempts},\"heartbeat_bytes_attempted\":{attempted},\"heartbeat_failures\":{failures},\"state_bytes\":{},\"state_limit_bytes\":{},\"state_high_water\":{},\"read_only\":{},\"storage_error\":{},\"expiry_degraded\":{},\"dedup_high_water\":{},\"namespace_high_water\":{},\"pinned_high_water\":{},\"retire_blocked_high_water\":{},\"dedup_entries\":{},\"retained_bytes\":{},\"retired_bytes\":{}}}\n",
+        h.state_bytes,
+        h.state_limit_bytes,
+        h.state_high_water,
+        h.read_only as u8,
+        h.storage_error as u8,
+        h.expiry_degraded as u8,
+        h.dedup_high_water as u8,
+        h.namespace_high_water as u8,
+        h.pinned_high_water as u8,
+        h.retire_blocked_high_water as u8,
+        h.dedup_entries,
+        h.retained_total,
+        h.retired_bytes
+    )
+}
 /// Retirement, expiry summaries, tombstone drops and the clock check (5.3, 5.4), shared with the tick thread.
 struct Maint {
     state: Arc<Mutex<State>>,
@@ -2458,6 +2559,67 @@ impl Store {
         let state = self.state.lock().unwrap();
         (state.keys, state.namespace_counts.get(ns).copied().unwrap_or(0))
     }
+    /// HEALTH2's reading. Lock order: a stripe's sink before the chunk table (the write path), and the state before
+    /// the chunk table (retirement); so the open chunks are counted before either lock is taken here.
+    pub fn health2(&self) -> Health2 {
+        let chunks_open = self.router.open_chunks();
+        let state = self.state.lock().unwrap();
+        let cs = self.chunks.lock().unwrap();
+        let utc = self.maint.clock.utc_ms();
+        let c = &self.config;
+        let mut h = Health2 {
+            state_bytes: state.persisted_bytes,
+            state_limit_bytes: c.state_limit_bytes,
+            state_high_water: state.persisted_bytes >= c.state_limit_bytes - c.state_limit_bytes / 4,
+            read_only: state.read_only,
+            storage_error: self.flags.storage_error.load(Ordering::SeqCst),
+            expiry_degraded: self.flags.expiry_degraded.load(Ordering::SeqCst),
+            dedup_entries: state.dedup.len(),
+            dedup_cap: c.dedup_cap,
+            dedup_high_water: state.dedup.len() * 100 >= c.dedup_cap * 70,
+            keys: state.keys,
+            index_cap: c.index_cap,
+            quota: c.quota,
+            chunks_open,
+            retired_chunks: cs.retired_chunks,
+            retired_bytes: cs.retired_bytes,
+            ..Health2::default()
+        };
+        let mut namespaces: Vec<(String, usize)> =
+            state.namespace_counts.iter().filter(|(_, n)| **n > 0).map(|(k, n)| (k.clone(), *n)).collect();
+        namespaces.sort();
+        h.namespace_high_water = namespaces.iter().any(|(_, n)| n * 100 >= c.quota * 70);
+        h.namespaces = namespaces;
+        let mut by_class: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+        let mut oldest_blocked = None::<u64>;
+        for chunk in cs.table.values() {
+            if chunk.state == chunks::ChunkState::Retired {
+                continue;
+            }
+            let label = if chunk.id == chunks::LEGACY_CHUNK { "legacy".to_owned() } else { chunk.class.label() };
+            *by_class.entry(label).or_insert(0) += chunk.bytes;
+            h.retained_total += chunk.bytes;
+            if chunk.state == chunks::ChunkState::Closed && chunk.id != chunks::LEGACY_CHUNK {
+                h.chunks_closed += 1;
+                let due = chunk.close_ms.is_some_and(|close| utc >= close.saturating_add(c.retry_ms));
+                if chunk.class.kind == 1
+                    && due
+                    && chunk.keys.keys().any(|k| state.metadata.get(k).is_some_and(|m| m.chunk == chunk.id))
+                {
+                    h.pinned_bytes += chunk.bytes;
+                }
+            }
+            if let Some(since) = chunk.blocked_since {
+                h.retire_blocked += 1;
+                oldest_blocked = Some(oldest_blocked.map_or(since, |o| o.min(since)));
+            }
+        }
+        h.retained_bytes = by_class.into_iter().collect();
+        h.pinned_high_water = h.pinned_bytes >= c.pinned_high_water_bytes;
+        h.retire_blocked_oldest_ms = oldest_blocked.map_or(0, |since| utc.saturating_sub(since));
+        h.retire_blocked_high_water = h.retire_blocked_oldest_ms > 3_600_000;
+        h
+    }
     /// GET_STATUS (5.3): 0 live with its version, 1 expired (in a summary), 2 missing.
     pub fn get_status(&self, ns: &str, key: &str) -> (u8, u64) {
         if let Some(v) = self.get_handle(ns, key) {
@@ -2920,6 +3082,15 @@ impl Store {
                         lp(&mut p, prefix.as_bytes());
                         p.push(class.kind);
                         p.extend(class.retention_ms.to_le_bytes());
+                    }
+                    Ok(p)
+                }
+                HEALTH2 => {
+                    c.end()?;
+                    let fields = self.health2().fields();
+                    let mut p = (fields.len() as u16).to_le_bytes().to_vec();
+                    for (k, v) in fields {
+                        lp(&mut p, format!("{k}={v}").as_bytes());
                     }
                     Ok(p)
                 }
