@@ -1,0 +1,436 @@
+{
+ "read_at": "2026-10-11T08:59:25.765000+00:00",
+ "state": "D:\\projects\\membus\\state",
+ "stripe_bytes": {
+  "stripe-0.log": 560819,
+  "stripe-1.log": 1504922,
+  "stripe-2.log": 2656867,
+  "stripe-3.log": 3532698
+ },
+ "total_stripe_bytes": 8255306,
+ "records": 10886,
+ "first_record": "2026-10-09T19:19:32.595000+00:00",
+ "last_record": "2026-10-11T08:59:11.544000+00:00",
+ "windows": {
+  "since_2026-10-11T00:44Z": {
+   "since": "2026-10-11T00:44:00+00:00",
+   "hours": 8.257,
+   "records": 2996,
+   "bytes": 2426911,
+   "bytes_per_hour": 293916.1,
+   "records_per_hour": 362.8,
+   "distinct_op_ids": 2996,
+   "removes": 0,
+   "by_writer": {
+    "slots inference": {
+     "records": 366,
+     "bytes": 1225829,
+     "bytes_per_hour": 148456.5
+    },
+    "quota resets": {
+     "records": 231,
+     "bytes": 487186,
+     "bytes_per_hour": 59001.7
+    },
+    "quota state/": {
+     "records": 236,
+     "bytes": 106055,
+     "bytes_per_hour": 12844.0
+    },
+    "quota tokens/": {
+     "records": 353,
+     "bytes": 91031,
+     "bytes_per_hour": 11024.5
+    },
+    "slots cpu": {
+     "records": 249,
+     "bytes": 90236,
+     "bytes_per_hour": 10928.2
+    },
+    "quota event/": {
+     "records": 231,
+     "bytes": 89216,
+     "bytes_per_hour": 10804.7
+    },
+    "slots mem": {
+     "records": 240,
+     "bytes": 86959,
+     "bytes_per_hour": 10531.3
+    },
+    "__membus_timers_v1 p/": {
+     "records": 495,
+     "bytes": 74250,
+     "bytes_per_hour": 8992.2
+    },
+    "quota fit/": {
+     "records": 235,
+     "bytes": 67745,
+     "bytes_per_hour": 8204.4
+    },
+    "lease-claims quota/": {
+     "records": 124,
+     "bytes": 33082,
+     "bytes_per_hour": 4006.5
+    },
+    "capacity event/": {
+     "records": 46,
+     "bytes": 22715,
+     "bytes_per_hour": 2750.9
+    },
+    "slots event/": {
+     "records": 63,
+     "bytes": 16195,
+     "bytes_per_hour": 1961.3
+    },
+    "slots inference-codex": {
+     "records": 26,
+     "bytes": 14430,
+     "bytes_per_hour": 1747.6
+    },
+    "lease-control epoch": {
+     "records": 62,
+     "bytes": 9114,
+     "bytes_per_hour": 1103.8
+    },
+    "slots disk:d": {
+     "records": 17,
+     "bytes": 5582,
+     "bytes_per_hour": 676.0
+    },
+    "slots gpu": {
+     "records": 14,
+     "bytes": 4672,
+     "bytes_per_hour": 565.8
+    },
+    "slots disk:c": {
+     "records": 8,
+     "bytes": 2614,
+     "bytes_per_hour": 316.6
+    }
+   }
+  },
+  "since_2026-10-11T07:21Z": {
+   "since": "2026-10-11T07:21:00+00:00",
+   "hours": 1.64,
+   "records": 674,
+   "bytes": 652598,
+   "bytes_per_hour": 397806.7,
+   "records_per_hour": 410.9,
+   "distinct_op_ids": 674,
+   "removes": 0,
+   "by_writer": {
+    "slots inference": {
+     "records": 87,
+     "bytes": 380957,
+     "bytes_per_hour": 232221.4
+    },
+    "quota resets": {
+     "records": 52,
+     "bytes": 109956,
+     "bytes_per_hour": 67026.3
+    },
+    "quota state/": {
+     "records": 52,
+     "bytes": 23329,
+     "bytes_per_hour": 14220.7
+    },
+    "slots mem": {
+     "records": 62,
+     "bytes": 23091,
+     "bytes_per_hour": 14075.7
+    },
+    "slots cpu": {
+     "records": 61,
+     "bytes": 22759,
+     "bytes_per_hour": 13873.3
+    },
+    "quota event/": {
+     "records": 52,
+     "bytes": 20061,
+     "bytes_per_hour": 12228.7
+    },
+    "quota tokens/": {
+     "records": 64,
+     "bytes": 16536,
+     "bytes_per_hour": 10079.9
+    },
+    "quota fit/": {
+     "records": 56,
+     "bytes": 16145,
+     "bytes_per_hour": 9841.6
+    },
+    "__membus_timers_v1 p/": {
+     "records": 98,
+     "bytes": 14700,
+     "bytes_per_hour": 8960.7
+    },
+    "lease-claims quota/": {
+     "records": 38,
+     "bytes": 10146,
+     "bytes_per_hour": 6184.7
+    },
+    "capacity event/": {
+     "records": 7,
+     "bytes": 3211,
+     "bytes_per_hour": 1957.3
+    },
+    "slots event/": {
+     "records": 11,
+     "bytes": 2829,
+     "bytes_per_hour": 1724.5
+    },
+    "lease-control epoch": {
+     "records": 19,
+     "bytes": 2793,
+     "bytes_per_hour": 1702.5
+    },
+    "slots inference-codex": {
+     "records": 5,
+     "bytes": 2775,
+     "bytes_per_hour": 1691.6
+    },
+    "slots gpu": {
+     "records": 6,
+     "bytes": 2002,
+     "bytes_per_hour": 1220.4
+    },
+    "slots disk:d": {
+     "records": 4,
+     "bytes": 1308,
+     "bytes_per_hour": 797.3
+    }
+   }
+  },
+  "last_24h": {
+   "since": "2026-10-10T08:59:25.765000+00:00",
+   "hours": 24.0,
+   "records": 6687,
+   "bytes": 4703508,
+   "bytes_per_hour": 195979.5,
+   "records_per_hour": 278.6,
+   "distinct_op_ids": 6687,
+   "removes": 0,
+   "by_writer": {
+    "slots inference": {
+     "records": 815,
+     "bytes": 2099034,
+     "bytes_per_hour": 87459.8
+    },
+    "quota resets": {
+     "records": 476,
+     "bytes": 993804,
+     "bytes_per_hour": 41408.5
+    },
+    "quota state/": {
+     "records": 495,
+     "bytes": 222037,
+     "bytes_per_hour": 9251.5
+    },
+    "quota tokens/": {
+     "records": 808,
+     "bytes": 208351,
+     "bytes_per_hour": 8681.3
+    },
+    "slots cpu": {
+     "records": 565,
+     "bytes": 205528,
+     "bytes_per_hour": 8563.7
+    },
+    "slots mem": {
+     "records": 550,
+     "bytes": 199603,
+     "bytes_per_hour": 8316.8
+    },
+    "quota event/": {
+     "records": 478,
+     "bytes": 183729,
+     "bytes_per_hour": 7655.4
+    },
+    "__membus_timers_v1 p/": {
+     "records": 1106,
+     "bytes": 165583,
+     "bytes_per_hour": 6899.3
+    },
+    "quota fit/": {
+     "records": 491,
+     "bytes": 141455,
+     "bytes_per_hour": 5894.0
+    },
+    "lease-claims quota/": {
+     "records": 266,
+     "bytes": 71016,
+     "bytes_per_hour": 2959.0
+    },
+    "capacity event/": {
+     "records": 118,
+     "bytes": 57865,
+     "bytes_per_hour": 2411.0
+    },
+    "slots inference-codex": {
+     "records": 97,
+     "bytes": 53576,
+     "bytes_per_hour": 2232.3
+    },
+    "slots event/": {
+     "records": 168,
+     "bytes": 43270,
+     "bytes_per_hour": 1802.9
+    },
+    "lease-control epoch": {
+     "records": 137,
+     "bytes": 20139,
+     "bytes_per_hour": 839.1
+    },
+    "slots disk:d": {
+     "records": 53,
+     "bytes": 17635,
+     "bytes_per_hour": 734.8
+    },
+    "slots gpu": {
+     "records": 40,
+     "bytes": 13352,
+     "bytes_per_hour": 556.3
+    },
+    "slots disk:c": {
+     "records": 18,
+     "bytes": 5882,
+     "bytes_per_hour": 245.1
+    },
+    "lease-claims inference/": {
+     "records": 3,
+     "bytes": 795,
+     "bytes_per_hour": 33.1
+    },
+    "quota open": {
+     "records": 2,
+     "bytes": 629,
+     "bytes_per_hour": 26.2
+    },
+    "__membus_timers_v1 s/": {
+     "records": 1,
+     "bytes": 225,
+     "bytes_per_hour": 9.4
+    }
+   }
+  },
+  "last_6h": {
+   "since": "2026-10-11T02:59:25.765000+00:00",
+   "hours": 6.0,
+   "records": 2238,
+   "bytes": 1957007,
+   "bytes_per_hour": 326167.8,
+   "records_per_hour": 373.0,
+   "distinct_op_ids": 2238,
+   "removes": 0,
+   "by_writer": {
+    "slots inference": {
+     "records": 284,
+     "bytes": 1065119,
+     "bytes_per_hour": 177519.8
+    },
+    "quota resets": {
+     "records": 171,
+     "bytes": 361292,
+     "bytes_per_hour": 60215.3
+    },
+    "quota state/": {
+     "records": 173,
+     "bytes": 77664,
+     "bytes_per_hour": 12944.0
+    },
+    "slots cpu": {
+     "records": 187,
+     "bytes": 68012,
+     "bytes_per_hour": 11335.3
+    },
+    "slots mem": {
+     "records": 186,
+     "bytes": 67650,
+     "bytes_per_hour": 11275.0
+    },
+    "quota event/": {
+     "records": 171,
+     "bytes": 65999,
+     "bytes_per_hour": 10999.8
+    },
+    "quota tokens/": {
+     "records": 246,
+     "bytes": 63506,
+     "bytes_per_hour": 10584.3
+    },
+    "__membus_timers_v1 p/": {
+     "records": 360,
+     "bytes": 54000,
+     "bytes_per_hour": 9000.0
+    },
+    "quota fit/": {
+     "records": 177,
+     "bytes": 51027,
+     "bytes_per_hour": 8504.5
+    },
+    "lease-claims quota/": {
+     "records": 100,
+     "bytes": 26674,
+     "bytes_per_hour": 4445.7
+    },
+    "capacity event/": {
+     "records": 30,
+     "bytes": 14203,
+     "bytes_per_hour": 2367.2
+    },
+    "slots event/": {
+     "records": 51,
+     "bytes": 13101,
+     "bytes_per_hour": 2183.5
+    },
+    "slots inference-codex": {
+     "records": 19,
+     "bytes": 10545,
+     "bytes_per_hour": 1757.5
+    },
+    "lease-control epoch": {
+     "records": 50,
+     "bytes": 7350,
+     "bytes_per_hour": 1225.0
+    },
+    "slots disk:d": {
+     "records": 17,
+     "bytes": 5582,
+     "bytes_per_hour": 930.3
+    },
+    "slots gpu": {
+     "records": 8,
+     "bytes": 2669,
+     "bytes_per_hour": 444.8
+    },
+    "slots disk:c": {
+     "records": 8,
+     "bytes": 2614,
+     "bytes_per_hour": 435.7
+    }
+   }
+  }
+ },
+ "dedup": {
+  "table_entries": 262144,
+  "distinct_op_ids_last_24h": 6687,
+  "occupancy": 0.0255,
+  "note": "Distinct op_ids among records appended in the last 24 h; the table also holds op_ids of puts whose records it deduplicated and of refused puts, which leave no record, so this is a lower bound of its occupancy."
+ },
+ "key_slots": {
+  "distinct_keys_all_time": 1567,
+  "per_namespace": {
+   "capacity": 195,
+   "quota": 711,
+   "slots": 636,
+   "F-E6-33-health": 1,
+   "lease-control": 1,
+   "lease-claims": 9,
+   "__membus_timers_v1": 4,
+   "e6-resident-restart-1791573572": 3,
+   "e6-resident-restart-1791573602": 3,
+   "e6-install-proof": 3,
+   "quota-test": 1
+  }
+ }
+}
