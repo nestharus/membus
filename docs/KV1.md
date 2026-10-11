@@ -187,3 +187,16 @@ The128row prototype at50ms saves3of16syncs (about19%) while taking about40times 
 ## Persisted timers (F-E6-41)
 
 Identity feature timers=1 adds operations21 set/replace,22 cancel,23 status and refusal25 discovery, without changing old hello or existing calls. [TIMERS.md](TIMERS.md) specifies fields, bounds, per-fire bytes, catch-up and crash windows. Subscription delivery carries MBT1 as an MBC1 value; generation/index identify a due, and payload execution remains the caller's lease.
+
+## Chunk retirement opcodes (F-E6-52)
+
+Opcodes 24-27 are additive under kv/1 minor 0 ([CHUNK-RETIREMENT.md](CHUNK-RETIREMENT.md) section 6); hello and health keep their layouts, and an older server answers `unsupported` (2). Each carries the common fields; the namespace `__membus_policy_v1` is refused (3) to every client operation, as the timers namespace is.
+
+| Opcode | Payload after common fields | Successful reply after common header |
+|---|---|---|
+| 24 policy_set | string prefix (may be empty); u8 kind (0 forever, 1 latest, 2 expire, 255 clear); u64 retention_ms (expire only, at least the retry window) | u64 version; u8 achieved_ack |
+| 25 policy_get | empty | u16 count; (string prefix; u8 kind; u64 retention_ms)* for the request's namespace |
+| 26 get_status | string key | u8 status (0 live, 1 expired, 2 missing); u64 version (live only, else 0) |
+| 27 health2 | empty | u16 count; (string "key=value")* |
+
+`policy_set` refuses a 65th distinct class with `capacity` (7). The namespace in the common fields is the one the policy governs; longest prefix wins, and a key with no policy is `forever`. `get_status` reports `expired` for 30 days after an expire class retires the key's latest record, then `missing`. `health2`'s keys are listed in CHUNK-RETIREMENT.md section 6 (`namespace.<ns>` and `retained_bytes.<class>` repeat per namespace and class). The Python client's `health2()` and `get_status()` raise `NotAvailable` on an older server; `membus policy PIPE get|set|clear` and `membus expiry resume STATE_DIR` are the CLI.

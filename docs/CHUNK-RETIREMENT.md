@@ -1,7 +1,8 @@
 # Chunk retirement: plan (F-E6-52)
 
-**Status:** plan for lane 87, written by claude6-eco's e17 Act on 2026-10-11. No code yet. The build follows in a
-later Act; lane 87's answers are in section 12. Account: claude6-eco's ledger
+**Status:** plan for lane 87, written by claude6-eco's e17 Act on 2026-10-11; built as CR1-CR4 by claude6-eco's e18
+Act on 2026-10-11 on branch `F-E6-52-chunk-retirement` (section 13 records what was built and where it departs from
+this plan). Lane 87's answers are in section 12. Account: claude6-eco's ledger
 (`D:/projects/oulipoly/trunk/research/87_operations_representation/claude6-eco/ledger.json`), frontier F-E6-52.
 Working records are in that loop's `runs/e17/act-work/F-E6-52/`. This version takes the dispositions of the plan's observe-class read
 (`runs/e17/act-work/F-E6-52/review/DISPOSITIONS.md`, O1-O21). Measurement scripts and their outputs are in
@@ -504,11 +505,20 @@ Every base test passes unchanged except where KV1.md's slot rule changes, and th
 
 ## 9. Review and install
 
-**Review:** one code review runbook run (CODE_REVIEW_RUNBOOK.md, sha256 9be0c0f3) on the combined release, as lane 87
-answered (claude6-eco row 2020 (b); runbook :104-107, "Several changes released together"). It covers membus 51d6553
-to its merged head and membus-leases 86fba3b to its merged head, with an area scout per package, at about 90 seats
-instead of about 180 for two runs. The leases repair's merge waits for it. Lane 87 notes that nothing in that repair is
-a correctness defect: F-E6-74 found the service sound as a lease authority.
+**Review:** the code review runbook's loop form (CODE_REVIEW_RUNBOOK.md, sha256 1e6abdb7, :5-31; lane 87 in
+claude6-eco rows 2030 and 2058, which withdrew the combined runbook run this section first named). The review is the
+loop's own observation, not a separate run:
+1. The Act that built the change ends its phase with one ledger row, signal `observer-request`, naming the artifact:
+   membus 330d2b4 to the branch head and membus-leases 86fba3b to the F-E6-74 repair head (bf043ea), with each commit's
+   origin, the suite, and an area scout per package. It carries no question and no goal.
+2. The loop's next Observe runs the requested suite itself under the sub-agent gate, its rows going to the loop's own
+   ledger; each observer's history on this artifact is checked before launch and retired observers are left out
+   (runbook :20-22).
+3. The loop's Orient runs the nine family interpreters, then the central interpreter, and writes covering conclusions.
+4. The loop's Decide holds the reading and commissions any fix. A fix is built by a later Act, which ends with an
+   observer request for what the fix touched and the rows it answers.
+The leases repair's merge waits for the reading. Lane 87 notes that nothing in that repair is a correctness defect:
+F-E6-74 found the service sound as a lease authority.
 
 **Install:** through lane 88's stopped swap, at a time agreed with lane 88:
 - `fleet services swap membus NEXT SHA256` (about 65 s on the writers' file fallback, F-E6-28), then
@@ -534,13 +544,14 @@ a correctness defect: F-E6-74 found the service sound as a lease authority.
    capacity-pressure alert consumer is wired yet", since fleet's heartbeat_warn reads `state_high_water`
    (`services.toml`:210).
 4. **CR4:** the legacy import and the production-shaped replay (T11, T15).
-5. **CR5:** review (section 9), with fixes by its decider's report.
+5. **CR5:** review in the loop form (section 9): the observer request, the next Observe's suite, Orient's interpreters
+   and Decide's reading, with fixes commissioned from it.
 6. **CR6:** the combined qualification (T16), release, the swap window and readback, and the policies set by their
    owners.
 
 ## 11. Beyond this loop's capacity
 
-- One runbook run of about 90 seats (combined) or two of about 90 each.
+- The requested code review suite, run by the loop's Observe one sub-agent at a time at this loop's seats.
 - One swap window with lane 88.
 - Lane 88's policy choices.
 - Lane 87's answers (section 12).
@@ -553,7 +564,8 @@ The build itself is one Act's work under lane 87's one build at a time (seq 1083
 - (a) May chunk retirement's build start while the leases repair's re-gate waits for room? **Yes.** One build at a time
   holds (1083 (1)). The build runs within claude6-eco's seats: at 0 whole seats, at the per-loop floor of one, one
   sub-agent at a time.
-- (b) One runbook run on the combined release? **Yes** (section 9).
+- (b) One runbook run on the combined release? **Answered yes, then withdrawn** (lane 87, rows 2030 and 2058): review
+  is the loop form of section 9, an observer request at the end of the building Act, with no run count.
 - (c) The one-time legacy import? **Commissioned,** as part of this slice and under the same review, with the migration
   and backup plan in 5.6. Removing the legacy files is a later, separate ask.
 - (d) The `latest` class's reading of "expired"? **Accepted, not put to the founder** (FD-110). It is recorded as an
@@ -566,3 +578,51 @@ The build itself is one Act's work under lane 87's one build at a time (seq 1083
   days (`quotafwd.py`:49).
 - Whether lane 88's reopen-timer replace and the pillar successor write are live as fenced lease adopters (5.8).
 - Which of section 6's heartbeat flags its watchers read, and whether HEALTH2's fields are the ones it needs.
+
+## 13. As built (e18, CR1-CR4)
+
+Built on branch `F-E6-52-chunk-retirement` from main 330d2b4 in claude6-eco's e18 Act. Commits: CR1 bd7ae6b (T1, T6,
+T7, T12), CR2 aecda05 (T2-T5, T8, T10, T13), CR3 a0d014c (T9, T14), CR4 (T11, T15). Run records are in claude6-eco's
+`runs/e18/act-work/F-E6-52/runs/`.
+
+**Departures from this plan, each with its reason:**
+- **Base tests' file lookup.** Three tests in tests/protocol.rs and four Python harnesses (integration.py, resident.py,
+  timers_native.py, subscribe_native.py) opened `stripe-N.log` by path. They now find chunk files (5.2's layout): a
+  stripe's bytes are its chunks' sum, and a torn tail goes to the newest chunk, which was open at the stop. Every
+  assertion is unchanged.
+- **An empty chunk retires at start.** A chunk open at a stop whose replay keeps no whole record (its only record was
+  cut) is deleted and recorded `retired` at start, so no empty chunk stays (O3). Its truncation is still listed.
+- **A tombstone's index entry** drops once no *other* retained chunk holds an older record of its key. An older record
+  in the tombstone's own chunk retires with it and cannot bring the key back, so it does not hold the entry (5.3).
+- **An expire retention shorter than the retry window is refused** (POLICY_SET and the import's policies, code 3).
+  Retiring a record younger than 24 h would drop the dedup entry a restart rebuilds from it (T8). The first policies
+  are all 24 h or longer.
+- **The class cap** (a 65th class) is refused with 7 (`capacity`); the plan named no code.
+- **The heartbeat's seven new flags are written 0 or 1,** not true or false. Fleet reads a count above 0 as a flag
+  (fleet-manager 669bcc0 services.rs `heartbeat_warnings`), and the widest beat at a year's counters is then 509 B,
+  under T9's 512 B; with true/false it was 542 B. `state_high_water` keeps its bool. A real beat measured 452 B.
+- **The maintenance reserve** is 1 GiB at the 8 GiB limit; a smaller `--state-limit-bytes` keeps an eighth, so test
+  servers still admit (`--maintenance-reserve-bytes` overrides).
+- **The import's policies** come from `state/import-policies.txt` (`NS<TAB>PREFIX<TAB>CLASS`), written before the
+  swap; the import writes them as policy records ahead of the imported keys, so each key takes its class at import.
+  Without it every imported key would land in `forever` (no policy exists before the swap). tests/import_production.py
+  `policies()` writes the first policies: lane 88's (claude6-eco row 2029 item 5: expire(3 d) for quota, slots and
+  capacity `event/` and `quota-test`; latest for quota `state/`, `open`, `resets`, `tokens/`, `fit/` and slots'
+  resources), lease-claims and lease-control `latest` (5.4), and eco's test namespaces `expire(1 d)` (5.1).
+- **A legacy torn tail** is left in place and not imported (the legacy files stay unmodified); the replay record names
+  it. A chunk store that already holds chunks beside legacy logs (no production state does) reads the logs as one
+  forever chunk instead of importing.
+- **The retirement pass** runs on the maintenance thread with the state and chunk locks held through its catalogue
+  write, not on a separate I/O pool; a delete runs with the chunk lock only.
+- **T6's kills** are simulated by a stop seam (`retire_stop_after`) and dropping the store, whose drop runs no close;
+  T12's process kill likewise.
+- **T15's flushes per gather** come from flush_burst.py (3,070 durable writes): 304 syncs on this build against 311 on
+  the installed binary, both in one namespace (the forever class). T15's replay itself writes with ack=os.
+
+**Measured.** T11 on a copy of production state (12,342 legacy records, 9.67 MB): 1,728 keys imported (613,811 B) and
+equal through the previous binary and this one, in 2.7 s of replay; expire(3 d) 568,377 B, latest 32,404 B, forever
+11,728 B, expire(1 d) 1,302 B. T15: after the import and 73 simulated hours of the copy's last 24 h of records (6,967
+records, 21,184 puts), 5,899,383 B retained, 0.967 of 5.7's 6.1 MB (expire(3 d) 823,470 B, latest 5,064,185 B, forever
+11,728 B).
+
+**Open:** CR5 (the review, by observer request), CR6 (qualification, release, swap window, policies by their owners).

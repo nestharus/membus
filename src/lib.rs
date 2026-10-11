@@ -309,6 +309,8 @@ pub struct Config {
     pub clock: Option<Arc<chunks::ManualClock>>,
     /// Test seam: stop a retirement after step N (1: after `retiring`, 2: after the delete).
     pub retire_stop_after: u8,
+    /// Test seam: the import leaves one key out, so its check must find the difference (T11).
+    pub import_inject_difference: bool,
     #[cfg(test)]
     pub sync_test_gate: Option<Arc<(Mutex<(bool, bool)>, Condvar)>>,
     #[cfg(test)]
@@ -346,6 +348,7 @@ impl Default for Config {
             pinned_high_water_bytes: 64 * 1024 * 1024,
             clock: None,
             retire_stop_after: 0,
+            import_inject_difference: false,
             #[cfg(test)]
             sync_test_gate: None,
             #[cfg(test)]
@@ -1343,28 +1346,372 @@ impl Replayed {
         Ok(offset)
     }
 }
-fn replay(path: &Path, config: &Config, clock: &chunks::Clock) -> Result<Replayed, (io::Error, chunks::ReplayReport)> {
-    let mut rp = Replayed {
+/// The legacy stripe logs a folder holds: the state root before the import, legacy-<epoch>/ after it.
+fn legacy_files(dir: &Path) -> Vec<(usize, PathBuf)> {
+    (0..4).map(|i| (i, dir.join(format!("stripe-{i}.log")))).filter(|(_, p)| p.exists()).collect()
+}
+/// What the legacy logs hold, read without changing them: each key's latest record whole, and the dedup window.
+struct Legacy {
+    committed: HashMap<Key, Arc<Value>>,
+    dedup: HashMap<Key, Dedup>,
+    next: u64,
+    /// Each key's latest record: version, stripe, payload.
+    latest: HashMap<Key, (u64, usize, Vec<u8>)>,
+    /// Torn tails left in place: file, offset, bytes.
+    torn: Vec<(String, u64, u64)>,
+    records: u64,
+}
+fn read_legacy(files: &[(usize, PathBuf)], config: &Config, now: u64) -> io::Result<Legacy> {
+    let mut l = Legacy {
         committed: HashMap::new(),
-        chunk_of: HashMap::new(),
         dedup: HashMap::new(),
         next: 1,
-        persisted: 0,
-        chunks: chunks::ChunkStore::new(path.join("chunks")),
-        truncate: Vec::new(),
-        report: chunks::ReplayReport::default(),
-        storage_errors: Vec::new(),
-        cat_last_ms: 0,
+        latest: HashMap::new(),
+        torn: Vec::new(),
+        records: 0,
     };
-    match replay_into(&mut rp, path, config, clock) {
+    for (si, p) in files {
+        let mut f = File::open(p)?;
+        let len = f.metadata()?.len();
+        let name = p.display().to_string();
+        let mut offset = 0u64;
+        while offset < len {
+            match chunks::read_frame_at(&mut f, b"MBK1", offset, len, &name)? {
+                chunks::Frame::Torn(_) => {
+                    l.torn.push((name.clone(), offset, len - offset));
+                    break;
+                }
+                chunks::Frame::Whole(b, n) => {
+                    let (m, v, at) = parse_record(&b)
+                        .map_err(|_| corrupt(format!("interior-corrupt {name} offset {offset}: payload")))?;
+                    if stripe(&m.ns, &m.key) != *si {
+                        return Err(corrupt(format!("interior-corrupt {name} offset {offset}: wrong stripe")));
+                    }
+                    l.next = l.next.max(v + 1);
+                    let k = (m.ns.clone(), m.key.clone());
+                    if l.committed.get(&k).map_or(true, |old| old.version < v) {
+                        l.committed.insert(
+                            k.clone(),
+                            Arc::new(Value { version: v, ack: m.ack, bytes: m.bytes.clone(), tombstone: m.remove }),
+                        );
+                        l.latest.insert(k, (v, *si, b));
+                    }
+                    if now.saturating_sub(at) <= config.retry_ms && !timers::is_progress(&m.ns, &m.key) {
+                        l.dedup.insert(
+                            (m.ns.clone(), m.op_id.clone()),
+                            Dedup {
+                                fingerprint: fingerprint(&m),
+                                at,
+                                outcome: Some(Outcome { code: 0, version: v, ack: m.ack }),
+                            },
+                        );
+                    }
+                    l.records += 1;
+                    offset += n;
+                }
+            }
+        }
+    }
+    Ok(l)
+}
+/// The policies an import applies before it writes: `state/import-policies.txt`, one `NS<TAB>PREFIX<TAB>CLASS` a
+/// line (CLASS forever, latest or expire:MS; PREFIX may be empty); `#` starts a comment line.
+fn import_policies(path: &Path, config: &Config) -> io::Result<Vec<(String, String, Class)>> {
+    let p = path.join("import-policies.txt");
+    if !p.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    let mut check = chunks::Policies::default();
+    for (n, line) in fs::read_to_string(&p)?.lines().enumerate() {
+        let line = line.trim_end_matches('\r');
+        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+            continue;
+        }
+        let bad = || io::Error::new(io::ErrorKind::InvalidData, format!("import-policies.txt line {}: {line}", n + 1));
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() != 3 {
+            return Err(bad());
+        }
+        let class = match parts[2] {
+            "forever" => Class::FOREVER,
+            "latest" => Class::LATEST,
+            c => Class::expire(
+                c.strip_prefix("expire:")
+                    .and_then(|ms| ms.parse().ok())
+                    .filter(|ms| *ms >= config.retry_ms)
+                    .ok_or_else(bad)?,
+            ),
+        };
+        chunks::policy_key(parts[0], parts[1]).map_err(|_| bad())?;
+        if check.would_exceed(parts[0], parts[1], class) {
+            return Err(bad());
+        }
+        check.set(parts[0], parts[1], Some(class));
+        out.push((parts[0].to_owned(), parts[1].to_owned(), class));
+    }
+    Ok(out)
+}
+/// Writes the import's chunk files and catalogue records into its own folder.
+struct ImportWriter {
+    cs: chunks::ChunkStore,
+    open: HashMap<(usize, Class), (u64, File, u64)>,
+    chunk_bytes: u64,
+    utc: u64,
+    next: u64,
+    written: u64,
+}
+impl ImportWriter {
+    fn write(&mut self, stripe: usize, class: Class, policy: &str, payload: &[u8]) -> io::Result<()> {
+        let mut record = b"MBK1".to_vec();
+        record.extend((payload.len() as u32).to_le_bytes());
+        record.extend((!(payload.len() as u32)).to_le_bytes());
+        record.extend(crc32(payload).to_le_bytes());
+        record.extend(payload);
+        if self.open.get(&(stripe, class)).is_some_and(|(_, _, b)| *b > 0 && b + record.len() as u64 > self.chunk_bytes) {
+            self.close(stripe, class)?;
+        }
+        if !self.open.contains_key(&(stripe, class)) {
+            let id = self.cs.next_id;
+            self.cs.next_id += 1;
+            let path = chunks::chunk_path(&self.cs.dir, class, stripe, id);
+            self.cs.log(
+                self.utc,
+                chunks::Rec::Open { seq: id, stripe: stripe as u8, class, policy: policy.to_owned(), next: self.next },
+            )?;
+            fs::create_dir_all(path.parent().unwrap())?;
+            let file = OpenOptions::new().create_new(true).append(true).open(&path)?;
+            self.open.insert((stripe, class), (id, file, 0));
+        }
+        let (_, file, bytes) = self.open.get_mut(&(stripe, class)).unwrap();
+        file.write_all(&record)?;
+        *bytes += record.len() as u64;
+        self.written += record.len() as u64;
+        Ok(())
+    }
+    fn close(&mut self, stripe: usize, class: Class) -> io::Result<()> {
+        if let Some((id, file, bytes)) = self.open.remove(&(stripe, class)) {
+            sync_file(&file)?;
+            self.cs.log(self.utc, chunks::Rec::Close { seq: id, bytes, next: self.next })?;
+        }
+        Ok(())
+    }
+    fn close_all(&mut self) -> io::Result<()> {
+        let open: Vec<(usize, Class)> = self.open.keys().copied().collect();
+        for (stripe, class) in open {
+            self.close(stripe, class)?;
+        }
+        Ok(())
+    }
+}
+/// Move the legacy logs into legacy-<epoch>/, unmodified, and set them read-only (5.6, step 1). Run again after a
+/// stop between the switch and the move.
+fn move_legacy(path: &Path, import: &chunks::Import) -> io::Result<()> {
+    let to = path.join(&import.legacy_dir);
+    fs::create_dir_all(&to)?;
+    for (name, _, _) in &import.files {
+        let from = path.join(name);
+        if from.exists() {
+            fs::rename(&from, to.join(name))?;
+        }
+        let dest = to.join(name);
+        if dest.exists() {
+            let mut permissions = fs::metadata(&dest)?.permissions();
+            permissions.set_readonly(true);
+            fs::set_permissions(&dest, permissions)?;
+        }
+    }
+    Ok(())
+}
+/// The one-time import (CHUNK-RETIREMENT.md 5.6): each key's latest legacy record, at its version and time, into
+/// chunks by class under chunks.import/, checked against the legacy replay before the switch. None when there is
+/// nothing to import; Err (legacy logs untouched, chunks.import/ removed) on any difference.
+fn import_legacy(path: &Path, config: &Config, clock: &chunks::Clock, epoch: u64) -> io::Result<Option<(chunks::Import, String)>> {
+    use chunks::Rec;
+    let files = legacy_files(path);
+    if files.is_empty() {
+        return Ok(None);
+    }
+    let chunks_dir = path.join("chunks");
+    let catalogue = chunks_dir.join("catalogue.log");
+    let records = if catalogue.exists() { chunks::read_catalogue(&catalogue)?.0 } else { Vec::new() };
+    // Imported already (a stop before the move is finished at replay), or chunks written beside the legacy logs
+    // (they stay one forever chunk, as CR1 reads them).
+    if records.iter().any(|r| matches!(r.rec, Rec::Import(_) | Rec::Open { .. })) {
+        return Ok(None);
+    }
+    let utc = clock.utc_ms();
+    let mut listed = Vec::new();
+    for (_, p) in &files {
+        let name = p.file_name().unwrap().to_string_lossy().into_owned();
+        listed.push((name, fs::metadata(p)?.len(), chunks::sha256_file(p)?));
+    }
+    let legacy = read_legacy(&files, config, now_ms())?;
+    let dir = path.join("chunks.import");
+    if dir.exists() {
+        // An import cut short starts again from the untouched legacy logs.
+        fs::remove_dir_all(&dir)?;
+    }
+    fs::create_dir_all(&dir)?;
+    let built = (|| -> io::Result<(chunks::Import, u64)> {
+        let mut cs = chunks::ChunkStore::new(dir.clone());
+        cs.cat = Some(chunks::Catalogue::open(&dir.join("catalogue.log"))?);
+        let mut w = ImportWriter { cs, open: HashMap::new(), chunk_bytes: config.chunk_bytes, utc, next: legacy.next, written: 0 };
+        let mut policies = chunks::Policies::default();
+        // The policies first, as policy records at new versions, so each imported key takes its class.
+        for (n, (ns, prefix, class)) in import_policies(path, config)?.into_iter().enumerate() {
+            policies.set(&ns, &prefix, Some(class));
+            let key = chunks::policy_key(&ns, &prefix).map_err(|_| io::Error::other("policy key"))?;
+            let m = Mutation {
+                ns: POLICY_NS.into(),
+                key: key.clone(),
+                op_id: format!("import-policy/{epoch}/{n}"),
+                deadline: 0,
+                ack: 2,
+                expected: None,
+                bytes: chunks::policy_value(class),
+                remove: false,
+            };
+            let version = w.next;
+            w.next += 1;
+            let (c, label) = policies.resolve(POLICY_NS, &key);
+            w.write(stripe(POLICY_NS, &key), c, &label, &mutation_bytes(&m, version, utc))?;
+        }
+        let mut latest: Vec<_> = legacy.latest.iter().collect();
+        latest.sort_by_key(|(_, (v, _, _))| *v);
+        let mut leave_out = config.import_inject_difference;
+        for ((ns, key), (_, si, payload)) in latest {
+            if std::mem::take(&mut leave_out) {
+                continue;
+            }
+            let (class, label) = policies.resolve(ns, key);
+            w.write(*si, class, &label, payload)?;
+        }
+        w.close_all()?;
+        // The check: the import replayed alone against the legacy replay held in memory.
+        let mut rp = Replayed::empty(dir.clone());
+        replay_into(&mut rp, path, &dir, false, config, clock)?;
+        let mut first: Option<String> = None;
+        for (k, v) in &legacy.committed {
+            match rp.committed.get(k) {
+                Some(x) if x.version == v.version && x.bytes == v.bytes && x.tombstone == v.tombstone && x.ack == v.ack => {}
+                Some(x) => {
+                    first.get_or_insert(format!(
+                        "{}/{}: imported version {} tombstone {} {} B, legacy version {} tombstone {} {} B",
+                        k.0, k.1, x.version, x.tombstone, x.bytes.len(), v.version, v.tombstone, v.bytes.len()
+                    ));
+                }
+                None => {
+                    first.get_or_insert(format!("{}/{}: missing from the import (legacy version {})", k.0, k.1, v.version));
+                }
+            }
+        }
+        for k in rp.committed.keys() {
+            if k.0 != POLICY_NS && !legacy.committed.contains_key(k) {
+                first.get_or_insert(format!("{}/{}: in the import only", k.0, k.1));
+            }
+        }
+        let live = |c: &HashMap<Key, Arc<Value>>| {
+            let mut counts = std::collections::BTreeMap::new();
+            for (k, v) in c {
+                if !v.tombstone && k.0 != POLICY_NS {
+                    *counts.entry(k.0.clone()).or_insert(0usize) += 1;
+                }
+            }
+            counts
+        };
+        let (a, b) = (live(&legacy.committed), live(&rp.committed));
+        if a != b {
+            first.get_or_insert(format!("namespace live counts: legacy {a:?}, imported {b:?}"));
+        }
+        if rp.next != w.next || w.next < legacy.next {
+            first.get_or_insert(format!("next: imported {}, legacy {}, written {}", rp.next, legacy.next, w.next));
+        }
+        for (k, d) in &rp.dedup {
+            if k.0 == POLICY_NS {
+                continue;
+            }
+            match legacy.dedup.get(k) {
+                Some(l) if l.fingerprint == d.fingerprint && l.outcome == d.outcome => {}
+                _ => {
+                    first.get_or_insert(format!("dedup {}/{}: differs from the legacy replay", k.0, k.1));
+                }
+            }
+        }
+        if let Some(e) = rp.storage_errors.first() {
+            first.get_or_insert(format!("storage error in the import: {e}"));
+        }
+        if let Some(f) = first {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, format!("import refused, legacy logs left in place: {f}")));
+        }
+        let import = chunks::Import {
+            files: listed,
+            keys: legacy.latest.len() as u64,
+            bytes: w.written,
+            epoch,
+            legacy_dir: format!("legacy-{epoch}"),
+        };
+        w.cs.log(utc, Rec::Import(import.clone()))?;
+        Ok((import, w.written))
+    })();
+    let (import, written) = match built {
+        Ok(x) => x,
+        Err(e) => {
+            let _ = fs::remove_dir_all(&dir);
+            return Err(e);
+        }
+    };
+    // The switch: chunks.import/ becomes chunks/; then the legacy logs move, unmodified and read-only.
+    if chunks_dir.exists() {
+        if records.is_empty() {
+            fs::remove_dir_all(&chunks_dir)?;
+        } else {
+            fs::rename(&chunks_dir, path.join(format!("chunks.pre-import-{epoch}")))?;
+        }
+    }
+    fs::rename(&dir, &chunks_dir)?;
+    move_legacy(path, &import)?;
+    let torn: Vec<String> = legacy.torn.iter().map(|(f, o, b)| format!("{f} offset {o} ({b} B torn tail, left in place)")).collect();
+    let line = format!(
+        "imported {} keys ({written} B) of {} legacy records from {} legacy logs into chunks/; legacy logs in {}{}",
+        import.keys,
+        legacy.records,
+        import.files.len(),
+        import.legacy_dir,
+        if torn.is_empty() { String::new() } else { format!("; {}", torn.join("; ")) }
+    );
+    Ok(Some((import, line)))
+}
+impl Replayed {
+    fn empty(dir: PathBuf) -> Self {
+        Replayed {
+            committed: HashMap::new(),
+            chunk_of: HashMap::new(),
+            dedup: HashMap::new(),
+            next: 1,
+            persisted: 0,
+            chunks: chunks::ChunkStore::new(dir),
+            truncate: Vec::new(),
+            report: chunks::ReplayReport::default(),
+            storage_errors: Vec::new(),
+            cat_last_ms: 0,
+        }
+    }
+}
+fn replay(path: &Path, config: &Config, clock: &chunks::Clock) -> Result<Replayed, (io::Error, chunks::ReplayReport)> {
+    let dir = path.join("chunks");
+    let mut rp = Replayed::empty(dir.clone());
+    match replay_into(&mut rp, path, &dir, true, config, clock) {
         Ok(()) => Ok(rp),
         Err(e) => Err((e, rp.report)),
     }
 }
-fn replay_into(rp: &mut Replayed, path: &Path, config: &Config, clock: &chunks::Clock) -> io::Result<()> {
+/// Replay the chunks in `dir`; with `legacy`, also the state's legacy logs (before an import, as one forever chunk;
+/// after it, for dedup alone within 24 h).
+fn replay_into(rp: &mut Replayed, path: &Path, dir: &Path, legacy: bool, config: &Config, clock: &chunks::Clock) -> io::Result<()> {
     use chunks::{ChunkState, Rec};
     let now = now_ms();
-    let dir = path.join("chunks");
+    let dir = dir.to_owned();
     fs::create_dir_all(&dir)?;
     let (records, torn) = chunks::read_catalogue(&dir.join("catalogue.log"))?;
     rp.report.catalogue_truncation = torn.map(|(o, b, r)| (o, b, r.to_string()));
@@ -1427,7 +1774,10 @@ fn replay_into(rp: &mut Replayed, path: &Path, config: &Config, clock: &chunks::
             }
             Rec::Next(n) => next_hw = next_hw.max(*n),
             Rec::Resume => {}
-            Rec::Import(i) => rp.chunks.import = Some(i.clone()),
+            Rec::Import(i) => {
+                rp.chunks.import = Some(i.clone());
+                rp.chunks.import_at = r.at_ms;
+            }
         }
     }
     let horizon_map = chunks::horizon_set(&horizons);
@@ -1441,8 +1791,8 @@ fn replay_into(rp: &mut Replayed, path: &Path, config: &Config, clock: &chunks::
         }
     }
     // Legacy stripe logs (before the import): read as one forever chunk that never retires.
-    let legacy: Vec<PathBuf> = (0..4).map(|i| path.join(format!("stripe-{i}.log"))).collect();
-    if legacy.iter().any(|p| p.exists()) && rp.chunks.import.is_none() {
+    let legacy_logs: Vec<PathBuf> = (0..4).map(|i| path.join(format!("stripe-{i}.log"))).collect();
+    if legacy && legacy_logs.iter().any(|p| p.exists()) && rp.chunks.import.is_none() {
         rp.chunks.table.insert(
             chunks::LEGACY_CHUNK,
             chunks::ChunkInfo {
@@ -1463,7 +1813,7 @@ fn replay_into(rp: &mut Replayed, path: &Path, config: &Config, clock: &chunks::
             },
         );
         let mut total = 0;
-        for (i, p) in legacy.iter().enumerate() {
+        for (i, p) in legacy_logs.iter().enumerate() {
             if !p.exists() {
                 continue;
             }
@@ -1518,8 +1868,41 @@ fn replay_into(rp: &mut Replayed, path: &Path, config: &Config, clock: &chunks::
             }
         }
     }
+    if let (true, Some(import)) = (legacy, rp.chunks.import.clone()) {
+        // A stop between the switch and the move: finish the move.
+        if !legacy_files(path).is_empty() {
+            move_legacy(path, &import)?;
+        }
+        let ldir = path.join(&import.legacy_dir);
+        let mut changed = Vec::new();
+        for (name, size, sha) in &import.files {
+            let p = ldir.join(name);
+            let same = fs::metadata(&p).is_ok_and(|m| m.len() == *size) && chunks::sha256_file(&p).is_ok_and(|s| s == *sha);
+            if !same {
+                changed.push(format!("legacy file changed or missing since the import: {}", p.display()));
+            }
+        }
+        let window = clock.utc_ms().saturating_sub(rp.chunks.import_at) < config.retry_ms;
+        if !changed.is_empty() {
+            rp.storage_errors.extend(changed);
+        } else if window {
+            // For 24 h after the import the legacy logs give their dedup entries alone, never values (5.6).
+            let files = legacy_files(&ldir);
+            let l = read_legacy(&files, config, now)?;
+            for (k, d) in l.dedup {
+                rp.dedup.entry(k).or_insert(d);
+            }
+            rp.report.legacy = files.iter().map(|(_, p)| format!("{} (dedup only)", p.display())).collect();
+        }
+        rp.report.import = Some(format!(
+            "import of epoch {} ({} keys, {} B); legacy dedup replay {}",
+            import.epoch,
+            import.keys,
+            import.bytes,
+            if window { "on (within 24 h of the import)" } else { "off (24 h passed)" }
+        ));
+    }
     rp.next = rp.next.max(next_hw);
-    let _ = clock;
     Ok(())
 }
 /// HEALTH2 (opcode 27; CHUNK-RETIREMENT.md section 6): the store's state, limits and chunk retirement in one read.
@@ -1959,10 +2342,21 @@ impl Store {
             let _ = report.write(path);
             e
         };
+        let peek = fs::read(path.join("epoch")).ok().filter(|b| b.len() == 8).map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
+        let imported = match import_legacy(path, &config, &clock, peek + 1) {
+            Ok(x) => x,
+            Err(e) => {
+                let report = chunks::ReplayReport { import: Some(format!("refused: {e}")), ..Default::default() };
+                return Err(refuse(e, report));
+            }
+        };
         let mut rp = match replay(path, &config, &clock) {
             Ok(rp) => rp,
             Err((e, report)) => return Err(refuse(e, report)),
         };
+        if let Some((_, line)) = imported {
+            rp.report.import = Some(format!("{line}; {}", rp.report.import.take().unwrap_or_default()));
+        }
         if rp.committed.len() > config.index_cap
             || rp.committed.values().map(|v| v.bytes.len()).sum::<usize>()
                 + rp.dedup

@@ -375,6 +375,10 @@ fn main() -> io::Result<()> {
         }
         i += 2
     }
+    // Test seam (T11 on a production copy): the import leaves one key out, so its check refuses the switch.
+    if env::var_os("MEMBUS_TEST_IMPORT_DIFFERENCE").is_some() {
+        config.import_inject_difference = true;
+    }
     // Ordinary admissions stop at the limit less a 1 GiB maintenance reserve (CHUNK-RETIREMENT.md 5.5); a limit
     // under 8 GiB keeps an eighth, so a small test limit still admits.
     config.maintenance_reserve_bytes =

@@ -1,6 +1,6 @@
 //! CR3 (docs/CHUNK-RETIREMENT.md section 10): HEALTH2 and the heartbeat fields. Test T9 of section 7.
 use membus::*;
-use std::{collections::HashMap, fs, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf};
 fn path(label: &str) -> PathBuf {
     let p = std::env::var("MEMBUS_TEST_OUTPUT").unwrap_or_else(|_| ".test-output".into());
     PathBuf::from(p).join(format!("{label}-{}-{}", std::process::id(), now_ms()))
@@ -76,7 +76,7 @@ fn t9_health2_fields_equal_the_store_state() {
     }
     // read_only turns true after a failed append.
     #[cfg(not(windows))]
-    let _ = fs::remove_file(p.join("owner.lock"));
+    let _ = std::fs::remove_file(p.join("owner.lock"));
     let s = Store::open(&p, Config { fail_partial_append: true, ..c }).unwrap();
     assert!(!s.health2().read_only);
     assert_eq!(s.mutate(put("k7", "op7")).code, 16);

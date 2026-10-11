@@ -793,6 +793,8 @@ pub struct ChunkStore {
     pub retired_chunks: u64,
     pub retired_bytes: u64,
     pub import: Option<Import>,
+    /// When the import record was written; a catalogue rewrite keeps it, so the 24 h dedup window does not move.
+    pub import_at: u64,
     /// Retirement pauses while the clock is in doubt (5.4); the reason, and the stable run since.
     pub degraded: Option<String>,
     pub stable_since: Option<(u64, u64)>,
@@ -811,6 +813,7 @@ impl ChunkStore {
             retired_chunks: 0,
             retired_bytes: 0,
             import: None,
+            import_at: 0,
             degraded: None,
             stable_since: None,
             last_tick: None,
@@ -838,7 +841,7 @@ impl ChunkStore {
     pub fn live_list(&self, now: u64, next: u64) -> Vec<CatRecord> {
         let mut out = vec![CatRecord { at_ms: now, rec: Rec::Next(next) }];
         if let Some(i) = &self.import {
-            out.push(CatRecord { at_ms: now, rec: Rec::Import(i.clone()) });
+            out.push(CatRecord { at_ms: self.import_at, rec: Rec::Import(i.clone()) });
         }
         for c in self.table.values() {
             if c.id == LEGACY_CHUNK || c.state == ChunkState::Retired {
