@@ -1,0 +1,78 @@
+{
+ "read_at": "2026-10-11T09:06:03.640000+00:00",
+ "records": 10941,
+ "first_record": "2026-10-09T19:19:32.595000+00:00",
+ "stored_bytes_by_class": {
+  "E3": 514299,
+  "S": 7692804,
+  "F": 21984,
+  "E1": 72345
+ },
+ "live_latest_bytes_by_class": {
+  "E3": 514299,
+  "S": 30604,
+  "F": 11135,
+  "E1": 2406
+ },
+ "live_keys_by_class": {
+  "E3": 1507,
+  "S": 45,
+  "F": 12,
+  "E1": 9
+ },
+ "latest_is_tombstone_by_class": {
+  "E3": 0,
+  "S": 1,
+  "F": 10,
+  "E1": 0
+ },
+ "forms": {
+  "rotate_60s": {
+   "chunks": 5660,
+   "chunks_by_class": {
+    "E3": 1335,
+    "S": 4180,
+    "F": 11,
+    "E1": 134
+   },
+   "E_kept_bytes": 586644,
+   "F_kept_bytes": 21984,
+   "S_wait_kept_bytes": 101348,
+   "S_wait_pinned_chunks": 37,
+   "S_closed_chunks": 4178,
+   "S_wait_retry24h_kept_bytes": 4390154,
+   "S_largest_chunk_bytes": 25240,
+   "S_wait_pinned_largest_chunk_bytes": 10425,
+   "S_carry_1h_kept_bytes": 401204,
+   "S_carry_1h_carry_bytes_per_hour": 17059.0,
+   "S_carry_1h_keys_carried_per_period": 22,
+   "S_carry_24h_kept_bytes": 4380960,
+   "S_carry_24h_carry_bytes_per_hour": 502.2,
+   "S_carry_24h_keys_carried_per_period": 6
+  },
+  "rotate_3600s": {
+   "chunks": 286,
+   "chunks_by_class": {
+    "E3": 120,
+    "S": 116,
+    "F": 7,
+    "E1": 43
+   },
+   "E_kept_bytes": 586644,
+   "F_kept_bytes": 21984,
+   "S_wait_kept_bytes": 1823830,
+   "S_wait_pinned_chunks": 20,
+   "S_closed_chunks": 112,
+   "S_wait_retry24h_kept_bytes": 5120317,
+   "S_largest_chunk_bytes": 766945,
+   "S_wait_pinned_largest_chunk_bytes": 253645,
+   "S_carry_1h_kept_bytes": 689992,
+   "S_carry_1h_carry_bytes_per_hour": 17059.0,
+   "S_carry_1h_keys_carried_per_period": 22,
+   "S_carry_24h_kept_bytes": 4553637,
+   "S_carry_24h_carry_bytes_per_hour": 502.2,
+   "S_carry_24h_keys_carried_per_period": 6
+  }
+ },
+ "S_checkpoint_snapshot_bytes": 30604
+}
