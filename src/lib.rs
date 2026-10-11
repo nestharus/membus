@@ -251,6 +251,8 @@ struct State {
     pending_disk: u64,
     read_only: bool,
     warming: bool,
+    /// Tombstones whose index entry may drop once no other retained chunk holds their key (5.3).
+    tomb_candidates: HashSet<(String, String)>,
 }
 #[derive(Clone)]
 struct Meta {
@@ -355,21 +357,21 @@ pub struct Store {
     timers: timers::Shared,
     signals: signals::Hub,
     capture_metrics: [AtomicU64; 7],
-    committed: RwLock<HashMap<(String, String), Arc<Value>>>,
+    committed: Arc<RwLock<HashMap<(String, String), Arc<Value>>>>,
     scans: Arc<Mutex<ScanState>>,
     scan_usage: Arc<ScanUsage>,
     scan_reaper: Option<(mpsc::Sender<()>, std::thread::JoinHandle<()>)>,
     /// The idle tick (5.2): closes finite-class chunks past their age and rewrites a large catalogue.
     ticker: Option<(mpsc::Sender<()>, std::thread::JoinHandle<()>)>,
-    state: Mutex<State>,
+    state: Arc<Mutex<State>>,
     done: Condvar,
+    maint: Arc<Maint>,
     router: Arc<ChunkRouter>,
     chunks: Arc<Mutex<chunks::ChunkStore>>,
     policies: Arc<RwLock<chunks::Policies>>,
     /// The version high-water the catalogue records at each open and close.
     next_issued: Arc<AtomicU64>,
     flags: Arc<Flags>,
-    clock: chunks::Clock,
     path: PathBuf,
     report: Mutex<chunks::ReplayReport>,
     appenders: Vec<AppendOwner>,
@@ -1520,6 +1522,289 @@ fn replay_into(rp: &mut Replayed, path: &Path, config: &Config, clock: &chunks::
     let _ = clock;
     Ok(())
 }
+/// Retirement, expiry summaries, tombstone drops and the clock check (5.3, 5.4), shared with the tick thread.
+struct Maint {
+    state: Arc<Mutex<State>>,
+    committed: Arc<RwLock<HashMap<(String, String), Arc<Value>>>>,
+    chunks: Arc<Mutex<chunks::ChunkStore>>,
+    router: Arc<ChunkRouter>,
+    flags: Arc<Flags>,
+    clock: chunks::Clock,
+    next_issued: Arc<AtomicU64>,
+    config: Config,
+    path: PathBuf,
+}
+type Key = (String, String);
+impl Maint {
+    /// Retire closed chunks due by their class, or (forced) one chunk that holds no key's latest record.
+    /// Returns the chunks retired whole; a stopped, kept or held chunk is left out.
+    fn retire(&self, forced: Option<u64>) -> io::Result<Vec<u64>> {
+        use chunks::ChunkState;
+        let utc = self.clock.utc_ms();
+        let mono = self.clock.mono_ms();
+        let mut gone: Vec<(Key, u64)> = Vec::new();
+        let mut started: Vec<(u64, PathBuf, u64, Vec<Key>)> = Vec::new();
+        {
+            let mut state = self.state.lock().unwrap();
+            let mut cs = self.chunks.lock().unwrap();
+            if forced.is_none() && cs.degraded.is_some() {
+                return Ok(Vec::new());
+            }
+            let ids: Vec<u64> = match forced {
+                Some(id) => vec![id],
+                None => cs.table.keys().copied().collect(),
+            };
+            for id in ids {
+                let Some(c) = cs.table.get(&id) else { continue };
+                if id == chunks::LEGACY_CHUNK || c.state != ChunkState::Closed {
+                    continue;
+                }
+                let expire = forced.is_none() && c.class.kind == 2;
+                if forced.is_none() {
+                    let window = match c.class.kind {
+                        1 => self.config.retry_ms,
+                        2 => c.class.retention_ms,
+                        _ => continue,
+                    };
+                    let Some(close) = c.close_ms else { continue };
+                    // Never earlier than both clocks allow: UTC close time, and monotonic time within this run.
+                    if utc < close.saturating_add(window) || c.close_mono.is_some_and(|m| mono.saturating_sub(m) < window) {
+                        continue;
+                    }
+                }
+                if c.keys.keys().any(|k| state.pending.contains_key(k)) {
+                    continue;
+                }
+                let latest: Vec<Key> =
+                    c.keys.keys().filter(|k| state.metadata.get(*k).is_some_and(|m| m.chunk == id)).cloned().collect();
+                if !latest.is_empty() && !expire {
+                    continue;
+                }
+                let c = c.clone();
+                let horizons: Vec<(String, String, u64)> = c
+                    .keys
+                    .iter()
+                    .filter(|(k, _)| cs.holders.others(k, id).next().is_some())
+                    .map(|((n, k), (_, max))| (n.clone(), k.clone(), *max))
+                    .collect();
+                let next = self.next_issued.load(Ordering::SeqCst);
+                // Step 1: `retiring` with its horizons and the version high-water, flushed before anything changes.
+                if let Err(e) = cs.log(
+                    utc,
+                    chunks::Rec::Retiring { seq: id, next, horizons: horizons.clone(), expired: latest.clone() },
+                ) {
+                    self.flags.storage_error.store(true, Ordering::SeqCst);
+                    return Err(e);
+                }
+                for (n, k, v) in &horizons {
+                    let h = cs.horizons.entry((n.clone(), k.clone())).or_insert(0);
+                    *h = (*h).max(*v);
+                }
+                // Step 2: an expired key leaves the index and frees its slots; a summary keeps it for 30 days.
+                for k in &latest {
+                    if let Some(m) = state.metadata.remove(k) {
+                        state.keys -= 1;
+                        state.committed_bytes -= m.bytes;
+                        if !m.tombstone {
+                            if let Some(n) = state.namespace_counts.get_mut(&k.0) {
+                                *n -= 1;
+                            }
+                        }
+                        gone.push((k.clone(), m.version));
+                    }
+                }
+                if !latest.is_empty() {
+                    state.keys += cs.summaries.add(utc, latest.clone());
+                }
+                let info = cs.table.get_mut(&id).unwrap();
+                info.state = ChunkState::Retiring;
+                info.horizons = horizons;
+                info.expired = latest;
+                if self.config.retire_stop_after == 1 {
+                    continue;
+                }
+                for k in c.keys.keys() {
+                    cs.holders.remove(k, id);
+                    state.tomb_candidates.insert(k.clone());
+                }
+                started.push((id, c.path.clone(), c.bytes, c.keys.keys().cloned().collect()));
+            }
+        }
+        if !gone.is_empty() {
+            let mut committed = self.committed.write().unwrap();
+            for (k, v) in gone {
+                if committed.get(&k).is_some_and(|x| x.version == v) {
+                    committed.remove(&k);
+                }
+            }
+        }
+        // Steps 3 and 4: delete the file, then `retired`. A held delete stays retiring and is retried.
+        let mut done = Vec::new();
+        let mut freed = 0;
+        {
+            let mut cs = self.chunks.lock().unwrap();
+            for (id, p, bytes, keys) in started {
+                match fs::remove_file(&p) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(_) => {
+                        cs.table.get_mut(&id).unwrap().blocked_since.get_or_insert(utc);
+                        continue;
+                    }
+                }
+                if self.config.retire_stop_after == 2 {
+                    continue;
+                }
+                if let Err(e) = cs.log(utc, chunks::Rec::Retired { seq: id }) {
+                    self.flags.storage_error.store(true, Ordering::SeqCst);
+                    return Err(e);
+                }
+                let info = cs.table.get_mut(&id).unwrap();
+                info.state = ChunkState::Retired;
+                info.keys.clear();
+                info.blocked_since = None;
+                cs.retired_chunks += 1;
+                cs.retired_bytes += bytes;
+                freed += bytes;
+                done.push(id);
+                // A horizon whose key no retained chunk holds has nothing left to hide.
+                for k in keys {
+                    if !cs.holders.map.contains_key(&k) {
+                        cs.horizons.remove(&k);
+                    }
+                }
+            }
+        }
+        if freed > 0 {
+            let mut state = self.state.lock().unwrap();
+            state.persisted_bytes = state.persisted_bytes.saturating_sub(freed);
+        }
+        Ok(done)
+    }
+    /// Retry the held deletes; a retiring chunk's index work and horizons are already done.
+    fn retry_retiring(&self) -> io::Result<usize> {
+        let mut cs = self.chunks.lock().unwrap();
+        let ids: Vec<u64> =
+            cs.table.values().filter(|c| c.state == chunks::ChunkState::Retiring).map(|c| c.id).collect();
+        let mut done = 0;
+        let mut freed = 0;
+        for id in ids {
+            let (p, bytes) = (cs.table[&id].path.clone(), cs.table[&id].bytes);
+            match fs::remove_file(&p) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(_) => continue,
+            }
+            let now = self.clock.utc_ms();
+            if let Err(e) = cs.log(now, chunks::Rec::Retired { seq: id }) {
+                self.flags.storage_error.store(true, Ordering::SeqCst);
+                return Err(e);
+            }
+            let info = cs.table.get_mut(&id).unwrap();
+            info.state = chunks::ChunkState::Retired;
+            info.keys.clear();
+            info.blocked_since = None;
+            cs.retired_chunks += 1;
+            cs.retired_bytes += bytes;
+            freed += bytes;
+            done += 1;
+        }
+        drop(cs);
+        let mut state = self.state.lock().unwrap();
+        state.persisted_bytes = state.persisted_bytes.saturating_sub(freed);
+        Ok(done)
+    }
+    /// Drop tombstone index entries no other retained chunk can contradict (5.3), and expired summaries.
+    fn drop_tombstones(&self) {
+        let utc = self.clock.utc_ms();
+        let mut gone = Vec::new();
+        {
+            let mut state = self.state.lock().unwrap();
+            let mut cs = self.chunks.lock().unwrap();
+            let freed = cs.summaries.expire(utc, self.config.summary_ms);
+            state.keys -= freed;
+            let candidates: Vec<Key> = state.tomb_candidates.drain().collect();
+            for k in candidates {
+                if state.pending.contains_key(&k) {
+                    state.tomb_candidates.insert(k);
+                    continue;
+                }
+                let Some(m) = state.metadata.get(&k) else { continue };
+                if !m.tombstone {
+                    continue;
+                }
+                let others: Vec<u64> = cs.holders.others(&k, m.chunk).collect();
+                if others.is_empty() {
+                    let m = state.metadata.remove(&k).unwrap();
+                    state.keys -= 1;
+                    state.committed_bytes -= m.bytes;
+                    gone.push((k, m.version));
+                } else if others
+                    .iter()
+                    .all(|c| *c != chunks::LEGACY_CHUNK && cs.table.get(c).is_some_and(|i| i.class.finite()))
+                {
+                    // Older records in finite chunks retire in time; one in a forever chunk never does.
+                    state.tomb_candidates.insert(k);
+                }
+            }
+        }
+        if !gone.is_empty() {
+            let mut committed = self.committed.write().unwrap();
+            for (k, v) in gone {
+                if committed.get(&k).is_some_and(|x| x.version == v) {
+                    committed.remove(&k);
+                }
+            }
+        }
+    }
+    /// One tick's clock check (5.4): a stable run of a rotation age, or `expiry.resume`, ends a pause.
+    fn clock_tick(&self) {
+        let utc = self.clock.utc_ms();
+        let mono = self.clock.mono_ms();
+        let mut cs = self.chunks.lock().unwrap();
+        match cs.last_tick {
+            Some((u0, m0)) => {
+                let drift = (utc as i128 - u0 as i128) - (mono as i128 - m0 as i128);
+                if drift.abs() <= 2000 {
+                    cs.stable_since.get_or_insert((utc, mono));
+                } else {
+                    cs.stable_since = None;
+                }
+            }
+            None => cs.stable_since = Some((utc, mono)),
+        }
+        cs.last_tick = Some((utc, mono));
+        let resume_file = self.path.join("expiry.resume");
+        let resume = resume_file.exists();
+        let stable = cs.stable_since.is_some_and(|(_, m)| mono.saturating_sub(m) >= self.config.rotation_ms);
+        if cs.degraded.is_some() && (resume || stable) && cs.log(utc, chunks::Rec::Resume).is_ok() {
+            cs.degraded = None;
+            self.flags.expiry_degraded.store(false, Ordering::SeqCst);
+        }
+        if resume {
+            let _ = fs::remove_file(resume_file);
+        }
+    }
+    /// The 10 s pass: held deletes, chunks due, tombstones and summaries.
+    fn pass(&self) {
+        let _ = self.retry_retiring();
+        let _ = self.retire(None);
+        self.drop_tombstones();
+    }
+    /// A catalogue past its size is rewritten to the live list (5.2).
+    fn rewrite_catalogue(&self) {
+        let mut cs = self.chunks.lock().unwrap();
+        let at = self.config.catalogue_rewrite_bytes;
+        if at > 0 && cs.cat_bytes() > at {
+            let live = cs.live_list(self.clock.utc_ms(), self.next_issued.load(Ordering::SeqCst));
+            if let Some(cat) = cs.cat.as_mut() {
+                if cat.rewrite(&live).is_err() {
+                    self.flags.storage_error.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+    }
+}
 fn mutation_bytes(m: &Mutation, version: u64, at: u64) -> Vec<u8> {
     let mut b = Vec::new();
     b.extend(at.to_le_bytes());
@@ -1698,7 +1983,23 @@ impl Store {
             f.sync_all()?;
         }
         fs::rename(epoch_tmp, epoch_path)?;
-        let committed = rp.committed;
+        let mut committed = rp.committed;
+        cs.summaries.expire(utc, config.summary_ms);
+        // A tombstone no other retained chunk holds a record of leaves the index at start (5.3).
+        let mut tomb_candidates = HashSet::new();
+        let tombs: Vec<Key> = committed.iter().filter(|(_, v)| v.tombstone).map(|(k, _)| k.clone()).collect();
+        for k in tombs {
+            let chunk = rp.chunk_of.get(&k).copied().unwrap_or(0);
+            let others: Vec<u64> = cs.holders.others(&k, chunk).collect();
+            if others.is_empty() {
+                committed.remove(&k);
+            } else if others
+                .iter()
+                .all(|c| *c != chunks::LEGACY_CHUNK && cs.table.get(c).is_some_and(|i| i.class.finite()))
+            {
+                tomb_candidates.insert(k);
+            }
+        }
         let metadata: HashMap<_, _> = committed
             .iter()
             .map(|(k, v)| {
@@ -1713,13 +2014,17 @@ impl Store {
                 )
             })
             .collect();
+        // The namespace count is live keys; the index count adds tombstones and expiry summaries (5.3).
         let mut namespace_counts = HashMap::new();
-        for (ns, _) in metadata.keys() {
-            *namespace_counts.entry(ns.clone()).or_insert(0) += 1;
+        for ((ns, _), m) in metadata.iter() {
+            if !m.tombstone {
+                *namespace_counts.entry(ns.clone()).or_insert(0) += 1;
+            }
         }
         let keys = metadata.len() + cs.summaries.charged;
         let committed_bytes = metadata.values().map(|m| m.bytes).sum();
         let dedup = rp.dedup;
+        let dedup_entries = dedup.len();
         let dedup_bytes = dedup.values().map(|d| d.fingerprint.len()).sum();
         let mut expiry: Vec<_> = dedup.iter().map(|(k, d)| (k.clone(), d.at)).collect();
         expiry.sort_by_key(|(_, at)| *at);
@@ -1750,29 +2055,56 @@ impl Store {
             fail_sync: config.fail_sync,
         });
         let (appenders, flush_owner) = start_routed_owners(router.clone(), 4, &config);
+        let committed = Arc::new(RwLock::new(committed));
+        let state = Arc::new(Mutex::new(State {
+            pending: HashMap::new(),
+            metadata,
+            namespace_counts: namespace_counts.clone(),
+            keys,
+            committed_bytes,
+            dedup_bytes,
+            dedup,
+            retired: VecDeque::new(),
+            retired_set: HashSet::new(),
+            expiry: expiry.into(),
+            next,
+            reserved_bytes: 0,
+            stripe_reserved: [0; 4],
+            stripe_items: [0; 4],
+            persisted_bytes,
+            pending_disk: 0,
+            read_only: flags.storage_error.load(Ordering::SeqCst),
+            warming: false,
+            tomb_candidates,
+        }));
+        let maint = Arc::new(Maint {
+            state: state.clone(),
+            committed: committed.clone(),
+            chunks: chunks.clone(),
+            router: router.clone(),
+            flags: flags.clone(),
+            clock: clock.clone(),
+            next_issued: next_issued.clone(),
+            config: config.clone(),
+            path: path.to_owned(),
+        });
         let (tick_stop, tick_receiver) = mpsc::channel();
-        let tick_router = router.clone();
-        let tick_chunks = chunks.clone();
-        let tick_flags = flags.clone();
+        let tick_maint = maint.clone();
         let tick_every = Duration::from_millis(config.tick_ms.max(1));
-        let rewrite_at = config.catalogue_rewrite_bytes;
-        let tick_clock = clock.clone();
-        let tick_next = next_issued.clone();
+        let retire_every = Duration::from_millis(config.retire_ms);
         let ticker = std::thread::spawn(move || {
+            let mut last_pass = Instant::now();
             while matches!(
                 tick_receiver.recv_timeout(tick_every),
                 Err(mpsc::RecvTimeoutError::Timeout)
             ) {
-                tick_router.idle_close();
-                let mut cs = tick_chunks.lock().unwrap();
-                if rewrite_at > 0 && cs.cat_bytes() > rewrite_at {
-                    let live = cs.live_list(tick_clock.utc_ms(), tick_next.load(Ordering::SeqCst));
-                    if let Some(cat) = cs.cat.as_mut() {
-                        if cat.rewrite(&live).is_err() {
-                            tick_flags.storage_error.store(true, Ordering::SeqCst);
-                        }
-                    }
+                tick_maint.router.idle_close();
+                tick_maint.clock_tick();
+                if last_pass.elapsed() >= retire_every {
+                    last_pass = Instant::now();
+                    tick_maint.pass();
                 }
+                tick_maint.rewrite_catalogue();
             }
         });
         let scans = Arc::new(Mutex::new(ScanState {
@@ -1798,48 +2130,28 @@ impl Store {
         let mut report = rp.report;
         report.epoch = epoch;
         report.start_ms = start_ms;
-        report.dedup_entries = dedup.len();
+        report.dedup_entries = dedup_entries;
         report.keys = keys;
         report.namespace_counts = namespace_counts.iter().map(|(k, v)| (k.clone(), *v)).collect();
         report.ready_ms = now_ms();
         report.write(path)?;
-        let read_only = flags.storage_error.load(Ordering::SeqCst);
         Ok(Self {
             timers,
             signals: signals::Hub::new(epoch, &config),
             capture_metrics: std::array::from_fn(|_| AtomicU64::new(0)),
-            committed: RwLock::new(committed),
+            committed,
             scans,
             scan_usage: Arc::new(ScanUsage::default()),
             scan_reaper: Some((stop, reaper)),
             ticker: Some((tick_stop, ticker)),
-            state: Mutex::new(State {
-                pending: HashMap::new(),
-                metadata,
-                namespace_counts,
-                keys,
-                committed_bytes,
-                dedup_bytes,
-                dedup,
-                retired: VecDeque::new(),
-                retired_set: HashSet::new(),
-                expiry: expiry.into(),
-                next,
-                reserved_bytes: 0,
-                stripe_reserved: [0; 4],
-                stripe_items: [0; 4],
-                persisted_bytes,
-                pending_disk: 0,
-                read_only,
-                warming: false,
-            }),
+            state,
+            maint,
             done: Condvar::new(),
             router,
             chunks,
             policies,
             next_issued,
             flags,
-            clock,
             path: path.to_owned(),
             report: Mutex::new(report),
             appenders,
@@ -2124,103 +2436,39 @@ impl Store {
     pub fn expiry_degraded(&self) -> bool {
         self.flags.expiry_degraded.load(Ordering::SeqCst)
     }
-    /// Retire one closed chunk by the steps of 5.4: `retiring` (with horizons), drop it from the holders,
-    /// delete the file, `retired`. A chunk still holding a key's latest record, or a pending key, stays.
-    /// Ok(true) when retired; Ok(false) when kept, blocked or stopped at the test seam.
+    /// Retire one closed chunk by the steps of 5.4 (`retiring` with horizons, holders dropped, delete,
+    /// `retired`) whatever its class's window; a chunk holding a key's latest record, or a pending key, stays.
+    /// Ok(true) when retired; Ok(false) when kept, held or stopped at the test seam.
     pub fn retire_chunk(&self, id: u64) -> io::Result<bool> {
-        let state = self.state.lock().unwrap();
-        let mut cs = self.chunks.lock().unwrap();
-        let Some(c) = cs.table.get(&id).cloned() else {
-            return Ok(false);
-        };
-        if id == chunks::LEGACY_CHUNK || c.state != chunks::ChunkState::Closed {
-            return Ok(false);
-        }
-        if c.keys.keys().any(|k| state.pending.contains_key(k) || state.metadata.get(k).is_some_and(|m| m.chunk == id)) {
-            return Ok(false);
-        }
-        drop(state);
-        let horizons: Vec<(String, String, u64)> = c
-            .keys
-            .iter()
-            .filter(|(k, _)| cs.holders.others(k, id).next().is_some())
-            .map(|((ns, key), (_, max))| (ns.clone(), key.clone(), *max))
-            .collect();
-        let now = self.clock.utc_ms();
-        let next = self.next_issued.load(Ordering::SeqCst);
-        cs.log(now, chunks::Rec::Retiring { seq: id, next, horizons: horizons.clone(), expired: Vec::new() })?;
-        for (ns, key, v) in &horizons {
-            let h = cs.horizons.entry((ns.clone(), key.clone())).or_insert(0);
-            *h = (*h).max(*v);
-        }
-        if let Some(info) = cs.table.get_mut(&id) {
-            info.state = chunks::ChunkState::Retiring;
-            info.horizons = horizons;
-        }
-        if self.config.retire_stop_after == 1 {
-            return Ok(false);
-        }
-        for k in c.keys.keys() {
-            cs.holders.remove(k, id);
-        }
-        match fs::remove_file(&c.path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(_) => {
-                if let Some(info) = cs.table.get_mut(&id) {
-                    info.blocked_since.get_or_insert(now);
-                }
-                return Ok(false);
-            }
-        }
-        if self.config.retire_stop_after == 2 {
-            return Ok(false);
-        }
-        cs.log(now, chunks::Rec::Retired { seq: id })?;
-        if let Some(info) = cs.table.get_mut(&id) {
-            info.state = chunks::ChunkState::Retired;
-            info.keys.clear();
-            info.blocked_since = None;
-        }
-        cs.retired_chunks += 1;
-        cs.retired_bytes += c.bytes;
-        drop(cs);
-        let mut state = self.state.lock().unwrap();
-        state.persisted_bytes = state.persisted_bytes.saturating_sub(c.bytes);
-        Ok(true)
+        Ok(self.maint.retire(Some(id))?.contains(&id))
+    }
+    /// The 10 s maintenance pass, run now: held deletes, chunks due by class, tombstones, summaries.
+    pub fn retirement_pass(&self) {
+        self.maint.pass();
     }
     /// Chunks whose delete is held (retiring, retried by the next pass).
     pub fn retire_blocked(&self) -> usize {
         self.chunks.lock().unwrap().table.values().filter(|c| c.blocked_since.is_some()).count()
     }
-    /// Retry the held deletes; a retiring chunk's horizons are already recorded.
     pub fn retry_retiring(&self) -> io::Result<usize> {
-        let mut cs = self.chunks.lock().unwrap();
-        let ids: Vec<u64> = cs.table.values().filter(|c| c.state == chunks::ChunkState::Retiring).map(|c| c.id).collect();
-        let mut done = 0;
-        let mut freed = 0;
-        for id in ids {
-            let (p, bytes) = (cs.table[&id].path.clone(), cs.table[&id].bytes);
-            match fs::remove_file(&p) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(_) => continue,
-            }
-            let now = self.clock.utc_ms();
-            cs.log(now, chunks::Rec::Retired { seq: id })?;
-            let info = cs.table.get_mut(&id).unwrap();
-            info.state = chunks::ChunkState::Retired;
-            info.keys.clear();
-            info.blocked_since = None;
-            cs.retired_chunks += 1;
-            cs.retired_bytes += bytes;
-            freed += bytes;
-            done += 1;
+        self.maint.retry_retiring()
+    }
+    /// (index entries with summaries, live keys in `ns`).
+    pub fn slots(&self, ns: &str) -> (usize, usize) {
+        let state = self.state.lock().unwrap();
+        (state.keys, state.namespace_counts.get(ns).copied().unwrap_or(0))
+    }
+    /// GET_STATUS (5.3): 0 live with its version, 1 expired (in a summary), 2 missing.
+    pub fn get_status(&self, ns: &str, key: &str) -> (u8, u64) {
+        if let Some(v) = self.get_handle(ns, key) {
+            return (0, v.version);
         }
-        drop(cs);
-        let mut state = self.state.lock().unwrap();
-        state.persisted_bytes = state.persisted_bytes.saturating_sub(freed);
-        Ok(done)
+        let k = (ns.to_owned(), key.to_owned());
+        if self.chunks.lock().unwrap().summaries.keys.contains_key(&k) {
+            (1, 0)
+        } else {
+            (2, 0)
+        }
     }
     /// Set (Some) or clear (None) a namespace prefix's class: written durably to POLICY_NS, then used by
     /// writes that follow (5.1). Records already written keep their chunk's class.
@@ -2230,8 +2478,12 @@ impl Store {
             Err(code) => return Outcome::error(code),
         };
         if let Some(c) = class {
+            // An expire class shorter than the retry window would retire records whose dedup a restart still needs.
+            if c.kind == 2 && c.retention_ms < self.config.retry_ms {
+                return Outcome::error(3);
+            }
             if self.policies.read().unwrap().would_exceed(ns, prefix, c) {
-                return Outcome::error(9);
+                return Outcome::error(7);
             }
         }
         let m = Mutation {
@@ -2260,6 +2512,7 @@ impl Store {
     /// The idle tick's work, run now (tests use it with a manual clock).
     pub fn tick(&self) {
         self.router.idle_close();
+        self.maint.clock_tick();
     }
     #[allow(dead_code)]
     fn state_path(&self) -> &Path {
@@ -2369,11 +2622,13 @@ impl Store {
         if state.pending.contains_key(&k) {
             return Outcome::error(6);
         }
+        // An index entry is new when the key has none; a live key is new when it has none or a tombstone (5.3).
         let new = old.is_none();
+        let live_new = !m.remove && old.as_ref().map_or(true, |o| o.tombstone);
         if new && state.keys >= self.config.index_cap {
             return Outcome::error(9);
         }
-        if new && state.namespace_counts.get(&m.ns).copied().unwrap_or(0) >= self.config.quota {
+        if live_new && state.namespace_counts.get(&m.ns).copied().unwrap_or(0) >= self.config.quota {
             return Outcome::error(8);
         }
         while let Some((key, time)) = state.expiry.front().cloned() {
@@ -2403,7 +2658,10 @@ impl Store {
         {
             return Outcome::error(7);
         }
-        if state.persisted_bytes + state.pending_disk + disk_bytes > self.config.state_limit_bytes {
+        // Ordinary admissions stop at the limit less the maintenance reserve (5.5).
+        if state.persisted_bytes + state.pending_disk + disk_bytes
+            > self.config.state_limit_bytes.saturating_sub(self.config.maintenance_reserve_bytes)
+        {
             return Outcome::error(7);
         }
         if state.reserved_bytes + queue_charge > self.config.queue_bytes
@@ -2439,6 +2697,8 @@ impl Store {
         );
         if new {
             state.keys += 1;
+        }
+        if live_new {
             *state.namespace_counts.entry(m.ns.clone()).or_default() += 1;
         }
         state.reserved_bytes += queue_charge;
@@ -2516,7 +2776,7 @@ impl Store {
             state.committed_bytes =
                 state.committed_bytes - old.as_ref().map_or(0, |v| v.bytes) + m.bytes.len();
             state.metadata.insert(
-                k,
+                k.clone(),
                 Meta {
                     version,
                     tombstone: m.remove,
@@ -2524,9 +2784,20 @@ impl Store {
                     chunk: *chunk,
                 },
             );
-        } else if new {
-            state.keys -= 1;
-            *state.namespace_counts.get_mut(&m.ns).unwrap() -= 1;
+            if m.remove {
+                // A remove of a live key frees its namespace slot at commit; the tombstone keeps an index entry.
+                if old.as_ref().is_some_and(|o| !o.tombstone) {
+                    *state.namespace_counts.get_mut(&m.ns).unwrap() -= 1;
+                }
+                state.tomb_candidates.insert(k.clone());
+            }
+        } else {
+            if new {
+                state.keys -= 1;
+            }
+            if live_new {
+                *state.namespace_counts.get_mut(&m.ns).unwrap() -= 1;
+            }
         }
         if result.is_err() {
             state.read_only = true
@@ -2611,7 +2882,7 @@ impl Store {
             let _op_id = c.text()?;
             let ns = c.text()?;
             // Internal schedule/progress records are not a public KV namespace.
-            if ns == timers::NS { return Err(3); }
+            if ns == timers::NS || ns == chunks::POLICY_NS { return Err(3); }
             if op == PUT || op == CONDITIONAL_PUT || op == REMOVE {
                 let m = parse_mutation(&mut c, op, deadline, _op_id, ns)?;
                 c.end()?;
@@ -2629,6 +2900,37 @@ impl Store {
             }
             match op {
                 TIMER_SET | TIMER_CANCEL | TIMER_STATUS => self.timer_call(op,ns,_op_id,deadline,&mut c),
+                POLICY_SET => {
+                    let prefix = c.bound()?;
+                    let kind = c.u8()?;
+                    let retention = c.u64()?;
+                    c.end()?;
+                    let class = if kind == 255 { None } else { Some(Class::from_wire(kind, retention)?) };
+                    let o = self.set_policy(&ns, &prefix, class, deadline);
+                    if o.code != 0 {
+                        return Err(o.code);
+                    }
+                    Ok(o.bytes())
+                }
+                POLICY_GET => {
+                    c.end()?;
+                    let rows: Vec<_> = self.policies().into_iter().filter(|r| r.0 == ns).collect();
+                    let mut p = (rows.len() as u16).to_le_bytes().to_vec();
+                    for (_, prefix, class) in rows {
+                        lp(&mut p, prefix.as_bytes());
+                        p.push(class.kind);
+                        p.extend(class.retention_ms.to_le_bytes());
+                    }
+                    Ok(p)
+                }
+                GET_STATUS => {
+                    let key = c.text()?;
+                    c.end()?;
+                    let (status, version) = self.get_status(&ns, &key);
+                    let mut p = vec![status];
+                    p.extend(version.to_le_bytes());
+                    Ok(p)
+                }
                 SUBSCRIBE => {
                     let prefix = c.bound()?;
                     let endpoint = c.text()?;

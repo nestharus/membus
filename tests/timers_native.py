@@ -22,7 +22,7 @@ def receive(listener):
     return event,decode_timer(event['value'])
 def records(state):
     rows=[]
-    for path in sorted(state.glob('stripe-*.log')):
+    for path in sorted(state.glob('chunks/*/*.log'),key=lambda p:int(p.stem.split('-')[1])):
         data=path.read_bytes();at=0
         while at<len(data):
             assert data[at:at+4]==b'MBK1'
@@ -73,15 +73,15 @@ def run(args):
                         else:raise AssertionError('timers-only subscription access')
             finally:legacy.close()
         l=listener();sub=c.subscribe('quota',l.endpoint,'timer/',include_value=True)['subscription']
-        before=sum(p.stat().st_size for p in (out/'main-state').glob('stripe-*.log'))
+        before=sum(p.stat().st_size for p in (out/'main-state').glob('chunks/*/*.log'))
         due=int(time.time()*1000)+500
         gen=c.timer_set('quota','once','timer/once',due,payload=b'tick',expected=0)
-        after_set=sum(p.stat().st_size for p in (out/'main-state').glob('stripe-*.log'))
+        after_set=sum(p.stat().st_size for p in (out/'main-state').glob('chunks/*/*.log'))
         assert int(time.time()*1000)<due
         event,wake=receive(l);received=int(time.time()*1000)
         check('one-off at due, not early, under 1000ms late',wake['due_ms']==due and 0<=received-due<1000 and wake['missed_count']==1 and wake['due_id']==(gen,0),lateness_ms=received-due,received_ms=received,wake=wake)
         wait_for(lambda:not c.timer_status('quota','once')['active'])
-        after_fire=sum(p.stat().st_size for p in (out/'main-state').glob('stripe-*.log'))
+        after_fire=sum(p.stat().st_size for p in (out/'main-state').glob('chunks/*/*.log'))
         fire_rows=[r for r in records(out/'main-state') if r['key'].startswith('p/')]
         check('one isolated fire appends exactly one compact progress record',len(fire_rows)==1 and after_fire-after_set==fire_rows[0]['total'],
               stripe_bytes_before_set=before,stripe_bytes_after_set=after_set,stripe_bytes_after_fire=after_fire,

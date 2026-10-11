@@ -117,8 +117,8 @@ def run(args):
                           'flush_calls':after['flush_calls']-before['flush_calls']}
         results['initial_run']=after
         epoch=c.epoch;server.stop()
-        # A verified short final header on an otherwise valid stripe is torn, not corrupt.
-        with open(output/'main-state/stripe-0.log','ab') as log: log.write(b'MBK1\x20\x00')
+        # A verified short final header on the chunk open at the stop is torn, not corrupt (CHUNK-RETIREMENT.md 5.5).
+        with open(max((output/'main-state'/'chunks').glob('*/*.log'),key=lambda p:int(p.stem.split('-')[1])),'ab') as log: log.write(b'MBK1\x20\x00')
         server=Server(args.binary,output/'main-state',output/'restarted-server.txt');servers.append(server)
         assert server.client.epoch!=epoch
         keys=list(acknowledged)
@@ -137,7 +137,7 @@ def run(args):
         (output/'acknowledged-ids.json').write_text(json.dumps(keys),encoding='utf8')
         (output/'replayed-ids.json').write_text(json.dumps(replayed),encoding='utf8')
         server.stop()
-        log=next(path for path in (output/'main-state').glob('stripe-*.log') if path.stat().st_size>12)
+        log=next(path for path in (output/'main-state').glob('chunks/*/*.log') if path.stat().st_size>12)
         data=bytearray(log.read_bytes());data[12]^=1;log.write_bytes(data)
         results['test_mutations']={'torn_header_bytes':6,'corruption_rewrite_bytes':len(data),'captures':'acknowledged/replayed JSON lists plus small text/JSON reports; physical bytes unmeasured'}
         corrupt=subprocess.run([str(args.binary),str(output/'main-state'),'tcp',endpoint('tcp')],capture_output=True,text=True,timeout=10)

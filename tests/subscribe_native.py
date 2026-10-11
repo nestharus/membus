@@ -160,12 +160,12 @@ def run(args):
         # one exact charged representation without evictions.
         mem_listener=listener();mem_sub=c.subscribe('quota',mem_listener.endpoint,'memory/',include_value=True)['subscription']
         mem_before=process_memory(server.process.pid);ring_before=c.signal_usage();disk_before=io(c)
-        files_before=sum(p.stat().st_size for p in (out/'state').glob('stripe*'))
+        files_before=sum(p.stat().st_size for p in (out/'state').glob('chunks/*/*.log'))
         for i in range(16):
             c.put('quota','memory/fixed',b'memory',op_id=f'memory-{i}')
             mem_listener.receive()
         mem_after=process_memory(server.process.pid);ring_after=c.signal_usage();disk_after=io(c)
-        files_after=sum(p.stat().st_size for p in (out/'state').glob('stripe*'))
+        files_after=sum(p.stat().st_size for p in (out/'state').glob('chunks/*/*.log'))
         result['fresh_signal_memory']=dict(signals=16,before=mem_before,after=mem_after,
             process_delta_bytes={k:mem_after[k]-mem_before[k] for k in mem_before},
             combined_process_delta_bytes_per_signal={k:(mem_after[k]-mem_before[k])/16 for k in mem_before},

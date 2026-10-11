@@ -87,7 +87,8 @@ def main():
         server.stop();server=None
         kill_seconds=time.monotonic()-kill_started
         assert kill_seconds<.2,'stale server IO could have idled out before kill'
-        stripe=next(p for p in (out/'state').glob('stripe-*.log') if p.stat().st_size)
+        # The newest chunk was open at the kill, so its torn tail is truncated at replay (CHUNK-RETIREMENT.md 5.5).
+        stripe=max((p for p in (out/'state').glob('chunks/*/*.log') if p.stat().st_size),key=lambda p:int(p.stem.split('-')[1]))
         before_tail=stripe.stat().st_size
         with stripe.open('ab') as f:f.write(b'MBK')
         server=Server(args.binary,out/'state',out/'server.txt','pipe',flags,address=address)

@@ -300,13 +300,20 @@ fn main() -> io::Result<()> {
     if args.get(1).map(String::as_str) == Some("health") {
         return health_command(&args[2..]);
     }
+    if args.get(1).map(String::as_str) == Some("policy") {
+        return policy_command(&args[2..]);
+    }
+    if args.get(1).map(String::as_str) == Some("expiry") {
+        return expiry_command(&args[2..]);
+    }
     if args.len() < 4 {
-        return Err(io::Error::other("usage: membus STATE_DIR tcp|pipe ADDRESS [--idle-ms N] [--heartbeat-ms N] [--state-limit-bytes N] [--flush-ms N] [--retry-ms N] [--quota N] [--index-cap N] [--capacity N] [--queue-bytes N] [--dedup-cap N] [--delay-ms N] [--allow-mem] [--snapshot-bytes N] [--snapshot-max N] [--snapshot-ttl-ms N]; membus health PIPE [--state-dir PATH]"));
+        return Err(io::Error::other("usage: membus STATE_DIR tcp|pipe ADDRESS [--idle-ms N] [--heartbeat-ms N] [--state-limit-bytes N] [--flush-ms N] [--retry-ms N] [--quota N] [--index-cap N] [--capacity N] [--queue-bytes N] [--dedup-cap N] [--delay-ms N] [--allow-mem] [--snapshot-bytes N] [--snapshot-max N] [--snapshot-ttl-ms N] [--maintenance-reserve-bytes N] [--chunk-bytes N] [--rotation-ms N] [--retire-ms N]; membus health PIPE [--state-dir PATH]; membus policy PIPE get NS|set NS PREFIX forever|latest|expire:MS|clear NS PREFIX; membus expiry resume STATE_DIR"));
     }
     let path = PathBuf::from(&args[1]);
     let mut config = Config::default();
     let mut idle_ms = 60000u32;
     let mut heartbeat_ms = 30000u64;
+    let mut reserve = None;
     let mut i = 4;
     while i < args.len() {
         if args[i] == "--allow-mem" {
@@ -355,9 +362,25 @@ fn main() -> io::Result<()> {
                 config.snapshot_max = usize::try_from(n).map_err(io::Error::other)?
             }
             "--snapshot-ttl-ms" => config.snapshot_ttl_ms = n,
+            "--maintenance-reserve-bytes" => reserve = Some(n),
+            "--chunk-bytes" => {
+                if n == 0 {
+                    return Err(io::Error::other("chunk-bytes must be positive"));
+                }
+                config.chunk_bytes = n;
+            }
+            "--rotation-ms" => config.rotation_ms = n,
+            "--retire-ms" => config.retire_ms = n,
             _ => return Err(io::Error::other("unknown option")),
         }
         i += 2
+    }
+    // Ordinary admissions stop at the limit less a 1 GiB maintenance reserve (CHUNK-RETIREMENT.md 5.5); a limit
+    // under 8 GiB keeps an eighth, so a small test limit still admits.
+    config.maintenance_reserve_bytes =
+        reserve.unwrap_or_else(|| (1u64 << 30).min(config.state_limit_bytes / 8));
+    if config.maintenance_reserve_bytes >= config.state_limit_bytes {
+        return Err(io::Error::other("maintenance-reserve-bytes must be below state-limit-bytes"));
     }
     let state_limit = config.state_limit_bytes;
     let store = Arc::new(Store::open(&path, config)?);
@@ -456,6 +479,85 @@ fn health_command(args: &[String]) -> io::Result<()> {
     }
     println!("healthy pid={pid} epoch={epoch}");
     Ok(())
+}
+/// `membus expiry resume STATE_DIR`: end a clock pause (5.4); the running server's next tick reads the file.
+fn expiry_command(args: &[String]) -> io::Result<()> {
+    if args.len() != 2 || args[0] != "resume" {
+        return Err(io::Error::other("usage: membus expiry resume STATE_DIR"));
+    }
+    let file = PathBuf::from(&args[1]).join("expiry.resume");
+    fs::write(&file, membus::now_ms().to_string())?;
+    println!("expiry resume requested: {}", file.display());
+    Ok(())
+}
+/// `membus policy PIPE get NS | set NS PREFIX CLASS | clear NS PREFIX` (5.1), over POLICY_GET and POLICY_SET.
+#[cfg(windows)]
+fn policy_command(args: &[String]) -> io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    let usage = || io::Error::other("usage: membus policy PIPE get NS | set NS PREFIX forever|latest|expire:MS | clear NS PREFIX");
+    let (pipe_name, verb) = (args.first().ok_or_else(usage)?, args.get(1).ok_or_else(usage)?.as_str());
+    let ns = args.get(2).ok_or_else(usage)?;
+    let class = match (verb, args.len()) {
+        ("get", 3) => None,
+        ("clear", 4) => Some((255u8, 0u64)),
+        ("set", 5) => Some(match args[4].as_str() {
+            "forever" => (0, 0),
+            "latest" => (1, 0),
+            other => {
+                let ms = other.strip_prefix("expire:").ok_or_else(usage)?;
+                (2, ms.parse::<u64>().map_err(io::Error::other)?)
+            }
+        }),
+        _ => return Err(usage()),
+    };
+    let connect_until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let file = loop {
+        match fs::OpenOptions::new().read(true).write(true).custom_flags(0x40000000).open(pipe_name) {
+            Ok(file) => break file,
+            Err(error) if error.raw_os_error() == Some(231) && std::time::Instant::now() < connect_until => {
+                thread::sleep(std::time::Duration::from_millis(5))
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    let mut pipe = pipe_io::Pipe::new(file, 2000);
+    let mut payload = (membus::MAX_FRAME as u32).to_le_bytes().to_vec();
+    payload.push(0);
+    membus::lp(&mut payload, b"membus-policy");
+    health_exchange(&mut pipe, membus::HELLO, 1, &payload)?;
+    let mut payload = (membus::now_ms() + 5000).to_le_bytes().to_vec();
+    membus::lp(&mut payload, format!("policy-cli-{}", membus::now_ms()).as_bytes());
+    membus::lp(&mut payload, ns.as_bytes());
+    match class {
+        None => {
+            let reply = health_exchange(&mut pipe, membus::POLICY_GET, 2, &payload)?;
+            let mut c = membus::Cursor::new(&reply);
+            let n = c.u16().map_err(|code| io::Error::other(format!("reply code {code}")))?;
+            for _ in 0..n {
+                let row = (|| -> Result<_, u16> { Ok((c.bound()?, c.u8()?, c.u64()?)) })()
+                    .map_err(|code| io::Error::other(format!("reply code {code}")))?;
+                let class = match row.1 {
+                    0 => "forever".to_owned(),
+                    1 => "latest".to_owned(),
+                    _ => format!("expire:{}", row.2),
+                };
+                println!("{ns}\t{}\t{class}", row.0);
+            }
+        }
+        Some((kind, retention)) => {
+            membus::lp(&mut payload, args[3].as_bytes());
+            payload.push(kind);
+            payload.extend(retention.to_le_bytes());
+            let reply = health_exchange(&mut pipe, membus::POLICY_SET, 2, &payload)?;
+            let version = u64::from_le_bytes(reply.get(..8).ok_or_else(|| io::Error::other("short reply"))?.try_into().unwrap());
+            println!("policy {verb} {ns} {} version={version}", args[3]);
+        }
+    }
+    Ok(())
+}
+#[cfg(not(windows))]
+fn policy_command(_: &[String]) -> io::Result<()> {
+    Err(io::Error::other("membus policy requires a Windows pipe"))
 }
 #[cfg(not(windows))]
 fn health_command(_: &[String]) -> io::Result<()> {
