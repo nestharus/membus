@@ -452,6 +452,7 @@ pub fn read_frame_at(f: &mut File, magic: &[u8; 4], offset: u64, len: u64, name:
 
 /// The catalogue as read at start: its records, and a torn tail's offset when one was found.
 pub fn read_catalogue(path: &Path) -> io::Result<(Vec<CatRecord>, Option<(u64, u64, &'static str)>)> {
+    require_resolved_append(path)?;
     let mut out = Vec::new();
     if !path.exists() {
         return Ok((out, None));
@@ -478,6 +479,38 @@ pub fn read_catalogue(path: &Path) -> io::Result<(Vec<CatRecord>, Option<(u64, u
     Ok((out, None))
 }
 
+fn append_pending_path(path: &Path) -> PathBuf {
+    path.with_extension("log.append-pending")
+}
+
+// A complete frame is not evidence that an append returned successfully. Persist the unresolved
+// boundary before writing, and retain it when neither publication nor rollback can be established.
+// Replay refuses even a malformed marker; it never guesses that its absence of usable detail means
+// there was no outstanding append. Recovery by a known live-list rewrite is separately explicit.
+fn require_resolved_append(path: &Path) -> io::Result<()> {
+    let pending = append_pending_path(path);
+    if pending.try_exists()? {
+        return Err(io::Error::other(format!(
+            "catalogue append unresolved: {}; replay refused, catalogue and chunks retained",
+            pending.display()
+        )));
+    }
+    Ok(())
+}
+
+fn begin_append(path: &Path, boundary: u64) -> io::Result<()> {
+    let mut marker = OpenOptions::new().write(true).create_new(true).open(append_pending_path(path))?;
+    let mut bytes = b"MBCP1\0\0\0".to_vec();
+    bytes.extend(boundary.to_le_bytes());
+    bytes.extend(crc32(&bytes).to_le_bytes());
+    marker.write_all(&bytes)?;
+    crate::sync_file(&marker)
+}
+
+fn resolve_append(path: &Path) -> io::Result<()> {
+    fs::remove_file(append_pending_path(path))
+}
+
 pub struct Catalogue {
     pub path: PathBuf,
     file: File,
@@ -490,14 +523,15 @@ pub struct Catalogue {
     #[cfg(test)]
     fail_partial_once: Option<usize>,
     #[cfg(test)]
-    fail_sync_once: bool,
+    pub(crate) fail_sync_once: bool,
     #[cfg(test)]
     fail_reopen_once: bool,
     #[cfg(test)]
-    fail_recovery_once: bool,
+    pub(crate) fail_recovery_once: bool,
 }
 impl Catalogue {
     pub fn open(path: &Path) -> io::Result<Self> {
+        require_resolved_append(path)?;
         let file = OpenOptions::new().create(true).read(true).write(true).open(path)?;
         let bytes = file.metadata()?.len();
         Ok(Self {
@@ -532,6 +566,12 @@ impl Catalogue {
         }
         let b = encode(r);
         let boundary = self.file.metadata()?.len();
+        if let Err(error) = begin_append(&self.path, boundary) {
+            // Marker creation/sync can fail after creating bytes. No catalogue append was attempted;
+            // retain all evidence and require an explicit rewrite rather than overwriting the marker.
+            self.fenced = true;
+            return Err(error);
+        }
         let written = (|| -> io::Result<()> {
             self.file.seek(SeekFrom::End(0))?;
             #[cfg(test)]
@@ -554,13 +594,18 @@ impl Catalogue {
                     return Err(io::Error::other("test injected boundary recovery failure"));
                 }
                 self.file.set_len(boundary)?;
-                crate::sync_file(&self.file)
+                crate::sync_file(&self.file)?;
+                resolve_append(&self.path)
             })();
             if let Err(recovery) = recovered {
                 self.fenced = true;
                 return Err(io::Error::other(format!("{error}; catalogue boundary recovery failed: {recovery}")));
             }
             return Err(error);
+        }
+        if let Err(error) = resolve_append(&self.path) {
+            self.fenced = true;
+            return Err(io::Error::other(format!("catalogue publication unresolved: {error}")));
         }
         self.bytes += b.len() as u64;
         self.last_ms = self.last_ms.max(r.at_ms);
@@ -589,6 +634,13 @@ impl Catalogue {
         fs::rename(&tmp, &self.path)?;
         self.file = replacement;
         self.bytes = bytes;
+        // A retained marker is cleared only after the caller's known live list has replaced the
+        // uncertain catalogue. Any failure keeps replay fenced across process restart.
+        let pending = append_pending_path(&self.path);
+        self.fenced = true;
+        if pending.try_exists()? {
+            resolve_append(&self.path)?;
+        }
         self.fenced = false;
         Ok(())
     }
@@ -1174,5 +1226,47 @@ mod catalogue_failure_tests {
         c.rewrite(&[record(1)]).unwrap();
         c.append(&record(3)).unwrap();
         assert_eq!(read_catalogue(&c.path).unwrap(), (vec![record(1), record(3)], None));
+    }
+    #[test]
+    fn complete_failed_append_is_not_admitted_on_reopen() {
+        let mut c = catalogue("complete-unresolved");
+        c.append(&record(1)).unwrap();
+        c.fail_sync_once = true;
+        c.fail_recovery_once = true;
+        assert!(c.append(&record(2)).unwrap_err().to_string().contains("boundary recovery failed"));
+        let path = c.path.clone();
+        let failed_bytes = fs::read(&path).unwrap();
+        assert!(failed_bytes.ends_with(&encode(&record(2))), "witness must leave the complete failed frame");
+        drop(c);
+        assert!(read_catalogue(&path).unwrap_err().to_string().contains("append unresolved"));
+        assert!(Catalogue::open(&path).err().unwrap().to_string().contains("append unresolved"));
+        assert_eq!(fs::read(&path).unwrap(), failed_bytes, "refusal preserves recovery evidence");
+    }
+    #[test]
+    fn unresolved_complete_append_can_be_replaced_only_with_known_live_state() {
+        let mut c = catalogue("complete-rewrite");
+        c.append(&record(1)).unwrap();
+        c.fail_sync_once = true;
+        c.fail_recovery_once = true;
+        assert!(c.append(&record(2)).is_err());
+        assert!(read_catalogue(&c.path).is_err());
+        c.rewrite(&[record(1)]).unwrap();
+        assert_eq!(read_catalogue(&c.path).unwrap(), (vec![record(1)], None));
+        let path = c.path.clone();
+        drop(c);
+        let mut reopened = Catalogue::open(&path).unwrap();
+        reopened.append(&record(3)).unwrap();
+        assert_eq!(read_catalogue(&path).unwrap(), (vec![record(1), record(3)], None));
+    }
+    #[test]
+    fn incomplete_marker_never_authorizes_replay_or_overwrite() {
+        let mut c = catalogue("incomplete-marker");
+        c.append(&record(1)).unwrap();
+        let before = fs::read(&c.path).unwrap();
+        fs::write(append_pending_path(&c.path), b"MBC").unwrap();
+        assert!(read_catalogue(&c.path).is_err());
+        assert!(c.append(&record(2)).is_err());
+        assert_eq!(fs::read(&c.path).unwrap(), before);
+        assert_eq!(fs::read(append_pending_path(&c.path)).unwrap(), b"MBC");
     }
 }
