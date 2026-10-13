@@ -310,3 +310,27 @@ fn t11_rollback_restores_the_legacy_logs() {
     assert_eq!(shas(&p), before, "the restored legacy logs are the originals");
     println!("T11: rollback restored the legacy logs byte for byte (the previous binary's run is in import_production.py)");
 }
+
+
+fn refuse_unexamined_chunks(label: &str, catalogue: Option<&[u8]>) {
+    let p = path(label);
+    legacy_state(&p);
+    let legacy_before = shas(&p);
+    let dir = p.join("chunks").join("forever");
+    fs::create_dir_all(&dir).unwrap();
+    let protected = dir.join("0-99.log");
+    let bytes = b"existing chunk whose catalogue evidence is unavailable";
+    fs::write(&protected, bytes).unwrap();
+    if let Some(bytes) = catalogue { fs::write(p.join("chunks/catalogue.log"), bytes).unwrap(); }
+    let clock = ManualClock::new(now_ms());
+    assert!(Store::open(&p, config(&clock)).is_err(), "import must refuse rather than replace unexplained chunks");
+    assert_eq!(fs::read(&protected).unwrap(), bytes);
+    assert_eq!(shas(&p), legacy_before);
+    assert!(!p.join("chunks.import").exists());
+}
+#[test]
+fn import_refuses_chunks_with_missing_catalogue() { refuse_unexamined_chunks("missing-catalogue", None); }
+#[test]
+fn import_refuses_chunks_with_empty_catalogue() { refuse_unexamined_chunks("empty-catalogue", Some(b"")); }
+#[test]
+fn import_refuses_chunks_with_torn_catalogue() { refuse_unexamined_chunks("torn-catalogue", Some(b"MBC1")); }

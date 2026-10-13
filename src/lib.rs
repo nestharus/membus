@@ -1540,6 +1540,17 @@ fn import_legacy(path: &Path, config: &Config, clock: &chunks::Clock, epoch: u64
     if records.iter().any(|r| matches!(r.rec, Rec::Import(_) | Rec::Open { .. })) {
         return Ok(None);
     }
+    if chunks_dir.exists() {
+        // Missing or torn catalogue evidence does not establish that existing chunk files are empty.
+        // A fresh directory (optionally with an empty catalogue) is the only safe import destination.
+        for entry in fs::read_dir(&chunks_dir)? {
+            let entry = entry?;
+            if entry.file_name() != "catalogue.log" || !entry.file_type()?.is_file() || entry.metadata()?.len() != 0 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData,
+                    "legacy import refused: existing chunks have no open or import catalogue record"));
+            }
+        }
+    }
     let utc = clock.utc_ms();
     let mut listed = Vec::new();
     for (_, p) in &files {
@@ -1663,11 +1674,7 @@ fn import_legacy(path: &Path, config: &Config, clock: &chunks::Clock, epoch: u64
     };
     // The switch: chunks.import/ becomes chunks/; then the legacy logs move, unmodified and read-only.
     if chunks_dir.exists() {
-        if records.is_empty() {
-            fs::remove_dir_all(&chunks_dir)?;
-        } else {
-            fs::rename(&chunks_dir, path.join(format!("chunks.pre-import-{epoch}")))?;
-        }
+        fs::rename(&chunks_dir, path.join(format!("chunks.pre-import-{epoch}")))?;
     }
     fs::rename(&dir, &chunks_dir)?;
     move_legacy(path, &import)?;
@@ -2028,6 +2035,7 @@ impl Maint {
         let mono = self.clock.mono_ms();
         let mut gone: Vec<(Key, u64)> = Vec::new();
         let mut started: Vec<(u64, PathBuf, u64, Vec<Key>)> = Vec::new();
+        let mut failure = None;
         {
             let mut state = self.state.lock().unwrap();
             let mut cs = self.chunks.lock().unwrap();
@@ -2078,7 +2086,8 @@ impl Maint {
                     chunks::Rec::Retiring { seq: id, next, horizons: horizons.clone(), expired: latest.clone() },
                 ) {
                     self.flags.storage_error.store(true, Ordering::SeqCst);
-                    return Err(e);
+                    failure = Some(e);
+                    break;
                 }
                 for (n, k, v) in &horizons {
                     let h = cs.horizons.entry((n.clone(), k.clone())).or_insert(0);
@@ -2128,6 +2137,9 @@ impl Maint {
         {
             let mut cs = self.chunks.lock().unwrap();
             for (id, p, bytes, keys) in started {
+                if failure.is_some() {
+                    break;
+                }
                 match fs::remove_file(&p) {
                     Ok(()) => {}
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -2141,7 +2153,8 @@ impl Maint {
                 }
                 if let Err(e) = cs.log(utc, chunks::Rec::Retired { seq: id }) {
                     self.flags.storage_error.store(true, Ordering::SeqCst);
-                    return Err(e);
+                    failure = Some(e);
+                    break;
                 }
                 let info = cs.table.get_mut(&id).unwrap();
                 info.state = ChunkState::Retired;
@@ -2163,7 +2176,7 @@ impl Maint {
             let mut state = self.state.lock().unwrap();
             state.persisted_bytes = state.persisted_bytes.saturating_sub(freed);
         }
-        Ok(done)
+        match failure { Some(error) => Err(error), None => Ok(done) }
     }
     /// Retry the held deletes; a retiring chunk's index work and horizons are already done.
     fn retry_retiring(&self) -> io::Result<usize> {
@@ -2172,6 +2185,7 @@ impl Maint {
             cs.table.values().filter(|c| c.state == chunks::ChunkState::Retiring).map(|c| c.id).collect();
         let mut done = 0;
         let mut freed = 0;
+        let mut failure = None;
         for id in ids {
             let (p, bytes) = (cs.table[&id].path.clone(), cs.table[&id].bytes);
             match fs::remove_file(&p) {
@@ -2182,7 +2196,8 @@ impl Maint {
             let now = self.clock.utc_ms();
             if let Err(e) = cs.log(now, chunks::Rec::Retired { seq: id }) {
                 self.flags.storage_error.store(true, Ordering::SeqCst);
-                return Err(e);
+                failure = Some(e);
+                break;
             }
             let info = cs.table.get_mut(&id).unwrap();
             info.state = chunks::ChunkState::Retired;
@@ -2196,7 +2211,7 @@ impl Maint {
         drop(cs);
         let mut state = self.state.lock().unwrap();
         state.persisted_bytes = state.persisted_bytes.saturating_sub(freed);
-        Ok(done)
+        match failure { Some(error) => Err(error), None => Ok(done) }
     }
     /// Drop tombstone index entries no other retained chunk can contradict (5.3), and expired summaries.
     fn drop_tombstones(&self) {
@@ -3795,5 +3810,79 @@ mod scan_retention_tests {
                 .err(),
             Some(4)
         );
+    }
+}
+
+
+#[cfg(test)]
+mod retirement_failure_tests {
+    use super::*;
+    fn store(label: &str, stop: u8) -> (Store, Arc<ManualClock>) {
+        let p = PathBuf::from(std::env::var("MEMBUS_TEST_OUTPUT").unwrap_or_else(|_| ".test-output".into()))
+            .join(format!("retirement-failure-{label}-{}-{}", std::process::id(), now_ms()));
+        let clock = ManualClock::new(now_ms());
+        let s = Store::open(&p, Config { clock: Some(clock.clone()), tick_ms: 3_600_000,
+            retire_ms: 3_600_000, rotation_ms: 1, retire_stop_after: stop, ..Config::default() }).unwrap();
+        let day = 86_400_000;
+        assert_eq!(s.set_policy("expiry", "", Some(Class::expire(2 * day)), now_ms() + 10_000).code, 0);
+        let a = "a";
+        let b = (0..100).map(|i| format!("b{i}")).find(|k| stripe("expiry", k) != stripe("expiry", a)).unwrap();
+        for (n, k) in [a, &b].iter().enumerate() {
+            assert_eq!(s.mutate(Mutation { ns: "expiry".into(), key: k.to_string(), op_id: format!("put{n}"),
+                deadline: now_ms() + 10_000, ack: 1, expected: None, bytes: b"value".to_vec(), remove: false }).code, 0);
+        }
+        clock.advance(2);
+        s.tick();
+        clock.advance(2 * day);
+        (s, clock)
+    }
+    fn expired_chunks(s: &Store) -> Vec<(u64, u64)> {
+        s.chunks.lock().unwrap().table.values().filter(|c| c.class.kind == 2).map(|c| (c.id, c.bytes)).collect()
+    }
+    fn inject_after(s: &Store, n: usize) { s.chunks.lock().unwrap().cat.as_mut().unwrap().fail_after_once = Some(n); }
+    fn assert_readable_index_agrees(s: &Store) {
+        let state = s.state.lock().unwrap();
+        let committed = s.committed.read().unwrap();
+        for (k, v) in committed.iter() {
+            assert!(state.metadata.get(k).is_some_and(|m| m.version == v.version), "readable expired value left behind: {k:?}");
+        }
+    }
+    #[test]
+    fn later_retiring_failure_cleans_up_earlier_expired_values() {
+        let (s, _) = store("index", 0);
+        inject_after(&s, 1);
+        assert!(s.maint.retire(None).is_err());
+        assert_readable_index_agrees(&s);
+        let closed = s.chunks.lock().unwrap().table.values().filter(|c| c.class.kind == 2 && c.state == chunks::ChunkState::Closed).count();
+        assert_eq!(closed, 1);
+        s.maint.retire(None).unwrap();
+        s.retry_retiring().unwrap();
+        assert_eq!(s.slots("expiry").1, 0);
+        assert_readable_index_agrees(&s);
+    }
+    #[test]
+    fn later_retired_failure_keeps_successful_byte_reclamation() {
+        let (s, _) = store("bytes", 0);
+        let ids = expired_chunks(&s);
+        assert_eq!(ids.len(), 2);
+        let before = s.state.lock().unwrap().persisted_bytes;
+        inject_after(&s, 3); // two Retiring records, one successful Retired record, then failure
+        assert!(s.maint.retire(None).is_err());
+        assert_eq!(s.state.lock().unwrap().persisted_bytes, before - ids[0].1);
+        assert_readable_index_agrees(&s);
+        assert_eq!(s.retry_retiring().unwrap(), 1);
+        assert_eq!(s.state.lock().unwrap().persisted_bytes, before - ids.iter().map(|x| x.1).sum::<u64>());
+    }
+    #[test]
+    fn retry_failure_keeps_prior_successful_byte_reclamation() {
+        let (s, _) = store("retry", 2);
+        let ids = expired_chunks(&s);
+        let before = s.state.lock().unwrap().persisted_bytes;
+        s.maint.retire(None).unwrap();
+        inject_after(&s, 1);
+        assert!(s.retry_retiring().is_err());
+        assert_eq!(s.state.lock().unwrap().persisted_bytes, before - ids[0].1);
+        assert_eq!(s.retry_retiring().unwrap(), 1);
+        assert_eq!(s.state.lock().unwrap().persisted_bytes, before - ids.iter().map(|x| x.1).sum::<u64>());
     }
 }

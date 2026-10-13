@@ -7,7 +7,7 @@ use crate::{crc32, lp, Cursor, MAX_FRAME, MAX_ID};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     fs::{self, File, OpenOptions},
-    io::{self, Read, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -484,21 +484,84 @@ pub struct Catalogue {
     pub bytes: u64,
     pub last_ms: u64,
     pub fail_writes: bool,
+    fenced: bool,
+    #[cfg(test)]
+    pub(crate) fail_after_once: Option<usize>,
+    #[cfg(test)]
+    fail_partial_once: Option<usize>,
+    #[cfg(test)]
+    fail_sync_once: bool,
+    #[cfg(test)]
+    fail_reopen_once: bool,
+    #[cfg(test)]
+    fail_recovery_once: bool,
 }
 impl Catalogue {
     pub fn open(path: &Path) -> io::Result<Self> {
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let file = OpenOptions::new().create(true).read(true).write(true).open(path)?;
         let bytes = file.metadata()?.len();
-        Ok(Self { path: path.to_owned(), file, bytes, last_ms: 0, fail_writes: false })
+        Ok(Self {
+            path: path.to_owned(), file, bytes, last_ms: 0, fail_writes: false, fenced: false,
+            #[cfg(test)]
+            fail_after_once: None,
+            #[cfg(test)]
+            fail_partial_once: None,
+            #[cfg(test)]
+            fail_sync_once: false,
+            #[cfg(test)]
+            fail_reopen_once: false,
+            #[cfg(test)]
+            fail_recovery_once: false,
+        })
     }
     /// Append and flush; the record takes effect only after this returns Ok.
     pub fn append(&mut self, r: &CatRecord) -> io::Result<()> {
+        if self.fenced {
+            return Err(io::Error::other("catalogue append fenced after boundary recovery failure"));
+        }
+        #[cfg(test)]
+        if let Some(left) = self.fail_after_once.as_mut() {
+            if *left == 0 {
+                self.fail_after_once = None;
+                return Err(io::Error::other("test injected catalogue append failure"));
+            }
+            *left -= 1;
+        }
         if self.fail_writes {
             return Err(io::Error::other("test injected catalogue write failure"));
         }
         let b = encode(r);
-        self.file.write_all(&b)?;
-        crate::sync_file(&self.file)?;
+        let boundary = self.file.metadata()?.len();
+        let written = (|| -> io::Result<()> {
+            self.file.seek(SeekFrom::End(0))?;
+            #[cfg(test)]
+            if let Some(n) = self.fail_partial_once.take() {
+                self.file.write_all(&b[..n.min(b.len())])?;
+                return Err(io::Error::other("test injected partial catalogue append"));
+            }
+            self.file.write_all(&b)?;
+            #[cfg(test)]
+            if std::mem::take(&mut self.fail_sync_once) {
+                return Err(io::Error::other("test injected catalogue sync failure"));
+            }
+            crate::sync_file(&self.file)
+        })();
+        if let Err(error) = written {
+            // No caller applied this record. Restore and flush its old boundary before another append.
+            let recovered = (|| -> io::Result<()> {
+                #[cfg(test)]
+                if std::mem::take(&mut self.fail_recovery_once) {
+                    return Err(io::Error::other("test injected boundary recovery failure"));
+                }
+                self.file.set_len(boundary)?;
+                crate::sync_file(&self.file)
+            })();
+            if let Err(recovery) = recovered {
+                self.fenced = true;
+                return Err(io::Error::other(format!("{error}; catalogue boundary recovery failed: {recovery}")));
+            }
+            return Err(error);
+        }
         self.bytes += b.len() as u64;
         self.last_ms = self.last_ms.max(r.at_ms);
         Ok(())
@@ -515,9 +578,18 @@ impl Catalogue {
             f.write_all(&all)?;
             crate::sync_file(&f)?;
         }
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_reopen_once) {
+            return Err(io::Error::other("test injected replacement open failure"));
+        }
+        // Prepare every fallible handle operation before publishing the replacement. On error the
+        // current handle still names the current path, so a later append cannot go to an unlinked log.
+        let replacement = OpenOptions::new().read(true).write(true).open(&tmp)?;
+        let bytes = replacement.metadata()?.len();
         fs::rename(&tmp, &self.path)?;
-        self.file = OpenOptions::new().append(true).open(&self.path)?;
-        self.bytes = self.file.metadata()?.len();
+        self.file = replacement;
+        self.bytes = bytes;
+        self.fenced = false;
         Ok(())
     }
 }
@@ -1034,5 +1106,73 @@ mod tests {
         assert_eq!(p.classes().len(), 64);
         assert!(p.would_exceed("many", "x/", Class::expire(999_999)));
         assert!(!p.would_exceed("many", "y/", Class::LATEST));
+    }
+}
+
+
+#[cfg(test)]
+mod catalogue_failure_tests {
+    use super::*;
+    fn catalogue(label: &str) -> Catalogue {
+        let p = PathBuf::from(std::env::var("MEMBUS_TEST_OUTPUT").unwrap_or_else(|_| ".test-output".into()))
+            .join(format!("catalogue-{label}-{}-{}", std::process::id(), crate::now_ms()));
+        fs::create_dir_all(&p).unwrap();
+        Catalogue::open(&p.join("catalogue.log")).unwrap()
+    }
+    fn record(n: u64) -> CatRecord { CatRecord { at_ms: n, rec: Rec::Next(n) } }
+    fn check_append_failure(n: usize) {
+        let mut c = catalogue(&format!("partial-{n}"));
+        c.append(&record(1)).unwrap();
+        let before = fs::read(&c.path).unwrap();
+        c.fail_partial_once = Some(n);
+        assert!(c.append(&record(2)).is_err());
+        assert_eq!(fs::read(&c.path).unwrap(), before, "failed append must restore the durable frame boundary");
+        c.append(&record(3)).unwrap();
+        let (rows, torn) = read_catalogue(&c.path).unwrap();
+        assert_eq!(rows, vec![record(1), record(3)]);
+        assert_eq!(torn, None);
+    }
+    #[test]
+    fn partial_catalogue_header_does_not_poison_later_appends() { check_append_failure(7); }
+    #[test]
+    fn partial_catalogue_body_does_not_hide_later_appends() { check_append_failure(20); }
+    #[test]
+    fn failed_catalogue_sync_does_not_apply_an_uncommitted_record() {
+        let mut c = catalogue("sync");
+        c.append(&record(1)).unwrap();
+        let before = fs::read(&c.path).unwrap();
+        c.fail_sync_once = true;
+        assert!(c.append(&record(2)).is_err());
+        assert_eq!(fs::read(&c.path).unwrap(), before);
+        c.append(&record(3)).unwrap();
+        assert_eq!(read_catalogue(&c.path).unwrap(), (vec![record(1), record(3)], None));
+    }
+    #[test]
+    fn failed_replacement_open_keeps_the_published_catalogue_and_append_handle() {
+        let mut c = catalogue("replace");
+        c.append(&record(1)).unwrap();
+        let before = fs::read(&c.path).unwrap();
+        c.fail_reopen_once = true;
+        assert!(c.rewrite(&[record(2)]).is_err());
+        assert_eq!(fs::read(&c.path).unwrap(), before);
+        c.append(&record(3)).unwrap();
+        assert_eq!(read_catalogue(&c.path).unwrap(), (vec![record(1), record(3)], None));
+        c.rewrite(&[record(3)]).unwrap();
+        c.append(&record(4)).unwrap();
+        assert_eq!(read_catalogue(&c.path).unwrap(), (vec![record(3), record(4)], None));
+    }
+    #[test]
+    fn failed_boundary_recovery_fences_appends_until_a_successful_rewrite() {
+        let mut c = catalogue("fence");
+        c.append(&record(1)).unwrap();
+        c.fail_partial_once = Some(7);
+        c.fail_recovery_once = true;
+        assert!(c.append(&record(2)).unwrap_err().to_string().contains("boundary recovery failed"));
+        let failed = fs::read(&c.path).unwrap();
+        assert!(c.append(&record(3)).unwrap_err().to_string().contains("fenced"));
+        assert_eq!(fs::read(&c.path).unwrap(), failed);
+        c.rewrite(&[record(1)]).unwrap();
+        c.append(&record(3)).unwrap();
+        assert_eq!(read_catalogue(&c.path).unwrap(), (vec![record(1), record(3)], None));
     }
 }
