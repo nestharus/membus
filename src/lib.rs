@@ -1,6 +1,7 @@
 //! membus.kv/1 slice 1: bounded framing, independent committed reads, durable replay.
 mod signals;
 mod timers;
+pub mod client;
 #[cfg(windows)]
 pub mod pipe_io;
 use std::{
