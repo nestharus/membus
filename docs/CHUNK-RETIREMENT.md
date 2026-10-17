@@ -394,8 +394,8 @@ records. Its owner-visible cost is about 0.56 MB written once, plus 8.26 MB kept
    - the previous binary starts on them, and its replay reads them as before the import.
 
    Writes made after the switch are absent from the restored state. Whether lane 88's writers re-put them from their
-   files is not located (seq 1932); it is asked in lane 88's row 245. A rollback after the dedup window has passed
-   loses nothing more.
+   files is not established here. Restoring the pre-switch backup omits all post-switch writes regardless of
+   the dedup window; each writer's re-put or reconciliation still needs its actual receiving.
 
 Removing the legacy files is a later, separate ask (lane 87, row 2020 (c)).
 

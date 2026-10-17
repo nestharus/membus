@@ -66,7 +66,11 @@ fn write_legacy(dir: &Path, records: &[Rec]) -> HashMap<(String, String), (u64, 
     model
 }
 /// A production-shaped legacy state: lane 88's families, a ledger, a removed key; recent and older records.
-fn legacy_state(dir: &Path) -> (HashMap<(String, String), (u64, bool, Vec<u8>)>, Rec) {
+fn legacy_state(dir: &Path) -> (HashMap<(String, String), (u64, bool, Vec<u8>)>, Rec) {legacy_state_with_probe_id(dir,None)}
+fn legacy_state_with_probe_id(dir: &Path, probe_id: Option<&str>) -> (HashMap<(String, String), (u64, bool, Vec<u8>)>, Rec) {
+    legacy_state_with_probe_ids(dir,probe_id,None)
+}
+fn legacy_state_with_probe_ids(dir: &Path, probe_id: Option<&str>, next_id: Option<&str>) -> (HashMap<(String, String), (u64, bool, Vec<u8>)>, Rec) {
     let now = now_ms();
     let mut v = 0;
     let mut rec = |ns: &'static str, key: &str, op: &str, age: u64, remove: bool, bytes: &[u8]| {
@@ -99,6 +103,8 @@ fn legacy_state(dir: &Path) -> (HashMap<(String, String), (u64, bool, Vec<u8>)>,
     records.push(rec("ledger", "row/1", "l1", 5 * DAY, false, b"forever"));
     records.push(rec("ledger", "gone", "l2", 5 * DAY, false, b"x"));
     records.push(rec("ledger", "gone", "l3", HOUR, true, b""));
+    if let Some(id)=probe_id {records[51].op_id=id.into();}
+    if let Some(id)=next_id {records[53].op_id=id.into();}
     let model = write_legacy(dir, &records);
     let r = &records[51];
     let probe = Rec { ns: r.ns, key: r.key.clone(), op_id: r.op_id.clone(), bytes: r.bytes.clone(), ..*r };
@@ -334,3 +340,20 @@ fn import_refuses_chunks_with_missing_catalogue() { refuse_unexamined_chunks("mi
 fn import_refuses_chunks_with_empty_catalogue() { refuse_unexamined_chunks("empty-catalogue", Some(b"")); }
 #[test]
 fn import_refuses_chunks_with_torn_catalogue() { refuse_unexamined_chunks("torn-catalogue", Some(b"MBC1")); }
+
+#[test]
+fn imported_policy_does_not_displace_superseded_legacy_operation_identity() {
+    let p=path("policy-import-alias");let(model,probe)=legacy_state_with_probe_ids(&p,Some("import-policy/8/0"),Some("import-policy/8/0/1"));
+    let before=shas(&p);policies(&p);let clock=ManualClock::new(now_ms());let mut separate=None;
+    for _ in 0..2 {
+        let s=reopen(&p,config(&clock));check_model(&s,&model);
+        let retry=Mutation{ns:probe.ns.into(),key:probe.key.clone(),op_id:probe.op_id.clone(),deadline:now_ms()+10000,
+            ack:probe.ack,expected:probe.expected,bytes:probe.bytes.clone(),remove:probe.remove};
+        assert_eq!(s.mutate(retry.clone()),Outcome{code:0,version:probe.version,ack:probe.ack},"retained original legacy outcome must remain authoritative");
+        let mut mismatch=retry.clone();mismatch.bytes.push(0);assert_eq!(s.mutate(mismatch).code,14);
+        let mut other=retry;other.ns="separate".into();let result=s.mutate(other);
+        assert_eq!(result.code,0);assert!(result.version>model.values().map(|x|x.0).max().unwrap());
+        if let Some(original)=&separate {assert_eq!(&result,original)} else {separate=Some(result);}
+        assert_eq!(shas(&p.join("legacy-8")),before);
+    }
+}

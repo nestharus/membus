@@ -323,6 +323,13 @@ pub fn encode(r: &CatRecord) -> Vec<u8> {
     }
     frame(b"MBC1", &b)
 }
+fn encode_bounded(r: &CatRecord) -> io::Result<Vec<u8>> {
+    let bytes = encode(r);
+    if bytes.len().saturating_sub(16) > MAX_FRAME {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "catalogue record exceeds replay frame bound"));
+    }
+    Ok(bytes)
+}
 pub fn frame(magic: &[u8; 4], b: &[u8]) -> Vec<u8> {
     let mut out = magic.to_vec();
     out.extend((b.len() as u32).to_le_bytes());
@@ -570,7 +577,7 @@ impl Catalogue {
         if self.fail_writes {
             return Err(io::Error::other("test injected catalogue write failure"));
         }
-        let b = encode(r);
+        let b = encode_bounded(r)?;
         let boundary = self.file.metadata()?.len();
         if let Err(error) = begin_append(&self.path, boundary) {
             // Marker creation/sync can fail after creating bytes. No catalogue append was attempted;
@@ -624,7 +631,7 @@ impl Catalogue {
             let mut f = File::create(&tmp)?;
             let mut all = Vec::new();
             for r in live {
-                all.extend(encode(r));
+                all.extend(encode_bounded(r)?);
             }
             f.write_all(&all)?;
             crate::sync_file(&f)?;
@@ -698,7 +705,8 @@ pub struct ReplayReport {
     pub epoch: u64,
     pub start_ms: u64,
     pub ready_ms: u64,
-    /// Empty on historical/ready records; a pre-truncation report is explicitly not ready.
+    /// Empty historically; current stages are ready, refused and truncation_pending.
+    /// Pending records describe a plan, not proof that truncation completed.
     pub stage: String,
     pub stripes: [StripeReport; 4],
     pub catalogue_truncation: Option<(u64, u64, String)>,
@@ -797,11 +805,14 @@ impl ReplayReport {
         fs::rename(&tmp, state.join("replay.json"))?;
         let log = state.join("replay.log");
         if fs::metadata(&log).map(|m| m.len()).unwrap_or(0) > 1024 * 1024 {
-            let text = fs::read_to_string(&log).unwrap_or_default();
+            let text = fs::read_to_string(&log)?;
             let lines: Vec<&str> = text.lines().collect();
             let keep = lines[lines.len().saturating_sub(256)..].join("\n");
             let tmp = state.join("replay.log.tmp");
-            fs::write(&tmp, format!("{keep}\n"))?;
+            let mut retained = File::create(&tmp)?;
+            retained.write_all(format!("{keep}\n").as_bytes())?;
+            crate::sync_file(&retained)?;
+            drop(retained);
             fs::rename(&tmp, &log)?;
         }
         let mut f = OpenOptions::new().create(true).append(true).open(&log)?;
@@ -1014,7 +1025,21 @@ impl ChunkStore {
             out.push(CatRecord { at_ms: now, rec: Rec::Horizons(horizons) });
         }
         for (at, keys) in &self.summaries.list {
-            out.push(CatRecord { at_ms: *at, rec: Rec::Summary { retired_ms: *at, keys: keys.clone() } });
+            // Payload: kind + at_ms + retired_ms + count, then length-prefixed UTF-8 pairs.
+            let mut part = Vec::new();
+            let mut bytes = 21usize;
+            for key in keys {
+                let size = 8usize.saturating_add(key.0.len()).saturating_add(key.1.len());
+                if !part.is_empty() && bytes.checked_add(size).is_none_or(|n| n > MAX_FRAME) {
+                    out.push(CatRecord { at_ms: *at, rec: Rec::Summary { retired_ms: *at, keys: std::mem::take(&mut part) } });
+                    bytes = 21;
+                }
+                bytes = bytes.saturating_add(size);
+                part.push(key.clone());
+            }
+            if !part.is_empty() {
+                out.push(CatRecord { at_ms: *at, rec: Rec::Summary { retired_ms: *at, keys: part } });
+            }
         }
         out
     }

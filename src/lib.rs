@@ -240,6 +240,8 @@ struct State {
     committed_bytes: usize,
     dedup_bytes: usize,
     dedup: HashMap<(String, String), Dedup>,
+    /// POLICY_SET still owes its routing projection after the durable outcome is known.
+    policy_publishing: HashSet<Key>,
     retired: VecDeque<(String, String)>,
     retired_set: HashSet<(String, String)>,
     expiry: VecDeque<((String, String), u64)>,
@@ -390,11 +392,45 @@ pub struct Store {
     batch_gate: Mutex<()>,
     // Administrative ordering never holds the routing map lock across append/flush work.
     policy_updates: Mutex<()>,
+    class_reservations: Arc<Mutex<HashMap<Class, usize>>>,
     #[cfg(test)]
     policy_after_commit: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
     pub config: Config,
     pub epoch: u64,
     _owner: File,
+}
+/// A selected route or admitted policy owns its class until a chunk or the published policy owns it.
+/// Coordination order: reservations -> policies -> chunks. None is held across queued I/O;
+/// router stripe/chunk/table locks and maintenance never acquire reservations in reverse.
+struct ClassReservation {
+    counts: Arc<Mutex<HashMap<Class, usize>>>,
+    class: Class,
+}
+impl ClassReservation {
+    fn add(counts: &Arc<Mutex<HashMap<Class, usize>>>, held: &mut HashMap<Class, usize>, class: Class) -> Self {
+        *held.entry(class).or_default() += 1;
+        Self { counts: counts.clone(), class }
+    }
+}
+impl Drop for ClassReservation {
+    fn drop(&mut self) {
+        let mut counts = self.counts.lock().unwrap();
+        let n = counts.get_mut(&self.class).unwrap();
+        *n -= 1;
+        if *n == 0 { counts.remove(&self.class); }
+    }
+}
+/// Release before notifying under state coordination, including early refusals.
+struct PolicyUpdate<'a> {
+    guard: Option<std::sync::MutexGuard<'a, ()>>,
+    store: &'a Store,
+}
+impl Drop for PolicyUpdate<'_> {
+    fn drop(&mut self) {
+        self.guard.take();
+        let _state = self.store.state.lock().unwrap();
+        self.store.done.notify_all();
+    }
 }
 #[derive(Default)]
 struct ScanUsage {
@@ -1060,11 +1096,13 @@ struct SinkEntry {
 /// Chunk files by stripe and class (CHUNK-RETIREMENT.md 5.2). Each stripe's open chunks are held under that
 /// stripe's lock while a record is written, so a close never meets a half-written record.
 struct ChunkRouter {
+    #[cfg(test)] selection_hook: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
     sinks: Vec<Mutex<HashMap<Class, OpenChunk>>>,
     table: RwLock<HashMap<usize, SinkEntry>>,
     fenced: [AtomicBool; 4],
     closed_io: Mutex<[u64; 3]>,
     policies: Arc<RwLock<chunks::Policies>>,
+    class_reservations: Arc<Mutex<HashMap<Class, usize>>>,
     chunks: Arc<Mutex<chunks::ChunkStore>>,
     clock: chunks::Clock,
     next: Arc<AtomicU64>,
@@ -1195,7 +1233,16 @@ impl Route for ChunkRouter {
         let Some((ns, key, version)) = record.get(16..).and_then(chunks::record_key) else {
             return (Err(io::Error::other("unroutable record")), 0, 0);
         };
-        let (class, policy) = self.policies.read().unwrap().resolve(&ns, &key);
+        let (class, policy, _selection) = {
+            let mut counts = self.class_reservations.lock().unwrap();
+            let (class, policy) = self.policies.read().unwrap().resolve(&ns, &key);
+            let selected = ClassReservation::add(&self.class_reservations, &mut counts, class);
+            (class, policy, selected)
+        };
+        #[cfg(test)] {
+            let hook = self.selection_hook.lock().unwrap().take();
+            if let Some((reached, resume)) = hook { let _ = reached.send(()); let _ = resume.recv(); }
+        }
         let mut open = self.sinks[stripe].lock().unwrap();
         if self.fenced[stripe].load(Ordering::SeqCst) {
             return (Err(io::Error::other("stripe fenced after failed append")), 0, 0);
@@ -1380,6 +1427,22 @@ struct Legacy {
     /// Torn tails left in place: file, offset, bytes.
     torn: Vec<(String, u64, u64)>,
     records: u64,
+}
+fn merge_legacy_dedup(target: &mut HashMap<Key, Dedup>, legacy: HashMap<Key, Dedup>) -> io::Result<()> {
+    for (k, d) in legacy {
+        match target.entry(k) {
+            std::collections::hash_map::Entry::Vacant(e) => { e.insert(d); }
+            std::collections::hash_map::Entry::Occupied(e) => {
+                let current = e.get();
+                if current.fingerprint != d.fingerprint || current.outcome != d.outcome || current.at != d.at {
+                    // Origin cannot be inferred from an ID prefix or replay order. Neither
+                    // the backup nor a possibly later record may silently replace the other.
+                    return Err(corrupt("legacy retry identity conflicts with imported or later record; original files retained".into()));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 fn read_legacy(files: &[(usize, PathBuf)], config: &Config, now: u64) -> io::Result<Legacy> {
     let mut l = Legacy {
@@ -1589,14 +1652,28 @@ fn import_legacy(path: &Path, config: &Config, clock: &chunks::Clock, epoch: u64
         cs.cat = Some(chunks::Catalogue::open(&dir.join("catalogue.log"))?);
         let mut w = ImportWriter { cs, open: HashMap::new(), chunk_bytes: config.chunk_bytes, utc, next: legacy.next, written: 0 };
         let mut policies = chunks::Policies::default();
+        let mut used_ids: HashSet<Key> = legacy.dedup.keys().cloned().collect();
+        for (_, _, payload) in legacy.latest.values() {
+            let (m, _, _) = parse_record(payload).map_err(|_| corrupt("legacy import record".into()))?;
+            used_ids.insert(dedup_identity(&m));
+        }
+        let mut synthetic = HashMap::new();
         // The policies first, as policy records at new versions, so each imported key takes its class.
         for (n, (ns, prefix, class)) in import_policies(path, config)?.into_iter().enumerate() {
             policies.set(&ns, &prefix, Some(class));
             let key = chunks::policy_key(&ns, &prefix).map_err(|_| io::Error::other("policy key"))?;
+            let mut salt = 0u64;
+            let op_id = loop {
+                let candidate = if salt == 0 { format!("import-policy/{epoch}/{n}") }
+                    else { format!("import-policy/{epoch}/{n}/{salt}") };
+                if candidate.len() > MAX_ID { return Err(corrupt("import identity too large".into())); }
+                if used_ids.insert((ns.clone(), candidate.clone())) { break candidate; }
+                salt = salt.checked_add(1).ok_or_else(|| corrupt("import identity exhausted".into()))?;
+            };
             let m = Mutation {
                 ns: POLICY_NS.into(),
                 key: key.clone(),
-                op_id: format!("import-policy/{epoch}/{n}"),
+                op_id,
                 deadline: 0,
                 ack: 2,
                 expected: None,
@@ -1605,6 +1682,8 @@ fn import_legacy(path: &Path, config: &Config, clock: &chunks::Clock, epoch: u64
             };
             let version = w.next;
             w.next += 1;
+            synthetic.insert(dedup_identity(&m), Dedup { fingerprint: fingerprint(&m), at: utc,
+                outcome: Some(Outcome { code: 0, version, ack: 2 }) });
             let (c, label) = policies.resolve(POLICY_NS, &key);
             w.write(stripe(POLICY_NS, &key), c, &label, &mutation_bytes(&m, version, utc))?;
         }
@@ -1659,14 +1738,23 @@ fn import_legacy(path: &Path, config: &Config, clock: &chunks::Clock, epoch: u64
             first.get_or_insert(format!("next: imported {}, legacy {}, written {}", rp.next, legacy.next, w.next));
         }
         for (k, d) in &rp.dedup {
-            if parse_record(&d.fingerprint).is_ok_and(|(m, _, _)| m.ns == POLICY_NS) {
+            if synthetic.get(k).is_some_and(|s| s.fingerprint == d.fingerprint && s.outcome == d.outcome && s.at == d.at)
+                && !legacy.dedup.contains_key(k) {
                 continue;
             }
             match legacy.dedup.get(k) {
-                Some(l) if l.fingerprint == d.fingerprint && l.outcome == d.outcome => {}
+                Some(l) if l.fingerprint == d.fingerprint && l.outcome == d.outcome && l.at == d.at => {}
                 _ => {
                     first.get_or_insert(format!("dedup {}/{}: differs from the legacy replay", k.0, k.1));
                 }
+            }
+        }
+        // Latest-value copying omits superseded operations. Check the complete retry
+        // projection with the unchanged backup that startup will actually graft.
+        merge_legacy_dedup(&mut rp.dedup, legacy.dedup.clone())?;
+        for (k, d) in &legacy.dedup {
+            if !rp.dedup.get(k).is_some_and(|x| x.fingerprint == d.fingerprint && x.outcome == d.outcome && x.at == d.at) {
+                first.get_or_insert(format!("legacy retry {}/{} missing or changed", k.0, k.1));
             }
         }
         if let Some(e) = rp.storage_errors.first() {
@@ -1916,9 +2004,7 @@ fn replay_into(rp: &mut Replayed, path: &Path, dir: &Path, legacy: bool, config:
             // For 24 h after the import the legacy logs give their dedup entries alone, never values (5.6).
             let files = legacy_files(&ldir);
             let l = read_legacy(&files, config, now)?;
-            for (k, d) in l.dedup {
-                rp.dedup.entry(k).or_insert(d);
-            }
+            merge_legacy_dedup(&mut rp.dedup, l.dedup)?;
             rp.report.legacy = files.iter().map(|(_, p)| format!("{} (dedup only)", p.display())).collect();
         }
         rp.report.import = Some(format!(
@@ -2606,14 +2692,17 @@ impl Store {
             }
         }
         let policies = Arc::new(RwLock::new(policies));
+        let class_reservations = Arc::new(Mutex::new(HashMap::new()));
         let next_issued = Arc::new(AtomicU64::new(next));
         let chunks = Arc::new(Mutex::new(cs));
         let router = Arc::new(ChunkRouter {
+            #[cfg(test)] selection_hook: Mutex::new(None),
             sinks: (0..4).map(|_| Mutex::new(HashMap::new())).collect(),
             table: RwLock::new(HashMap::new()),
             fenced: std::array::from_fn(|_| AtomicBool::new(false)),
             closed_io: Mutex::new([0; 3]),
             policies: policies.clone(),
+            class_reservations: class_reservations.clone(),
             chunks: chunks.clone(),
             clock: clock.clone(),
             next: next_issued.clone(),
@@ -2632,6 +2721,7 @@ impl Store {
             committed_bytes,
             dedup_bytes,
             dedup,
+            policy_publishing: HashSet::new(),
             retired: VecDeque::new(),
             retired_set: HashSet::new(),
             expiry: expiry.into(),
@@ -2728,6 +2818,7 @@ impl Store {
             flush_owner: Some(flush_owner),
             batch_gate: Mutex::new(()),
             policy_updates: Mutex::new(()),
+            class_reservations,
             #[cfg(test)]
             policy_after_commit: Mutex::new(None),
             config,
@@ -3113,7 +3204,6 @@ impl Store {
     }
     /// Caller-scoped POLICY_SET retry identity. A duplicate never reapplies an older projection.
     pub fn set_policy_with_id(&self, ns: &str, prefix: &str, class: Option<Class>, op_id: &str, deadline: u64) -> Outcome {
-        let _update = self.policy_updates.lock().unwrap();
         let key = match chunks::policy_key(ns, prefix) {
             Ok(k) => k,
             Err(code) => return Outcome::error(code),
@@ -3122,26 +3212,58 @@ impl Store {
             ns: POLICY_NS.into(), key: key.clone(), op_id: op_id.into(), deadline, ack: 2,
             expected: None, bytes: class.map(chunks::policy_value).unwrap_or_default(), remove: class.is_none(),
         };
+        let id = dedup_identity(&m);
+        let fp = fingerprint(&m);
+        // A duplicate joins the actual completion boundary, including projection, without
+        // waiting for the administrative mutex. A missed identity is rechecked on every wake.
+        let _update = loop {
+            let mut state = self.state.lock().unwrap();
+            if let Some(d) = state.dedup.get(&id) {
+                if d.fingerprint != fp { return Outcome::error(14); }
+                if now_ms().saturating_sub(d.at) > self.config.retry_ms { return Outcome::error(13); }
+                if !state.policy_publishing.contains(&id) {
+                    if let Some(outcome) = &d.outcome { return outcome.clone(); }
+                }
+            } else {
+                if state.retired_set.contains(&id) { return Outcome::error(13); }
+                match self.policy_updates.try_lock() {
+                    Ok(guard) => { drop(state); break PolicyUpdate { guard: Some(guard), store: self }; }
+                    Err(std::sync::TryLockError::WouldBlock) => {}
+                    Err(std::sync::TryLockError::Poisoned(_)) => return Outcome::error(10),
+                }
+            }
+            let wait = deadline.saturating_sub(now_ms());
+            if wait == 0 { return Outcome::error(if state.dedup.contains_key(&id) { 17 } else { 5 }); }
+            state = self.done.wait_timeout(state, Duration::from_millis(wait)).unwrap().0;
+            drop(state);
+        };
         let retry = {
             let state = self.state.lock().unwrap();
             let id = dedup_identity(&m);
             state.dedup.contains_key(&id) || state.retired_set.contains(&id)
         };
         if !retry && now_ms() >= deadline { return Outcome::error(5); }
-        if !retry { if let Some(c) = class {
+        let _prospective = if !retry { if let Some(c) = class {
             // An expire class shorter than the retry window would retire records whose dedup a restart still needs.
             if c.kind == 2 && c.retention_ms < self.config.retry_ms {
                 return Outcome::error(3);
             }
-            let mut proposed = self.policies.read().unwrap().clone();
+            let mut counts = self.class_reservations.lock().unwrap();
+            let current = self.policies.read().unwrap();
+            let mut proposed = current.clone();
             proposed.set(ns, prefix, class);
             let mut classes = proposed.classes();
+            // Old policies remain routable throughout the admitted policy's durable wait.
+            classes.extend(current.classes());
+            classes.extend(counts.keys().copied());
             classes.extend(self.chunks.lock().unwrap().table.values()
                 .filter(|chunk| chunk.state != chunks::ChunkState::Retired).map(|chunk| chunk.class));
             if classes.len() > chunks::MAX_CLASSES {
                 return Outcome::error(7);
             }
-        } }
+            Some(ClassReservation::add(&self.class_reservations, &mut counts, c))
+        } else { None } } else { None };
+        self.state.lock().unwrap().policy_publishing.insert(id.clone());
         let outcome = self.mutate(m);
         if outcome.code == 0 {
             #[cfg(test)]
@@ -3152,9 +3274,12 @@ impl Store {
             let latest = self.state.lock().unwrap().metadata.get(&(POLICY_NS.into(), key))
                 .is_some_and(|latest| latest.version == outcome.version);
             if latest {
+                let _coordination = self.class_reservations.lock().unwrap();
                 self.policies.write().unwrap().set(ns, prefix, class);
             }
         }
+        self.state.lock().unwrap().policy_publishing.remove(&id);
+        self.done.notify_all();
         outcome
     }
     /// Policy rows as (namespace, prefix, class).
@@ -3287,7 +3412,7 @@ impl Store {
             if at.saturating_sub(time) <= self.config.retry_ms {
                 break;
             }
-            if state.dedup.get(&key).is_some_and(|d| d.outcome.is_none()) {
+            if state.policy_publishing.contains(&key) || state.dedup.get(&key).is_some_and(|d| d.outcome.is_none()) {
                 break;
             }
             state.expiry.pop_front();
@@ -3368,6 +3493,7 @@ impl Store {
                 outcome: None,
             },
         );
+        self.done.notify_all();
         }
         drop(state);
         let result = if m.ack == 0 {
@@ -4210,5 +4336,186 @@ mod receiving_correction_tests {
         assert_eq!(writer.join().unwrap().code,0,"late closed-sink flush must retain its covering extent");
         assert!(s.retire_chunk(old).unwrap());s.maint.prune_discharged();
         assert!(s.router.sink(old as usize).is_none());assert!(s.router.sink(new as usize).is_some());
+    }
+    #[test]
+    fn selected_uninstantiated_class_is_counted_during_policy_replacement() {
+        let (path,_,config)=fixture("selected-class");let s=Arc::new(Store::open(&path,config).unwrap());
+        for i in 0..61 {
+            let prefix=format!("p{i}/");
+            assert_eq!(s.set_policy("classes",&prefix,Some(Class::expire(DAY+i)),now_ms()+10000).code,0);
+            assert_eq!(s.mutate(put("classes",&(prefix+"k"),&format!("fill-{i}"))).code,0);
+        }
+        assert_eq!(s.set_policy("classes","L/",Some(Class::LATEST),now_ms()+10000).code,0);
+        assert_eq!(s.mutate(put("classes","L/k","latest-fill")).code,0);
+        assert_eq!(s.set_policy("race","p/",Some(Class::expire(2*DAY)),now_ms()+10000).code,0);
+        let policy_stripe=stripe(POLICY_NS,&chunks::policy_key("race","p/").unwrap());
+        let key=(0..100).map(|n|format!("p/{n}")).find(|k|stripe("race",k)!=policy_stripe).unwrap();
+        let (reached,selection)=mpsc::channel();let(resume,resumed)=mpsc::channel();
+        *s.router.selection_hook.lock().unwrap()=Some((reached,resumed));
+        let a=s.clone();let writer=std::thread::spawn(move||a.mutate(put("race",&key,"selected")));
+        selection.recv_timeout(Duration::from_secs(5)).unwrap();
+        // Remove the old policy while X has no chunk: only its in-flight selection owns it now.
+        assert_eq!(s.set_policy("race","p/",None,now_ms()+10000).code,0);
+        let b=s.clone();let(finished,result)=mpsc::channel();let setter=std::thread::spawn(move||{
+            let r=b.set_policy("race","p/",Some(Class::expire(3*DAY)),now_ms()+10000);finished.send(r).unwrap();
+        });
+        let early=result.recv_timeout(Duration::from_millis(100));resume.send(()).unwrap();
+        assert_eq!(writer.join().unwrap().code,0);setter.join().unwrap();
+        let got=early.unwrap_or_else(|_|result.recv().unwrap());
+        assert_eq!(got.code,7,"an already selected X must not disappear while Y is admitted");
+        let mut classes=s.policies.read().unwrap().classes();classes.extend(s.chunks.lock().unwrap().table.values()
+            .filter(|c|c.state!=chunks::ChunkState::Retired).map(|c|c.class));assert_eq!(classes.len(),64);
+    }
+    #[test]
+    fn pending_policy_duplicate_observes_its_deadline_without_cancelling_original() {
+        let(path,_,mut config)=fixture("policy-pending");
+        let gate=Arc::new((Mutex::new((false,false)),Condvar::new()));config.sync_test_gate=Some(gate.clone());
+        let s=Arc::new(Store::open(&path,config).unwrap());let first=s.clone();
+        let original=std::thread::spawn(move||policy(&first,"deadline","",Some(Class::LATEST),"A"));
+        {let(lock,ready)=&*gate;let mut status=lock.lock().unwrap();while !status.0 {
+            let(next,timeout)=ready.wait_timeout(status,Duration::from_secs(5)).unwrap();status=next;assert!(!timeout.timed_out());
+        }}
+        let second=s.clone();let(finished,result)=mpsc::channel();let duplicate=std::thread::spawn(move||{
+            let mut p=(now_ms()+20).to_le_bytes().to_vec();lp(&mut p,b"A");lp(&mut p,b"deadline");lp(&mut p,b"");p.push(1);p.extend(0u64.to_le_bytes());
+            let reply=second.dispatch(&frame(POLICY_SET,23,&p)[4..]);finished.send(u16::from_le_bytes(reply[17..19].try_into().unwrap())).unwrap();
+        });
+        let before_release=result.recv_timeout(Duration::from_millis(200));
+        {let(lock,ready)=&*gate;let mut status=lock.lock().unwrap();status.1=true;ready.notify_all();}
+        let original=original.join().unwrap();duplicate.join().unwrap();let was_pending=before_release.is_ok();
+        let code=before_release.unwrap_or_else(|_|result.recv().unwrap());
+        assert!(was_pending,"a pending duplicate must return while original I/O is held");assert_eq!(code,17);
+        assert_eq!(original.code,0);assert_eq!(policy(&s,"deadline","",Some(Class::LATEST),"A"),original);
+    }
+    #[test]
+    fn aggregated_summary_timestamp_rewrites_as_replayable_bounded_frames() {
+        let(path,_,_)=fixture("summary-frame");let dir=path.join("chunks");fs::create_dir_all(&dir).unwrap();
+        let mut chunks=chunks::ChunkStore::new(dir.clone());
+        let count=2*(MAX_FRAME/(MAX_ID+17)/2+2);
+        for part in 0..2 {
+            let keys=(part*count/2..(part+1)*count/2).map(|i|("aggregate".into(),format!("{i:08}{}","k".repeat(1016)))).collect();
+            chunks.summaries.add(10,keys);
+        }
+        let live=chunks.live_list(20,1);let mut catalogue=chunks::Catalogue::open(&dir.join("catalogue.log")).unwrap();
+        catalogue.rewrite(&live).unwrap();
+        let records=chunks::read_catalogue(&dir.join("catalogue.log")).expect("a valid aggregate must survive the bounded replay reader").0;
+        let saved:HashSet<Key>=records.iter().flat_map(|r|match &r.rec{chunks::Rec::Summary{keys,retired_ms}=>{
+            assert_eq!(*retired_ms,10); assert_eq!(r.at_ms,10); keys.clone()
+        },_=>Vec::new()}).collect();
+        assert_eq!(saved,chunks.summaries.keys.keys().cloned().collect());
+        assert_eq!(saved.len(),2*(count/2));
+        assert!(records.iter().all(|r|chunks::encode(r).len()-16<=MAX_FRAME));
+    }
+    #[test]
+    fn policy_duplicate_waits_for_projection_and_keeps_completed_outcome() {
+        let(path,_,config)=fixture("policy-projection"); let s=Arc::new(Store::open(&path,config.clone()).unwrap());
+        let(reached,committed)=mpsc::channel();let(resume,resumed)=mpsc::channel();
+        *s.policy_after_commit.lock().unwrap()=Some((reached,resumed));
+        let first=s.clone();let writer=std::thread::spawn(move||policy(&first,"projection","",Some(Class::LATEST),"A"));
+        committed.recv_timeout(Duration::from_secs(5)).unwrap();
+        let second=s.clone();let(finished,result)=mpsc::channel();let duplicate=std::thread::spawn(move||{
+            finished.send(second.set_policy_with_id("projection","",Some(Class::LATEST),"A",now_ms()+20)).unwrap();
+        });
+        let before_release=result.recv_timeout(Duration::from_millis(300));
+        let other=s.clone();let(mismatch_sent,mismatch_result)=mpsc::channel();let mismatch=std::thread::spawn(move||{
+            mismatch_sent.send(other.set_policy_with_id("projection","other",Some(Class::LATEST),"A",now_ms()+20)).unwrap();
+        });
+        let other=s.clone();let(fresh_sent,fresh_result)=mpsc::channel();let fresh=std::thread::spawn(move||{
+            fresh_sent.send(other.set_policy_with_id("fresh","",Some(Class::LATEST),"B",now_ms()+20)).unwrap();
+        });
+        let mismatch_before=mismatch_result.recv_timeout(Duration::from_millis(300));
+        let fresh_before=fresh_result.recv_timeout(Duration::from_millis(300));
+        let next=s.next_issued.load(Ordering::SeqCst);
+        resume.send(()).unwrap();let original=writer.join().unwrap();duplicate.join().unwrap();
+        mismatch.join().unwrap();fresh.join().unwrap();
+        assert_eq!(before_release.expect("duplicate must finish before projection is released").code,17);
+        assert_eq!(mismatch_before.expect("mismatch must finish before projection is released").code,14);
+        assert_eq!(fresh_before.expect("fresh deadline must finish before projection is released").code,5);
+        assert_eq!(original.code,0);
+        assert_eq!(s.set_policy_with_id("projection","",Some(Class::LATEST),"A",0),original);
+        assert_eq!(s.next_issued.load(Ordering::SeqCst),next,"retries must not mint another version");
+        assert_eq!(s.policies().iter().find(|r|r.0=="projection").unwrap().2,Class::LATEST);
+        drop(s);let reopened=Store::open(&path,config).unwrap();
+        assert_eq!(reopened.set_policy_with_id("projection","",Some(Class::LATEST),"A",0),original);
+    }
+    #[test]
+    fn prospective_policy_class_survives_durable_wait_and_failure_cleans_it() {
+        let(path,_,mut config)=fixture("prospective-class");
+        let gate=Arc::new((Mutex::new((false,false)),Condvar::new()));config.sync_test_gate=Some(gate.clone());
+        let s=Arc::new(Store::open(&path,config).unwrap());
+        s.set_read_only(true);
+        assert_eq!(s.set_policy("failed","",Some(Class::expire(DAY)),now_ms()+10000).code,10);
+        assert!(s.class_reservations.lock().unwrap().is_empty());
+        assert!(s.state.lock().unwrap().policy_publishing.is_empty());s.set_read_only(false);
+        let first=s.clone();let writer=std::thread::spawn(move||first.set_policy("new","",Some(Class::expire(DAY)),now_ms()+10000));
+        {let(lock,ready)=&*gate;let mut status=lock.lock().unwrap();while !status.0 {
+            let(next,timeout)=ready.wait_timeout(status,Duration::from_secs(5)).unwrap();status=next;assert!(!timeout.timed_out());
+        }}
+        assert_eq!(s.class_reservations.lock().unwrap().get(&Class::expire(DAY)),Some(&1));
+        // The old route remains usable while its replacement is durable but not published.
+        assert_eq!(s.mutate(put("new","old-route","ordinary")).code,0);
+        assert!(s.chunks.lock().unwrap().table.values().any(|c|c.class==Class::FOREVER&&c.keys.contains_key(&("new".into(),"old-route".into()))));
+        {let(lock,ready)=&*gate;let mut status=lock.lock().unwrap();status.1=true;ready.notify_all();}
+        assert_eq!(writer.join().unwrap().code,0);assert!(s.class_reservations.lock().unwrap().is_empty());
+        assert_eq!(s.mutate(put("new","new-route","following")).code,0);
+        assert!(s.chunks.lock().unwrap().table.values().any(|c|c.class==Class::expire(DAY)&&c.keys.contains_key(&("new".into(),"new-route".into()))));
+    }
+    #[test]
+    fn catalogue_summary_utf8_boundary_and_writer_refusal_preserve_all_bytes() {
+        let(path,_,_)=fixture("frame-boundary");fs::create_dir_all(&path).unwrap();
+        let payload=MAX_FRAME-21;let n=payload/1038;
+        let base:Vec<Key>=(0..n-1).map(|i|("ééé".into(),format!("{i:08}{}","k".repeat(1016)))).collect();
+        for delta in [-1i32,0,1] {
+            let mut keys=base.clone();
+            keys.push((format!("ééé{}","x".repeat((1+delta.max(0))as usize)),"z".repeat((1024+delta.min(0))as usize)));
+            let original=chunks::CatRecord{at_ms:10,rec:chunks::Rec::Summary{retired_ms:10,keys:keys.clone()}};
+            assert_eq!(chunks::encode(&original).len()-16,(MAX_FRAME as i64+delta as i64)as usize);
+            let mut cs=chunks::ChunkStore::new(path.clone());cs.summaries.add(10,keys.clone());
+            let live=cs.live_list(20,1);let p=path.join(format!("{delta}.log"));let mut cat=chunks::Catalogue::open(&p).unwrap();
+            cat.rewrite(&live).unwrap();let read=chunks::read_catalogue(&p).unwrap().0;
+            let got:HashSet<Key>=read.iter().flat_map(|r|match &r.rec{chunks::Rec::Summary{keys,retired_ms}=>{assert_eq!(*retired_ms,10);keys.clone()},_=>Vec::new()}).collect();
+            assert_eq!(got,keys.into_iter().collect());
+            assert!(read.iter().all(|r|chunks::encode(r).len()-16<=MAX_FRAME));
+            if delta>0 {
+                let before=fs::read(&p).unwrap();assert!(cat.append(&original).is_err());assert_eq!(fs::read(&p).unwrap(),before);
+                assert!(cat.rewrite(&[original]).is_err());assert_eq!(fs::read(&p).unwrap(),before);
+            }
+        }
+        let mut summaries=chunks::Summaries::default();let k=("ns".into(),"key".into());
+        assert_eq!(summaries.add(10,vec![k.clone()]),1);assert_eq!(summaries.add(10,vec![k.clone()]),0);
+        assert_eq!(summaries.add(9,vec![k.clone()]),0);assert_eq!(summaries.add(12,vec![k.clone()]),0);
+        assert_eq!(summaries.expire(11,1),0);assert_eq!(summaries.keys.get(&k),Some(&12));assert_eq!(summaries.expire(13,1),1);
+    }
+    #[test]
+    fn replay_history_trim_failure_preserves_history_and_torn_source() {
+        let(path,_,config)=fixture("trim-evidence");let s=Store::open(&path,config.clone()).unwrap();
+        assert_eq!(s.mutate(put("trim","key","A")).code,0);let data=s.chunks.lock().unwrap().table.values()
+            .find(|c|c.keys.contains_key(&("trim".into(),"key".into()))).unwrap().path.clone();drop(s);
+        OpenOptions::new().append(true).open(&data).unwrap().write_all(b"MBK").unwrap();let source=fs::read(&data).unwrap();
+        let mut history=b"old line\n".repeat(140000);history.extend(b"truncation_pending witness\n\xff\n");
+        fs::write(path.join("replay.log"),&history).unwrap();
+        assert!(Store::open(&path,config.clone()).is_err());assert_eq!(fs::read(path.join("replay.log")).unwrap(),history);
+        assert_eq!(fs::read(&data).unwrap(),source,"publication failure must precede any truncation");
+        let lines:Vec<String>=(0..300).map(|n|format!("{n:03} {}","h".repeat(4000))).collect();
+        fs::write(path.join("replay.log"),format!("{}\n",lines.join("\n"))).unwrap();
+        let report=chunks::ReplayReport{stage:"ready".into(),..Default::default()};report.write(&path).unwrap();
+        let retained=fs::read_to_string(path.join("replay.log")).unwrap();let kept:Vec<&str>=retained.lines().collect();
+        assert_eq!(kept.len(),257);assert_eq!(kept[0],lines[44]);assert_eq!(kept[255],lines[299]);assert_eq!(kept[256],report.json());
+    }
+    #[test]
+    fn maintenance_summary_cohort_reopens_with_unrelated_live_value() {
+        let(path,clock,mut config)=fixture("summary-cohort");config.chunk_bytes=4*1024*1024;
+        let s=Store::open(&path,config.clone()).unwrap();
+        assert_eq!(s.set_policy("aggregate","",Some(Class::expire(DAY)),now_ms()+10000).code,0);
+        let retained=s.mutate(put("other","retained","other"));assert_eq!(retained.code,0);
+        let expected:HashSet<Key>=(0..17000).map(|i|("aggregate".into(),format!("{i:08}{}","k".repeat(1016)))).collect();
+        for (i,(_,key)) in expected.iter().enumerate(){assert_eq!(s.mutate(put("aggregate",key,&format!("cohort-{i}"))).code,0);}
+        clock.advance(2);s.tick();clock.advance(DAY+1);assert!(s.maint.retire(None).unwrap().len()>=2);
+        assert_eq!(s.chunks.lock().unwrap().summaries.keys.keys().cloned().collect::<HashSet<_>>(),expected);
+        s.maint.rewrite_catalogue();drop(s);
+        let reopened=Store::open(&path,config).unwrap();
+        assert_eq!(reopened.get("other","retained").unwrap().version,retained.version);
+        assert_eq!(reopened.get("other","retained").unwrap().bytes,b"retained");
+        assert_eq!(reopened.chunks.lock().unwrap().summaries.keys.keys().cloned().collect::<HashSet<_>>(),expected);
+        assert!(expected.iter().all(|(ns,key)|reopened.get_status(ns,key)==(1,0)));
     }
 }

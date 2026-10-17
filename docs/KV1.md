@@ -204,10 +204,14 @@ Opcodes 24-27 are additive under kv/1 minor 0 ([CHUNK-RETIREMENT.md](CHUNK-RETIR
 `policy_set` uses the common caller namespace and literal operation ID under the
 same mutation retry rules as other writes. Changing prefix/class/clear content
 under that identity refuses with `op_id_mismatch`; an identical retry returns its
-original version and does not reapply an older policy after a newer setter. Policy
+original version and does not reapply an older policy after a newer setter. Pending
+duplicates join through routing publication, bounded by their own deadline. Policy
 admission and live routing publication share an order without holding a routing
 lock during append/flush work. The class count includes nonretired instantiated
-classes left by policy replacement, as well as selected policy classes; retired
-historical names do not consume a permanent lifetime quota. Existing chunks keep
+classes left by policy replacement, selected policies, in-flight route selections
+and admitted prospective policies. Old policies remain selected during a setter's
+durable wait; replacing a class at the limit can therefore require first clearing
+its policy and waiting for its remaining obligations to discharge. Retired historical
+names do not consume a permanent lifetime quota. Existing chunks keep
 their original class. The native policy-list command receives within its actual
 negotiated frame bound; native health retains its smaller fixed reply bound.
