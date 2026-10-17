@@ -81,6 +81,9 @@ impl std::fmt::Display for Error {
 }
 impl std::error::Error for Error {}
 type Result<T> = std::result::Result<T, Error>;
+#[path = "client_m3.rs"]
+mod m3;
+pub use m3::{Change, ScanPage, Subscription, SubscriptionStatus};
 fn parse<T>(v: std::result::Result<T, u16>) -> Result<T> {
     v.map_err(|_| Error::Protocol("malformed reply"))
 }
@@ -96,6 +99,7 @@ pub struct Options {
     pub identity: String,
     pub max_frame: usize,
     pub scans: bool,
+    pub subscriptions: bool,
 }
 impl Options {
     pub fn new(identity: impl Into<String>, max_frame: usize) -> Self {
@@ -103,6 +107,7 @@ impl Options {
             identity: identity.into(),
             max_frame,
             scans: false,
+            subscriptions: false,
         }
     }
 }
@@ -115,6 +120,7 @@ pub struct Negotiated {
     pub server_mem_enabled: bool,
     pub retry_window_ms: u64,
     pub scans: bool,
+    pub subscriptions: bool,
     pub refusals: BTreeMap<u16, Refusal>,
 }
 /// Both deadlines are supplied explicitly: server Unix milliseconds and local monotonic budget.
@@ -177,6 +183,7 @@ impl<T: Transport> Client<T> {
                 server_mem_enabled: false,
                 retry_window_ms: 0,
                 scans: false,
+                subscriptions: false,
                 refusals: CODES[..19]
                     .iter()
                     .map(|&(code, name, transient)| {
@@ -192,11 +199,14 @@ impl<T: Transport> Client<T> {
                     .collect(),
             },
         };
-        let identity = if options.scans {
-            format!("{};scans=1", options.identity)
-        } else {
-            options.identity
-        };
+        let mut identity = options.identity;
+        if options.subscriptions {
+            identity.push_str(";subscribe=1");
+        }
+        // The current server recognizes scans only as the final feature.
+        if options.scans {
+            identity.push_str(";scans=1");
+        }
         identifier(&identity)?;
         let mut p = (options.max_frame as u32).to_le_bytes().to_vec();
         p.push(0);
@@ -219,8 +229,8 @@ impl<T: Transport> Client<T> {
             return Err(Error::Protocol("HELLO limits"));
         }
         let count = parse(c.u16())? as usize;
-        // This slice deliberately negotiates only legacy19 or scan22, without extension tails.
-        if count != 19 && !(options.scans && count == 22) {
+        if count != 19 && !(options.scans && count == 22) && !(options.subscriptions && count == 24)
+        {
             return Err(Error::Protocol("HELLO refusal count"));
         }
         let mut refusals = BTreeMap::new();
@@ -248,6 +258,31 @@ impl<T: Transport> Client<T> {
         if (1..=count as u16).any(|code| !refusals.contains_key(&code)) {
             return Err(Error::Protocol("HELLO missing code"));
         }
+        if count == 24 {
+            if parse(c.u16())? != 1 {
+                return Err(Error::Protocol("change version"));
+            }
+            let frame = parse(c.u32())?;
+            let history = parse(c.u64())?;
+            let history_bytes = parse(c.u64())?;
+            let subscriptions = parse(c.u16())?;
+            let items = parse(c.u16())?;
+            let bytes = parse(c.u64())?;
+            let queue = parse(c.u64())?;
+            let write_ms = parse(c.u32())?;
+            if frame < 1024
+                || frame as usize > MAX_FRAME
+                || history == 0
+                || history_bytes == 0
+                || subscriptions == 0
+                || items == 0
+                || bytes == 0
+                || queue == 0
+                || write_ms == 0
+            {
+                return Err(Error::Protocol("change limits"));
+            }
+        }
         parse(c.end())?;
         this.negotiated = Negotiated {
             epoch,
@@ -256,7 +291,8 @@ impl<T: Transport> Client<T> {
             max_batch,
             server_mem_enabled: mem == 1,
             retry_window_ms,
-            scans: count == 22,
+            scans: count >= 22,
+            subscriptions: count == 24,
             refusals,
         };
         Ok(this)

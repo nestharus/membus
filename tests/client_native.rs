@@ -88,6 +88,79 @@ fn mutation(id: &str, key: &str, ack: Ack, expected: Option<u64>) -> MutationReq
     }
 }
 #[test]
+fn actual_pinned_scan_and_subscription_failure_are_distinct_from_absence() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root =
+        PathBuf::from(std::env::var_os("MEMBUS_CLIENT_TEST_ROOT").expect("owned fixture root"))
+            .join(format!("scan-{stamp}"));
+    fs::create_dir_all(&root).unwrap();
+    let pipe = format!(r"\\.\pipe\membus-m3-owned-{stamp}");
+    let mut server = Server::start(&root, &pipe, 0, 1);
+    let mut options = Options::new("m3-owned", membus::MAX_FRAME);
+    options.scans = true;
+    options.subscriptions = true;
+    let mut c = Client::connect_pipe(std::path::Path::new(&pipe), options, d(5000).local).unwrap();
+    assert_eq!(c.negotiated().refusals.len(), 24);
+    let ns = "rust-client-owned";
+    let sub = c
+        .subscribe(
+            ns,
+            "key-",
+            &format!(r"\\.\pipe\missing-m3-owned-{stamp}"),
+            "subscribe",
+            d(2000),
+        )
+        .unwrap();
+    let token = c.snapshot_open(ns, "open", d(2000)).unwrap();
+    let mut a = c
+        .prepare(mutation("after-snapshot", "key-after", Ack::Os, Some(0)))
+        .unwrap();
+    c.mutate(&mut a, d(2000)).unwrap();
+    let page = c
+        .scan_prefix(ns, "key-", &token, &[], 1, 65536, "scan", d(2000))
+        .unwrap();
+    assert!(page.done && page.items.is_empty());
+    c.snapshot_release(ns, &token, "release", d(2000)).unwrap();
+    assert!(matches!(
+        c.scan_prefix(ns, "key-", &token, &[], 1, 65536, "expired", d(2000)),
+        Err(Error::Refused(Refusal { code: 20, .. }))
+    ));
+    let token = c.snapshot_open(ns, "fresh", d(2000)).unwrap();
+    let page = c
+        .scan_prefix(ns, "key-", &token, &[], 1, 65536, "fresh-page", d(2000))
+        .unwrap();
+    assert_eq!(page.items[0].0, "key-after");
+    assert_eq!(page.items[0].1.bytes, b"after-snapshot");
+    c.snapshot_release(ns, &token, "fresh-release", d(2000))
+        .unwrap();
+    let until = Instant::now() + Duration::from_secs(2);
+    loop {
+        let status = c
+            .subscription_status(ns, &sub.token, "status", d(2000))
+            .unwrap();
+        if status.failed > 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < until,
+            "missing endpoint was not observed as failed"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    c.unsubscribe(ns, &sub.token, "unsubscribe", d(2000))
+        .unwrap();
+    assert!(
+        !c.subscription_status(ns, &sub.token, "cancelled", d(2000))
+            .unwrap()
+            .active
+    );
+    drop(c);
+    server.stop();
+}
+#[test]
 fn actual_resident_legacy_reads_os_flush_put_cas_pending_timeout_and_restart() {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
