@@ -102,8 +102,17 @@ returns the full reading. The cap itself is enforced immediately.
 
 A wire minor/major change needs hello negotiation and documented compatibility;
 an incompatible client receives incompatible_version. An on-disk format change
-requires an explicit migration/backup plan before replacing the binary. This
-slice retains MBK1 and kv/1.0, so replay uses existing state without migration.
+requires an explicit migration/backup plan before replacing the binary.
+MBK1 records and kv/1.0 remain compatible, but chunk startup migrates the legacy
+layout: it verifies an import into separate chunks, switches directories and moves
+untouched legacy files into the recorded backup directory. Follow the explicit
+import/backup/rollback procedure in CHUNK-RETIREMENT.md section 5.6 before a stopped
+replacement. Binary replacement alone does not restore the legacy layout. Restoring
+that backup omits writes accepted after the switch; the retry window does not cap
+that possible loss at 24 hours. Keep the backup until its owner selects removal.
+An unresolved catalogue append refuses startup and retains its evidence. Do not
+remove its marker manually or open that state with a marker-unaware older binary;
+see CATALOGUE-APPEND-RECOVERY.md for that boundary.
 Lane88's eco seq452 answer selects task `Oulipoly membus`, xteam logon plus
 1-minute repeats, IgnoreNew, below-normal priority, unlimited duration. The
 minute repeat restarts after exit; Task Scheduler RestartOnFailure concerns

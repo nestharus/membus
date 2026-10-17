@@ -529,13 +529,18 @@ fn policy_command(args: &[String]) -> io::Result<()> {
     let mut payload = (membus::MAX_FRAME as u32).to_le_bytes().to_vec();
     payload.push(0);
     membus::lp(&mut payload, b"membus-policy");
-    health_exchange(&mut pipe, membus::HELLO, 1, &payload)?;
+    let hello = health_exchange(&mut pipe, membus::HELLO, 1, &payload)?;
+    let negotiated = u32::from_le_bytes(hello.get(8..12)
+        .ok_or_else(|| io::Error::other("short policy HELLO"))?.try_into().unwrap()) as usize;
+    if !(1024..=membus::MAX_FRAME).contains(&negotiated) {
+        return Err(io::Error::other("invalid policy frame limit"));
+    }
     let mut payload = (membus::now_ms() + 5000).to_le_bytes().to_vec();
     membus::lp(&mut payload, format!("policy-cli-{}", membus::now_ms()).as_bytes());
     membus::lp(&mut payload, ns.as_bytes());
     match class {
         None => {
-            let reply = health_exchange(&mut pipe, membus::POLICY_GET, 2, &payload)?;
+            let reply = health_exchange_limit(&mut pipe, membus::POLICY_GET, 2, &payload, negotiated)?;
             let mut c = membus::Cursor::new(&reply);
             let n = c.u16().map_err(|code| io::Error::other(format!("reply code {code}")))?;
             for _ in 0..n {
@@ -548,6 +553,7 @@ fn policy_command(args: &[String]) -> io::Result<()> {
                 };
                 println!("{ns}\t{}\t{class}", row.0);
             }
+            c.end().map_err(|code| io::Error::other(format!("reply code {code}")))?;
         }
         Some((kind, retention)) => {
             membus::lp(&mut payload, args[3].as_bytes());
@@ -575,8 +581,12 @@ fn health_exchange<S: Read + Write>(
     id: u64,
     payload: &[u8],
 ) -> io::Result<Vec<u8>> {
+    health_exchange_limit(stream, op, id, payload, 1024)
+}
+#[cfg(windows)]
+fn health_exchange_limit<S: Read + Write>(stream: &mut S, op: u8, id: u64, payload: &[u8], limit: usize) -> io::Result<Vec<u8>> {
     stream.write_all(&membus::frame(op, id, payload))?;
-    let body = membus::read_frame_limit(stream, 1024)?;
+    let body = membus::read_frame_limit(stream, limit)?;
     if body.len() < 15
         || body[..2] != 1u16.to_le_bytes()
         || body[2..4] != 0u16.to_le_bytes()
@@ -587,6 +597,27 @@ fn health_exchange<S: Read + Write>(
         return Err(io::Error::other("health protocol association/refusal"));
     }
     Ok(body[15..].to_vec())
+}
+#[cfg(all(test, windows))]
+mod policy_reply_tests {
+    use super::*;
+    struct Peer(std::io::Cursor<Vec<u8>>);
+    impl Read for Peer { fn read(&mut self,b:&mut[u8])->io::Result<usize>{self.0.read(b)} }
+    impl Write for Peer {
+        fn write(&mut self,b:&[u8])->io::Result<usize>{Ok(b.len())}
+        fn flush(&mut self)->io::Result<()>{Ok(())}
+    }
+    #[test]
+    fn policy_reply_uses_selected_bound_while_health_keeps_its_small_bound() {
+        let payload=vec![42;2048];
+        let response=membus::reply(membus::POLICY_GET,7,0,&payload);
+        let mut peer=Peer(std::io::Cursor::new(response.clone()));
+        assert_eq!(health_exchange_limit(&mut peer,membus::POLICY_GET,7,&[],4096).unwrap(),payload);
+        let mut peer=Peer(std::io::Cursor::new(response.clone()));
+        assert!(health_exchange_limit(&mut peer,membus::POLICY_GET,7,&[],1024).is_err());
+        let mut peer=Peer(std::io::Cursor::new(response));
+        assert!(health_exchange(&mut peer,membus::POLICY_GET,7,&[]).is_err());
+    }
 }
 #[cfg(windows)]
 fn heartbeat_number(text: &str, key: &str) -> io::Result<u64> {

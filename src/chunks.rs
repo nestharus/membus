@@ -5,7 +5,7 @@
 //! append-only log of `open`, `close`, `retiring` and `retired` records, each flushed before it takes effect.
 use crate::{crc32, lp, Cursor, MAX_FRAME, MAX_ID};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -516,6 +516,10 @@ pub struct Catalogue {
     file: File,
     pub bytes: u64,
     pub last_ms: u64,
+    /// Bytes in the last successful compact image; only subsequent growth triggers compaction.
+    pub rewrite_base_bytes: u64,
+    #[cfg(test)]
+    pub(crate) rewrites: u64,
     pub fail_writes: bool,
     fenced: bool,
     #[cfg(test)]
@@ -535,7 +539,9 @@ impl Catalogue {
         let file = OpenOptions::new().create(true).read(true).write(true).open(path)?;
         let bytes = file.metadata()?.len();
         Ok(Self {
-            path: path.to_owned(), file, bytes, last_ms: 0, fail_writes: false, fenced: false,
+            path: path.to_owned(), file, bytes, last_ms: 0, rewrite_base_bytes: 0, fail_writes: false, fenced: false,
+            #[cfg(test)]
+            rewrites: 0,
             #[cfg(test)]
             fail_after_once: None,
             #[cfg(test)]
@@ -642,7 +648,13 @@ impl Catalogue {
             resolve_append(&self.path)?;
         }
         self.fenced = false;
+        self.rewrite_base_bytes = self.bytes;
+        #[cfg(test)]
+        { self.rewrites += 1; }
         Ok(())
+    }
+    pub fn needs_rewrite(&self, threshold: u64) -> bool {
+        threshold > 0 && (self.fenced || self.bytes.saturating_sub(self.rewrite_base_bytes) > threshold)
     }
 }
 
@@ -673,6 +685,8 @@ pub struct ChunkInfo {
     pub blocked_since: Option<u64>,
     pub horizons: Vec<(String, String, u64)>,
     pub expired: Vec<Key>,
+    /// Original logical retirement time, preserved by live-list rewrites.
+    pub retired_ms: Option<u64>,
 }
 pub fn chunk_path(dir: &Path, class: Class, stripe: usize, seq: u64) -> PathBuf {
     dir.join(class.dir()).join(format!("{stripe}-{seq}.log"))
@@ -684,6 +698,8 @@ pub struct ReplayReport {
     pub epoch: u64,
     pub start_ms: u64,
     pub ready_ms: u64,
+    /// Empty on historical/ready records; a pre-truncation report is explicitly not ready.
+    pub stage: String,
     pub stripes: [StripeReport; 4],
     pub catalogue_truncation: Option<(u64, u64, String)>,
     pub retirements_finished: Vec<u64>,
@@ -746,10 +762,11 @@ impl ReplayReport {
         let list = |v: &Vec<String>| v.iter().map(|s| format!("\"{}\"", esc(s))).collect::<Vec<_>>().join(",");
         let opt = |v: &Option<String>| v.as_ref().map_or("null".into(), |s| format!("\"{}\"", esc(s)));
         format!(
-            "{{\"epoch\":{},\"start_ms\":{},\"ready_ms\":{},\"duration_ms\":{},\"stripes\":[{}],\"catalogue_truncation\":{},\"retirements_finished\":{:?},\"closed_at_start\":[{}],\"empty_closed\":{:?},\"dedup_entries\":{},\"keys\":{},\"namespace_counts\":{{{}}},\"horizons\":{},\"legacy\":[{}],\"import\":{},\"expiry_degraded\":{},\"storage_errors\":[{}],\"refusal\":{}}}",
+            "{{\"epoch\":{},\"start_ms\":{},\"ready_ms\":{},\"stage\":\"{}\",\"duration_ms\":{},\"stripes\":[{}],\"catalogue_truncation\":{},\"retirements_finished\":{:?},\"closed_at_start\":[{}],\"empty_closed\":{:?},\"dedup_entries\":{},\"keys\":{},\"namespace_counts\":{{{}}},\"horizons\":{},\"legacy\":[{}],\"import\":{},\"expiry_degraded\":{},\"storage_errors\":[{}],\"refusal\":{}}}",
             self.epoch,
             self.start_ms,
             self.ready_ms,
+            esc(&self.stage),
             self.ready_ms.saturating_sub(self.start_ms),
             stripes.join(","),
             self.catalogue_truncation
@@ -773,7 +790,10 @@ impl ReplayReport {
     pub fn write(&self, state: &Path) -> io::Result<()> {
         let line = self.json();
         let tmp = state.join("replay.json.tmp");
-        fs::write(&tmp, format!("{line}\n"))?;
+        let mut pending = File::create(&tmp)?;
+        pending.write_all(format!("{line}\n").as_bytes())?;
+        crate::sync_file(&pending)?;
+        drop(pending);
         fs::rename(&tmp, state.join("replay.json"))?;
         let log = state.join("replay.log");
         if fs::metadata(&log).map(|m| m.len()).unwrap_or(0) > 1024 * 1024 {
@@ -786,6 +806,7 @@ impl ReplayReport {
         }
         let mut f = OpenOptions::new().create(true).append(true).open(&log)?;
         f.write_all(format!("{line}\n").as_bytes())?;
+        crate::sync_file(&f)?;
         Ok(())
     }
     pub fn summary(&self) -> String {
@@ -869,30 +890,33 @@ impl Holders {
 /// Expiry summaries: the key sets of retired expire-class chunks, kept for 30 days.
 #[derive(Default)]
 pub struct Summaries {
-    pub list: VecDeque<(u64, Vec<Key>)>,
+    pub list: BTreeMap<u64, Vec<Key>>,
     pub keys: HashMap<Key, u64>,
     pub charged: usize,
 }
 impl Summaries {
     pub fn add(&mut self, retired_ms: u64, keys: Vec<Key>) -> usize {
         let mut added = 0;
-        for k in &keys {
-            if self.keys.insert(k.clone(), retired_ms).is_none() {
-                added += 1;
+        for k in keys {
+            match self.keys.get(&k) {
+                Some(previous) if *previous >= retired_ms => continue,
+                None => added += 1,
+                _ => {}
             }
+            self.keys.insert(k.clone(), retired_ms);
+            self.list.entry(retired_ms).or_default().push(k);
         }
         self.charged += added;
-        self.list.push_back((retired_ms, keys));
         added
     }
     /// Drop summaries past `keep_ms`; returns the index slots freed.
     pub fn expire(&mut self, now: u64, keep_ms: u64) -> usize {
         let mut freed = 0;
-        while let Some((at, _)) = self.list.front() {
+        while let Some((at, _)) = self.list.first_key_value() {
             if now.saturating_sub(*at) < keep_ms {
                 break;
             }
-            let (at, keys) = self.list.pop_front().unwrap();
+            let (at, keys) = self.list.pop_first().unwrap();
             for k in keys {
                 if self.keys.get(&k) == Some(&at) {
                     self.keys.remove(&k);
@@ -980,7 +1004,7 @@ impl ChunkStore {
             }
             if c.state == ChunkState::Retiring {
                 out.push(CatRecord {
-                    at_ms: now,
+                    at_ms: c.retired_ms.unwrap_or(now),
                     rec: Rec::Retiring { seq: c.id, next, horizons: c.horizons.clone(), expired: c.expired.clone() },
                 });
             }

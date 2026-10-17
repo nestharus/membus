@@ -200,3 +200,14 @@ Opcodes 24-27 are additive under kv/1 minor 0 ([CHUNK-RETIREMENT.md](CHUNK-RETIR
 | 27 health2 | empty | u16 count; (string "key=value")* |
 
 `policy_set` refuses a 65th distinct class with `capacity` (7). The namespace in the common fields is the one the policy governs; longest prefix wins, and a key with no policy is `forever`. `get_status` reports `expired` for 30 days after an expire class retires the key's latest record, then `missing`. `health2`'s keys are listed in CHUNK-RETIREMENT.md section 6 (`namespace.<ns>` and `retained_bytes.<class>` repeat per namespace and class). The Python client's `health2()` and `get_status()` raise `NotAvailable` on an older server; `membus policy PIPE get|set|clear` and `membus expiry resume STATE_DIR` are the CLI.
+
+`policy_set` uses the common caller namespace and literal operation ID under the
+same mutation retry rules as other writes. Changing prefix/class/clear content
+under that identity refuses with `op_id_mismatch`; an identical retry returns its
+original version and does not reapply an older policy after a newer setter. Policy
+admission and live routing publication share an order without holding a routing
+lock during append/flush work. The class count includes nonretired instantiated
+classes left by policy replacement, as well as selected policy classes; retired
+historical names do not consume a permanent lifetime quota. Existing chunks keep
+their original class. The native policy-list command receives within its actual
+negotiated frame bound; native health retains its smaller fixed reply bound.

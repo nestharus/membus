@@ -505,6 +505,13 @@ Every base test passes unchanged except where KV1.md's slot rule changes, and th
 
 ## 9. Review and install
 
+The review procedure quoted below records the original build's historical selection.
+Current engineering continuation uses the engineering subsection of the maintained
+code review runbook: nine Sol high source families, then separate Sol high factual
+interpretation and consequential decision. Historical observer retirement does not
+establish current-source exposure. The earlier claims and measurements below remain
+historical evidence, not current acceptance or a new instruction to rerun that procedure.
+
 **Review:** the code review runbook's loop form (CODE_REVIEW_RUNBOOK.md, sha256 1e6abdb7, :5-31; lane 87 in
 claude6-eco rows 2030 and 2058, which withdrew the combined runbook run this section first named). The review is the
 loop's own observation, not a separate run:

@@ -315,6 +315,10 @@ pub struct Config {
     pub sync_test_gate: Option<Arc<(Mutex<(bool, bool)>, Condvar)>>,
     #[cfg(test)]
     pub sync_test_notice: Option<mpsc::Sender<()>>,
+    #[cfg(test)]
+    pub stop_after_replay_truncation: bool,
+    #[cfg(test)]
+    pub flush_covered_count: Option<Arc<AtomicUsize>>,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -353,6 +357,10 @@ impl Default for Config {
             sync_test_gate: None,
             #[cfg(test)]
             sync_test_notice: None,
+            #[cfg(test)]
+            stop_after_replay_truncation: false,
+            #[cfg(test)]
+            flush_covered_count: None,
         }
     }
 }
@@ -380,6 +388,10 @@ pub struct Store {
     appenders: Vec<AppendOwner>,
     flush_owner: Option<std::thread::JoinHandle<()>>,
     batch_gate: Mutex<()>,
+    // Administrative ordering never holds the routing map lock across append/flush work.
+    policy_updates: Mutex<()>,
+    #[cfg(test)]
+    policy_after_commit: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
     pub config: Config,
     pub epoch: u64,
     _owner: File,
@@ -584,6 +596,8 @@ fn start_routed_owners(
     let fail_sync = config.fail_sync;
     #[cfg(test)]
     let sync_test_gate = config.sync_test_gate.clone();
+    #[cfg(test)]
+    let covered_count = config.flush_covered_count.clone();
     let flush_owner = std::thread::spawn(move || {
         let mut pending = VecDeque::new();
         let mut last: Option<std::time::Instant> = None;
@@ -611,6 +625,11 @@ fn start_routed_owners(
             None
         };
         loop {
+            // A retired sink is removed only after Store pending operations have settled. A late
+            // notice for a merely closed sink still needs its synced extent and remains present.
+            covered.retain(|sink, _| flush_route.sink(*sink).is_some());
+            #[cfg(test)]
+            if let Some(count) = &covered_count { count.store(covered.len(), Ordering::SeqCst); }
             let mut gather = true;
             if pending.is_empty() {
                 match flush_recv.recv() {
@@ -1086,7 +1105,7 @@ impl ChunkRouter {
                 keys: HashMap::new(),
                 blocked_since: None,
                 horizons: Vec::new(),
-                expired: Vec::new(),
+                expired: Vec::new(), retired_ms: None,
             },
         );
         drop(cs);
@@ -1110,6 +1129,7 @@ impl ChunkRouter {
         if let Err(e) = synced {
             c.log.lock().unwrap().poisoned = true;
             self.fence(stripe);
+            self.flags.storage_error.store(true, Ordering::SeqCst);
             return Err(e);
         }
         let now = self.clock.utc_ms();
@@ -1288,7 +1308,7 @@ impl Replayed {
         }
         if now.saturating_sub(at) <= config.retry_ms && !timers::is_progress(&m.ns, &m.key) {
             self.dedup.insert(
-                (m.ns.clone(), m.op_id.clone()),
+                dedup_identity(&m),
                 Dedup {
                     fingerprint: fingerprint(&m),
                     at,
@@ -1398,7 +1418,7 @@ fn read_legacy(files: &[(usize, PathBuf)], config: &Config, now: u64) -> io::Res
                     }
                     if now.saturating_sub(at) <= config.retry_ms && !timers::is_progress(&m.ns, &m.key) {
                         l.dedup.insert(
-                            (m.ns.clone(), m.op_id.clone()),
+                            dedup_identity(&m),
                             Dedup {
                                 fingerprint: fingerprint(&m),
                                 at,
@@ -1639,7 +1659,7 @@ fn import_legacy(path: &Path, config: &Config, clock: &chunks::Clock, epoch: u64
             first.get_or_insert(format!("next: imported {}, legacy {}, written {}", rp.next, legacy.next, w.next));
         }
         for (k, d) in &rp.dedup {
-            if k.0 == POLICY_NS {
+            if parse_record(&d.fingerprint).is_ok_and(|(m, _, _)| m.ns == POLICY_NS) {
                 continue;
             }
             match legacy.dedup.get(k) {
@@ -1746,7 +1766,7 @@ fn replay_into(rp: &mut Replayed, path: &Path, dir: &Path, legacy: bool, config:
                         keys: HashMap::new(),
                         blocked_since: None,
                         horizons: Vec::new(),
-                        expired: Vec::new(),
+                        expired: Vec::new(), retired_ms: None,
                     },
                 );
             }
@@ -1764,7 +1784,7 @@ fn replay_into(rp: &mut Replayed, path: &Path, dir: &Path, legacy: bool, config:
                 if let Some(c) = rp.chunks.table.get_mut(seq) {
                     c.state = ChunkState::Retiring;
                     c.horizons = h.clone();
-                    c.expired = expired.clone();
+                    c.expired = expired.clone(); c.retired_ms = Some(r.at_ms);
                 }
                 if !expired.is_empty() {
                     rp.chunks.summaries.add(r.at_ms, expired.clone());
@@ -1816,7 +1836,7 @@ fn replay_into(rp: &mut Replayed, path: &Path, dir: &Path, legacy: bool, config:
                 keys: HashMap::new(),
                 blocked_since: None,
                 horizons: Vec::new(),
-                expired: Vec::new(),
+                expired: Vec::new(), retired_ms: None,
             },
         );
         let mut total = 0;
@@ -2112,7 +2132,7 @@ impl Maint {
                 let info = cs.table.get_mut(&id).unwrap();
                 info.state = ChunkState::Retiring;
                 info.horizons = horizons;
-                info.expired = latest;
+                info.expired = latest; info.retired_ms = Some(utc);
                 if self.config.retire_stop_after == 1 {
                     continue;
                 }
@@ -2290,11 +2310,28 @@ impl Maint {
         let _ = self.retire(None);
         self.drop_tombstones();
     }
+    fn prune_discharged(&self) {
+        let state = self.state.lock().unwrap();
+        let mut cs = self.chunks.lock().unwrap();
+        let referenced: HashSet<u64> = state.metadata.values().map(|m|m.chunk).collect();
+        let ids: HashSet<u64> = cs.table.values()
+            .filter(|c| c.state == chunks::ChunkState::Retired && !referenced.contains(&c.id))
+            .map(|c| c.id).collect();
+        if ids.is_empty() { return; }
+        // Retirement requires no pending key belonging to a closed chunk. Mutation keeps that
+        // reservation through append completion AND any delayed flush notice/result. Therefore a
+        // durably Retired sink has no outstanding Store waiter; Retiring/closed sinks are retained.
+        self.router.table.write().unwrap().retain(|id, _| !ids.contains(&(*id as u64)));
+        cs.table.retain(|id, _| !ids.contains(id));
+        cs.holders.map.retain(|_, holders| { holders.retain(|id| !ids.contains(id)); !holders.is_empty() });
+        let held: HashSet<_> = cs.holders.map.keys().cloned().collect();
+        cs.horizons.retain(|key, _| held.contains(key));
+    }
     /// A catalogue past its size is rewritten to the live list (5.2).
     fn rewrite_catalogue(&self) {
         let mut cs = self.chunks.lock().unwrap();
         let at = self.config.catalogue_rewrite_bytes;
-        if at > 0 && cs.cat_bytes() > at {
+        if cs.cat.as_ref().is_some_and(|cat| cat.needs_rewrite(at)) {
             let live = cs.live_list(self.clock.utc_ms(), self.next_issued.load(Ordering::SeqCst));
             if let Some(cat) = cs.cat.as_mut() {
                 if cat.rewrite(&live).is_err() {
@@ -2319,6 +2356,13 @@ fn mutation_bytes(m: &Mutation, version: u64, at: u64) -> Vec<u8> {
 }
 fn fingerprint(m: &Mutation) -> Vec<u8> {
     mutation_bytes(m, 0, 0)
+}
+fn dedup_identity(m: &Mutation) -> Key {
+    // The existing policy target key carries its caller namespace; retain the literal operation ID.
+    let ns = if m.ns == POLICY_NS {
+        m.key.split_once('\0').map_or(m.ns.as_str(), |(ns, _)| ns)
+    } else { m.ns.as_str() };
+    (ns.to_owned(), m.op_id.clone())
 }
 fn stripe(ns: &str, key: &str) -> usize {
     let mut b = ns.as_bytes().to_vec();
@@ -2351,7 +2395,8 @@ impl Store {
         let start_ms = now_ms();
         let refuse = |e: io::Error, mut report: chunks::ReplayReport| -> io::Error {
             report.start_ms = start_ms;
-            report.ready_ms = now_ms();
+            report.ready_ms = 0;
+            report.stage = "refused".into();
             report.refusal = Some(e.to_string());
             // The replay record is written before exit; its own failure does not hide the refusal.
             let _ = report.write(path);
@@ -2384,12 +2429,25 @@ impl Store {
             let report = rp.report.clone();
             return Err(refuse(io::Error::other("replayed state exceeds configured limits"), report));
         }
+        if !rp.truncate.is_empty() || rp.report.catalogue_truncation.is_some() {
+            rp.report.start_ms = start_ms;
+            rp.report.ready_ms = 0;
+            rp.report.stage = "truncation_pending".into();
+            // Preserve what replay found before its source bytes disappear. A later successful
+            // start can replace replay.json; the bounded replay.log retains this non-ready stage.
+            rp.report.write(path)?;
+        }
         for (p, offset) in &rp.truncate {
             OpenOptions::new().write(true).open(p)?.set_len(*offset)?;
         }
         let cat_path = path.join("chunks").join("catalogue.log");
         if let Some((offset, _, _)) = &rp.report.catalogue_truncation {
             OpenOptions::new().write(true).open(&cat_path)?.set_len(*offset)?;
+        }
+        checkpoint("MEMBUS_TEST_PAUSE_REPLAY_TRUNCATED");
+        #[cfg(test)]
+        if config.stop_after_replay_truncation {
+            return Err(io::Error::other("test stop after replay truncation"));
         }
         let mut cs = std::mem::replace(&mut rp.chunks, chunks::ChunkStore::new(path.join("chunks")));
         let mut catalogue = chunks::Catalogue::open(&cat_path)?;
@@ -2615,6 +2673,7 @@ impl Store {
                     tick_maint.pass();
                 }
                 tick_maint.rewrite_catalogue();
+                tick_maint.prune_discharged();
             }
         });
         let scans = Arc::new(Mutex::new(ScanState {
@@ -2644,6 +2703,7 @@ impl Store {
         report.keys = keys;
         report.namespace_counts = namespace_counts.iter().map(|(k, v)| (k.clone(), *v)).collect();
         report.ready_ms = now_ms();
+        report.stage = "ready".into();
         report.write(path)?;
         Ok(Self {
             timers,
@@ -2667,6 +2727,9 @@ impl Store {
             appenders,
             flush_owner: Some(flush_owner),
             batch_gate: Mutex::new(()),
+            policy_updates: Mutex::new(()),
+            #[cfg(test)]
+            policy_after_commit: Mutex::new(None),
             config,
             epoch,
             _owner: owner,
@@ -3044,35 +3107,53 @@ impl Store {
     /// Set (Some) or clear (None) a namespace prefix's class: written durably to POLICY_NS, then used by
     /// writes that follow (5.1). Records already written keep their chunk's class.
     pub fn set_policy(&self, ns: &str, prefix: &str, class: Option<Class>, deadline: u64) -> Outcome {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let id = format!("policy/{}/{}/{}", self.epoch, now_ms(), SEQ.fetch_add(1, Ordering::SeqCst));
+        self.set_policy_with_id(ns, prefix, class, &id, deadline)
+    }
+    /// Caller-scoped POLICY_SET retry identity. A duplicate never reapplies an older projection.
+    pub fn set_policy_with_id(&self, ns: &str, prefix: &str, class: Option<Class>, op_id: &str, deadline: u64) -> Outcome {
+        let _update = self.policy_updates.lock().unwrap();
         let key = match chunks::policy_key(ns, prefix) {
             Ok(k) => k,
             Err(code) => return Outcome::error(code),
         };
-        if let Some(c) = class {
+        let m = Mutation {
+            ns: POLICY_NS.into(), key: key.clone(), op_id: op_id.into(), deadline, ack: 2,
+            expected: None, bytes: class.map(chunks::policy_value).unwrap_or_default(), remove: class.is_none(),
+        };
+        let retry = {
+            let state = self.state.lock().unwrap();
+            let id = dedup_identity(&m);
+            state.dedup.contains_key(&id) || state.retired_set.contains(&id)
+        };
+        if !retry && now_ms() >= deadline { return Outcome::error(5); }
+        if !retry { if let Some(c) = class {
             // An expire class shorter than the retry window would retire records whose dedup a restart still needs.
             if c.kind == 2 && c.retention_ms < self.config.retry_ms {
                 return Outcome::error(3);
             }
-            if self.policies.read().unwrap().would_exceed(ns, prefix, c) {
+            let mut proposed = self.policies.read().unwrap().clone();
+            proposed.set(ns, prefix, class);
+            let mut classes = proposed.classes();
+            classes.extend(self.chunks.lock().unwrap().table.values()
+                .filter(|chunk| chunk.state != chunks::ChunkState::Retired).map(|chunk| chunk.class));
+            if classes.len() > chunks::MAX_CLASSES {
                 return Outcome::error(7);
             }
-        }
-        let m = Mutation {
-            ns: POLICY_NS.into(),
-            key: key.clone(),
-            op_id: {
-                static SEQ: AtomicU64 = AtomicU64::new(0);
-                format!("policy/{}/{}/{}", self.epoch, now_ms(), SEQ.fetch_add(1, Ordering::SeqCst))
-            },
-            deadline,
-            ack: 2,
-            expected: None,
-            bytes: class.map(chunks::policy_value).unwrap_or_default(),
-            remove: class.is_none(),
-        };
+        } }
         let outcome = self.mutate(m);
         if outcome.code == 0 {
-            self.policies.write().unwrap().set(ns, prefix, class);
+            #[cfg(test)]
+            {
+                let hook = self.policy_after_commit.lock().unwrap().take();
+                if let Some((reached, resume)) = hook { let _ = reached.send(()); let _ = resume.recv(); }
+            }
+            let latest = self.state.lock().unwrap().metadata.get(&(POLICY_NS.into(), key))
+                .is_some_and(|latest| latest.version == outcome.version);
+            if latest {
+                self.policies.write().unwrap().set(ns, prefix, class);
+            }
         }
         outcome
     }
@@ -3127,7 +3208,7 @@ impl Store {
             return Outcome::error(15);
         }
         let k = (m.ns.clone(), m.key.clone());
-        let id = (m.ns.clone(), m.op_id.clone());
+        let id = dedup_identity(&m);
         let fp = fingerprint(&m);
         let at = now_ms();
         let log_index = stripe(&m.ns, &m.key);
@@ -3466,7 +3547,7 @@ impl Store {
                 }
                 return Ok(o.bytes());
             }
-            if now_ms() >= deadline {
+            if now_ms() >= deadline && op != POLICY_SET {
                 return Err(5);
             }
             match op {
@@ -3477,7 +3558,7 @@ impl Store {
                     let retention = c.u64()?;
                     c.end()?;
                     let class = if kind == 255 { None } else { Some(Class::from_wire(kind, retention)?) };
-                    let o = self.set_policy(&ns, &prefix, class, deadline);
+                    let o = self.set_policy_with_id(&ns, &prefix, class, &_op_id, deadline);
                     if o.code != 0 {
                         return Err(o.code);
                     }
@@ -3932,5 +4013,202 @@ mod retirement_failure_tests {
         assert_eq!(s.state.lock().unwrap().persisted_bytes, before - ids[0].1);
         assert_eq!(s.retry_retiring().unwrap(), 1);
         assert_eq!(s.state.lock().unwrap().persisted_bytes, before - ids.iter().map(|x| x.1).sum::<u64>());
+    }
+}
+
+#[cfg(test)]
+mod receiving_correction_tests {
+    use super::*;
+    const DAY: u64 = 86_400_000;
+    fn fixture(label: &str) -> (PathBuf, Arc<chunks::ManualClock>, Config) {
+        let path = PathBuf::from(std::env::var("MEMBUS_TEST_OUTPUT").unwrap_or_else(|_| ".test-output".into()))
+            .join(format!("receiving-{label}-{}-{}", std::process::id(), now_ms()));
+        let clock = chunks::ManualClock::new(now_ms());
+        let config = Config { clock: Some(clock.clone()), tick_ms: 3_600_000, retire_ms: 3_600_000,
+            rotation_ms: 1, ..Config::default() };
+        (path, clock, config)
+    }
+    fn put(ns: &str, key: &str, id: &str) -> Mutation {
+        Mutation { ns: ns.into(), key: key.into(), op_id: id.into(), deadline: now_ms()+10_000,
+            ack: 1, expected: None, bytes: b"retained".to_vec(), remove: false }
+    }
+    fn policy(s: &Store, ns: &str, prefix: &str, class: Option<Class>, id: &str) -> Outcome {
+        let mut p = (now_ms()+10_000).to_le_bytes().to_vec();
+        lp(&mut p, id.as_bytes()); lp(&mut p, ns.as_bytes()); lp(&mut p, prefix.as_bytes());
+        p.push(class.map_or(255, |c| c.kind)); p.extend(class.map_or(0, |c| c.retention_ms).to_le_bytes());
+        let r = s.dispatch(&frame(POLICY_SET, 17, &p)[4..]);
+        let code = u16::from_le_bytes(r[17..19].try_into().unwrap());
+        if code != 0 { Outcome::error(code) } else {
+            Outcome { code, version: u64::from_le_bytes(r[19..27].try_into().unwrap()), ack: r[27] }
+        }
+    }
+    #[test]
+    fn policy_retry_identity_survives_interposed_policy_and_restart() {
+        let (path, _, config) = fixture("policy-id");
+        let s = Store::open(&path, config.clone()).unwrap();
+        let first = policy(&s, "caller", "p/", Some(Class::expire(DAY)), "A");
+        assert_eq!(first.code, 0);
+        assert_eq!(policy(&s,"caller","p/",Some(Class::FOREVER),"B").code,0);
+        assert_eq!(policy(&s,"caller","p/",Some(Class::expire(DAY)),"A"),first);
+        assert_eq!(s.policies().into_iter().find(|r|r.0=="caller").unwrap().2,Class::FOREVER);
+        for (prefix, class) in [("other/",Some(Class::expire(DAY))), ("p/",None), ("p/",Some(Class::LATEST))] {
+            assert_eq!(policy(&s,"caller",prefix,class,"A").code,14);
+        }
+        assert_eq!(s.mutate(put("caller","ordinary","A")).code,14);
+        assert_eq!(policy(&s,"another","p/",Some(Class::LATEST),"A").code,0);
+        drop(s);
+        let s = Store::open(&path, config).unwrap();
+        assert_eq!(policy(&s,"caller","p/",Some(Class::expire(DAY)),"A"),first);
+        assert_eq!(s.policies().into_iter().find(|r|r.0=="caller").unwrap().2,Class::FOREVER);
+    }
+    fn paused_setters(fill: bool) {
+        let (path, _, config) = fixture(if fill {"cap-race"} else {"policy-order"});
+        let s = Arc::new(Store::open(&path, config).unwrap());
+        if fill { for i in 0..61 {
+            assert_eq!(s.set_policy("classes",&format!("{i}/"),Some(Class::expire(DAY+i)),now_ms()+10_000).code,0);
+        } }
+        let (reached, committed) = mpsc::channel(); let (resume, resumed) = mpsc::channel();
+        *s.policy_after_commit.lock().unwrap() = Some((reached,resumed));
+        let a = s.clone();
+        let first = std::thread::spawn(move || a.set_policy("ordered","",Some(Class::expire(2*DAY)),now_ms()+10_000));
+        committed.recv_timeout(Duration::from_secs(5)).unwrap();
+        let b = s.clone(); let (finished, result) = mpsc::channel();
+        let second = std::thread::spawn(move || {
+            let got=b.set_policy(if fill {"other"} else {"ordered"},"",Some(if fill {Class::expire(3*DAY)} else {Class::FOREVER}),now_ms()+10_000);
+            finished.send(got).unwrap();
+        });
+        let early=result.recv_timeout(Duration::from_millis(100));
+        resume.send(()).unwrap();
+        assert_eq!(first.join().unwrap().code,0);
+        second.join().unwrap();
+        let completed_early=early.is_ok(); let got=early.unwrap_or_else(|_|result.recv().unwrap());
+        assert!(!completed_early,"another setter must not pass committed-but-unpublished policy state");
+        assert_eq!(got.code,if fill {7} else {0});
+        if !fill {
+            assert_eq!(s.mutate(put("ordered","later","later")).code,0);
+            let chunks=s.chunks.lock().unwrap();
+            assert!(chunks.table.values().filter(|c|c.keys.contains_key(&("ordered".into(),"later".into())))
+                .all(|c|c.class==Class::FOREVER));
+            drop(chunks);drop(s);
+            let reopened=Store::open(&path,Config::default()).unwrap();
+            assert_eq!(reopened.policies().into_iter().find(|r|r.0=="ordered").unwrap().2,Class::FOREVER);
+        }
+    }
+    #[test] fn policy_publication_orders_concurrent_setters() { paused_setters(false); }
+    #[test] fn policy_cap_counts_competing_admissions() { paused_setters(true); }
+    #[test]
+    fn policy_cap_counts_retained_classes_after_prefix_replacement() {
+        let (path, clock, config)=fixture("class-churn");let s=Store::open(&path,config).unwrap();
+        for i in 0..62 {
+            assert_eq!(s.set_policy("classes","",Some(Class::expire(DAY+i)),now_ms()+10_000).code,0);
+            assert_eq!(s.mutate(put("classes","same-key",&format!("put-{i}"))).code,0);
+        }
+        assert_eq!(s.set_policy("classes","",Some(Class::expire(2*DAY)),now_ms()+10_000).code,7);
+        clock.advance(2);s.tick();
+        let old=s.chunk_rows().into_iter().find(|c|c.2==format!("expire({DAY}ms)")).unwrap().0;
+        assert!(s.retire_chunk(old).unwrap());
+        assert_eq!(s.set_policy("classes","",Some(Class::expire(2*DAY)),now_ms()+10_000).code,0,
+            "retired historical class names must not consume a lifetime quota");
+    }
+    #[test]
+    fn idle_close_sync_failure_is_visible_before_next_mutation() {
+        let (path, clock, mut config)=fixture("idle-health");config.fail_sync=true;
+        let s=Store::open(&path,config).unwrap();
+        // Select the finite class in the fixture; fail_sync must first act at idle close, not a policy flush.
+        s.policies.write().unwrap().set("idle","",Some(Class::LATEST));
+        assert_eq!(s.mutate(put("idle","k","idle-os")).code,0);
+        clock.advance(2);s.tick();
+        assert!(s.health2().storage_error);
+        assert!(!s.health2().read_only,"no later client failure has exposed the fence yet");
+    }
+    #[test]
+    fn rewrite_does_not_repeat_oversized_unchanged_live_state() {
+        let (path,_,mut config)=fixture("rewrite");config.catalogue_rewrite_bytes=1;
+        let s=Store::open(&path,config).unwrap();
+        assert_eq!(s.mutate(put("rewrite","k","one")).code,0);
+        s.maint.rewrite_catalogue();
+        assert_eq!(s.chunks.lock().unwrap().cat.as_ref().unwrap().rewrites,1);
+        for _ in 0..3 {s.maint.rewrite_catalogue();}
+        assert_eq!(s.chunks.lock().unwrap().cat.as_ref().unwrap().rewrites,1);
+        s.chunks.lock().unwrap().log(now_ms(),chunks::Rec::Next(100)).unwrap();
+        s.maint.rewrite_catalogue();
+        assert_eq!(s.chunks.lock().unwrap().cat.as_ref().unwrap().rewrites,2);
+    }
+    #[test]
+    fn truncation_evidence_survives_failed_start_and_clean_restart() {
+        use std::io::Write;
+        let (path,_,config)=fixture("truncation");let s=Store::open(&path,config.clone()).unwrap();
+        assert_eq!(s.mutate(put("evidence","k","tail")).code,0);
+        let file=s.chunks.lock().unwrap().table.values().find(|c|c.keys.contains_key(&("evidence".into(),"k".into()))).unwrap().path.clone();
+        drop(s);let before=fs::metadata(&file).unwrap().len();
+        OpenOptions::new().append(true).open(&file).unwrap().write_all(b"MBK").unwrap();
+        let mut interrupted=config.clone();interrupted.stop_after_replay_truncation=true;
+        assert!(Store::open(&path,interrupted).is_err());
+        assert_eq!(fs::metadata(&file).unwrap().len(),before);
+        let report=fs::read_to_string(path.join("replay.json")).unwrap();
+        assert!(report.contains("truncation_pending")&&report.contains("short header")&&report.contains("\"ready_ms\":0"));
+        drop(Store::open(&path,config).unwrap());
+        assert!(fs::read_to_string(path.join("replay.log")).unwrap().contains("truncation_pending"));
+    }
+    #[cfg(windows)]
+    #[test]
+    fn blocked_retirement_rewrite_preserves_original_summary_age() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let (path,clock,mut config)=fixture("summary-age");config.catalogue_rewrite_bytes=1;
+        let s=Store::open(&path,config.clone()).unwrap();
+        assert_eq!(s.set_policy("summary","",Some(Class::expire(DAY)),now_ms()+10_000).code,0);
+        assert_eq!(s.mutate(put("summary","k","value")).code,0);
+        clock.advance(2);s.tick();
+        let file=s.chunks.lock().unwrap().table.values().find(|c|c.class==Class::expire(DAY)).unwrap().path.clone();
+        let held=OpenOptions::new().read(true).share_mode(3).open(&file).unwrap();
+        clock.advance(DAY);let original=clock.utc_ms();s.retirement_pass();
+        assert_eq!(s.retire_blocked(),1);assert_eq!(s.get_status("summary","k"),(1,0));
+        clock.advance(3_600_000);s.maint.rewrite_catalogue();
+        let records=chunks::read_catalogue(&path.join("chunks/catalogue.log")).unwrap().0;
+        assert!(records.iter().any(|r|matches!(r.rec,chunks::Rec::Retiring{..})&&r.at_ms==original));
+        drop(held);drop(s);
+        let s=Store::open(&path,config).unwrap();
+        let charged=s.slots("summary").0;
+        clock.advance(30*DAY-3_600_000);s.retirement_pass();
+        assert_eq!(s.get_status("summary","k"),(2,0));
+        assert_eq!(s.slots("summary").0,charged-1);
+    }
+    #[test]
+    fn repeated_fixed_set_churn_reclaims_discharged_bookkeeping() {
+        let (path,clock,mut config)=fixture("bookkeeping");config.retry_ms=1;
+        let covered=Arc::new(AtomicUsize::new(0));config.flush_covered_count=Some(covered.clone());
+        let s=Store::open(&path,config).unwrap();
+        assert_eq!(s.set_policy("churn","",Some(Class::LATEST),now_ms()+10_000).code,0);
+        for i in 0..100 {
+            let mut m=put("churn","one-key",&format!("churn-{i}"));m.ack=2;
+            assert_eq!(s.mutate(m).code,0);
+            clock.advance(2);s.tick();s.retirement_pass();s.maint.prune_discharged();
+            assert!(s.chunks.lock().unwrap().table.len()<=2,"historical chunk rows survived discharge");
+            assert!(s.router.table.read().unwrap().len()<=2,"historical closed sink rows survived discharge");
+            assert!(covered.load(Ordering::SeqCst)<=4,"flush coverage grew with historical churn");
+        }
+        assert_eq!(s.get("churn","one-key").unwrap().bytes,b"retained");
+        assert!(s.health2().retired_chunks>=99);
+    }
+    #[test]
+    fn delayed_flush_notice_keeps_its_closed_sink_until_settlement() {
+        let (path,clock,mut config)=fixture("late-sink");config.flush_notice_delay_ms=200;
+        let s=Arc::new(Store::open(&path,config).unwrap());
+        assert_eq!(s.set_policy("late","",Some(Class::LATEST),now_ms()+10_000).code,0);
+        assert_eq!(s.mutate(put("late","k","before")).code,0);
+        clock.advance(2);s.tick();
+        let old=s.chunks.lock().unwrap().table.values().find(|c|c.class==Class::LATEST).unwrap().id;
+        let other=s.clone();let writer=std::thread::spawn(move||{let mut m=put("late","k","delayed");m.ack=2;other.mutate(m)});
+        let until=Instant::now()+Duration::from_secs(5);
+        let new=loop {
+            let found=s.chunks.lock().unwrap().table.values().find(|c|c.class==Class::LATEST&&c.id!=old&&c.keys.contains_key(&("late".into(),"k".into()))).map(|c|c.id);
+            if let Some(id)=found {break id} assert!(Instant::now()<until);std::thread::sleep(Duration::from_millis(1));
+        };
+        clock.advance(2);s.tick();
+        assert!(!s.retire_chunk(new).unwrap());s.maint.prune_discharged();
+        assert!(s.router.sink(new as usize).is_some());
+        assert_eq!(writer.join().unwrap().code,0,"late closed-sink flush must retain its covering extent");
+        assert!(s.retire_chunk(old).unwrap());s.maint.prune_discharged();
+        assert!(s.router.sink(old as usize).is_none());assert!(s.router.sink(new as usize).is_some());
     }
 }
