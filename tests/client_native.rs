@@ -16,6 +16,15 @@ struct Server {
 }
 impl Server {
     fn start(root: &std::path::Path, pipe: &str, delay_ms: u64, generation: u8) -> Self {
+        Self::start_with(root, pipe, delay_ms, generation, &[])
+    }
+    fn start_with(
+        root: &std::path::Path,
+        pipe: &str,
+        delay_ms: u64,
+        generation: u8,
+        extra: &[&str],
+    ) -> Self {
         let stderr = fs::File::create(root.join(format!("server-{generation}.stderr"))).unwrap();
         let stdout = fs::File::create(root.join(format!("server-{generation}.stdout"))).unwrap();
         let child = Command::new(env!("CARGO_BIN_EXE_membus"))
@@ -32,6 +41,7 @@ impl Server {
                 "--delay-ms",
             ])
             .arg(delay_ms.to_string())
+            .args(extra)
             .stdin(Stdio::null())
             .stdout(stdout)
             .stderr(stderr)
@@ -136,6 +146,31 @@ fn actual_pinned_scan_and_subscription_failure_are_distinct_from_absence() {
     assert_eq!(page.items[0].1.bytes, b"after-snapshot");
     c.snapshot_release(ns, &token, "fresh-release", d(2000))
         .unwrap();
+    let prefix = "x".repeat(1000);
+    for suffix in ["a", "b"] {
+        let mut a = c
+            .prepare(mutation(
+                &format!("long-{suffix}"),
+                &format!("{prefix}{suffix}"),
+                Ack::Os,
+                Some(0),
+            ))
+            .unwrap();
+        c.mutate(&mut a, d(2000)).unwrap();
+    }
+    let t = c.snapshot_open(ns, "long-open", d(2000)).unwrap();
+    let one = c
+        .scan_prefix(ns, &prefix, &t, &[], 1, 65536, "long-one", d(2000))
+        .unwrap();
+    assert!(!one.done);
+    assert!(one.cursor.len() > 1024);
+    assert_eq!(one.items[0].0, format!("{prefix}a"));
+    let two = c
+        .scan_prefix(ns, &prefix, &t, &one.cursor, 1, 65536, "long-two", d(2000))
+        .unwrap();
+    assert!(two.done);
+    assert_eq!(two.items[0].0, format!("{prefix}b"));
+    c.snapshot_release(ns, &t, "long-release", d(2000)).unwrap();
     let until = Instant::now() + Duration::from_secs(2);
     loop {
         let status = c
@@ -159,6 +194,45 @@ fn actual_pinned_scan_and_subscription_failure_are_distinct_from_absence() {
     );
     drop(c);
     server.stop();
+}
+#[test]
+fn actual_zero_retention_negotiation_and_active_cancellation() {
+    for flag in ["--signal-history", "--signal-bytes"] {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = PathBuf::from(std::env::var_os("MEMBUS_CLIENT_TEST_ROOT").unwrap())
+            .join(format!("zero-{stamp}"));
+        fs::create_dir_all(&root).unwrap();
+        let pipe = format!(r"\\.\pipe\m3-zero-{stamp}");
+        let mut server = Server::start_with(&root, &pipe, 0, 1, &[flag, "0"]);
+        let mut o = Options::new("zero-retention-control", 65536);
+        o.subscriptions = true;
+        let mut c = Client::connect_pipe(std::path::Path::new(&pipe), o, d(5000).local).unwrap();
+        let s = c
+            .subscribe(
+                "owned",
+                "",
+                &format!(r"\\.\pipe\quiet-{stamp}"),
+                "live-only",
+                d(2000),
+            )
+            .unwrap();
+        assert!(
+            c.subscription_status("owned", &s.token, "active", d(2000))
+                .unwrap()
+                .active
+        );
+        c.unsubscribe("owned", &s.token, "cancel", d(2000)).unwrap();
+        assert!(
+            !c.subscription_status("owned", &s.token, "inactive", d(2000))
+                .unwrap()
+                .active
+        );
+        drop(c);
+        server.stop();
+    }
 }
 #[test]
 fn actual_resident_legacy_reads_os_flush_put_cas_pending_timeout_and_restart() {

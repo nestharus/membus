@@ -15,9 +15,18 @@ GET_MANY preserves input order and validates the exact returned count.
 bound. Baseline negotiation validates all original 19 refusal names/classes,
 epoch, frame/value/batch limits and retry horizon. Optional `Options.scans` uses
 the existing `;scans=1` suffix and accepts the current scan22 list or an older
-legacy19 server. `Negotiated.scans` reports actual availability. Scan operations,
-subscriptions and timers are not yet exposed by this Rust API; they must extend
-this client when needed. Memory acknowledgment is deliberately not offered.
+legacy19 server. `Negotiated.scans` reports actual availability. Snapshot open,
+prefix paging and release use the current service cursor bound. Set
+`Options.subscriptions` to request the existing subscribe24 vocabulary and its
+change limits; zero history retention still permits live subscriptions.
+Subscription creation, cancellation, status and change-frame decoding are public.
+Timers and memory acknowledgment are not offered by this client.
+
+The caller owns snapshot release, listening before subscription, bounded paging,
+buffering hints during capture, periodic refresh and cancellation. Creation is
+never retried automatically: a lost reply can leave an unknown remote token.
+Known tokens require a continuing cleanup owner; tokens alone are not durable
+cleanup across owner loss. Change hints establish no receipt or native authority.
 
 `connect_pipe` uses an explicit local Windows pipe. `connect_tcp` uses an explicit
 socket address for foreground tests. A caller-supplied `Transport` must enforce

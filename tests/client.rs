@@ -387,3 +387,107 @@ fn preflight_never_marks_mutation_uncertain() {
     assert!(c.prepare(m).is_err());
     assert!(c.get_many("owned", &[], "get", deadline()).is_err());
 }
+fn subscription_hello(history: u64, history_bytes: u64) -> Vec<u8> {
+    let mut h = hello(51, 22);
+    h[46..48].copy_from_slice(&24u16.to_le_bytes());
+    for (code, name) in [(23u16, "resume_gap"), (24, "subscription_missing")] {
+        h.extend(code.to_le_bytes());
+        h.push(0);
+        blob(&mut h, name.as_bytes());
+    }
+    h.extend(1u16.to_le_bytes());
+    h.extend(65536u32.to_le_bytes());
+    h.extend(history.to_le_bytes());
+    h.extend(history_bytes.to_le_bytes());
+    h.extend(64u16.to_le_bytes());
+    h.extend(256u16.to_le_bytes());
+    h.extend(8388608u64.to_le_bytes());
+    h.extend(16777216u64.to_le_bytes());
+    h.extend(100u32.to_le_bytes());
+    let size = (h.len() - 4) as u32;
+    h[..4].copy_from_slice(&size.to_le_bytes());
+    h
+}
+struct CountScript(Script, std::sync::Arc<std::sync::atomic::AtomicUsize>);
+impl Read for CountScript {
+    fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+        self.0.read(b)
+    }
+}
+impl Write for CountScript {
+    fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+        self.1
+            .fetch_add(b.len(), std::sync::atomic::Ordering::SeqCst);
+        self.0.write(b)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+impl Transport for CountScript {
+    fn deadline(&mut self, t: Instant) -> io::Result<()> {
+        self.0.deadline(t)
+    }
+}
+#[test]
+fn m3_malformed_replies_poison_without_later_send() {
+    for op in [10u8, 11, 13, 16, 17, 18] {
+        let subscriptions = op >= 16;
+        let h = if subscriptions {
+            subscription_hello(0, 0)
+        } else {
+            hello(51, 22)
+        };
+        let mut options = Options::new("m3-independent-control", 65536);
+        options.scans = true;
+        options.subscriptions = subscriptions;
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut c = Client::handshake(
+            CountScript(
+                Script::new(vec![h, wire(op | 128, 2, Some(0), &[99])]),
+                count.clone(),
+            ),
+            options,
+            deadline().local,
+        )
+        .unwrap();
+        let token = [0; 16];
+        let bad = match op {
+            10 => c.snapshot_open("owned", "open", deadline()).map(|_| ()),
+            11 => c
+                .scan_prefix("owned", "head/", &token, &[], 1, 65536, "page", deadline())
+                .map(|_| ()),
+            13 => c.snapshot_release("owned", &token, "release", deadline()),
+            16 => c
+                .subscribe("owned", "", r"\\.\pipe\owned", "sub", deadline())
+                .map(|_| ()),
+            17 => c.unsubscribe("owned", &token, "unsub", deadline()),
+            _ => c
+                .subscription_status("owned", &token, "status", deadline())
+                .map(|_| ()),
+        };
+        assert!(matches!(bad, Err(Error::Protocol(_))), "opcode {op}");
+        assert!(!c.is_usable());
+        let before = count.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(c.get("owned", "key", "later", deadline()).is_err());
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), before);
+    }
+    // Fully formed but internally incomplete progress must also poison.
+    let token = [7; 16];
+    let mut p = vec![];
+    blob(&mut p, &token);
+    blob(&mut p, b"next");
+    p.extend([0, 0, 0]);
+    let mut o = Options::new("m3-independent-control", 65536);
+    o.scans = true;
+    let mut c = Client::handshake(
+        Script::new(vec![hello(51, 22), wire(139, 2, Some(0), &p)]),
+        o,
+        deadline().local,
+    )
+    .unwrap();
+    assert!(c
+        .scan_prefix("owned", "head/", &token, &[], 1, 65536, "page", deadline())
+        .is_err());
+    assert!(!c.is_usable());
+}

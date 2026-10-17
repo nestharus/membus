@@ -272,8 +272,6 @@ impl<T: Transport> Client<T> {
             let write_ms = parse(c.u32())?;
             if frame < 1024
                 || frame as usize > MAX_FRAME
-                || history == 0
-                || history_bytes == 0
                 || subscriptions == 0
                 || items == 0
                 || bytes == 0
@@ -282,6 +280,7 @@ impl<T: Transport> Client<T> {
             {
                 return Err(Error::Protocol("change limits"));
             }
+            let _ = (history, history_bytes); // zero explicitly disables retention
         }
         parse(c.end())?;
         this.negotiated = Negotiated {

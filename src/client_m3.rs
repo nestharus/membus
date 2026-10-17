@@ -82,16 +82,31 @@ impl Change {
     }
 }
 impl<T: Transport> Client<T> {
+    fn m3_response<R>(
+        &mut self,
+        op: u8,
+        p: &[u8],
+        until: Instant,
+        decode: impl FnOnce(&Self, &[u8]) -> Result<R>,
+    ) -> Result<R> {
+        let b = self.exchange(op, p, until)?;
+        let result = decode(self, &b);
+        if result.is_err() {
+            self.usable = false;
+        }
+        result
+    }
     pub fn snapshot_open(&mut self, ns: &str, op: &str, d: Deadline) -> Result<[u8; 16]> {
         if !self.negotiated.scans {
             return Err(Error::Invalid("scans unavailable"));
         }
         let p = self.prefix(op, ns, d)?;
-        let b = self.exchange(crate::SNAPSHOT_OPEN, &p, d.local)?;
-        let mut c = Cursor::new(&b);
-        let t = token(&mut c)?;
-        parse(c.end())?;
-        Ok(t)
+        self.m3_response(crate::SNAPSHOT_OPEN, &p, d.local, |_, b| {
+            let mut c = Cursor::new(b);
+            let t = token(&mut c)?;
+            parse(c.end())?;
+            Ok(t)
+        })
     }
     pub fn snapshot_release(
         &mut self,
@@ -105,11 +120,12 @@ impl<T: Transport> Client<T> {
         }
         let mut p = self.prefix(op, ns, d)?;
         lp(&mut p, snapshot);
-        let b = self.exchange(crate::SNAPSHOT_RELEASE, &p, d.local)?;
-        if !b.is_empty() {
-            return Err(Error::Protocol("release payload"));
-        }
-        Ok(())
+        self.m3_response(crate::SNAPSHOT_RELEASE, &p, d.local, |_, b| {
+            if !b.is_empty() {
+                return Err(Error::Protocol("release payload"));
+            }
+            Ok(())
+        })
     }
     /// One page of one immutable view. The caller owns paging and release.
     pub fn scan_prefix(
@@ -130,7 +146,7 @@ impl<T: Transport> Client<T> {
             || limit == 0
             || limit as usize > self.negotiated.max_batch
             || !(42..=self.negotiated.max_frame).contains(&max_bytes)
-            || cursor.len() > MAX_ID
+            || cursor.len() > 2 * MAX_ID + 48
         {
             return Err(Error::Invalid("scan bounds"));
         }
@@ -140,44 +156,45 @@ impl<T: Transport> Client<T> {
         p.extend(limit.to_le_bytes());
         p.extend((max_bytes as u32).to_le_bytes());
         lp(&mut p, prefix.as_bytes());
-        let b = self.exchange(crate::SCAN_PREFIX, &p, d.local)?;
-        if b.len() > max_bytes {
-            return Err(Error::Protocol("scan page bytes"));
-        }
-        let mut c = Cursor::new(&b);
-        let returned = token(&mut c)?;
-        let next = parse(c.bytes(MAX_ID))?.to_vec();
-        let done = parse(c.u8())?;
-        let count = parse(c.u16())?;
-        if &returned != snapshot
-            || done > 1
-            || (done == 1) != next.is_empty()
-            || count > limit
-            || (done == 0 && (count == 0 || next == cursor))
-        {
-            return Err(Error::Protocol("scan progress"));
-        }
-        let mut items = Vec::new();
-        for _ in 0..count {
-            let key = parse(c.text())?;
-            let value = self
-                .value(&mut c)?
-                .ok_or(Error::Protocol("scan tombstone"))?;
-            if !key.starts_with(prefix)
-                || items
-                    .last()
-                    .is_some_and(|(last, _): &(String, CommittedValue)| last >= &key)
-            {
-                return Err(Error::Protocol("scan ordering"));
+        self.m3_response(crate::SCAN_PREFIX, &p, d.local, |this, b| {
+            if b.len() > max_bytes {
+                return Err(Error::Protocol("scan page bytes"));
             }
-            items.push((key, value));
-        }
-        parse(c.end())?;
-        Ok(ScanPage {
-            snapshot: returned,
-            cursor: next,
-            done: done == 1,
-            items,
+            let mut c = Cursor::new(b);
+            let returned = token(&mut c)?;
+            let next = parse(c.bytes(2 * MAX_ID + 48))?.to_vec();
+            let done = parse(c.u8())?;
+            let count = parse(c.u16())?;
+            if &returned != snapshot
+                || done > 1
+                || (done == 1) != next.is_empty()
+                || count > limit
+                || (done == 0 && (count == 0 || next == cursor))
+            {
+                return Err(Error::Protocol("scan progress"));
+            }
+            let mut items = Vec::new();
+            for _ in 0..count {
+                let key = parse(c.text())?;
+                let value = this
+                    .value(&mut c)?
+                    .ok_or(Error::Protocol("scan tombstone"))?;
+                if !key.starts_with(prefix)
+                    || items
+                        .last()
+                        .is_some_and(|(last, _): &(String, CommittedValue)| last >= &key)
+                {
+                    return Err(Error::Protocol("scan ordering"));
+                }
+                items.push((key, value));
+            }
+            parse(c.end())?;
+            Ok(ScanPage {
+                snapshot: returned,
+                cursor: next,
+                done: done == 1,
+                items,
+            })
         })
     }
     /// No retry after a lost reply: the remote subscription may already exist.
@@ -202,14 +219,15 @@ impl<T: Transport> Client<T> {
         lp(&mut p, &[]);
         lp(&mut p, b"membus.change/1");
         p.extend((self.negotiated.max_frame as u32).to_le_bytes());
-        let b = self.exchange(crate::SUBSCRIBE, &p, d.local)?;
-        let mut c = Cursor::new(&b);
-        let s = Subscription {
-            token: token(&mut c)?,
-            cursor: token(&mut c)?,
-        };
-        parse(c.end())?;
-        Ok(s)
+        self.m3_response(crate::SUBSCRIBE, &p, d.local, |_, b| {
+            let mut c = Cursor::new(b);
+            let s = Subscription {
+                token: token(&mut c)?,
+                cursor: token(&mut c)?,
+            };
+            parse(c.end())?;
+            Ok(s)
+        })
     }
     pub fn unsubscribe(
         &mut self,
@@ -223,11 +241,12 @@ impl<T: Transport> Client<T> {
         }
         let mut p = self.prefix(op, ns, d)?;
         lp(&mut p, subscription);
-        let b = self.exchange(crate::UNSUBSCRIBE, &p, d.local)?;
-        if !b.is_empty() {
-            return Err(Error::Protocol("unsubscribe payload"));
-        }
-        Ok(())
+        self.m3_response(crate::UNSUBSCRIBE, &p, d.local, |_, b| {
+            if !b.is_empty() {
+                return Err(Error::Protocol("unsubscribe payload"));
+            }
+            Ok(())
+        })
     }
     pub fn subscription_status(
         &mut self,
@@ -241,24 +260,25 @@ impl<T: Transport> Client<T> {
         }
         let mut p = self.prefix(op, ns, d)?;
         lp(&mut p, subscription);
-        let b = self.exchange(crate::SUBSCRIPTION_STATUS, &p, d.local)?;
-        let mut c = Cursor::new(&b);
-        let active = parse(c.u8())?;
-        let status = parse(c.u8())?;
-        let s = SubscriptionStatus {
-            active: active == 1,
-            status,
-            queued: parse(c.u32())?,
-            charged_bytes: parse(c.u64())?,
-            written: parse(c.u64())?,
-            failed: parse(c.u64())?,
-            dropped: parse(c.u64())?,
-            cursor: token(&mut c)?,
-        };
-        parse(c.end())?;
-        if active > 1 || status > 4 {
-            return Err(Error::Protocol("subscription status"));
-        }
-        Ok(s)
+        self.m3_response(crate::SUBSCRIPTION_STATUS, &p, d.local, |_, b| {
+            let mut c = Cursor::new(b);
+            let active = parse(c.u8())?;
+            let status = parse(c.u8())?;
+            let s = SubscriptionStatus {
+                active: active == 1,
+                status,
+                queued: parse(c.u32())?,
+                charged_bytes: parse(c.u64())?,
+                written: parse(c.u64())?,
+                failed: parse(c.u64())?,
+                dropped: parse(c.u64())?,
+                cursor: token(&mut c)?,
+            };
+            parse(c.end())?;
+            if active > 1 || status > 4 {
+                return Err(Error::Protocol("subscription status"));
+            }
+            Ok(s)
+        })
     }
 }
