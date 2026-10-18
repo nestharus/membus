@@ -23,7 +23,51 @@ prefix paging and release use the current service cursor bound. Set
 `Options.subscriptions` to request the existing subscribe24 vocabulary and its
 change limits; zero history retention still permits live subscriptions.
 Subscription creation, cancellation, status and change-frame decoding are public.
-Timers and memory acknowledgment are not offered by this client.
+Memory acknowledgment is not offered by this client.
+
+### Additional resident capabilities
+
+Existing `Options`, `Negotiated`, `Subscription`, mutation `Attempt` and ordinary
+constructors retain their fields and behavior. `AdditionalFeatures { timers: true }`
+opts into timers with `handshake_with_features`, `connect_pipe_with_features` or
+`connect_tcp_with_features`. `feature_limits()` retains typed optional signal and
+timer limits. Absence remains unavailable before an operation is sent. Timer-only
+HELLO has codes 1–22 plus 25; combined HELLO has 1–25 and signal then timer limits.
+
+`subscribe_with` takes `SubscribeOptions { include_values, resume, max_frame }`.
+The receiving bound is distinct from the request connection's ingress bound and
+cannot exceed the advertised signal bound. A resume cursor is epoch scoped.
+Registration is not deduplicated: an unknown creation outcome is an unresolved
+cleanup obligation, never permission to automatically accumulate registrations.
+The original `subscribe` still requests no values and no cursor.
+
+`scan_range` pages an explicit immutable snapshot over a half-open key range.
+The caller retains release, total-work bounds and reconciliation responsibility.
+
+On Windows, `ChangeListener::bind` owns a caller-selected local first-instance
+pipe and rejects remote clients. Create it before subscribing. `receive` checks
+the token, namespace, prefix and cursor epoch. Quiet timeout preserves a clean
+stream; partial-frame timeout, truncation or malformed/foreign input retires the
+connection. `cancel`/`close` release the endpoint after canceled I/O is drained.
+These methods require exclusive mutable access; they are not an asynchronous
+cross-thread cancellation channel. A listener does not cancel a server token.
+
+`prepare_timer_set` and `prepare_timer_cancel` retain complete immutable typed
+requests, original epoch and conservative retry horizon. Explicit `timer_set` or
+`timer_cancel` never reconnects or retries. Set returns only generation, as the
+server actually replies; cancel returns no payload and uses the service's fixed
+OS persistence mode. `TimerExpectation` distinguishes unconditional, absent and
+exact generation. Operation IDs must be globally unique across timer namespaces.
+Retain an original uncertain result even if later status or an explicit retry
+settles present state; a later refusal does not disprove the original effect.
+
+`timer_status` returns the version-bound schedule and latest envelope;
+`TimerEnvelope::decode` owns MBT1 decoding. Namespace comes from the surrounding
+operation/change, not MBT1 itself. Timer change versions are configuration
+generations, not KV revisions at signal keys. Wakes precede progress persistence,
+can repeat after restart, can be lost after checkpoint, and stop on progress
+refusal. Latest status and pipe writes are not receiver receipts. Canceled timer
+identities retain capacity. See [TIMERS.md](TIMERS.md) for the resident contract.
 
 The caller owns snapshot release, listening before subscription, bounded paging,
 buffering hints during capture, periodic refresh and cancellation. Creation is

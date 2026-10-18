@@ -206,19 +206,47 @@ impl<T: Transport> Client<T> {
         op: &str,
         d: Deadline,
     ) -> Result<Subscription> {
+        self.subscribe_with(
+            ns,
+            prefix,
+            endpoint,
+            SubscribeOptions {
+                include_values: false,
+                resume: None,
+                max_frame: self.negotiated.max_frame,
+            },
+            op,
+            d,
+        )
+    }
+    /// Registration has no operation-ID deduplication. An unknown outcome must
+    /// retain its cleanup obligation; do not automatically create another one.
+    pub fn subscribe_with(
+        &mut self,
+        ns: &str,
+        prefix: &str,
+        endpoint: &str,
+        options: SubscribeOptions,
+        op: &str,
+        d: Deadline,
+    ) -> Result<Subscription> {
         if !self.negotiated.subscriptions {
             return Err(Error::Invalid("subscriptions unavailable"));
         }
-        if prefix.len() > MAX_ID || endpoint.len() > MAX_ID {
+        if prefix.len() > MAX_ID
+            || endpoint.len() > MAX_ID
+            || !(1024..=self.feature_limits.signals.as_ref().unwrap().max_frame)
+                .contains(&options.max_frame)
+        {
             return Err(Error::Invalid("subscription bounds"));
         }
         let mut p = self.prefix(op, ns, d)?;
         lp(&mut p, prefix.as_bytes());
         lp(&mut p, endpoint.as_bytes());
-        p.push(0);
-        lp(&mut p, &[]);
+        p.push(options.include_values as u8);
+        lp(&mut p, options.resume.as_ref().map_or(&[][..], |c| &c[..]));
         lp(&mut p, b"membus.change/1");
-        p.extend((self.negotiated.max_frame as u32).to_le_bytes());
+        p.extend((options.max_frame as u32).to_le_bytes());
         self.m3_response(crate::SUBSCRIBE, &p, d.local, |_, b| {
             let mut c = Cursor::new(b);
             let s = Subscription {
@@ -227,6 +255,80 @@ impl<T: Transport> Client<T> {
             };
             parse(c.end())?;
             Ok(s)
+        })
+    }
+    /// Half-open immutable range page using the resident's existing opcode12.
+    #[allow(clippy::too_many_arguments)] // Explicit snapshot, query and operation operands mirror scan_prefix.
+    pub fn scan_range(
+        &mut self,
+        ns: &str,
+        lower: &str,
+        upper: &str,
+        snapshot: &[u8; 16],
+        cursor: &[u8],
+        limit: u16,
+        max_bytes: usize,
+        op: &str,
+        d: Deadline,
+    ) -> Result<ScanPage> {
+        if !self.negotiated.scans {
+            return Err(Error::Invalid("scans unavailable"));
+        }
+        if lower.len() > MAX_ID
+            || upper.len() > MAX_ID
+            || lower >= upper
+            || limit == 0
+            || limit as usize > self.negotiated.max_batch
+            || !(42..=self.negotiated.max_frame).contains(&max_bytes)
+            || cursor.len() > 2 * MAX_ID + 48
+        {
+            return Err(Error::Invalid("scan bounds"));
+        }
+        let mut p = self.prefix(op, ns, d)?;
+        lp(&mut p, snapshot);
+        lp(&mut p, cursor);
+        p.extend(limit.to_le_bytes());
+        p.extend((max_bytes as u32).to_le_bytes());
+        lp(&mut p, lower.as_bytes());
+        lp(&mut p, upper.as_bytes());
+        self.m3_response(crate::SCAN_RANGE, &p, d.local, |this, b| {
+            if b.len() > max_bytes {
+                return Err(Error::Protocol("scan page bytes"));
+            }
+            let mut c = Cursor::new(b);
+            let returned = token(&mut c)?;
+            let next = parse(c.bytes(2 * MAX_ID + 48))?.to_vec();
+            let done = parse(c.u8())?;
+            let count = parse(c.u16())?;
+            if &returned != snapshot
+                || done > 1
+                || (done == 1) != next.is_empty()
+                || count > limit
+                || (done == 0 && (count == 0 || next == cursor))
+            {
+                return Err(Error::Protocol("scan progress"));
+            }
+            let mut items: Vec<(String, CommittedValue)> = Vec::new();
+            for _ in 0..count {
+                let key = parse(c.text())?;
+                let value = this
+                    .value(&mut c)?
+                    .ok_or(Error::Protocol("scan tombstone"))?;
+                if key.as_str() < lower
+                    || key.as_str() >= upper
+                    || items.last().is_some_and(|(last, _)| last >= &key)
+                {
+                    return Err(Error::Protocol("scan ordering"));
+                }
+                items.push((key, value));
+            }
+            parse(c.end())?;
+            Ok(ScanPage {
+                snapshot: returned,
+                cursor: next,
+                done: done == 1,
+                items,
+            })
         })
     }
     pub fn unsubscribe(

@@ -51,6 +51,9 @@ pub struct Pipe {
     idle_ms: u32,
 }
 impl Pipe {
+    pub(crate) fn raw_handle(&self) -> Handle {
+        self.file.as_raw_handle()
+    }
     /// Set the remaining whole-call budget before each bounded I/O operation.
     pub fn set_deadline(&mut self, deadline: std::time::Instant) -> io::Result<()> {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -97,13 +100,13 @@ impl Pipe {
             }
         };
         if ok != 0 {
-            if kind != 2 && unsafe { GetOverlappedResult(h, &mut operation, &mut done, 0) } == 0 {
+            if kind < 2 && unsafe { GetOverlappedResult(h, &mut operation, &mut done, 0) } == 0 {
                 return Err(io::Error::last_os_error());
             }
             return Ok(done as usize);
         }
         let error = io::Error::last_os_error();
-        if kind == 2 && error.raw_os_error() == Some(535) {
+        if kind >= 2 && error.raw_os_error() == Some(535) {
             return Ok(0);
         }
         if error.raw_os_error() != Some(997) {
@@ -114,9 +117,19 @@ impl Pipe {
         };
         if wait != 0 {
             // Keep event, OVERLAPPED and buffer alive until the kernel is done.
-            unsafe {
+            let completed = unsafe {
                 CancelIoEx(h, &mut operation);
-                GetOverlappedResult(h, &mut operation, &mut done, 1);
+                GetOverlappedResult(h, &mut operation, &mut done, 1)
+            };
+            // Completion may race cancellation: never discard consumed bytes.
+            if completed != 0 {
+                return Ok(done as usize);
+            }
+            if done != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "cancelled I/O consumed bytes",
+                ));
             }
             return Err(io::Error::new(io::ErrorKind::TimedOut, "pipe idle timeout"));
         }
@@ -128,7 +141,16 @@ impl Pipe {
     pub fn connect(&mut self) -> io::Result<()> {
         self.operation(std::ptr::null_mut(), 0, 2).map(|_| ())
     }
-    pub fn write_until(&mut self, mut bytes: &[u8], deadline: std::time::Instant) -> io::Result<()> {
+    /// Bounded accept; the original server-side connect remains indefinite.
+    pub fn connect_until(&mut self, deadline: std::time::Instant) -> io::Result<()> {
+        self.set_deadline(deadline)?;
+        self.operation(std::ptr::null_mut(), 0, 3).map(|_| ())
+    }
+    pub fn write_until(
+        &mut self,
+        mut bytes: &[u8],
+        deadline: std::time::Instant,
+    ) -> io::Result<()> {
         while !bytes.is_empty() {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
@@ -136,7 +158,12 @@ impl Pipe {
             }
             self.idle_ms = remaining.as_millis().clamp(1, u32::MAX as u128 - 1) as u32;
             let n = self.write(bytes)?;
-            if n == 0 { return Err(io::Error::new(io::ErrorKind::WriteZero, "signal zero write")); }
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "signal zero write",
+                ));
+            }
             bytes = &bytes[n..];
         }
         Ok(())

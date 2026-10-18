@@ -2,11 +2,13 @@
 //! Only fresh explicit fixture pipes/state are used. Run under an owned finite process Job.
 #![cfg(windows)]
 use membus::{client::*, pipe_io::Pipe};
+#[path = "support/child.rs"]
+mod child;
 use std::{
     fs,
     os::windows::process::CommandExt,
     path::PathBuf,
-    process::{Child, Command, Stdio},
+    process::{Command, Stdio},
     sync::{Arc, Barrier},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -16,7 +18,7 @@ fn fixture_base() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/client-fixtures"))
 }
 struct Server {
-    child: Child,
+    owner: child::Owned,
     stopped: bool,
 }
 impl Server {
@@ -32,7 +34,8 @@ impl Server {
     ) -> Self {
         let stderr = fs::File::create(root.join(format!("server-{generation}.stderr"))).unwrap();
         let stdout = fs::File::create(root.join(format!("server-{generation}.stdout"))).unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_membus"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_membus"));
+        command
             .arg(root.join("state"))
             .arg("pipe")
             .arg(pipe)
@@ -50,11 +53,10 @@ impl Server {
             .stdin(Stdio::null())
             .stdout(stdout)
             .stderr(stderr)
-            .creation_flags(0x08000000)
-            .spawn()
-            .unwrap();
+            .creation_flags(0x08000000);
+        let owner = child::Owned::spawn(&mut command).unwrap();
         Self {
-            child,
+            owner,
             stopped: false,
         }
     }
@@ -62,14 +64,11 @@ impl Server {
         if self.stopped {
             return;
         }
-        if self.child.try_wait().unwrap().is_none() {
-            self.child.kill().unwrap();
-        }
-        let status = self.child.wait().unwrap();
+        let (status, _) = self.owner.wait(Duration::ZERO).unwrap();
         self.stopped = true;
         println!(
             "fixture child pid={} stopped/waited/reaped status={status}",
-            self.child.id()
+            self.owner.child.id()
         );
     }
 }

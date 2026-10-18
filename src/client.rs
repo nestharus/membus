@@ -84,6 +84,42 @@ type Result<T> = std::result::Result<T, Error>;
 #[path = "client_m3.rs"]
 mod m3;
 pub use m3::{Change, ScanPage, Subscription, SubscriptionStatus};
+#[path = "client_timers.rs"]
+mod timer_client;
+pub use timer_client::*;
+#[cfg(windows)]
+#[path = "client_listener.rs"]
+mod listener;
+#[cfg(windows)]
+pub use listener::{ChangeListener, ReceiveError};
+
+/// Explicit additive opt-ins. Existing Options struct literals remain supported.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AdditionalFeatures {
+    pub timers: bool,
+}
+#[derive(Clone, Debug)]
+pub struct SignalLimits {
+    pub max_frame: usize,
+    pub history_items: u64,
+    pub history_bytes: u64,
+    pub subscriptions: u16,
+    pub queued_items: u16,
+    pub subscription_bytes: u64,
+    pub queue_bytes: u64,
+    pub write_ms: u32,
+}
+#[derive(Clone, Debug, Default)]
+pub struct FeatureLimits {
+    pub signals: Option<SignalLimits>,
+    pub timers: Option<TimerLimits>,
+}
+#[derive(Clone, Debug)]
+pub struct SubscribeOptions {
+    pub include_values: bool,
+    pub resume: Option<[u8; 16]>,
+    pub max_frame: usize,
+}
 fn parse<T>(v: std::result::Result<T, u16>) -> Result<T> {
     v.map_err(|_| Error::Protocol("malformed reply"))
 }
@@ -161,9 +197,18 @@ pub struct Client<T: Transport> {
     request_id: u64,
     negotiated: Negotiated,
     usable: bool,
+    feature_limits: FeatureLimits,
 }
 impl<T: Transport> Client<T> {
     pub fn handshake(io: T, options: Options, until: Instant) -> Result<Self> {
+        Self::handshake_with_features(io, options, AdditionalFeatures::default(), until)
+    }
+    pub fn handshake_with_features(
+        io: T,
+        options: Options,
+        additional: AdditionalFeatures,
+        until: Instant,
+    ) -> Result<Self> {
         identifier(&options.identity)?;
         if options.identity.contains(';') {
             return Err(Error::Invalid("identity contains feature delimiter"));
@@ -175,6 +220,7 @@ impl<T: Transport> Client<T> {
             io,
             request_id: 0,
             usable: true,
+            feature_limits: FeatureLimits::default(),
             negotiated: Negotiated {
                 epoch: 0,
                 max_frame: options.max_frame,
@@ -200,6 +246,9 @@ impl<T: Transport> Client<T> {
             },
         };
         let mut identity = options.identity;
+        if additional.timers {
+            identity.push_str(";timers=1");
+        }
         if options.subscriptions {
             identity.push_str(";subscribe=1");
         }
@@ -229,10 +278,14 @@ impl<T: Transport> Client<T> {
             return Err(Error::Protocol("HELLO limits"));
         }
         let count = parse(c.u16())? as usize;
-        if count != 19 && !(options.scans && count == 22) && !(options.subscriptions && count == 24)
-        {
-            return Err(Error::Protocol("HELLO refusal count"));
-        }
+        let codes: Vec<u16> = match count {
+            19 => (1..=19).collect(),
+            22 if options.scans => (1..=22).collect(),
+            24 if options.subscriptions => (1..=24).collect(),
+            23 if additional.timers && !options.subscriptions => (1..=22).chain([25]).collect(),
+            25 if additional.timers && options.subscriptions => (1..=25).collect(),
+            _ => return Err(Error::Protocol("HELLO refusal count")),
+        };
         let mut refusals = BTreeMap::new();
         for _ in 0..count {
             let code = parse(c.u16())?;
@@ -255,10 +308,10 @@ impl<T: Transport> Client<T> {
                 return Err(Error::Protocol("HELLO refusal vocabulary"));
             }
         }
-        if (1..=count as u16).any(|code| !refusals.contains_key(&code)) {
+        if codes.iter().any(|code| !refusals.contains_key(code)) {
             return Err(Error::Protocol("HELLO missing code"));
         }
-        if count == 24 {
+        if refusals.contains_key(&24) {
             if parse(c.u16())? != 1 {
                 return Err(Error::Protocol("change version"));
             }
@@ -280,7 +333,19 @@ impl<T: Transport> Client<T> {
             {
                 return Err(Error::Protocol("change limits"));
             }
-            let _ = (history, history_bytes); // zero explicitly disables retention
+            this.feature_limits.signals = Some(SignalLimits {
+                max_frame: frame as usize,
+                history_items: history,
+                history_bytes,
+                subscriptions,
+                queued_items: items,
+                subscription_bytes: bytes,
+                queue_bytes: queue,
+                write_ms,
+            });
+        }
+        if refusals.contains_key(&25) {
+            this.feature_limits.timers = Some(TimerLimits::parse(&mut c)?);
         }
         parse(c.end())?;
         this.negotiated = Negotiated {
@@ -291,13 +356,16 @@ impl<T: Transport> Client<T> {
             server_mem_enabled: mem == 1,
             retry_window_ms,
             scans: count >= 22,
-            subscriptions: count == 24,
+            subscriptions: refusals.contains_key(&24),
             refusals,
         };
         Ok(this)
     }
     pub fn negotiated(&self) -> &Negotiated {
         &self.negotiated
+    }
+    pub fn feature_limits(&self) -> &FeatureLimits {
+        &self.feature_limits
     }
     pub fn is_usable(&self) -> bool {
         self.usable
@@ -581,16 +649,32 @@ impl<T: Transport> Client<T> {
 impl Client<TcpStream> {
     /// Explicit foreground/test TCP endpoint; no service or account discovery.
     pub fn connect_tcp(address: SocketAddr, options: Options, until: Instant) -> Result<Self> {
+        Self::connect_tcp_with_features(address, options, AdditionalFeatures::default(), until)
+    }
+    pub fn connect_tcp_with_features(
+        address: SocketAddr,
+        options: Options,
+        additional: AdditionalFeatures,
+        until: Instant,
+    ) -> Result<Self> {
         let budget = until
             .checked_duration_since(Instant::now())
             .ok_or(Error::Invalid("connect deadline"))?;
         let io = TcpStream::connect_timeout(&address, budget).map_err(Error::Transport)?;
-        Self::handshake(io, options, until)
+        Self::handshake_with_features(io, options, additional, until)
     }
 }
 #[cfg(windows)]
 impl Client<crate::pipe_io::Pipe> {
     pub fn connect_pipe(path: &std::path::Path, options: Options, until: Instant) -> Result<Self> {
+        Self::connect_pipe_with_features(path, options, AdditionalFeatures::default(), until)
+    }
+    pub fn connect_pipe_with_features(
+        path: &std::path::Path,
+        options: Options,
+        additional: AdditionalFeatures,
+        until: Instant,
+    ) -> Result<Self> {
         use std::os::windows::fs::OpenOptionsExt;
         if !path.to_string_lossy().starts_with(r"\\.\pipe\") {
             return Err(Error::Invalid("explicit local named pipe required"));
@@ -616,6 +700,11 @@ impl Client<crate::pipe_io::Pipe> {
                 Err(e) => return Err(Error::Transport(e)),
             }
         };
-        Self::handshake(crate::pipe_io::Pipe::new(file, 1), options, until)
+        Self::handshake_with_features(
+            crate::pipe_io::Pipe::new(file, 1),
+            options,
+            additional,
+            until,
+        )
     }
 }
