@@ -214,3 +214,8 @@ rotation, class routing, expiry/anti-resurrection, key accounting, blocked delet
 import provenance/comparison and injected recovery failures. These controls do
 not establish physical power-loss behavior, a retirement deadline, service
 installation compatibility or an application-specific retention policy.
+
+Retained measurements refer to numbered rationale in the
+[earlier retirement document](https://github.com/nestharus/membus/blob/d7ec2b79bb48cc1f5edfa5e6cab8549c8e5d57d5/docs/CHUNK-RETIREMENT.md).
+That immutable version preserves the historical comparisons; the behavior and
+limits described above correspond to the current implementation.

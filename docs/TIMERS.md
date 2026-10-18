@@ -55,9 +55,11 @@ original epoch and conservative retry horizon. Explicit `timer_set`/`timer_cance
 never retry or reconnect. Retain uncertain results and reconcile status before
 choosing another send; later status or refusal does not disprove an earlier
 uncertain effect. A successfully applied cancel can reconcile absent. Cancellation
-persists a tombstone and retains identity capacity. Completed one-off status is
-present but inactive. Already queued/in-flight wakes can finish after cancel or
-replace; neither retracts receiver bytes or revokes application leases.
+persists a tombstone and retains identity charge in the running timer state;
+startup can reclaim that charge as described under capacity below. Completed
+one-off status is present but inactive. Already queued/in-flight wakes can finish
+after cancel or replace; neither retracts receiver bytes or revokes application
+leases.
 
 ## Anchored time and catch-up
 
@@ -117,8 +119,10 @@ the attempted identity to repeat. Preserve application effect results separately
 The executable starts timers after replay. An embedding using `Store::open` must
 explicitly keep the `Store::start_timers` guard alive and drop it before the Store.
 Only one owner per Store can run; this guard does not replace the cross-process
-state lock. Drop joins the owner and can wait on the current progress operation
-(deadline up to ten seconds). Unexpected lock poison is fatal rather than a
+state lock. Drop joins the owner and can wait on the current progress operation.
+Its ten-second deadline bounds admission, not admitted completion or shutdown;
+the timer mutex and owner join provide no fixed shutdown-time bound.
+Unexpected lock poison is fatal rather than a
 state repair mechanism; supervise the resident.
 
 ## Persisted bytes and capacity
@@ -142,9 +146,15 @@ value limits. Set/cancel and ordinary mutations retain normal dedup behavior.
 
 Identity charge is `256 + identity length`. A present schedule adds
 `768 + 3*(namespace length + id length) + signal_key length + payload capacity`.
-The 4096 identity/8 MiB limits include cancelled identities and are enforced on
-replay. Reuse fixed timer IDs for intentional replacements to avoid exhausting
-retained identity capacity. This is conservative representation accounting,
+The 4096 identity/8 MiB limits include cancelled identities in the running timer
+state. Replay checks the entries that survive Store startup's tombstone filtering.
+When no other retained chunk holds a cancelled schedule key, startup can remove
+its tombstone before timer restoration, releasing its timer identity charge even
+while that chunk still contains the set/cancel records. This does not reactivate
+the cancelled timer. Identity-charge retention across restart is therefore not
+guaranteed by retained record bytes alone. Reuse fixed timer IDs for intentional
+replacements to avoid exhausting retained identity capacity.
+This is conservative representation accounting,
 not a calibrated process RSS limit; KV and signal budgets also apply.
 
 Current timer chunks use latest retention, so superseded chunks can retire under

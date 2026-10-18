@@ -74,7 +74,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ack: Ack::Flush,
         expected: Some(0),
     })?;
-    // Keep the attempt and original ID if this returns Error::Uncertain.
+    // This one-shot example exits on error and drops its in-memory attempt.
+    // An uncertain outcome then requires deterministic-key reconciliation.
     client.mutate(&mut attempt, deadline)?;
     let value = client.get("example", "item/1", "example-read-1", Deadline {
         unix_ms: membus::now_ms() + 2_000,
@@ -90,9 +91,12 @@ fn main() {}
 `Some(0)` means absent, `Some(version)` compares a committed revision, and
 `None` selects unconditional PUT. Choose a new operation ID for each intentional
 mutation. The example's fixed ID is for its one logical creation. The client
-never retries or reconnects automatically. A lost reply can hide a committed
-write; retain the original attempt and reconcile a deterministic key before
-choosing another send. See [Rust client usage and uncertainty](docs/RUST_CLIENT.md).
+never retries or reconnects automatically. The example exits on a mutation error,
+so it does not preserve the Attempt's in-memory retry context. An application
+handling recovery must retain the original attempt and uncertain result. If that
+context is lost, reconcile the deterministic key and embedded operation identity
+before choosing another send; preparing again does not restore the old retry
+window. See [Rust client usage and uncertainty](docs/RUST_CLIENT.md).
 
 ## Documentation and checks
 

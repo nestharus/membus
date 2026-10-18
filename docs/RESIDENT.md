@@ -91,8 +91,10 @@ membus retirement-status LOCAL_PIPE
 Pass `--state-dir` explicitly to select the instance's heartbeat. Health performs
 HELLO and HEALTH, checks the Windows pipe server PID against the heartbeat PID,
 requires matching epoch and heartbeat age below 90 seconds, and uses two-second
-I/O bounds. A disabled heartbeat cannot pass this command. Freshness alone does
-not establish transport health. `retirement-status` projects selected HEALTH2
+I/O bounds. A disabled heartbeat cannot pass this command. Its success covers
+those association and freshness checks; it does not evaluate HEALTH2 degradation
+flags or individual timer errors. Freshness alone does not establish transport
+health. `retirement-status` projects selected HEALTH2
 fields; see [inspection](RETIREMENT-INSPECTION.md).
 
 `state_high_water` is 75% of the full state limit. Dedup and namespace pressure

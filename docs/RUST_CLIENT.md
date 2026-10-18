@@ -98,6 +98,11 @@ pages/bytes/work as well as individual requests. [KV1.md](KV1.md) gives charge,
 TTL and frame limits. Snapshot creation is not deduplicated by read ID; an
 unknown open outcome may retain a view until expiry.
 
+The current typed `scan_range` requires `lower < upper` in UTF-8 lexical order.
+It rejects equal bounds and an empty unbounded upper bound, although the wire
+operation accepts those cases. This is a client-surface restriction; the wire
+range contract in [KV1.md](KV1.md) remains distinct.
+
 Bind a Windows ChangeListener before registration. `subscribe` requests no values
 or resume cursor; `subscribe_with` takes
 `SubscribeOptions { include_values, resume, max_frame }`. This receive-frame
@@ -135,8 +140,11 @@ current state. Timer status returns version-bound schedule/latest envelope.
 Timer change revisions are configuration generations. Signal keys do not name
 public KV values; decode MBT1 and reconcile timer/application status instead of
 GET at that key. Wakes precede progress persistence, can repeat after restart,
-can be lost after checkpoint, and stop on progress refusal. Cancelled identities
-retain capacity. [TIMERS.md](TIMERS.md) states exact limits and crash windows.
+can be lost after checkpoint, and stop on progress refusal. Cancellation retains
+identity charge in the running timer state, but startup can release it when Store
+filters out the tombstoned schedule before restoration. Retained set/cancel bytes
+alone do not guarantee retained timer identity charge across restart.
+[TIMERS.md](TIMERS.md) states the limits, startup behavior and crash windows.
 
 Publication, GET, status, a decoded hint or attempted command establishes no
 useful duty completion or lease authority. Connection admission carries shared
