@@ -5,6 +5,7 @@ mod signals;
 mod timers;
 pub use chunks::{Class, ManualClock, POLICY_NS};
 pub mod client;
+pub mod indexed;
 #[cfg(windows)]
 pub mod pipe_io;
 use std::{

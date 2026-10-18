@@ -21,3 +21,8 @@ The current server implements kv/1 durable writes, grouped flushes, bounded name
 F-E6-41 adds persisted one-off/repeating timer wakes with anchored jitter, compact per-fire progress, catch-up counts and generation-fenced cancel/replace. The protocol, crash boundaries and byte rules are in [TIMERS.md](docs/TIMERS.md). Its verified outputs, reviews/dispositions, release source/hash binding and install/cleanup record belong to D:/projects/oulipoly/trunk/research/87_operations_representation/claude6-eco/runs/e9/act-work/F-E6-41/. Timers deliver generic wakes; the consumer's due-id/lease governs payload execution.
 
 The public resident Rust client is documented in [RUST_CLIENT.md](docs/RUST_CLIENT.md). It connects to an explicit existing endpoint and supports negotiated HELLO, committed GET/GET_MANY, OS/flush PUT/CAS and caller-owned uncertainty/reconciliation tokens; it never opens backing state. Consumer-specific retry, operation identity and clock policy remain above this API.
+
+[Indexed append-only collections](docs/INDEXED_COLLECTIONS.md) declare field/link
+indexes and query opaque rows through that existing resident client. Publication
+and pinned query boundaries are explicit; consumer interpretation stays with its
+own codec and assembler.
