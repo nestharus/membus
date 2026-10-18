@@ -9,8 +9,9 @@ operation identity, acknowledgment, deadline and query limits.
 `Schema { fields }` declares up to 64 distinct exact UTF-8 field names. A `Record`
 has an original ordinal, opaque payload bytes, and one list of byte values per
 field. The owning codec extracts these values. Missing fields have empty lists;
-multiple links do not clone a row. Original payload, value order and duplicate
-values survive retrieval. Collection names are bounded ASCII identifiers.
+each field permits at most 1024 values. Multiple links do not clone a row.
+Original payload, value order and duplicate values survive retrieval. Collection
+names are ASCII alphanumeric/underscore/hyphen identifiers of 1..64 bytes.
 
 The version-one typed query language is `Query::All`, inclusive
 `Query::Ordinals { first, last }`, and `Query::Equal { field, value }`. Results
@@ -30,7 +31,7 @@ Equality always compares complete original field bytes, including collisions.
 Append reserves the immutable row first, writes all declared postings, then
 conditionally advances the existing keyed `head` control record. A conflicting
 writer at the same ordinal cannot publish its postings for another row. The
-head's condition protects publication, not mutation of ledger rows: rows and
+head's condition protects publication, not mutation of immutable rows: rows and
 postings are never updated by this API. Existing keyed KV updates remain valid
 outside these immutable records. The control record is not an authored row.
 
@@ -52,7 +53,11 @@ apply. Encoded records, including field values, must fit the existing value
 bound. The library never truncates a large row.
 An encoded-byte budget of zero can return an actually empty collection after
 validating its declaration and committed boundary. A required record still
-refuses; the row-count budget must remain positive. `encoded_len` validates and
+refuses; the row-count budget must remain positive. For equality queries,
+`max_rows` bounds examined postings, including staged and collision candidates;
+`max_bytes` charges encoded committed records examined, including collisions,
+rather than only returned matches. These are query-work bounds, not a complete
+allocator/response-memory limit. `encoded_len` validates and
 measures an exact record before publication.
 
 This is an append/publication contract for participating callers in an explicitly
@@ -62,7 +67,13 @@ validation detects missing or malformed committed rows, but no universal
 malicious-writer, authenticity, power-loss or all-writer commitment claim is made.
 The namespace's class/retention and authority remain its owner's responsibility.
 
-## Verification
+Operation bases generate suffixed KV operation IDs (schema, row, posting and
+commit), so leave room within the resident identifier limit. Revisit an interrupted
+append with its original operation base, bytes, ordinal and acknowledgment. A
+staged ordinal cannot be skipped by publishing a later row. The API does not clean
+abandoned staging automatically.
+
+## Available checks
 
 `cargo test --offline --locked --test indexed` exercises actual isolated resident
 processes through the supported Client: pinned boundaries, complete ordinal and
