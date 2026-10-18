@@ -1,4 +1,4 @@
-use membus_offline_f48::{calculate, Inputs, Result};
+use membus_offline_f48::{regenerate, Result};
 use std::path::Path;
 fn run() -> Result<()> {
     let mut args = std::env::args().skip(1);
@@ -39,9 +39,7 @@ fn run() -> Result<()> {
         (None, None) => None,
         _ => return Err("--host and --host-sha256 must be supplied together".into()),
     };
-    let inputs = Inputs::load(Path::new(directory), host)?;
-    let reports = calculate(&inputs, change)?;
-    reports.write_fresh(Path::new(output))?;
+    regenerate(Path::new(directory), change, Path::new(output), host)?;
     println!("Offline numerical reports and input/output hashes written; host historical read-version remains unqualified.");
     Ok(())
 }

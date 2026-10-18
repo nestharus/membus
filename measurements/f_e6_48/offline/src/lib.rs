@@ -4,6 +4,8 @@ mod metric;
 mod project;
 mod render;
 mod supplement;
+#[cfg(test)]
+mod tests;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{json, Value};
@@ -11,6 +13,26 @@ use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, fs, io::Write, path::Path};
 
 pub type Result<T> = std::result::Result<T, String>;
+pub(crate) fn finite(value: f64, context: &str) -> Result<f64> {
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(format!("nonfinite calculation: {context}"))
+    }
+}
+pub(crate) fn add(total: &mut u64, value: u64, context: &str) -> Result<()> {
+    *total = total
+        .checked_add(value)
+        .ok_or_else(|| format!("integer overflow: {context}"))?;
+    Ok(())
+}
+pub(crate) fn checked_sum(values: impl IntoIterator<Item = u64>, context: &str) -> Result<u64> {
+    let mut total = 0;
+    for value in values {
+        add(&mut total, value, context)?;
+    }
+    Ok(total)
+}
 pub(crate) fn object(v: &Value) -> Result<&serde_json::Map<String, Value>> {
     v.as_object().ok_or_else(|| "expected object".into())
 }
@@ -60,31 +82,42 @@ pub fn sha256(bytes: &[u8]) -> String {
 }
 
 /// All required files are selected by the supplied directory; host is opt-in.
-pub struct Inputs {
-    pub start: Value,
-    pub end: Value,
-    pub marker: Value,
-    pub disk: Vec<Value>,
-    pub small: Value,
-    pub big: Value,
-    pub rates: Value,
-    pub identities: BTreeMap<String, Value>,
-    pub host: Option<Vec<Value>>,
+struct Inputs {
+    start: Value,
+    end: Value,
+    marker: Value,
+    disk: Vec<Value>,
+    small: Value,
+    big: Value,
+    rates: Value,
+    identities: BTreeMap<String, Value>,
+    host: Option<Vec<Value>>,
 }
-pub struct Reports {
-    pub projection: Value,
-    pub supplement: Value,
-    pub metric: Value,
-    pub host: Value,
-    pub manifest: Value,
+struct Reports {
+    projection: Value,
+    supplement: Value,
+    metric: Value,
+    host: Value,
+    manifest: Value,
+}
+
+/// Regenerate from files through the verified loader. In-memory input/report
+/// construction is internal; callers cannot replace verified data or identities.
+pub fn regenerate(
+    directory: &Path,
+    change_at: &str,
+    output: &Path,
+    host: Option<(&Path, &str)>,
+) -> Result<()> {
+    calculate(&Inputs::load(directory, host)?, change_at)?.write_fresh(output)
 }
 
 impl Inputs {
-    pub fn load(directory: &Path, host: Option<(&Path, &str)>) -> Result<Self> {
+    fn load(directory: &Path, host: Option<(&Path, &str)>) -> Result<Self> {
         input::load(directory, host)
     }
 }
-pub fn calculate(inputs: &Inputs, change_at: &str) -> Result<Reports> {
+fn calculate(inputs: &Inputs, change_at: &str) -> Result<Reports> {
     let change = stamp(change_at)?;
     let p = project::calculate(inputs, change)?;
     let s = supplement::calculate(inputs, &p, change)?;
@@ -97,6 +130,7 @@ pub fn calculate(inputs: &Inputs, change_at: &str) -> Result<Reports> {
             let t = num(row, "t")?;
             if first <= t && t <= last {
                 let v = field(row, "v")?;
+                object(v)?;
                 rows.push(json!({"at":utc(t)?,"queue":v.get("disk.D.queue"),"busy_pct":v.get("disk.D.busy_pct")}));
             }
         }
@@ -115,7 +149,7 @@ pub fn calculate(inputs: &Inputs, change_at: &str) -> Result<Reports> {
 
 impl Reports {
     /// Refuses an existing output location. Inputs are never opened for writing.
-    pub fn write_fresh(&self, output: &Path) -> Result<()> {
+    fn write_fresh(&self, output: &Path) -> Result<()> {
         let mut products = vec![];
         for (name, value) in [
             ("projection.json", &self.projection),

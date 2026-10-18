@@ -27,7 +27,7 @@ pub(super) fn reports(r: &Reports) -> Result<Vec<(&'static str, String)>> {
     let p = &r.projection;
     let s = &r.supplement;
     let m = &r.metric;
-    let pre="Numerical regeneration of the historical F48 experiment (2026-10-10, baseline 11c312c). Original producers and results remain authoritative dated evidence. This report does not reconstruct capture, qualify a current resident or select operating policy. See manifest.json for exact input/output hashes.\n\n";
+    let pre="Supplied saved-artifact analysis using the F48 historical calculation model. Historical reference only: the original experiment was conducted on 2026-10-10 at baseline 11c312c. That context does not identify another supplied fixture or establish its capture gap, policy or operating behavior. Original reference producers/results remain retained. This report does not reconstruct capture, qualify a current resident or select operating policy. See manifest.json for exact supplied input/output hashes.\n\n";
     let mut projection=format!("# Offline growth and projection\n\n{pre}Window: {} to {}. Endpoint hours: {}. Complete log bytes: {} → {}; growth {} bytes, {} bytes/hour, {} complete records. Health byte difference: {} bytes. Health flush delta: {}.\n\n",cell(&p["window"]["started_at"]),cell(&p["window"]["completed_at"]),cell(&p["hours"]),cell(&p["complete_log_bytes_start"]),cell(&p["complete_log_bytes_end"]),cell(&p["log_growth_bytes"]),cell(&p["bytes_per_hour"]),cell(&p["records"]),cell(&p["health_vs_log_difference_bytes"]),cell(&p["health_flush_delta"]));
     let ns = object(&p["namespaces"])?
         .iter()
@@ -111,7 +111,12 @@ pub(super) fn reports(r: &Reports) -> Result<Vec<(&'static str, String)>> {
         ],
     )?);
     projection.push_str(&format!("\nPhysical disk (shared, no attribution):\n\n```json\n{}\n```\n\n{}\n\nHost supplement: {}. {}\n",serde_json::to_string_pretty(&p["physical_disk"]).map_err(|e|e.to_string())?,cell(&p["limits"]),cell(&r.host["status"]),cell(&r.host["limits"])));
-    let mut supplement=format!("# Offline review supplement\n\n{pre}Post-change token records: {}; {} records/hour, {} bytes; historical owner bound 42/hour. The discrepancy remains unexplained counterevidence.\n\n",cell(&s["token_post_records"]),cell(&s["token_post_records_per_hour"]),cell(&s["token_post_bytes"]));
+    let comparison = if s["token_exceeds_historical_comparison_value"] == true {
+        "Supplied rate exceeds the historical comparison value"
+    } else {
+        "Supplied rate does not exceed the historical comparison value"
+    };
+    let mut supplement=format!("# Offline review supplement\n\n{pre}Post-change token records: {}; {} records/hour, {} bytes. {comparison} of 42/hour; this does not establish that the historical owner's bound governs these inputs. Historical reference only: the original approximately 136.54/hour versus 42/hour excess remains unexplained counterevidence.\n\n",cell(&s["token_post_records"]),cell(&s["token_post_records_per_hour"]),cell(&s["token_post_bytes"]));
     supplement.push_str(&table(
         &s["key_capacity"],
         &[

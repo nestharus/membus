@@ -17,12 +17,20 @@ impl Bucket {
         let removed = field(r, "removed")?
             .as_bool()
             .ok_or("removed must be boolean")?;
-        self.bytes += uint(r, "bytes")?;
-        self.records += 1;
-        self.value_bytes += uint(r, "value_bytes")?;
-        self.new_keys += u64::from(new);
-        self.overwrites += u64::from(!new && !removed);
-        self.removes += u64::from(removed);
+        add(&mut self.bytes, uint(r, "bytes")?, "bucket bytes")?;
+        add(&mut self.records, 1, "bucket records")?;
+        add(
+            &mut self.value_bytes,
+            uint(r, "value_bytes")?,
+            "bucket value bytes",
+        )?;
+        add(&mut self.new_keys, u64::from(new), "bucket new keys")?;
+        add(
+            &mut self.overwrites,
+            u64::from(!new && !removed),
+            "bucket overwrites",
+        )?;
+        add(&mut self.removes, u64::from(removed), "bucket removes")?;
         Ok(())
     }
 }
@@ -82,7 +90,11 @@ pub(super) fn tail(i: &Inputs) -> Result<Vec<&Value>> {
             }
             text(row, "family")?;
             uint(row, "at_ms")?;
-            uint(row, "value_bytes")?;
+            if uint(row, "value_bytes")? > bytes {
+                return Err(format!(
+                    "stripe {name}: value bytes exceed encoded record bytes"
+                ));
+            }
             if uint(row, "offset")? >= boundary {
                 out.push(row)
             }
@@ -117,6 +129,18 @@ fn optional_at(v: &Value, keys: &[&str], default: Value) -> Value {
     }
     p.clone()
 }
+fn scan<'a>(endpoint: &'a Value, ns: &str) -> Result<&'a Value> {
+    let scan = field(field(endpoint, "scans")?, ns)
+        .map_err(|_| format!("missing required scan for namespace {ns}"))?;
+    uint(scan, "live_keys")?;
+    for value in object(field(scan, "family_counts")?)?.values() {
+        value
+            .as_u64()
+            .filter(|n| *n <= 1u64 << 53)
+            .ok_or("malformed scan family count")?;
+    }
+    Ok(scan)
+}
 pub(super) fn calculate(i: &Inputs, change: f64) -> Result<Value> {
     let start = num(&i.start, "unix_time")?;
     let end = num(&i.end, "unix_time")?;
@@ -150,7 +174,10 @@ pub(super) fn calculate(i: &Inputs, change: f64) -> Result<Value> {
     if num(&i.marker, "duration_seconds")? <= 0.0 {
         return Err("window duration must be positive".into());
     }
-    let hours = (end - start) / 3600.0;
+    let hours = finite((end - start) / 3600.0, "endpoint hours")?;
+    if hours <= 0.0 {
+        return Err("endpoint hours underflowed".into());
+    }
     let tail = tail(i)?;
     let mut previous = prior(&i.start)?;
     let mut groups: BTreeMap<(String, String), Bucket> = BTreeMap::new();
@@ -166,20 +193,22 @@ pub(super) fn calculate(i: &Inputs, change: f64) -> Result<Value> {
     }
     let families = groups
         .iter()
-        .map(|((ns, fam), b)| {
+        .map(|((ns, fam), b)| -> Result<Value> {
+            scan(&i.start, ns)?;
+            scan(&i.end, ns)?;
             let mut v = b.value();
             v["namespace"] = json!(ns);
             v["family"] = json!(fam);
-            v["bytes_per_hour"] = json!(b.bytes as f64 / hours);
+            v["bytes_per_hour"] = json!(finite(b.bytes as f64 / hours, "family byte rate")?);
             v["bytes_per_record"] = json!(b.bytes as f64 / b.records as f64);
-            v["records_per_hour"] = json!(b.records as f64 / hours);
+            v["records_per_hour"] = json!(finite(b.records as f64 / hours, "family record rate")?);
             v["live_keys_start"] =
                 optional_at(&i.start, &["scans", ns, "family_counts", fam], json!(0));
             v["live_keys_end"] =
                 optional_at(&i.end, &["scans", ns, "family_counts", fam], json!(0));
-            v
+            Ok(v)
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>>>()?;
     let health_a = field(&i.start, "health")?;
     let health_b = field(&i.end, "health")?;
     for ns in object(health_a)?.keys().chain(object(health_b)?.keys()) {
@@ -187,24 +216,24 @@ pub(super) fn calculate(i: &Inputs, change: f64) -> Result<Value> {
     }
     let namespaces = namespaces
         .iter()
-        .map(|(ns, b)| {
+        .map(|(ns, b)| -> Result<(String, Value)> {
             let mut v = b.value();
             v.as_object_mut().unwrap().remove("value_bytes");
-            v["bytes_per_hour"] = json!(b.bytes as f64 / hours);
+            v["bytes_per_hour"] = json!(finite(b.bytes as f64 / hours, "namespace byte rate")?);
             v["bytes_per_record"] = if b.records > 0 {
                 json!(b.bytes as f64 / b.records as f64)
             } else {
                 Value::Null
             };
             for (label, e) in [("start", &i.start), ("end", &i.end)] {
+                let observed = scan(e, ns)?;
                 v[format!("quota_slots_{label}")] =
                     optional_at(e, &["health", ns, "namespace_keys"], Value::Null);
-                v[format!("live_keys_{label}")] =
-                    optional_at(e, &["scans", ns, "live_keys"], json!(0));
+                v[format!("live_keys_{label}")] = field(observed, "live_keys")?.clone();
             }
-            (ns.clone(), v)
+            Ok((ns.clone(), v))
         })
-        .collect::<serde_json::Map<_, _>>();
+        .collect::<Result<serde_json::Map<_, _>>>()?;
     let sum = |e: &Value| -> Result<u64> {
         logs(e)?.values().try_fold(0u64, |n, l| {
             n.checked_add(uint(l, "complete_bytes")?)
@@ -214,10 +243,10 @@ pub(super) fn calculate(i: &Inputs, change: f64) -> Result<Value> {
     let sizes_start = sum(&i.start)?;
     let sizes_end = sum(&i.end)?;
     let growth = sizes_end - sizes_start;
-    if growth != groups.values().map(|b| b.bytes).sum::<u64>() {
+    if growth != checked_sum(groups.values().map(|b| b.bytes), "grouped tail bytes")? {
         return Err("growth does not reconcile with tail".into());
     }
-    let own_rate = growth as f64 / hours;
+    let own_rate = finite(growth as f64 / hours, "full-window byte rate")?;
     let added = num(&i.rates, "publisher_upper_bytes_per_hour")?;
     if added < 0.0 || num(&i.rates, "total_rows_per_hour")? < 0.0 {
         return Err("negative publisher rate".into());
@@ -227,7 +256,10 @@ pub(super) fn calculate(i: &Inputs, change: f64) -> Result<Value> {
         ("before-slots-publisher-change", start, change, true),
         ("after-slots-publisher-change", change, end, false),
     ] {
-        let duration = (hi - lo) / 3600.0;
+        let duration = finite((hi - lo) / 3600.0, "era hours")?;
+        if duration <= 0.0 {
+            return Err("era hours underflowed".into());
+        }
         let mut by: BTreeMap<(String, String), (u64, u64)> = BTreeMap::new();
         for row in &tail {
             let t = uint(row, "at_ms")? as f64 / 1000.0;
@@ -235,15 +267,16 @@ pub(super) fn calculate(i: &Inputs, change: f64) -> Result<Value> {
                 let b = by
                     .entry((text(row, "namespace")?.into(), text(row, "family")?.into()))
                     .or_default();
-                b.0 += uint(row, "bytes")?;
-                b.1 += 1;
+                add(&mut b.0, uint(row, "bytes")?, "era bytes")?;
+                add(&mut b.1, 1, "era records")?;
             }
         }
-        let bytes = by.values().map(|b| b.0).sum::<u64>();
-        let records = by.values().map(|b| b.1).sum::<u64>();
-        eras.push(json!({"label":label,"start_at":utc(lo)?,"end_at":utc(hi)?,"hours":duration,"bytes":bytes,"records":records,"bytes_per_hour":bytes as f64/duration,
-            "families":by.iter().map(|((ns,f),(b,n))|json!({"namespace":ns,"family":f,"bytes":b,"records":n,"bytes_per_hour":*b as f64/duration})).collect::<Vec<_>>(),
-            "basis":"Explicit owner-reported historical effective timestamp; record times split populations, stripe offsets order same-key writes."}));
+        let bytes = checked_sum(by.values().map(|b| b.0), "era total bytes")?;
+        let records = checked_sum(by.values().map(|b| b.1), "era total records")?;
+        let era_families=by.iter().map(|((ns,f),(b,n))| -> Result<Value>{Ok(json!({"namespace":ns,"family":f,"bytes":b,"records":n,"bytes_per_hour":finite(*b as f64/duration,"era family byte rate")?}))}).collect::<Result<Vec<_>>>()?;
+        eras.push(json!({"label":label,"start_at":utc(lo)?,"end_at":utc(hi)?,"hours":duration,"bytes":bytes,"records":records,"bytes_per_hour":finite(bytes as f64/duration,"era byte rate")?,
+            "families":era_families,
+            "basis":"Supplied split timestamp; offset-selected tail records are partitioned by record timestamp without an extra endpoint-time filter. The reference experiment used the reported effective publisher-change minute."}));
     }
     let current_rate = num(&eras[1], "bytes_per_hour")?;
     let mut capacity = vec![];
@@ -251,18 +284,18 @@ pub(super) fn calculate(i: &Inputs, change: f64) -> Result<Value> {
         ("full-window-mixture", own_rate),
         (
             "full-window-mixture-plus-proposed-publisher",
-            own_rate + added,
+            finite(own_rate + added, "full-window combined rate")?,
         ),
         ("current-post-change", current_rate),
         (
             "current-post-change-plus-proposed-publisher",
-            current_rate + added,
+            finite(current_rate + added, "post-change combined rate")?,
         ),
     ] {
         for target in [6u64 * 1024u64.pow(3), 8u64 * 1024u64.pow(3)] {
             let remain = target.saturating_sub(sizes_end);
             let h = if rate > 0.0 {
-                Some(remain as f64 / rate)
+                Some(finite(remain as f64 / rate, "capacity hours")?)
             } else {
                 None
             };
@@ -286,15 +319,19 @@ pub(super) fn calculate(i: &Inputs, change: f64) -> Result<Value> {
         if t1 < 0.0 {
             return Err("negative readiness duration".into());
         }
-        let slope = (t1 - t0) / (x1 - x0);
-        let intercept = t0 - slope * x0;
-        fits.push(json!({"big_reading":text(run,"label")?,"small_bytes":x0,"small_seconds":t0,"big_bytes":x1,"big_seconds":t1,"seconds_per_byte":slope,"intercept_seconds":intercept,"projected_6GiB_seconds":intercept+slope*(6u64*1024u64.pow(3)) as f64,"projected_8GiB_seconds":intercept+slope*(8u64*1024u64.pow(3)) as f64}));
+        let slope = finite((t1 - t0) / (x1 - x0), "readiness slope")?;
+        let intercept = finite(t0 - slope * x0, "readiness intercept")?;
+        fits.push(json!({"big_reading":text(run,"label")?,"small_bytes":x0,"small_seconds":t0,"big_bytes":x1,"big_seconds":t1,"seconds_per_byte":slope,"intercept_seconds":intercept,"projected_6GiB_seconds":finite(intercept+slope*(6u64*1024u64.pow(3)) as f64,"6 GiB readiness")?,"projected_8GiB_seconds":finite(intercept+slope*(8u64*1024u64.pow(3)) as f64,"8 GiB readiness")?}));
     }
     let physical = disk(&i.disk)?;
-    let bytes_delta =
-        at(health_b, &["quota", "bytes_written"])? - at(health_a, &["quota", "bytes_written"])?;
-    let flush_delta =
-        at(health_b, &["quota", "flush_calls"])? - at(health_a, &["quota", "flush_calls"])?;
+    let bytes_delta = finite(
+        at(health_b, &["quota", "bytes_written"])? - at(health_a, &["quota", "bytes_written"])?,
+        "health byte delta",
+    )?;
+    let flush_delta = finite(
+        at(health_b, &["quota", "flush_calls"])? - at(health_a, &["quota", "flush_calls"])?,
+        "health flush delta",
+    )?;
     if bytes_delta < 0.0 || flush_delta < 0.0 {
         return Err("health cumulative counters reset".into());
     }
@@ -323,12 +360,12 @@ pub(super) fn calculate(i: &Inputs, change: f64) -> Result<Value> {
         .min();
     Ok(
         json!({"window":{"started_at":text(&i.marker,"started_at")?,"completed_at":text(&i.marker,"completed_at")?,"duration_seconds":num(&i.marker,"duration_seconds")?,"resident_pid":field(&i.marker,"resident_pid")?,"resident_epoch":field(&i.marker,"resident_epoch")?,"same_identity":true},
-        "endpoint_identity":{"binary_sha256":field(&i.start,"binary_sha256")?,"hello_epoch":field(&i.start,"hello_epoch")?},"hours":hours,"complete_log_bytes_start":sizes_start,"complete_log_bytes_end":sizes_end,"log_growth_bytes":growth,"bytes_per_hour":own_rate,"records":tail.len(),"records_per_hour":tail.len() as f64/hours,"mean_bytes_per_record":if tail.is_empty(){None}else{Some(growth as f64/tail.len() as f64)},"families":families,"namespaces":namespaces,
-        "health_bytes_delta":bytes_delta,"health_bytes_per_hour":bytes_delta/hours,"health_flush_delta":flush_delta,"health_flushes_per_hour":flush_delta/hours,"health_vs_log_difference_bytes":bytes_delta-growth as f64,
-        "heartbeat_bytes_delta":at(&i.end,&["heartbeat","heartbeat_bytes"])?-at(&i.start,&["heartbeat","heartbeat_bytes"])?,"heartbeat_at_start":field(field(&i.start,"heartbeat")?,"unix_ms")?,"heartbeat_at_end":field(field(&i.end,"heartbeat")?,"unix_ms")?,
+        "endpoint_identity":{"binary_sha256":field(&i.start,"binary_sha256")?,"hello_epoch":field(&i.start,"hello_epoch")?,"meaning":"Supplied installed-file hash and observed epoch; not independent loaded-image proof."},"hours":hours,"complete_log_bytes_start":sizes_start,"complete_log_bytes_end":sizes_end,"log_growth_bytes":growth,"bytes_per_hour":own_rate,"records":tail.len(),"records_per_hour":finite(tail.len() as f64/hours,"total record rate")?,"mean_bytes_per_record":if tail.is_empty(){None}else{Some(growth as f64/tail.len() as f64)},"families":families,"namespaces":namespaces,
+        "health_bytes_delta":bytes_delta,"health_bytes_per_hour":finite(bytes_delta/hours,"health byte rate")?,"health_flush_delta":flush_delta,"health_flushes_per_hour":finite(flush_delta/hours,"health flush rate")?,"health_vs_log_difference_bytes":finite(bytes_delta-growth as f64,"health/log difference")?,
+        "heartbeat_bytes_delta":finite(at(&i.end,&["heartbeat","heartbeat_bytes"])?-at(&i.start,&["heartbeat","heartbeat_bytes"])?,"heartbeat byte delta")?,"heartbeat_at_start":field(field(&i.start,"heartbeat")?,"unix_ms")?,"heartbeat_at_end":field(field(&i.end,"heartbeat")?,"unix_ms")?,
         "physical_disk":physical,"publisher":{"rows_per_hour":num(&i.rates,"total_rows_per_hour")?,"upper_bytes_per_hour":added,"share_of_combined_rate":if current_rate+added>0.0{Some(added/(current_rate+added))}else{None},"assumptions":"Saved trailing-24-hour ledger summary; 58 fixed record bytes + 9 namespace bytes + resolved key bytes + 36 assumed UUID bytes + 199 value bytes. Not a census of active loops or acknowledgement-policy selection."},
         "publisher_change_eras":eras,"last_slots_all_record_at":latest.map(|t|utc(t as f64/1000.0)).transpose()?,"first_post_change_slots_resource_record_at":first_resource.map(|t|utc(t as f64/1000.0)).transpose()?,"capacity_projections":capacity,"replay_fits":fits,
-        "limits":"Historical F48 experiment at baseline 11c312c (2026-10-10): heartbeat sampling had a 135.324-second gap; endpoint continuity does not fill it. Primary disk continuity is separately computed. Shared device traffic is unattributed. File-write and sync-attempt counters were not captured. Logical persisted records and health flush calls differ. Forecasts assume constant populations and publisher shape; RAM/index/namespace constraints may fail earlier. Both warm uncontrolled-cache startup-to-ready fits are conditional, not isolated replay or measured 6/8 GiB bootability. Historical removal retained log bytes/slots. Historical design statements do not describe current source. Future metric rate/key shape and token discrepancy cause remain unknown. Saved ledger summaries reproduce downstream arithmetic, not original acquisition."}),
+        "limits":"Historical reference only: the F48 experiment at baseline 11c312c on 2026-10-10 had a 135.324-second heartbeat sampling gap and continuous primary disk sampling. Those are not assertions about another supplied fixture. Endpoint continuity does not fill missing heartbeat samples; supplied disk gaps and offsets are computed separately. Shared device traffic is unattributed. The reference capture lacked file-write/sync-attempt counters; this command cannot manufacture them. Logical persisted records and health flush calls differ. Forecasts assume constant populations and publisher shape; RAM/index/namespace constraints may fail earlier. Warm readiness fits remain conditional different-shape extrapolations, not measured 6/8 GiB bootability. Historical removal retained log bytes/slots; dated design statements do not describe current source. Future metric rate/key shape and the reference token-excess cause remain unknown. Saved ledger summaries reproduce downstream arithmetic, not acquisition. Endpoint elapsed time is the rate denominator; positive marker duration has a separate unreconciled anchor. Stripe offsets select the tail; timestamps split it without another endpoint-time filter."}),
     )
 }
 
@@ -381,6 +418,15 @@ fn disk(series: &[Value]) -> Result<Value> {
             return Err("negative queue".into());
         }
         queues.push(q);
+        for key in [
+            "Timestamp_PerfTime",
+            "DiskWriteBytesPersec",
+            "DiskWritesPersec",
+        ] {
+            if num(r, key)? < 0.0 {
+                return Err(format!("negative cumulative disk counter: {key}"));
+            }
+        }
     }
     for pair in valid.windows(2) {
         let a = field(pair[0].1, "raw")?;
@@ -398,10 +444,22 @@ fn disk(series: &[Value]) -> Result<Value> {
             gaps.push(json!({"before":text(pair[0].1,"at")?,"after":text(pair[1].1,"at")?,"seconds":pair[1].0-pair[0].0}));
         }
     }
-    let seconds = (num(l, "Timestamp_PerfTime")? - num(f, "Timestamp_PerfTime")?) / frequency;
-    let bytes = num(l, "DiskWriteBytesPersec")? - num(f, "DiskWriteBytesPersec")?;
-    let writes = num(l, "DiskWritesPersec")? - num(f, "DiskWritesPersec")?;
+    let seconds = finite(
+        (num(l, "Timestamp_PerfTime")? - num(f, "Timestamp_PerfTime")?) / frequency,
+        "disk interval seconds",
+    )?;
+    if seconds <= 0.0 {
+        return Err("disk interval underflowed".into());
+    }
+    let bytes = finite(
+        num(l, "DiskWriteBytesPersec")? - num(f, "DiskWriteBytesPersec")?,
+        "disk byte delta",
+    )?;
+    let writes = finite(
+        num(l, "DiskWritesPersec")? - num(f, "DiskWritesPersec")?,
+        "disk write delta",
+    )?;
     Ok(
-        json!({"device":device,"primary_collector_pid":primary,"collector_sample_counts":collectors.iter().map(|(p,r)|(p.to_string(),json!(r.len()))).collect::<serde_json::Map<_,_>>(),"first":text(first,"at")?,"last":text(last,"at")?,"seconds":seconds,"cumulative_write_bytes_delta":bytes,"cumulative_writes_delta":writes,"mean_write_bytes_per_second":bytes/seconds,"mean_writes_per_second":writes/seconds,"samples":valid.len(),"sampled_queue_mean":queues.iter().sum::<f64>()/queues.len() as f64,"sampled_queue_max":queues.iter().copied().fold(0.0,f64::max),"sampled_queue_nonzero":queues.iter().filter(|q|**q>0.0).count(),"sampling_gaps":gaps,"limits":"Earliest valid collector is primary; duplicate collectors are counted separately, never summed. Gaps >25 seconds are explicit. Queue statistics are sampled instants only; shared physical traffic is not attributable to Membus."}),
+        json!({"device":device,"primary_collector_pid":primary,"collector_sample_counts":collectors.iter().map(|(p,r)|(p.to_string(),json!(r.len()))).collect::<serde_json::Map<_,_>>(),"first":text(first,"at")?,"last":text(last,"at")?,"seconds":seconds,"cumulative_write_bytes_delta":bytes,"cumulative_writes_delta":writes,"mean_write_bytes_per_second":finite(bytes/seconds,"disk byte rate")?,"mean_writes_per_second":finite(writes/seconds,"disk write rate")?,"samples":valid.len(),"sampled_queue_mean":finite(queues.iter().sum::<f64>()/queues.len() as f64,"sampled queue mean")?,"sampled_queue_max":queues.iter().copied().fold(0.0,f64::max),"sampled_queue_nonzero":queues.iter().filter(|q|**q>0.0).count(),"sampling_gaps":gaps,"limits":"Earliest valid collector is primary; duplicate collectors are counted separately, never summed. Gaps >25 seconds are explicit. Queue statistics are sampled instants only; shared physical traffic is not attributable to Membus."}),
     )
 }

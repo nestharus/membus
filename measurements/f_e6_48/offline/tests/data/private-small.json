@@ -1,0 +1,6 @@
+{
+  "restart": {
+    "startup_to_ready_seconds": 1,
+    "total_log_bytes": 100
+  }
+}

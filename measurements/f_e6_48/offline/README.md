@@ -44,13 +44,33 @@ refused. A write failure can leave a partial new directory; use a different fres
 location after diagnosing it. Do not treat a directory without manifest.json as a
 completed result.
 
+The library's public `regenerate` function follows the same file-loading and
+verification path as the executable. Input and report construction are internal;
+callers cannot replace verified host rows or their recorded identities. A supplied
+host without an expected matching hash is rejected; it cannot produce a verified
+report. There is no public in-memory verification bypass.
+
 Outputs are projection.json/PROJECTION.md, review-supplement.json/
 REVIEW-SUPPLEMENT.md, metric-retention-scenario.json/METRIC-RETENTION.md,
 host-metrics-supplement.json and manifest.json. The three calculations run in that
 order. The manifest identifies exact input bytes and every output except itself
-by SHA256 and byte count. JSON retains full numeric precision; Markdown tables
+by SHA256 and byte count. JSON serializes represented f64 results without display
+rounding; this is not arbitrary-precision arithmetic. Markdown tables
 render those same values. Zero growth produces null capacity dates. Signed
 negative key dates retain the meaning "threshold already exceeded".
+
+Required scans must contain namespace observations, integer live counts and
+family-count objects. A family absent from an otherwise complete scan means zero;
+a missing scan means missing evidence and is rejected. Impossible value/record
+sizes, checked-integer overflow and nonfinite derived arithmetic are errors before
+output creation; they never become unknown/null results.
+
+Rate denominators use endpoint unix_time differences. The marker duration has a
+separate producer anchor, is required positive and is reported separately; it is
+not reconciled with rate duration. Marker timestamps must be within five seconds
+of endpoint times. Stripe offsets select the appended tail. Record timestamps then
+split that tail without an extra endpoint-time filter, preserving original
+population semantics. These are explicit admission limits, not atomic capture.
 
 An optional host JSONL supplement requires **both** `--host FILE` and
 `--host-sha256 HEX`. Its rows use epoch-second `t` and `v` fields. The command
