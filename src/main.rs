@@ -1,4 +1,5 @@
 use membus::{Config, Store};
+mod qualification;
 #[cfg(windows)]
 use membus::pipe_io;
 use std::{
@@ -297,6 +298,12 @@ fn tcp(address: &str, store: Arc<Store>, idle_ms: u32) -> io::Result<()> {
 }
 fn main() -> io::Result<()> {
     let args: Vec<_> = env::args().collect();
+    if args.get(1).map(String::as_str) == Some("retirement-status") {
+        return qualification::retirement_command(&args[2..]);
+    }
+    if args.get(1).map(String::as_str) == Some("catalogue-state") {
+        return qualification::catalogue_command(&args[2..]);
+    }
     if args.get(1).map(String::as_str) == Some("health") {
         return health_command(&args[2..]);
     }
