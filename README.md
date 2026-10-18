@@ -1,5 +1,9 @@
 # Membus
 
+Read-only [retirement inspection](docs/RETIREMENT-INSPECTION.md) exposes selected
+HEALTH2 counters and exact chunk states from a stopped store's catalogue for
+qualification. These commands grant no lease or receiver authority.
+
 A memory and IPC store project. This repository begins empty apart from this scope record; implementation remains a separate selected act.
 
 Ledger: D:\projects\oulipoly\trunk\research\87_operations_representation\claude6\ledger.json
