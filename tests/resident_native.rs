@@ -204,7 +204,11 @@ fn assert_closed(pipe: &mut Pipe, label: &str) {
 fn newest_nonempty_log(state: &Path) -> PathBuf {
     let mut logs = vec![];
     for dir in fs::read_dir(state.join("chunks")).unwrap() {
-        for entry in fs::read_dir(dir.unwrap().path()).unwrap() {
+        let dir = dir.unwrap();
+        if !dir.file_type().unwrap().is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(dir.path()).unwrap() {
             let path = entry.unwrap().path();
             if path.extension().is_some_and(|s| s == "log")
                 && fs::metadata(&path).unwrap().len() != 0
@@ -366,8 +370,14 @@ fn run(state_cap: bool) {
     );
     let busy = health(&root, &state, &pipe, "health-busy");
     assert!(busy.0 && busy.3 < Duration::from_millis(2500), "{busy:?}");
+    assert_eq!(
+        busy.1.trim(),
+        format!("healthy pid={} epoch={epoch}", server.owner.child.id())
+    );
+    // Silent peers may idle out while health is admitted. This witnesses bounded
+    // health through that reclamation, not admission with 64 continuously live peers.
     println!(
-        "health under 64 opened connections: {}s",
+        "health after 64 opened silent connections (idle reclamation permitted): {}s",
         busy.3.as_secs_f64()
     );
     drop(peers);
