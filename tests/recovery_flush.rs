@@ -104,15 +104,60 @@ fn complete_uncovered_record_requires_recovery_sync_before_value_and_retry_publi
     request.bytes.push(0);
     assert_eq!(store.mutate(request).code, 14);
     drop(store);
+    let closed_failure = open(
+        &path,
+        Config {
+            fail_recovery_sync: true,
+            ..config
+        },
+    )
+    .err()
+    .expect("already closed recovered chunks still need the startup barrier");
+    assert!(closed_failure.to_string().contains("recovery sync failure"));
+}
+
+#[test]
+fn refused_recovery_retains_missing_file_evidence_already_found_by_replay() {
+    let path = fixture("combined-refusal");
+    let config = Config {
+        flush_ms: 0,
+        ..Config::default()
+    };
+    let store = open(&path, config.clone()).unwrap();
+    let first = mutation("first", b"one");
+    let stripe = membus::crc32(b"recovery-fixture\0state") % 4;
+    let mut second = mutation("second", b"two");
+    second.key = (0..100)
+        .map(|n| format!("other-{n}"))
+        .find(|key| membus::crc32(format!("recovery-fixture\0{key}").as_bytes()) % 4 != stripe)
+        .unwrap();
+    assert_eq!(store.mutate(first).code, 0);
+    assert_eq!(store.mutate(second).code, 0);
+    drop(store);
+    // Close both at a successful startup, then remove only this owned fixture's
+    // first data file. Replay must retain its missing-closed-file observation
+    // when the remaining present file's required sync subsequently fails.
+    drop(open(&path, config.clone()).unwrap());
+    let files = data_hashes(&path);
+    assert_eq!(files.len(), 2);
+    fs::remove_file(&files[0].0).unwrap();
+    let failed = open(
+        &path,
+        Config {
+            fail_recovery_sync: true,
+            ..config
+        },
+    );
+    assert!(failed
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("recovery sync failure"));
+    let report = fs::read_to_string(path.join("replay.json")).unwrap();
+    assert!(report.contains("\"stage\":\"refused\""));
+    assert!(report.contains("\"ready_ms\":0"));
     assert!(
-        open(
-            &path,
-            Config {
-                fail_recovery_sync: true,
-                ..config
-            }
-        )
-        .is_err(),
-        "already closed recovered chunks still need the startup barrier"
+        report.contains("\"storage_errors\":[\"chunk file missing with no retiring record:"),
+        "an early sync refusal must not discard the replay observation: {report}"
     );
 }
