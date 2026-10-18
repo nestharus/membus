@@ -1,222 +1,300 @@
-# membus.kv/1: protocol/replay slice, F-E6-11
+# membus.kv/1 protocol and storage behavior
 
-This document replaces PLAN.md §3's slice-1 wire description and §13.5's outage path. It is the implemented protocol/replay subset, not adoption of all the later PLAN operations. The code is std-only Rust; the Python client uses only its standard library. Run a foreground/test server; no service packaging.
+The resident implements version 1.0 framing over Windows local named pipes and
+loopback TCP. The supported native client is documented in
+[RUST_CLIENT.md](RUST_CLIENT.md). Wire operations exceed that client's typed
+surface; an opcode listed here does not imply a corresponding Rust Client method.
+Values are opaque bytes. Namespace/key interpretation, operation identity,
+application recovery and effect authorization belong to callers.
 
-Basis: lane 83's `research/83_loop_alignment/acts/membus-interface-review/review.md` on runtime main 9b51098, SHA256 `af6d9678fbeebedd` (prefix; full snapshot hash is in the F-E6-11 evidence). Design `D:/dev/handoff/memory-ecosystem.md` SHA256 `074d22267522e57ad4ed32e1d95aef64833358a41fc9908e1bf958d99d2ffcb6`; survey `D:/dev/handoff/fast-local-store-survey.md` SHA256 `b128d2588930d54819fceae4047299e4591535763f7048d89c4cf31a9fcfd10f`. Founder corrections: no SQLite, no ordered streams, cache eviction writes no data, expiry eventually retires entire chunks. Rotation/cache/tiering remain later slices; this slice retains all values in memory and all append files on disk.
+## Framing and discovery
 
-## 1. First-client evidence and allocation (lane 83 item 8)
+Integers are little endian. A frame is:
 
-Lane 83 review §1 (lines 30–40) replaces seq90's 10–90-row bursts and 44 KB maximum: pydantic seeded **3,065 rows in one second**, median 1,039 B, p95 1,311 B, maximum **59,499 B**; thirdkey seeded 2,387, median 1,073 B, p95 1,485 B, max 43,194 B. The runtime ledger median/p95 is 1,509/4,162 B; this ecosystem's is 1,687/7,639 B. These are located historical workloads, not a future throughput promise. Tests synthesize 3,065 rows alternating median/p95 size, one 59,499-byte row, in sequences of batches ≤128.
+```text
+u32 body_length; u16 major=1; u16 minor=0; u8 opcode; u64 request_id; payload
+```
 
-The client allocates seq with `conditional_put(row/<seq>, expected=absent)` and retries seq+1 on conflict. It keeps the contiguous-seq watermark and abandoned-row filling. Keys are UTF-8 identifiers, so encode numeric seqs as fixed-width hexadecimal or decimal strings for lexical order; raw big-endian binary keys from the preliminary review mapping are not accepted by this wire version. The test uses 16-digit decimal. No server counter, ordered stream, or key-order publication exists.
+`bytes` means `u32 length; bytes`; `text` is a nonempty UTF-8 byte string of at
+most 1024 bytes. `bound` has the same encoding but permits empty text. Values
+are at most 4 MiB; frame bodies at most 16 MiB; batch and GET_MANY at most 128
+items. The transport checks length before allocating the body, and field
+lengths/UTF-8/remaining input are validated by the decoder. No Unicode
+normalization is applied. Numeric lexical order requires a caller encoding
+such as fixed-width decimal keys.
 
-## 2. Framing and operations
+The first request must be HELLO (1): `u32 max_frame; u8 allow_mem; text identity`.
+Offer 1024..16 MiB. Success uses opcode `0x81`, the same request ID, then `u16
+code=0` and:
 
-All integers little endian, except client-defined opaque keys. A frame is `u32 body_length; u16 major=1; u16 minor=0; u8 opcode; u64 request_id; payload`. A byte string is `u32 byte_length; bytes`. Identifier fields are nonempty valid UTF-8, ≤1,024 bytes, validated before String allocation; values opaque, ≤4 MiB. Body ≤16 MiB, batch/get_many ≤128 items. The transport checks body length before body allocation, and the decoder checks field lengths/remaining bytes and UTF-8 before field allocations. Truncation closes the connection. Oversize transport input yields a `too_large` response with request_id=0 then closes; an unparseable header similarly has no usable association. The Python client treats association loss as an uncertain transport outcome.
+```text
+u64 epoch; u32 max_frame; u32 max_value; u16 max_batch;
+u8 server_mem_enabled; u64 retry_window_ms;
+u16 refusal_count; (u16 code; u8 transient; text name)*; feature extensions
+```
 
-First request on every connection is hello (opcode 1): `u32 max_frame; u8 allow_mem; string client_identity`. Offer at least 1,024 bytes so the refusal list fits hello_ok; the negotiated body limit is enforced for later request allocation and reply size. Version offer is the header's major/minor; unsupported versions return incompatible_version and close. Reply is hello_ok (0x81): common reply header then `u64 epoch; u32 max_frame; u32 max_value; u16 max_batch; u8 server_mem_enabled; u64 retry_window_ms; u16 refusal_count; (u16 code; u8 transient; string name)*`. No multiplexing is negotiated; one caller owns each persistent connection. The scan refusal-list opt-in below uses the client identity field. This minor version retains these exact fields; refusal entries can be additive as described below.
+The negotiated body limit is min(offered, 16 MiB) and bounds later requests and
+replies. A connection processes requests serially; no multiplexing is negotiated.
+Repeated HELLO is malformed. Unsupported versions refuse and close. Short or
+oversize transport frames return an unassociated refusal with request ID zero
+and close; truncation closes the connection. Aggregate ingress pressure can also
+return unassociated busy and close. Association loss after a mutation send is
+an uncertain outcome.
 
-Every non-hello request carries `u64 deadline_unix_ms; string op_id; string namespace` before its opcode payload. Reads carry op_id for tracing, with no dedup state. Mutations scope op_id to namespace, bind it to the full mutation (including key, expected version and ack, excluding deadline), and refuse changed content under the same op_id. Modes: mem=0, os=1 (default), flush=2. Explicit client opt-in and server `--allow-mem` are required for mem. Mem has no committed visibility or restart guarantee in slice 1; it is a disposable acknowledged mutation, not a durable promotion promise.
+Identity suffixes select additive discovery vocabulary:
 
-The retained retry comparator uses SHA-256 over that complete mutation and relies
-on collision resistance; it does not prove byte equality for arbitrary colliding
-inputs. Durable records remain complete. See [mutation retry retention](RETRY_RETENTION.md)
-for replay, accounting and compatibility boundaries.
-
-| Opcode | Payload after common fields | Successful reply after common header |
+| Features | Refusal entries | Extension after entries |
 |---|---|---|
-| 2 get | string key | value |
-| 3 get_many | u16 count; string keys | u16 count; values |
-| 4 put | string key; u8 ack; bytes value | u64 version; u8 achieved_ack |
-| 5 conditional_put | string key; u8 ack; u64 expected; bytes value | u64 version; u8 achieved_ack |
-| 6 remove | string key; u8 ack; u64 expected | u64 version; u8 achieved_ack |
-| 7 batch | u16 count; (u8 mutation_opcode; string item_op_id; that opcode's payload)* | u16 count; (u16 item_code; u64 version; u8 ack)* |
-| 8 health | empty | u64 bytes_written; u64 flush_calls; u64 keys; u64 namespace_keys; u64 namespace_quota; u64 index_cap; u8 high_water; u8 namespace_high_water |
+| baseline | 1..19 | none |
+| final `;scans=1` | 1..22 | none |
+| `;subscribe=1` | 1..24 | 46 signal bytes |
+| `;timers=1` without subscriptions | 1..22 plus 25 | 34 timer bytes |
+| timers and subscriptions | 1..25 | signal bytes, then timer bytes |
 
-`expected=0` means absent, including a committed tombstone. Nonzero expected is an opaque revision token. A remove is a persisted tombstone. A value is `u8 present`, then if present `u64 version; u8 ack; bytes value`. Replies use opcode|0x80, the request_id, and `u16 code` followed by payload on success. Batch is non-atomic: validate the entire frame first, then independent item outcomes in input order; duplicate batch retry uses the unchanged item op_ids, not a fresh batch identity. A get_many too large for a reply is refused; callers page it.
+Keep `;scans=1` last when combining features. The resident gates subscription
+control (16..19) and timers (21..23) on their negotiated features. Scans are
+advertised through refusal vocabulary; retirement operations (24..27) are
+additive calls, with unsupported (2) on older implementations. See
+[subscriptions](SUBSCRIPTIONS.md) and [timers](TIMERS.md) for extensions.
+Identity and tokens do not authenticate application actors.
 
-## 3. Pending writes and duplicate identity (item 1)
+Every non-HELLO request begins with `u64 deadline_unix_ms; text op_id; text
+namespace`. Read IDs have no retained deduplication or snapshot-creation lookup.
+`__membus_timers_v1` and `__membus_policy_v1` are reserved and refused through
+public requests. Replies use `opcode | 0x80`, the request ID, then `u16 code`
+and successful payload; nonzero codes carry no successful payload.
 
-Admission reserves the key and its future version before log I/O. A competing conditional_put sees the admitted reservation and returns **pending_conflict (19)**, even before publication; **conflict (12)** instead names a mismatching committed expected state. A pending remove does not make absent true before that remove commits. Unconditional mutations of a pending key return busy. A duplicate op_id with the same payload joins the original's eventual outcome (waiting only until the duplicate's deadline); it does not create a new conflict. A later deadline lets the caller query the same outcome. Different payload under an existing id returns op_id_mismatch.
+## Key/value operations
 
-Committed reads use a distinct snapshot lock and never take an append, admission, or flush lock. They can see the previous committed value while a mutation is pending. The conditional operation checks pending reservations and a separate metadata map under admission coordination. Key/namespace/value/dedup counters and an expiry queue avoid full key-map scans during admission; no admission holds the committed read lock. Publication is a short update after OS append or flush completes. A pending conflict is transient: re-read/reselect, and fill a client seq hole if that pending winner later fails.
+A returned `value` is `u8 present`; when present, it continues with `u64 version;
+u8 achieved_ack; bytes value`. Committed tombstones read absent.
 
-## 4. Deadlines and refusals (items 2 and 3)
-
-The server checks the request's absolute Unix-millisecond deadline immediately before admission. No new write is admitted at or after it. Clocks must be synchronized; local timeout and server admission refusal are different evidence. After admission, durable I/O may finish after the deadline; a timed-out caller has an uncertain outcome and retains op_id. A duplicate whose wait exceeds its deadline receives **pending_timeout_uncertain (17)**, without cancelling the original. **deadline (5)** is only the before-admission deadline refusal. Read requests are refused when already past deadline.
-
-Closed list, published verbatim by hello:
-
-| Code | Name | Class |
+| Opcode | Suffix after common fields | Successful payload |
 |---|---|---|
-| 1 | incompatible_version | persistent for this request |
-| 2 | unsupported | persistent |
-| 3 | malformed | persistent |
-| 4 | too_large | persistent |
-| 5 | deadline | transient with a renewed deadline; same op_id |
-| 6 | busy | transient; pending-key/queue pressure |
-| 7 | capacity | persistent until byte capacity/configuration changes |
-| 8 | quota | persistent until namespace quota changes |
-| 9 | index_cap | persistent until index capacity grows |
-| 10 | read_only | transient after storage repair; refused before admission |
-| 11 | warming | transient during replay/readiness |
-| 12 | conflict | persistent for the committed expected state; re-read/reselect |
-| 13 | retry_window_expired | persistent; reconcile by deterministic key |
-| 14 | op_id_mismatch | persistent |
-| 15 | mem_not_enabled | persistent until explicit opt-in configuration |
-| 16 | io_failed_uncertain | transient outcome after admission; reconcile deterministic key |
-| 17 | pending_timeout_uncertain | transient outcome of a pending duplicate; same op_id |
-| 18 | dedup_full | transient until retained outcomes expire or configured slots grow |
-| 19 | pending_conflict | transient: competing conditional reservation is unpublished |
+| 2 GET | text key | value |
+| 3 GET_MANY | u16 count; text keys | u16 count; values in input order |
+| 4 PUT | text key; u8 ack; bytes value | u64 version; u8 achieved_ack |
+| 5 CONDITIONAL_PUT | text key; u8 ack; u64 expected; bytes value | u64 version; u8 achieved_ack |
+| 6 REMOVE | text key; u8 ack; u64 expected | u64 version; u8 achieved_ack |
+| 7 BATCH | u16 count; (u8 mutation_opcode; text item_op_id; mutation suffix)* | u16 count; (u16 item_code; u64 version; u8 ack)* |
+| 8 HEALTH | empty | six u64: bytes_written, flush_calls, keys, namespace_keys, namespace_quota, index_cap; u8 high_water; u8 namespace_high_water |
+| 9 IO_METRICS | empty | three u64: data append bytes, write calls, accounted syncs |
 
-All 19 codes are tested through the dispatcher, including deterministic warming/read-only state and post-append failure fixtures. Before-admission refusals are safe to spool unsequenced. Codes 16/17 are uncertain outcomes, not evidence of non-admission; the client preserves op_id and reconciles its deterministic key. Busy/capacity/quota/index_cap/dedup_full remain distinct. A complete log record left by failed I/O may replay even when the same-lifetime outcome was uncertain; never mint a fresh id for it. Partial append failure fences its stripe under the file's append-owner lock before already-admitted followers can append behind the torn tail.
+BATCH accepts PUT, CONDITIONAL_PUT and REMOVE. It validates the whole request
+before independently admitting items. It is non-atomic; different keys may
+execute concurrently, same-key items and replies retain input order. Retry uses
+the original item IDs. GET_MANY reads each committed value separately and is not
+a multi-key snapshot. Oversize replies refuse rather than truncate; bound read
+sets and use snapshots for a common view.
 
-Scan opt-in adds codes 20 cursor_expired (permanent for that token), 21 invalid_cursor (permanent), and 22 snapshot_full (transient). Scan tests exercise all three; baseline mutation refusals remain unchanged.
+`expected=0` requires absent state (including tombstones and expired keys).
+A nonzero expected value is an opaque live revision token, not a timestamp or
+publication-order sequence. REMOVE writes a tombstone. A competing conditional
+write against an admitted pending key returns pending_conflict (19); a mismatch
+against committed state returns conflict (12). A pending remove does not yet
+make a key absent. Unconditional writes against a pending key return busy (6).
 
-## 5. Visibility and snapshots (items 4 and 5)
+## Acknowledgments, publication and uncertainty
 
-An os/flush ack follows publication: every later committed get/get_many on any connection sees that revision or a later committed revision. Within an epoch reads are monotonic across reconnects. A mem ack makes no committed guarantee. An epoch is a persisted counter incremented once at successful startup, independent of wall-clock steps. Python reconnect raises EpochChanged(previous,current) before replaying an uncertain request across a new epoch, so the caller can reconcile a deterministic key. Acknowledged durable values are replayed before ready/hello. Startup writes/syncs 8 epoch bytes; append metrics exclude this and tests name it separately.
+| Ack | Wire value | Boundary |
+|---|---:|---|
+| mem | 0 | Disposable success; no committed publication or restart guarantee |
+| os | 1 | Complete append, then committed publication |
+| flush | 2 | Complete append covered by file sync, then committed publication |
 
-F-E6-24 implements bounded prefix and half-open range pages over one **whole-namespace immutable committed snapshot**. Capture copies UTF-8 keys and `Arc<Value>` handles under the committed read lock, without copying payload bytes. Sorting, query selection, page encoding and transport writes run after releasing that lock. Namespace selection and byte charging require two traversals of the global committed hash index under the read lock; capture can therefore briefly delay publication in proportion to index size. Capture also holds the snapshot registry mutex, so other snapshot opens/pages/releases and the expiry reaper wait during its two traversals. Purging a last snapshot reference can reclaim its row vector/old values while that mutex is held. It never takes an append/flush lock or opens append files. Paging a retained snapshot holds neither committed nor append/flush locks.
+Memory mode requires both HELLO opt-in and server `--allow-mem`. It does not
+supply a speculative read API or eventual promotion. The public Rust Client
+offers only OS and Flush and requires an explicit Ack.
 
-A snapshot opened after an os/flush acknowledgement includes that revision or a later committed revision, because publication precedes the acknowledgement. A pre-existing snapshot keeps its captured values, even after later overwrites/removes. Committed tombstones are omitted; mem writes are excluded. Separate snapshots can see different revisions. A shared snapshot token lets several prefixes/ranges use exactly the same view, across connections to the same server epoch and namespace. This is read-only consistency, without multi-key write transactions. Cursor pages never switch to the current view.
+A successful durable acknowledgment follows publication: a later current GET
+sees that revision, a later published value, or subsequent removal/expiry.
+An already open snapshot retains its older view. Committed GET reads take the
+memory index's read lock, without append/flush/admission locks or backing-file
+I/O. Publication and snapshot capture can contend on that memory lock; this is
+not a lock-free or latency-bound claim. [Grouped flushing](GROUPED-FLUSH.md)
+explains the distinct append and covering-sync paths.
 
-### Scan wire and Python API
+OS acknowledgment covers process-kill replay, without an OS-crash/power-loss
+promise. Flush adds synchronization of the covering file; filesystem and
+hardware/cache behavior still limit persistence evidence. An unacknowledged
+write may disappear or replay. A complete record left after I/O failure can
+replay even though the original result was uncertain.
 
-The existing common request and successful reply headers apply. `bytes` below is the u32-length-prefixed opaque field; `bound` is u32-length-prefixed valid UTF-8, at most 1,024 bytes, **allowed to be empty**. Namespace/op_id/key identifiers remain nonempty. New operations:
+The acknowledgment byte in a recovered record states the requested mode, not
+proof that a covering live sync succeeded. Before exposing recovered values or
+retry outcomes, startup synchronizes present, nonempty active chunks, including
+closed chunks, and active legacy stripe logs. Truncation precedes this barrier;
+recovered Close publication follows it. Required sync failure refuses startup
+and attempts a non-ready report; report publication itself can fail. Already
+imported read-only backups do not receive a new data-file sync witness. See
+[RECOVERY_FLUSH.md](RECOVERY_FLUSH.md) for ordering and historical backup limits.
 
-| Opcode | Request suffix | Successful reply payload |
+Fresh mutation admission checks the absolute Unix-millisecond deadline
+immediately before reserving the key/version. Deadline (5) means this send was
+refused before admission. Clock conversion and a separate local monotonic budget
+are caller responsibilities. After admission, I/O may finish beyond the request
+deadline. A duplicate waiting past its own deadline returns
+pending_timeout_uncertain (17) without cancelling the original. Local timeout,
+reset, malformed/foreign reply or lost reply after send must preserve the original
+uncertainty. A later refusal never proves an earlier uncertain send had no effect.
+
+## Retry identity and refusals
+
+Ordinary mutation IDs are scoped to namespace. The store retains a 32-byte
+SHA-256 comparator over the complete canonical mutation representation with
+generated version and admission time zeroed. Key, bytes, expected token, remove
+flag, ack, namespace and operation ID participate; deadline does not. Matching
+comparators join/return the retained outcome; a mismatch refuses op_id_mismatch
+(14). Equality relies on SHA-256 collision resistance, not retained full-payload
+byte equality. The existing encoding aliases expected `None` and
+`Some(u64::MAX)` through the same sentinel. Full durable records are unchanged;
+replay/import derive the same comparator. See
+[RETRY_RETENTION.md](RETRY_RETENTION.md) for encoding, collision and resource
+limits. Policy setter IDs retain the caller namespace scope; timer control IDs
+share one internal scope across all caller namespaces.
+
+The default horizon is 24 hours from admission (`--retry-ms`). Successful durable
+outcomes within the horizon are rebuilt from records on restart. Conflicts and
+pre-admission refusals are not persisted outcomes; mem and failed-I/O outcomes
+are memory-only. Active dedup entries and the retired-ID ring each default to
+262144 slots (`--dedup-cap`). A known expired ID refuses (13); after ring eviction
+or restart an expired ID can be unknown and execute again. This is bounded
+retry deduplication. Beyond the original epoch/horizon, or after loss of the
+client Attempt, reconcile a deterministic key and embedded operation identity
+before deciding whether another send is safe.
+
+The HELLO transient flags are:
+
+| Code | Name | Transient |
 |---|---|---|
-| 10 snapshot_open | empty | bytes snapshot (16 bytes) |
-| 11 scan_prefix | bytes snapshot; bytes cursor; u16 limit; u32 max_bytes; bound prefix | bytes snapshot; bytes next_cursor; u8 done; u16 count; (string key; value)* |
-| 12 scan_range | bytes snapshot; bytes cursor; u16 limit; u32 max_bytes; bound lower; bound upper | same page layout |
-| 13 snapshot_release | bytes snapshot | empty |
-| 14 scan keys prefix | same request as 11 | same page header; (string key)* without value fields |
-| 15 scan keys range | same request as 12 | same page header; (string key)* without value fields |
+| 1 | incompatible_version | no |
+| 2 | unsupported | no |
+| 3 | malformed | no |
+| 4 | too_large | no |
+| 5 | deadline | yes |
+| 6 | busy | yes |
+| 7 | capacity | no |
+| 8 | quota | no |
+| 9 | index_cap | no |
+| 10 | read_only | yes |
+| 11 | warming | yes |
+| 12 | conflict | no |
+| 13 | retry_window_expired | no |
+| 14 | op_id_mismatch | no |
+| 15 | mem_not_enabled | no |
+| 16 | io_failed_uncertain | yes |
+| 17 | pending_timeout_uncertain | yes |
+| 18 | dedup_full | yes |
+| 19 | pending_conflict | yes |
+| 20 | cursor_expired | no |
+| 21 | invalid_cursor | no |
+| 22 | snapshot_full | yes |
+| 23 | resume_gap | no |
+| 24 | subscription_missing | no |
+| 25 | timer_missing | no |
 
-`limit` is 1..128. `max_bytes` is at least 42 and bounds the entire **reply body**, including its 15-byte common header, excluding the four-byte length prefix; its effective value is min(max_bytes, negotiated max_frame, 16 MiB). Empty snapshot and cursor implicitly capture a fresh snapshot. Empty cursor with an existing token starts a query from its beginning. A nonempty cursor requires its snapshot token. Prefix `''` selects all live keys. Range is [lower, upper) in UTF-8 byte lexical order; empty lower starts at the first key, empty upper has no upper bound. Equal nonempty bounds produce an empty result; lower > nonempty upper is malformed. No Unicode normalization is applied. Fixed-width numeric keys remain the client's responsibility.
+Transient is classification, not automatic retry authorization. Busy, byte
+capacity, namespace quota, index slots and dedup pressure are distinct. Read-only
+requires storage/restart reconciliation. Codes 16/17 explicitly preserve uncertain
+outcomes; never turn them into proof of absence or a new operation identity.
 
-Snapshots are opaque 16-byte little-endian epoch/id pairs. Cursors encode snapshot token, u64 absolute sorted-row position, query opcode and length-prefixed bounds, followed by a u64 tag from a snapshot-local std `RandomState` keyed hash. Cursor size is bounded by 2*MAX_ID+48 bytes. This tag guards edits/binding; it is not a cryptographic authorization claim. Callers must preserve cursors as opaque bytes. Cursor query/position/tag mismatch or a cross-namespace token returns **invalid_cursor (21)**. Expired, released, missing or previous-epoch tokens return **cursor_expired (20)**. Cursor structure/query validation precedes token lookup, so malformed cursor plus expired token returns21; capture exceeding its fixed lifetime returns20 even if no token was issued. Snapshot tokens are consistency handles, not credentials. Restart invalidates all snapshots without changing MBK1 replay.
+## Namespace snapshots and scans
 
-Page positions are stateless and query-bound. Retrying the same token/cursor and query with the same limits yields the same page until expiry/release. Limits may change when retrying a too_large page. Done means no continuation; done does **not** release the shared snapshot. If the first matching item cannot fit, the server returns **too_large (4)** without advancing; a newly implicit snapshot is removed on refusal. An existing shared snapshot survives that refusal. A page with no matches succeeds empty/done. Request bounds/cursor still have to fit negotiated ingress max_frame.
+Capture retains one immutable whole-namespace committed view, excluding
+tombstones and mem mutations. It copies keys and Arc handles rather than payload
+bytes; later changes, expiry or file retirement do not alter that view. Several
+queries/connections can share a token in the same namespace and epoch. Separate
+captures may see different revisions. There are no multi-key write transactions.
 
-Python methods are `snapshot_open(ns, **options) -> bytes`, `snapshot_release(ns, snapshot, **options) -> None`, `scan_prefix(ns, prefix='', *, snapshot=None, cursor=None, limit=128, max_bytes=DEFAULT_SCAN_BYTES, keys_only=False, **options)` and `scan_range(ns, lower='', upper='', *, snapshot=None, cursor=None, limit=128, max_bytes=DEFAULT_SCAN_BYTES, keys_only=False, **options)`. Page result is `{'snapshot': bytes, 'cursor': bytes, 'done': bool, 'items': [{'key': str, 'version': int, 'ack': int, 'value': bytes}, ...]}`. Options retain the existing deadline/op_id tracing semantics. Use an explicit snapshot_open when consistency must span multiple queries. Retain the returned snapshot token and cursor for subsequent pages/retries, and release in a finally block. A lost initial snapshot_open/implicit-first-page reply cannot be recovered by read op_id. Python propagates its transport error without automatically resending snapshot-creating calls; an explicit caller retry creates another view/retention until TTL. Known-token page retries can reconnect and replay the same immutable view. New Python reconnect still raises EpochChanged before retry across epochs; a token supplied to a connection already in the new epoch receives cursor_expired.
-
-Keys-only pages (`keys_only=True`, opcodes 14/15) return items as `{'key': str}` without version, ack or value bytes. They use the same namespace-wide snapshot and shared token, and their cursors bind the keys-only opcode. A keys-only watermark scan therefore locates holes without transferring row payloads; the client advances its contiguous watermark only through keys actually present and fills abandoned gaps under its own policy. Value and keys-only queries can share a snapshot token. Keys-only capture still retains and charges the whole namespace's values so a later value query on that shared token sees the same revision.
-
-Lane83's answer (eco seq653, 2026-10-09) confirms the shared token is needed for row/, mark/, cur/ and intake/ together, and fr/ when included by views; the graph rebuild uses row/ values, and the watermark uses row/ keys. Its shadow mirror first writes one key per file row (about44k), optionally two with src dedup (about89k). The primary layout estimates three fixed row/id/src keys plus2-4 mark keys and sparse frontier/operation/intake/cursor keys: approximately6-8 keys per row, or266-355k for44,326rows. These are owner mapping estimates, not a measured allocation count; link indexes are excluded because edges derive from rows. Snapshot retention cap and live value/dedup capacity are separate. A namespace whose entire retained representation exceeds --snapshot-bytes refuses snapshot_full even for a narrow or keys-only query; provision that admission budget from the conservative charge formula and desired simultaneous token count, and separately verify actual process RAM and live-key quota before primary adoption.
-
-Use `with client.snapshot(ns) as token:` for frequent one-page lists and multi-prefix views, passing `snapshot=token` to every page. The context attempts release with a fresh deadline and trace op_id on exit, independently of snapshot-open options. An already expired/released token needs no additional release. A release failure on normal exit is surfaced; during a consumer exception it is attached as an exception note when supported, preserving the consumer error. Transport failure can leave retention until bounded expiry. Raw implicit pages intentionally retain their returned shared token even on done; callers using those release it explicitly in finally. `snapshot_full` is bounded resource pressure, not a promise that unlimited simultaneous views fit.
-
-Default Python `max_bytes` is 256 KiB (`DEFAULT_SCAN_BYTES`); callers can explicitly raise it up to 16 MiB when a larger item needs it. The resident caps active connections at64, each serially holding one response. Thus returned scan buffers are bounded by64*16MiB (1GiB) at the maximum requested budgets; response construction temporarily has up to four copies of payload-sized buffers, a conservative total payload-buffer peak bound of4GiB across64 such requests, including the returned buffers. This transient egress is separate from retained snapshot accounting and the64MiB ingress budget. It writes no state. Use the smaller default or provision requested concurrency/budgets from measured RAM; large-page peak working set is measured in the F-E6-24 acceptance record. The bound applies to the resident transport; Rust callers of the in-process dispatcher choose their own concurrency.
-
-Measured F-E6-24 synthetic primary layout before the F-E6-20 rebase (source0712325):350,000 keys containing44,326 row envelopes (repeating the recorded pydantic rows) plus small derived metadata. The populating process RSS was484,483,072 bytes before snapshots; the256MiB default admitted two and refused the third with22;after restart,512MiB admitted three with67,596,288 bytes additional RSS above its462,209,024-byte pre-capture sample. The run used --capacity1GiB and --dedup-cap800000;350k keys set the namespace70% high-water warning at default quota500k. Admission charge includes full payload capacity on every token, unlike shared-payload RSS: budget sizing must use the formula below, not RSS per token; actual process RAM is a separate limit. These numbers differ from the earlier350k uniform-value allocation and are not a primary migration or a real namespace sizing guarantee. Three sequential captures alongside writers took155–186ms; writer calls had0.209ms median,0.765ms p99 and95.7ms max. Full44,326-row paging took358 pages/0.336s;350,001 keys took2,735 pages/0.610s, with591 writer acknowledgements during both scans. After replay read107,656,727 bytes, each scan added zero logical file-read bytes. Releasing all tokens in the restarted process reduced RSS to466,751,488 bytes and reopening three succeeded; allocators need not immediately return all memory. Detailed conditions/source binding and samples live in e6/act-work/F-E6-24/pre-rebase-evidence/scale.json. Physical device bytes are unmeasured. Consumer work between pages adds to these traversal times; the operator chooses a server-wide startup --snapshot-ttl-ms large enough for the intended rebuild, ; consumers restart the entire related view after expiry. No per-open TTL is supplied. Paging does not extend the lifetime.
-
-F-E6-24 lane87seq744 capture control uses the same release/fixed-key writer,3s baselines before/after and a3s three-capture phase,1ms pacing. Baseline writer maxima0.361/1.302ms; capture-phase max93.953ms overlaps capture,92.651ms excess over the larger baseline. Capture elapsed139.5-179.2ms includes sorting outside the committed lock; exact lock duration is not separately instrumented. See pre-rebase-evidence/capture-control.json raw intervals for this original control. Combined-source controls are in the current capture-control.json and REPORT.md. Unlocked chunked copying mixes revisions without version retention or immutable roots; real capture rate/total writer pause per hour should be observed at adoption before choosing that alternative. Lane87 accepted this cost as this slice's recorded limit (eco750).
-
-Exact replayed synthetic350,799-key charge is123,138,197 bytes per snapshot, versus about22.5MiB incremental RSS per capture with shared payloads. pre-rebase-evidence/final-sizing.json reconstructs the stated formula and proves budget123,138,196 refuses22 while123,138,197 admits. Three such charges require369,414,591 bytes of snapshot admission budget, independently of actual process RAM;512MiB covers this fixture. No live snapshot-accounting telemetry is added. Real value Vec capacities/layouts must be measured or conservatively calculated separately.
-
-### Retention bounds and compatibility
-
-Defaults: **256 MiB** retained accounting (`--snapshot-bytes`), **8** snapshots (`--snapshot-max`), **30,000 ms** fixed lifetime (`--snapshot-ttl-ms`, positive). Zero bytes/slots disables opening snapshots. Captures reserve slots and charged bytes under coordination before allocating keys/handles; concurrent creators cannot exceed either cap. Charge is 256 + namespace bytes + sum(key bytes + 128 + value Vec capacity), charging full payload capacity per snapshot even when shared. This is conservative retained representation accounting, not an allocator/RSS measurement. The immutable Arc's charge survives release/expiry while an in-flight dispatcher retains it. Lifetime uses monotonic Instant from capture start and never renews on page/retry. Idle expired registry entries are reclaimed by a separate worker at intervals min(TTL, 1 s); requests also purge them. An in-flight page checks expiry again before returning. Physical reclamation can lag expiry by that interval or the bounded active page lifetime. **snapshot_full (22)** is transient until release/expiry frees bytes/slots; no allocation occurs on a cap refusal.
-
-Hello clients whose identity ends `;scans=1` receive the additive 22-code list; other identities receive the original exact 19-code list. The original Python client's strict `codes == CODES` comparison **does not accept an unknown extended refusal list**. It works against this server because its unchanged `python-stdlib` identity gets the legacy list and its existing operations keep their codes/layouts. The updated Python client uses `python-stdlib;scans=1`, requires all 19 baseline entries unchanged, verifies any known scan entries that are offered, accepts extra named codes, and uses negotiated names/transient flags for refusals. It also connects to old 19-code servers; scans there return unsupported. No scan feature negotiation beyond this hello list opt-in is claimed. Existing get/get_many return values are unchanged, and payload copying/encoding now occurs after releasing the committed lock. The transport passes negotiated max_frame into the dispatcher so scans page to that bound before transport's final check. Dedup's actual bounded horizon in §6 is unchanged.
-
-## 6. Retry horizon and replay (item 6)
-
-Default retry horizon is 24 h from admission, configurable with `--retry-ms` for deterministic tests. Exact duplicate outcomes survive restart for successful os/flush writes whose admission is within the horizon. Conflicts/pre-admission refusals are not admitted and are not persisted as dedup outcomes. Mem outcomes and failed-I/O outcomes are memory-only. Retained outcomes and the retired-id ring each default to **262,144** ids, configurable with `--dedup-cap`; full active slots refuse transient dedup_full. After the horizon, an id still known in the in-memory retired-id ring returns retry_window_expired. An evicted or expired id after restart can be unknown and can execute again. Tests cover known expiry, ring membership and unknown-after-restart execution. This is a bounded retry guarantee, never permanent exactly once. Read a fixed key and its embedded op_id before retrying beyond the horizon.
-
-Four key-hash append files (`stripe-N.log`) contain `MBK1; u32 length; u32 bitwise_length_complement; u32 CRC32; payload`, covering namespace, key, op_id, admission time, expected token, opaque version, ack, value/tombstone. The length complement distinguishes length corruption from a valid incomplete final body. One key always maps to one file, with one append owner at a time. Replay reconstructs published values, tombstones, versions and recent outcomes before readiness. A short final header or final incomplete body is truncated to the last complete frame. Complete CRC failure, invalid magic/length/complement or malformed payload is reported as interior-corrupt and prevents startup; the file remains for diagnosis. A checksum-failed complete final frame is not silently discarded.
-
-State defaults to the caller's chosen `D:/projects/membus/state/`, outside source. Windows share-denied owner.lock is held for the server lifetime; process exit releases exclusive ownership automatically. On non-Windows the create-new lock needs operator cleanup after confirming the previous owner is dead. Named pipes reject remote clients, guard the first instance against an existing endpoint, and use an explicit ACL for the current user and LocalSystem. Both transports cap active connections at 64, with a separate aggregate 64 MiB ingress-frame budget reserved before body allocation and released after dispatch. TCP binds loopback only. Both transports have a configurable positive per-I/O idle bound (--idle-ms, default60000); overlapped pipe cancellation drains before buffers are freed, and Python reconnects after an idle close. A trickling partial frame can retain its bounded ingress reservation; this is not a whole-request deadline. Resident heartbeat, state growth limit and fleet packaging are described in RESIDENT.md. The TCP fallback is a foreground test endpoint for the trusted local machine, with no cross-user authentication or service deployment claim. os means append completed to the OS; it survives server process kill, without an OS-crash/power-loss claim. flush additionally syncs the covering file; hardware/cache policy still limits power-loss evidence.
-
-## 7. Capacity and growth (item 7)
-
-Each namespace defaults to **500,000** live keys (tombstones excluded since chunk retirement, CHUNK-RETIREMENT.md 5.3), configurable with `--quota`, covering the located 270–350k ledger keys. Global key cap defaults to 917,000 (`--index-cap`), below the plan's approximate 256 MiB metadata ceiling; F-E6-20 measures combined processRSS including values, retry fingerprints, metadata, allocator and workers at350000keys (see implemented policy below); metadata-only overhead remains unmeasured. Separate value/dedup-byte cap256MiB and queue representation budget64MiB (canonical mutation representation+value+128bytes, at mostonequarterperstripe) are configurable. Reservations count toward admission, so competing new-key writes cannot exceed quotas. Read-only access to old keys remains available at a cap; new keys are refused with the precise code. Capacity reserves the replacement value while the old value remains visible; this intentionally can refuse an overwrite early rather than exceed peak memory. Since chunk retirement (CHUNK-RETIREMENT.md 5.3) the two counts are kept apart: a remove of a live key frees its namespace slot when it commits and its tombstone keeps an index entry against `--index-cap`; a missing-key remove persists a tombstone charged to `--index-cap` alone; a tombstone's index entry drops once no other retained chunk holds an older record of its key; an expired key leaves the index and its expiry summary holds one `--index-cap` entry for 30 days.
-
-Health reports global and requested-namespace keys, configured per-namespace quota/global cap, bytes written and flushes for this server lifetime, and 70% high-water flags for both namespace quota and global cap. Clients poll before the cap (signals later). Retained 32-byte retry comparators are charged to the value/dedup capacity as well; full canonical mutation representations remain charged to the separate queue budget. CRC is only corruption detection; retry identity uses the SHA-256 comparator and the encoding/collision bounds linked above. The current workload has about 270–350k derived keys (44,326 rows/59 ledgers), 30–40% of the global cap and **54–70% of one 500k namespace**. Lane83's late answer (eco seq402) correctly notes that the namespace warning can fire at adoption; actual allocator memory per key remains unmeasured. Before growth reaches 70%, lane 83 should avoid derived link keys, raise provisioned quota/cap only after RAM accounting, or migrate namespaces to an additional membus instance. Forever namespaces cannot recover capacity by cache eviction. Cold indexing and capacity measured at allocator level are later commissions. At 100%, quarantine persistent refusals and raise an observation; do not let a forever spool loop silently.
-
-Resident persistent record admission also honors --state-limit-bytes (default 8 GiB), including replayed bytes and in-flight reservations; full state returns capacity 7 before acceptance even for a tombstone/remove. See [RESIDENT.md](RESIDENT.md) for conservative uncertain-write accounting, 75% diagnostic pressure warning and operator remedy; removing keys cannot shrink stripe logs.
-
-## 8. Client-owned refusal/outage path
-
-This replaces PLAN.md:13 and §13.5's seq90 journal/CAS-max proposal with lane 83 review §3. Runtime owns these changes; the membus slice does not implement its spool.
-
-Before first send mint stable row id and op_id; refused rows are fsynced into the existing spool **unsequenced**, and phase dispatch pauses. Do not run a seq-bearing file journal as a second writer or CAS max(seq) at drain. For timeout/reset after send persist `state: uncertain`. Reconcile `get(src/<source hash>)`: same op_id means done; absent means conditional_put(absent) with the same op_id; a different op_id means same-content dedup or a revision. Check an in-flight row/<seq>'s embedded op_id before choosing another seq. Deterministic keys retain idempotence beyond the dedup horizon. Source claim is the commit point; intent records let the client recover its five multi-key updates; contiguous watermark/hole filling remain client-owned.
-
-Lane83's **shadow proposal** (eco seq402) is separate from that primary-store outage path: the fsynced file ledger remains authoritative and is already the journal, so no extra shadow journal. Mirror with conditional_put(absent) on the file's own fixed-width seq key and explicit os ack; a client-owned mirror cursor catches up after an outage. Past-window safety requires all three invariants: authoritative mirror keys use only conditional puts; they are never removed (abandoned seqs get a value, not a remove); and a retry first reads the deterministic key and embedded op_id. Shadow choice belongs to lane83's Decide, with no primary migration. Grouped flushes and scan acceptance/replay measurements remain required before primary adoption. Scan token/cursor expiry requires the client to release/reopen and restart every related query on one fresh shared view; mixing old and new pages would lose consistency. This does not alter the refusal spool, uncertain mutation reconciliation, source claim, or bounded dedup horizon described above.
-
-## 9. Flush spacing and next slices
-
-`--flush-ms` defaults to 50 ms as an **initial configurable value**, not an owner-approved optimum. The historical pre-grouping comparison basis is lane 83 F-LP-33's isolated synthetic-copy report, `research/83_loop_alignment/acts/F-LP-33-load/C3-REPORT.md`, Append costs on isolated copies (late eco seq336): single-file API median **27.7 ms**, 2,094,815 logical bytes read/1,964,148 written; journal median **2.3 ms**, 138,101 read/557 written. CLI medians are **157.6/203.2 ms**, including process startup and differing from an in-process client's API cost. Hot cache, one writer, no contention; physical-drive bytes unmeasured. The earlier whole-file size observations (0.75 MB here, 6.5–8.7 MB on correction ledgers) are historical context rather than a benchmark of this slice. This slice appends only records. A device-wide ticket spaces actual flush calls by the configured value; readers take no ticket. The file append mutex is released before ticket sleep and sync, so os appends take no deliberate flush-spacing wait. Grouped flushing is implemented (14f8366; GROUPED-FLUSH.md); this earlier slice-1 comparison is historical. F-E6-24 implements the scan operations, shared snapshots and lifetime bounds described in §5. Cache/index tiers, signals/timers/namespace policy and lifecycle rotation/tiering remain later slices. F-E6-20 separately changes lone-writer flush spacing; its merged source and measurements determine that behavior. No primary adoption claim follows from these operations alone.
-
-## 10. Nice-to-have dispositions
-
-| Request | Decision and reason |
-|---|---|
-| outcome(op_id) | Deferred; deterministic-key get plus identical retry covers this slice and the permanent guard. |
-| tag co-location + atomic conditional batch | Deferred; slice batch remains non-atomic, so client intent/source recovery remains necessary. Atomicity would change the commit/recovery surface. |
-| shared scan snapshot token | Implemented in F-E6-24; namespace scope, release and lifetime are stated in §5. |
-| bulk value streaming | Deferred; bounded get_many paging is available; startup reconstruction measurements precede streaming. |
-| key/version write signals | Implemented F-E6-33, optional exact values, bounded epoch-scoped resume and explicit gaps; see SUBSCRIPTIONS.md. |
-| shadow adoption | Recommended to lane 83 as its adoption choice: file ledger primary, membus put-if-absent mirror, compare/reconcile under kills before primary migration. This does not make membus a provider or runtime adapter. |
-
-## 11. Run and verify
-
-F-E6-33 adds hello `subscribe=1` and operations16subscribe,17unsubscribe,18subscription_status,19signal_usage and20capture_metrics; [SUBSCRIPTIONS.md](SUBSCRIPTIONS.md) specifies all fields, limits and the Python named-pipe listener. A pipe write is not a receipt. Resume retention covers only the latest4096changes/16MiBglobally in the current epoch; old/restarted cursors return resume_gap23without silent truncation, and catch-up beyond256queueitems/8MiBreturns busy6. No signal log or persistent subscription is implemented. `scans=1` clients retain22codes, older clients19.
-
-`cargo test --offline --locked -- --nocapture`, then `python tests/integration.py --binary target/debug/membus.exe --output <ignored evidence dir>`. Queue both through lineup with cpu/mem and disk:d. Build outputs stay in ignored target; replay/burst states and captures in the commissioned act-work directory. No third-party crate or dependency execution. The Python test owns and stops every server it launches, compares acknowledged ids to replay, and reports record bytes/flush calls.
-
-### F-E6-20 implemented grouped write policy
-
-[GROUPED-FLUSH.md](GROUPED-FLUSH.md) defines the current group closing rule, actual cohort/admission bounds, --flush-ms meaning, batch concurrency and failure behavior. It supersedes section9's historical slice1 ungrouped behavior above; kv/1 remains minor0.
-
-Four append owners drain bounded stripe queues. Each stripe admits at most1024outstanding items and queue_bytes/4chargedbytes; all stripes share queue_bytes. Charge is canonical mutation representation+value+128bytes, replacing the earlier value-only description in §7. Busy6 precedes pending/version/retry identity insertion. Durable stripe records also reserve their exact encoded byte length under the8GiB default state_limit_bytes; capacity7 refuses a record before admission when it would exceed the cap. Resident CLI wiring belongs to F-E6-21; epoch/heartbeat sidecars are excluded from this stripe-log cap.
-
-When a flush notice arrives with no other outstanding flush waiter, the device worker syncs its handle immediately, bypassing both gathering and interval spacing. A notice arriving while another flush waiter is queued or syncing is classified at arrival as gathered. Its first worker receipt opens the configured gather window; retained groups keep interval spacing after the previous sync attempt. Every complete append before the captured extent is covered, so known covered waiters complete together and late notifications reuse successful extents. Actual cohort bound is1024outstanding admitted stripe items and charged byte cap;64rows/144192bytes is a selection budget. Distinct batch keys overlap through up to32helpers (one executing batch; concurrent batchbusy6); same-key and reply order remain the client's.
-
-Default50ms no longer bounds all attempts to20/s: idle serial writers perform one actual sync per uncovered row, without a deliberate50ms delay. Busy writers still gather. This is the idle-immediate form selected against per-request windows (wire negotiation/client changes) and second-arrival windows (close-race complexity); GROUPED-FLUSH.md records the historical measured costs and e6 source-bound verification. No optimum-default claim is made. A test-only sync-witness feature brackets actual Windows FlushFileBuffers, absent in ordinary release; its killed-call marker interval and surviving call durations are reported separately, without claiming a kernel trace.
-
-Optional diagnostic opcode9 uses the normal deadline/op_id/namespace prefix, no suffix, and returns threeLEu64: logical data-log append bytes, actual File::write calls, and accounted data-log syncs. The last quantity includes flush-worker attempts and syncs of successfully closed and published chunks; it omits failed close syncs and data syncs followed by failed catalogue Close publication. Catalogue/report/epoch syncs and physical-device I/O are excluded, as detailed in GROUPED-FLUSH.md. Existing HELLO/HEALTH layouts and refusal meanings are unchanged under minor0; old servers return unsupported2 for opcode9.
-
-F-E6-20 measured350000recorded-shape keys with explicit2GiBvalue/dedupcapacity and400000dedupcap: processRSS1140346880bytes, privatebytes1168203776, incrementalRSS3244.34bytes/key. This combines values, copied retry fingerprints, metadata, allocator and worker overhead; isolated metadata/key cost remains unknown. Namespacewarning istrueat350000/500000 and globalwarningfalseat350000/917000. Defaults256MiBcapacity and262144dedupcap are not shown to fit this workload. The earlier §7 allocator-unknown statement is historical; this located combined-process measurement replaces it without claiming a metadata-only bound.
-
-### e6 measurement and review clarification
-
-Current policy/source-bound evidence is runs/e6/act-work/F-E6-20/final-window/window.json and SOURCE-BINDING.json. Historical §9 figures and its ungrouped ticket policy do not predict current idle-immediate behavior. The actual runtime append_all bulk transaction is substantially faster than the retained50ms non-atomic membus batches; the report supplies both ack boundaries, exact bytes/sync counts and raw timings. Journal folding is configured at500lines; runtime38c195f folds when the count exceeds500, so the501idle serial sample includes a fold. Cadence deliberately starts with499recorded tail lines to locate that boundary.
-
-Candidate-policy costs: idle-immediate: serial median1.132ms,128rowbatch0.618468s/13syncs; per-request-window: serial median51.565ms,128rowbatch0.629238s/12syncs; per-request-window-zero: serial median1.084ms,128rowbatch0.015133s/16syncs; second-arrival-window: serial median1.074ms,128rowbatch0.619232s/13syncs. These artifact prototypes emulate selected per-request window values without implementing new wire negotiation; second-arrival checking has close-race complexity. Idle-immediate avoids caller/wire changes. Parallel low-rate overlap still gathers and is not measured by the serial workload. One sync per idle row has no global20/s ceiling, and physical-device pressure/sustained serial limits remain unmeasured. User-space entering/returned witness brackets satisfy the commissioned marker criterion; they do not prove a kernel interruption, dirty-page state, or power-loss survival.
-
-The128row prototype at50ms saves3of16syncs (about19%) while taking about40times the zero-window elapsed time. No physical-load benefit or optimum is established; existing --flush-ms0 is an owner option whose3065row result is unmeasured here. Prototype source paths/hashes and non-isolated subcase limits are recorded in policy-forms.json. The notice-order test forces first-sender preemption but was not mutation-tested; a late second-thread schedule could mask lock removal. The owner coverage seam checks one receive branch and cannot be produced by wire admission; grouped32write coverage remains separately tested.
-
-## Persisted timers (F-E6-41)
-
-Identity feature timers=1 adds operations21 set/replace,22 cancel,23 status and refusal25 discovery, without changing old hello or existing calls. [TIMERS.md](TIMERS.md) specifies fields, bounds, per-fire bytes, catch-up and crash windows. Subscription delivery carries MBT1 as an MBC1 value; generation/index identify a due, and payload execution remains the caller's lease.
-
-## Chunk retirement opcodes (F-E6-52)
-
-Opcodes 24-27 are additive under kv/1 minor 0 ([CHUNK-RETIREMENT.md](CHUNK-RETIREMENT.md) section 6); hello and health keep their layouts, and an older server answers `unsupported` (2). Each carries the common fields; the namespace `__membus_policy_v1` is refused (3) to every client operation, as the timers namespace is.
-
-| Opcode | Payload after common fields | Successful reply after common header |
+| Opcode | Suffix | Successful payload |
 |---|---|---|
-| 24 policy_set | string prefix (may be empty); u8 kind (0 forever, 1 latest, 2 expire, 255 clear); u64 retention_ms (expire only, at least the retry window) | u64 version; u8 achieved_ack |
-| 25 policy_get | empty | u16 count; (string prefix; u8 kind; u64 retention_ms)* for the request's namespace |
-| 26 get_status | string key | u8 status (0 live, 1 expired, 2 missing); u64 version (live only, else 0) |
-| 27 health2 | empty | u16 count; (string "key=value")* |
+| 10 SNAPSHOT_OPEN | empty | bytes snapshot |
+| 11 SCAN_PREFIX | bytes snapshot; bytes cursor; u16 limit; u32 max_bytes; bound prefix | bytes snapshot; bytes next_cursor; u8 done; u16 count; (text key; value)* |
+| 12 SCAN_RANGE | bytes snapshot; bytes cursor; u16 limit; u32 max_bytes; bound lower; bound upper | same page layout |
+| 13 SNAPSHOT_RELEASE | bytes snapshot | empty |
+| 14 SCAN_KEYS_PREFIX | same as 11 | same page header; text keys without values |
+| 15 SCAN_KEYS_RANGE | same as 12 | same page header; text keys without values |
 
-`policy_set` refuses a 65th distinct class with `capacity` (7). The namespace in the common fields is the one the policy governs; longest prefix wins, and a key with no policy is `forever`. `get_status` reports `expired` for 30 days after an expire class retires the key's latest record, then `missing`. `health2`'s keys are listed in CHUNK-RETIREMENT.md section 6 (`namespace.<ns>` and `retained_bytes.<class>` repeat per namespace and class). The Python client's `health2()` and `get_status()` raise `NotAvailable` on an older server; `membus policy PIPE get|set|clear` and `membus expiry resume STATE_DIR` are the CLI.
+Wire scans with empty snapshot and cursor capture implicitly; the Rust Client
+uses an explicit `snapshot_open` token. Empty cursor starts a query. Prefix empty
+selects all live keys. Ranges are half-open [lower, upper) in UTF-8 byte order;
+empty upper is unbounded, empty lower starts at the beginning. Equal nonempty bounds
+succeed empty; lower above a nonempty upper is malformed. Limit is 1..128;
+max_bytes is at least 42 and bounds the whole reply body including its 15-byte
+header, excluding the four-byte length. The negotiated frame limit also applies.
 
-`policy_set` uses the common caller namespace and literal operation ID under the
-same mutation retry rules as other writes. Changing prefix/class/clear content
-under that identity refuses with `op_id_mismatch`; an identical retry returns its
-original version and does not reapply an older policy after a newer setter. Pending
-duplicates join through routing publication, bounded by their own deadline. Policy
-admission and live routing publication share an order without holding a routing
-lock during append/flush work. The class count includes nonretired instantiated
-classes left by policy replacement, selected policies, in-flight route selections
-and admitted prospective policies. Old policies remain selected during a setter's
-durable wait; replacing a class at the limit can therefore require first clearing
-its policy and waiting for its remaining obligations to discharge. Retired historical
-names do not consume a permanent lifetime quota. Existing chunks keep
-their original class. The native policy-list command receives within its actual
-negotiated frame bound; native health retains its smaller fixed reply bound.
+Snapshot tokens are opaque 16-byte epoch/ID pairs. Cursors bind token, absolute
+row position, opcode and bounds with a snapshot-local keyed hash; they are
+bounded by `2*MAX_ID+48` bytes. Preserve them as opaque bytes. This binding is not
+cryptographic authority. Query/position/tag/namespace mismatch refuses
+invalid_cursor (21); missing, expired, released or old-epoch snapshots refuse
+cursor_expired (20). Structural cursor validation can precede token lookup.
+
+The same token/cursor/query can be paged again until expiry/release; page limits
+may change. If its first matching item cannot fit, a page refuses too_large (4)
+without advancing. An existing token survives this refusal; an implicitly
+created token is removed on page failure. Done means no continuation and does
+not release retention. Release explicitly, including error paths. A lost
+snapshot-creation reply cannot be recovered by read operation ID; recreating
+allocates a different view until old retention expires. After expiry, restart
+all related queries on a single fresh view rather than mixing pages.
+
+Defaults are 8 snapshots, 256 MiB aggregate conservative charge and a fixed
+30-second monotonic lifetime from capture entry (`--snapshot-max`,
+`--snapshot-bytes`, `--snapshot-ttl-ms`). Pages do not renew it. Charge per view
+is `256 + namespace bytes + sum(key bytes + 128 + value Vec capacity)` across
+the whole namespace, even for narrow or keys-only queries. Active page handles
+retain charge after release/expiry until their last reference drops. The
+maintenance reaper removes expired registry entries; this is not a renewal or
+unbounded retention facility.
+
+Capture makes two traversals of the global committed hash index under a read
+lock, charging before allocating owned rows, then copies namespace keys/handles.
+It releases the committed and registry locks before sorting. Capture can delay
+publication and other snapshot registry operations; paging reads retained data
+without append/flush locks. Payload encoding and concurrent response buffers
+add transient memory beyond the snapshot budget. With 64 connections and 16 MiB
+page budgets, returned bodies alone can approach 1 GiB, with additional temporary
+copies. Provision page size/concurrency separately from retained charges.
+
+Opcode 20 CAPTURE_METRICS returns seven cumulative u64 values: captures,
+read_lock_wait_ns, charge_walk_ns, selection_walk_ns, namespace_copy_ns,
+read_lock_held_ns, sort_and_release_ns. These instrument completed captures;
+concurrent atomic reads are not a transactional metrics snapshot.
+
+## Storage, capacity and related operations
+
+Records retain `MBK1; u32 payload_length; u32 bitwise_length_complement; u32 CRC32;
+payload`. Payload records admission time, revision, ack/remove, namespace, key,
+operation ID, expected token and bytes. CRC detects corruption, not identity.
+Four stable key-hash stripes route records to class-specific chunks. Replay
+resolves latest versions and retained outcomes before service. Open incomplete
+tails may be truncated after recording evidence; complete corruption refuses.
+There is no replay index checkpoint or warm/cold tier. See
+[chunk retirement, import and replay](CHUNK-RETIREMENT.md) and
+[catalogue append recovery](CATALOGUE-APPEND-RECOVERY.md).
+
+Default namespace quota is 500000 live keys. Default global index cap is 917000
+slots including tombstones and expiry summaries. Reservations count at admission.
+A remove frees a live namespace slot at commit but its tombstone retains an index
+slot until no other retained chunk can contradict it. Expiry summaries occupy
+index slots for 30 days. The default logical capacity setting is 256 MiB. Before
+admission, its check adds the incoming value and 32-byte comparator to existing
+committed-value, retained-comparator and reservation charges. Admission then adds
+the larger full queue charge to reservations while the old value remains visible.
+That increment can put the combined pending account above the capacity setting;
+the current check does not enforce an instantaneous ceiling on that sum.
+Queue admission independently charges the complete canonical mutation
+representation plus value length plus 128 bytes; durable disk admission reserves
+the complete MBK1 record.
+Identifiers, outcomes and bookkeeping still consume per-operation memory.
+Queue/snapshot/signal/timer budgets are additional,
+not a measured RSS ceiling. Retained data defaults to 8 GiB, with the executable
+reserving part for maintenance; [RESIDENT.md](RESIDENT.md) lists options.
+
+Opcodes 16..19 manage [subscriptions](SUBSCRIPTIONS.md), and 21..23 manage
+[timers](TIMERS.md). Opcodes 24..27 set/get retention policy, inspect key expiry
+status and return HEALTH2, as described in [CHUNK-RETIREMENT.md](CHUNK-RETIREMENT.md).
+Neither change transport nor timer status establishes receipt, lease authority
+or useful application completion. Indexed publication/query semantics are in
+[INDEXED_COLLECTIONS.md](INDEXED_COLLECTIONS.md).
