@@ -29,6 +29,10 @@ universal recovery durability.
 followed by an injected failure before a covering live sync. It distinguishes a
 refused recovery barrier from successful value and original retry publication,
 and checks that refusal changes neither the data nor the catalogue.
+It separately exercises a real Windows write-open denial on a fresh owned active
+data file and preserves already located missing-file evidence when another
+required sync fails. These controls do not represent every startup side effect
+or a physical-device sync failure.
 
 The explicit `sync-witness` feature records the actual file handle's target,
 extent and FlushFileBuffers result in an append-only `.calls` diagnostic when

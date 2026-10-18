@@ -161,3 +161,67 @@ fn refused_recovery_retains_missing_file_evidence_already_found_by_replay() {
         "an early sync refusal must not discard the replay observation: {report}"
     );
 }
+
+#[cfg(windows)]
+#[test]
+fn actual_recovery_write_open_denial_refuses_flush_publication_and_preserves_data() {
+    struct Restore {
+        path: PathBuf,
+        permissions: fs::Permissions,
+    }
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if let Err(error) = fs::set_permissions(&self.path, self.permissions.clone()) {
+                eprintln!("owned fixture permission restore failed: {error}");
+            }
+        }
+    }
+    let path = fixture("actual-open-denial");
+    let config = Config {
+        flush_ms: 0,
+        ..Config::default()
+    };
+    let store = open(
+        &path,
+        Config {
+            fail_after_append: true,
+            ..config.clone()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        store
+            .mutate(mutation("uncertain-os-case", b"retained complete bytes"))
+            .code,
+        16
+    );
+    drop(store);
+    let before = data_hashes(&path);
+    assert_eq!(before.len(), 1);
+    let data = &before[0].0;
+    let permissions = fs::metadata(data).unwrap().permissions();
+    assert!(!permissions.readonly());
+    let restore = Restore {
+        path: data.clone(),
+        permissions: permissions.clone(),
+    };
+    let mut readonly = permissions;
+    readonly.set_readonly(true);
+    fs::set_permissions(data, readonly).unwrap();
+    // No injected recovery fault: Windows itself refuses the required writable
+    // handle. This changes only this fresh owned active-file fixture.
+    let error = open(&path, config.clone())
+        .err()
+        .expect("required OS write-open failure must refuse startup");
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(error.to_string().contains("recovery data sync"));
+    assert_eq!(data_hashes(&path), before);
+    let report = fs::read_to_string(path.join("replay.json")).unwrap();
+    assert!(report.contains("\"stage\":\"refused\""));
+    assert!(report.contains("\"ready_ms\":0"));
+    drop(restore);
+    assert!(!fs::metadata(data).unwrap().permissions().readonly());
+    let store = open(&path, config).unwrap();
+    assert_eq!(store.get("recovery-fixture", "state").unwrap().ack, 2);
+    assert_eq!(data_hashes(&path), before);
+}
