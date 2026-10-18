@@ -389,7 +389,9 @@ impl Watcher {
                 s.written <= self.received,
                 "unexpected unread delivery: {s:?}"
             );
-            if s.written == self.received {
+            // A popped send leaves the queue but retains its charge until the
+            // writer settles. Wait for both bookkeeping and in-flight bytes.
+            if s.written == self.received && s.charged_bytes == 0 {
                 println!("quiet subscription received={} status={s:?}", self.received);
                 return;
             }
