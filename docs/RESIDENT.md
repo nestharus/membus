@@ -1,144 +1,125 @@
-# Resident membus (kv/1)
+# Resident operation
 
-F-E6-21 supplies the executable and checks; lane 88 owns service registration.
-The first client is lane 83's optional shadow mirror: its fsynced file ledger
-stays primary, conditional_put(row/<file seq>, absent) uses explicit os ack,
-and its own cursor catches up after outages. No primary adoption is implied.
+The executable serves one explicitly selected state directory and endpoint:
 
-## Installation and command
-
-Install a verified release binary at `D:/projects/membus/bin/membus.exe`, outside
-worktrees. Stage a replacement as `membus.next.exe`, verify its sha256 against
-the build record, stop through `fleet services`, replace only while stopped,
-then restart and check a fresh heartbeat and kv/1 hello. Keep the previous
-binary as `membus.previous.exe` until replay and readback pass; rollback uses
-the same stopped replacement. Do not replace a running executable or state.
-
-Working directory: `D:/projects/membus/`. State: `D:/projects/membus/state/`.
-Exact intended command (the pipe argument is one literal argument):
-
-```
-D:/projects/membus/bin/membus.exe D:/projects/membus/state pipe \\.\pipe\LOCAL\membus-kv1 --idle-ms 60000 --heartbeat-ms 30000 --state-limit-bytes 8589934592
+```text
+membus STATE_DIR pipe LOCAL_PIPE [OPTIONS]
+membus STATE_DIR tcp LOOPBACK_ADDRESS [OPTIONS]
 ```
 
-No third-party crate is added. Build and tests use host cargo offline/locked
-through lineup, cpu/memory and disk:d slots. The new CLI controls leave kv/1.0
-framing and refusal codes intact. `--idle-ms` is a positive per-I/O timeout
-(default 60000): a pipe or TCP client stalled in a read or write is closed,
-including a client that sends only part of a frame. A continuing trickle can
-keep a connection live; this is an idle bound, not a whole-request deadline.
-Pipe I/O uses overlapped operations, cancellation and completion drainage.
-An incomplete trickling frame keeps its ingress reservation as well as its
-connection slot; the aggregate64MiB frame budget remains bounded and other
-clients can receive busy6. A total-frame deadline is a later policy choice.
-The current-user/LocalSystem ACL, local-only endpoint and 64-client cap remain.
-The service must run as xteam in the same user/logon session as its clients;
-running as SYSTEM changes the current-user SID and would exclude user clients.
-Python's existing reconnect and epoch reconciliation require no wire change.
+`pipe` is available on Windows. `tcp` accepts loopback addresses only and is a
+foreground test transport without cross-user authentication. The named-pipe
+server uses first-instance protection, rejects remote connections, and sets an
+ACL for its current user and LocalSystem. Run with the intended account and
+logon/session access; changing the service account changes the current-user SID.
+HELLO identity is correlation, not application authentication. Admitted clients
+share the resident's local-principal powers.
 
-## Startup, health and bounded output
+Choose persistent storage independently of source checkouts and build output.
+`owner.lock` fences concurrent owners: Windows holds a share-denied handle for
+the resident lifetime, released on exit. On non-Windows the create-new lock
+requires operator cleanup after confirming the previous owner has stopped.
+The executable starts timer ownership after replay and writes its readiness
+message before entering the selected transport. Transport/heartbeat checks are
+needed to establish that it can actually serve.
 
-The existing share-denied owner.lock fences another live owner. A killed
-predecessor releases handles (including its pipe); startup replay truncates
-only a short final header/incomplete final body, rejects complete corruption,
-then creates a new epoch. Clients reconcile deterministic keys on epoch change
-before retrying an uncertain send. os and flush acknowledgements survive a
-server process kill; os is not a power-loss promise. mem requires explicit opt-in.
+## Options and resource bounds
 
-`heartbeat.json` is a single bounded JSON object in state, replaced every
-`--heartbeat-ms` milliseconds (default30000, minimum100; zero disables it).
-It contains pid, epoch, unix_ms, heartbeat_writes and heartbeat_bytes counters,
-plus heartbeat_attempts, heartbeat_bytes_attempted and heartbeat_failures.
-`heartbeat.tmp` is bounded to one object too. Each successful replacement
-counts one successful replacement; no sync is requested. Each attempted temp
-write is counted too, and failures appear in the next successful object. Bytes
-attempted bound the requested temp-write bytes, including failed/partial writes;
-they do not claim physical I/O. A persistent error retries once per interval,
-then becomes stale health. With an object below512bytes this costs below1024
-logical requested bytes/minute at the default interval during successful operation,
-plus filesystem metadata; physical-device bytes are not inferred. There is
-no per-request log. stdout/stderr have just startup/fatal messages; lane88's
-launcher must rotate/cap captures at1MiB with one prior file. Health check:
-fresh heartbeat (age<90s), matching live pid and successful kv/1 hello/health;
-heartbeat freshness alone is not a proof the transport can serve.
-Native `membus.exe health PIPE [--state-dir PATH]` (state defaults to the resident
-state path above) exits0 only after kv/1 hello+health, with the pipe server pid
-queried through Windows, matching heartbeat pid and hello epoch, age<90s.
-It uses2s per-I/O timeouts and emits a single success line; failures exit nonzero.
-Busy pipe instance creation retries for at most2s. Native health requires the
-heartbeat to be enabled; `--heartbeat-ms 0` is for foreground tests only.
+Byte options use bytes; time options use milliseconds.
 
-## State growth and upgrades
+| Option | Default | Meaning |
+|---|---:|---|
+| `--idle-ms` | 60000 | Positive timeout per transport I/O, below u32::MAX |
+| `--heartbeat-ms` | 30000 | Replacement interval; zero disables, otherwise at least 100 |
+| `--state-limit-bytes` | 8589934592 | Positive retained data-byte admission limit |
+| `--maintenance-reserve-bytes` | min(1 GiB, state limit / 8) | Ordinary writes stop below this reserve; must be below the limit |
+| `--flush-ms` | 50 | Gather window and spacing for gathered flush work |
+| `--retry-ms` | 86400000 | Bounded mutation outcome retention horizon |
+| `--quota` | 500000 | Live keys per namespace, including admission reservations |
+| `--index-cap` | 917000 | Global index slots, including tombstones and expiry summaries |
+| `--capacity` | 268435456 | Logical value/dedup/reservation byte budget |
+| `--queue-bytes` | 67108864 | Charged queued representations, divided across four stripes |
+| `--dedup-cap` | 262144 | Active outcomes and bounded retired-ID ring capacity |
+| `--snapshot-bytes` | 268435456 | Aggregate conservative retained snapshot charge |
+| `--snapshot-max` | 8 | Concurrent retained/in-flight snapshots |
+| `--snapshot-ttl-ms` | 30000 | Fixed lifetime from capture entry; reads do not renew it |
+| `--signal-history` | 4096 | Retained changes; zero disables history |
+| `--signal-bytes` | 16777216 | History representation budget; zero disables history |
+| `--chunk-bytes` | 8388608 | Positive chunk rotation size |
+| `--rotation-ms` | 3600000 | Age rotation for finite classes |
+| `--retire-ms` | 10000 | Retirement pass interval |
+| `--allow-mem` | off | Permit explicitly negotiated disposable memory acknowledgments |
+| `--delay-ms` | 0 | Artificial append delay used by tests |
 
-Until rotation/tiering exists, the four stripe logs only grow. Default
-`--state-limit-bytes 8589934592` caps their combined logical record bytes;
-replay counts existing lengths, and exact new record reservations refuse
-capacity(code7) before acceptance at the cap. Reads and heartbeat continue;
-do not delete stripe files to regain space. Raise the provisioned cap only
-after disk accounting or migrate an instance; zero is invalid. This bound
-excludes fixed owner.lock and heartbeat files, filesystem metadata and logs
-owned by the launcher. Existing state above the cap remains readable and
-refuses further persistent appends. Memory caps remain independent.
-Heartbeat also reads the in-memory replay+append counter `state_bytes`, names
-`state_limit_bytes`, and warns `state_high_water` at75% (6GiB of the default8GiB).
-This causes no drive reads. These fields are diagnostic local health readings;
-the existing kv/1 health packet is unchanged and its lifetime write counter
-still excludes pre-restart bytes. Operators poll the heartbeat before the cap.
-`state_bytes` conservatively charges the complete attempted frame after an
-uncertain append until replay recounts actual valid bytes; pending reservations
-are excluded from the diagnostic value. At the cap, persistent removes also
-refuse since tombstones append and cannot reclaim log space. Since chunk
-retirement (docs/CHUNK-RETIREMENT.md 5.5) the 8 GiB cap counts retained chunk
-bytes, retired bytes leave it at `retired`, and ordinary admissions refuse with
-7 at the cap less a 1 GiB maintenance reserve (7 GiB; an eighth of a smaller
-`--state-limit-bytes`, or `--maintenance-reserve-bytes`), which catalogue,
-retirement and import writes may use. Snapshots are still not supplied.
-Fleet's `heartbeat_warn` reads the heartbeat's `state_high_water` and the chunk
-retirement flags (fleet-manager 669bcc0 config/services.toml:209-214; CHUNK-RETIREMENT.md
-section 6): `read_only`, `storage_error`, `expiry_degraded`, `dedup_high_water`,
-`namespace_high_water`, `pinned_high_water` and `retire_blocked_high_water`,
-written 0 or 1 beside `state_high_water`'s true or false. HEALTH2 (opcode 27)
-returns the full reading. The cap itself is enforced immediately.
+The library's `Config::default()` has a zero maintenance reserve; the executable
+sets the reserve shown above. At the default state limit, ordinary persistent
+admissions stop at 7 GiB. Retired chunk bytes leave accounting only after
+`Retired` publication. Failed appends are charged conservatively until replay.
+The limit is data accounting, not an all-files disk quota: catalogue, import
+backups, epoch, heartbeat and replay reports need separate storage provision.
+A tombstone appends and can also refuse at capacity. Raising a limit requires
+sufficient disk and memory; deleting data files is not a capacity remedy.
 
-A wire minor/major change needs hello negotiation and documented compatibility;
-an incompatible client receives incompatible_version. An on-disk format change
-requires an explicit migration/backup plan before replacing the binary.
-MBK1 records and kv/1.0 remain compatible, but chunk startup migrates the legacy
-layout: it verifies an import into separate chunks, switches directories and moves
-untouched legacy files into the recorded backup directory. Follow the explicit
-import/backup/rollback procedure in CHUNK-RETIREMENT.md section 5.6 before a stopped
-replacement. Binary replacement alone does not restore the legacy layout. Restoring
-that backup omits writes accepted after the switch; the retry window does not cap
-that possible loss at 24 hours. Keep the backup until its owner selects removal.
-An unresolved catalogue append refuses startup and retains its evidence. Do not
-remove its marker manually or open that state with a marker-unaware older binary;
-see CATALOGUE-APPEND-RECOVERY.md for that boundary.
-Lane88's eco seq452 answer selects task `Oulipoly membus`, xteam logon plus
-1-minute repeats, IgnoreNew, below-normal priority, unlimited duration. The
-minute repeat restarts after exit; Task Scheduler RestartOnFailure concerns
-start failures and is deliberately omitted. Lane88's pythonw resident launcher
-owns the1MiB+one-prior capture. Registration waits for verified installed binary
-hash+commit and the native health command; the final Act report records whether
-that registration and fleet restart test happened.
+Both transports cap active connections at 64 and reserve an aggregate 64 MiB
+of incoming frame bodies before allocation. The reservation lasts through
+dispatch. Saturation can return busy and close a connection without a usable
+request association. A partial trickling frame can retain a connection and its
+reservation: the server idle option is not a whole-frame or request deadline.
+Windows overlapped I/O cancellation drains completion before releasing buffers.
 
-## Plan basis and verification
+Memory budgets are independent logical charges, not a calibrated process RSS
+limit. Values, exact dedup fingerprints, snapshots, history, queues, response
+encoding, worker metadata and OS pipe buffers all contribute. Large scan pages
+and concurrent responses add transient memory beyond snapshot accounting. All
+committed values remain in memory; there is no cache/tiering controller.
 
-Read against KV1 sections6,8,9, PLAN section12 O19 and lane83 review
-`membus-interface-review/review.md:145-149`. Design record
-`D:/dev/handoff/memory-ecosystem.md` sha256
-`074d22267522e57ad4ed32e1d95aef64833358a41fc9908e1bf958d99d2ffcb6`:
-Rust throughout; drive pressure is the biggest risk; cache eviction never
-rewrites data; avoid hard coupling. Survey
-`D:/dev/handoff/fast-local-store-survey.md` sha256
-`b128d2588930d54819fceae4047299e4591535763f7048d89c4cf31a9fcfd10f`.
+## Health and bounded reports
 
-Pass conditions, stated before runs: host cargo tests pass; named-pipe partial
-frame idle client is closed within the configured timeout plus scheduling
-tolerance; os/flush-acknowledged keys replay equally after kill and a torn tail;
-epoch changes; heartbeat counter and bytes agree with bounded-file updates;
-state cap refuses before acceptance and preserves old reads. Raw small outputs
-and co-tenant lineup/process context go in the e4 act-work/F-E6-21 directory.
-The first91-byte-object witness predates the additive failure counters; the
-final report locates the current object's measured byte count.
-An observe-class reviewer reads the diff against the commission and named
-basis; every observation gets a disposition before merge and private push.
+`heartbeat.json` is replaced via `heartbeat.tmp` each interval, without a sync
+request. It includes pid, epoch, UTC time, successful/attempted heartbeat writes
+and bytes, failures, state bytes/limit, pressure flags and retirement diagnostics.
+Failed replacements retry once per interval; the next successful object reports
+failures. Logical requested bytes do not measure physical storage I/O.
+
+On Windows:
+
+```text
+membus health LOCAL_PIPE --state-dir STATE_DIR
+membus retirement-status LOCAL_PIPE
+```
+
+Pass `--state-dir` explicitly to select the instance's heartbeat. Health performs
+HELLO and HEALTH, checks the Windows pipe server PID against the heartbeat PID,
+requires matching epoch and heartbeat age below 90 seconds, and uses two-second
+I/O bounds. A disabled heartbeat cannot pass this command. Freshness alone does
+not establish transport health. `retirement-status` projects selected HEALTH2
+fields; see [inspection](RETIREMENT-INSPECTION.md).
+
+`state_high_water` is 75% of the full state limit. Dedup and namespace pressure
+flags use 70%. Other flags include `read_only`, `storage_error`,
+`expiry_degraded`, `pinned_high_water` and `retire_blocked_high_water`.
+[Chunk retirement](CHUNK-RETIREMENT.md) describes their meaning and HEALTH2.
+The heartbeat does not aggregate timer errors; reconcile individual timer status.
+
+Startup writes `replay.json` and `replay.log`, including refusal/truncation
+stages. The log is compacted to its last 256 lines when it exceeds 1 MiB.
+Startup/fatal diagnostics go to stderr; there is no per-request access log.
+The supervisor must bound and rotate its own captures.
+
+## Restart and replacement
+
+Stop and wait for the existing resident before replacing its executable or
+inspecting stopped state. Verify the replacement's identity and qualify it
+against a retained state copy. Preserve backups independently of the checkout.
+A changed epoch invalidates snapshots, subscriptions and resume history; reconcile
+uncertain writes and application state after reconnecting.
+
+Replay reconstructs committed state before service. Complete corruption refuses
+startup; only allowed incomplete open tails are truncated, with evidence written
+first. Missing/unaccounted chunk files can start read-only with storage_error.
+Unresolved catalogue appends refuse replay and require an independently
+established recovery account. See [retirement/replay](CHUNK-RETIREMENT.md) and
+[catalogue recovery](CATALOGUE-APPEND-RECOVERY.md). Legacy import is automatic for
+a legacy-only store and retains its inputs; restoring those inputs loses every
+post-import write. An older executable must not be assumed compatible with
+current catalogue markers or timer state.

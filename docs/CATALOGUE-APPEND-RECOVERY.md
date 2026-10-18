@@ -47,4 +47,7 @@ append completion and any delayed flush notice/result. Merely closed or still
 retiring sinks retain their covering extent, holders and retry state. The flush
 owner drops coverage entries for discharged sinks on its next work-loop visit.
 Lifetime counters remain separate from these released rows. This is bookkeeping
-reclamation; it does not implement the deferred cache or RSS budget.
+reclamation; it does not implement cache eviction or a total RSS budget.
+
+See [chunk retirement](CHUNK-RETIREMENT.md) for the surrounding storage lifecycle
+and [read-only inspection](RETIREMENT-INSPECTION.md) for stopped-catalogue observation.

@@ -1,31 +1,79 @@
-# F-E6-20 grouped write path
+# Grouped append and flush
 
-kv/1 remains minor0 with unchanged MBK1 records. This realizes the four append owners and grouped writes of docs/PLAN.md4 with explicitly different policy choices below, superseding KV1.md9's historical slice1 ticket-per-waiter description. The plan's proposed1MiB append cap is not added: existing kv/1 MAX_VALUE4MiB compatibility remains, with bounded full-frame/queue admission. Its64row/144192byte ticket is a selection budget, and idle gathering starts on arrival rather than on an old wall-clock ticket.
+Four append workers drain bounded key-hash stripe queues. Current storage routes
+each stripe's writes into chunk files by retention class. One flush worker
+coordinates covering extents per sink. [KV1.md](KV1.md) describes admission,
+visibility and uncertainty; [CHUNK-RETIREMENT.md](CHUNK-RETIREMENT.md) describes
+rotation and retained-byte accounting.
 
-Optional diagnostic opcode9 IO_METRICS uses the ordinary deadline/op_id/namespace prefix and no suffix, returning threeLEu64values: current-process logical data-log append bytes, actual data-log File::write calls (including interrupted attempts), and accounted data-log syncs: flush-worker attempts plus syncs of successfully closed and published chunks. Failed close syncs, and successful data syncs followed by failed catalogue Close publication, are omitted. It is additive under minor0; old servers return unsupported2, and existing HELLO/HEALTH layouts remain unchanged. Counters exclude startup epoch I/O, replay reads, transport I/O, resident heartbeat I/O, catalogue marker/frame/rewrite writes and their synchronization, and replay-report publication. Partial data-log append bytes count even when its outcome is uncertain. These counters do not measure all-storage synchronization or physical-device cost; historical flush comparisons retain their original workload and image scope.
+Admission charges `fingerprint length + value length + 128` bytes per queued
+mutation, at most 1024 outstanding items and `queue_bytes / 4` charged bytes per
+stripe, within `queue_bytes` globally. Saturation returns busy (6) before pending
+key, version or retry identity insertion. Empty values still consume resources.
+A record larger than the configured stripe queue can repeatedly refuse busy;
+retry alone cannot fix the configuration. Durable writes reserve their exact
+encoded data length under the ordinary state ceiling before acceptance.
 
-Four persistent append workers each own a stripe file. Admission charges complete queued representations (fingerprint+value+128bytes), at most1024outstanding mutations and queue_bytes/4chargedbytes per stripe, queue_bytes overall. Oversize/saturated admission returns busy6 before pending key/version/retry identity insertion. The state_limit_bytes default8GiB includes replayed log bytes and exact pending record lengths. New durable records beyond the bound return capacity7 before admission; existing state stays readable. Failed I/O keeps a conservative disk reservation until restart.
+OS writes publish after complete append. Flush writes publish after a sync
+covers their complete-record end offset. OS appends do not deliberately wait for
+a flush gather window, although storage, routing, rotation and scheduling can
+still delay them. The append lock is released before gathering and syncing.
 
-os writes publish after complete append without waiting for flush. flush writes publish after their complete-record offset is covered by sync. One device worker syncs immediately when the first flush notice arrives with no other outstanding flush waiter. Notices arriving while another waiter is outstanding (queued or syncing) retain the gather policy, classified at arrival with an outstanding-waiter counter. The first such notice gathers for flush_ms after worker receipt; retained pending groups use the existing minimum interval. It selects one stripe, initially up to64waiters/144192recordbytes (one larger record allowed), then syncs that handle. Sync covers its whole earlier append extent: every already queued waiter with covered end offset can complete, including more than64waiters. Actual acknowledgement cohort is bounded by admitted1024outstanding items and the charged stripe byte bound;144192bytes is a selection budget rather than a physical flush-byte cap. Late waiters whose extent is already successfully covered complete without another sync; newer extents need a later sync. Physical device bytes are unmeasured.
+A flush notice arriving with no other outstanding flush waiter is classified
+idle-immediate and bypasses gathering and interval spacing. A notice arriving
+while another waiter is queued or syncing retains the gather policy. Its first
+worker receipt opens a `flush_ms` window; retained groups use interval spacing
+after the previous sync attempt. Selection initially takes one sink and up to
+64 waiters or 144192 record bytes, permitting one larger record. Sync covers all
+complete appends before its captured extent, so more than 64 known covered
+waiters can finish together. The actual cohort remains bounded by admitted
+stripe items and bytes. A late notice for an already covered extent reuses the
+successful coverage; a newer extent needs another sync.
 
-flush_ms sets the gather window and minimum interval only for gathered groups. An idle-immediate group bypasses both, including a serial caller issuing its next request immediately after the previous acknowledgement. Default50ms therefore no longer imposes a global20sync/s ceiling: isolated serial traffic pays one actual device sync per uncovered row and can sync faster than20/s. Busy traffic still shares covering extents and pays queueing/window/device time. The50ms value remains configurable and is not an owner-approved optimum.
+The default `flush_ms=50` is configurable, without an optimum or throughput
+claim. It imposes no global 20-sync/second ceiling: idle serial writes can sync
+once per uncovered row. Concurrent low-rate writers can overlap and enter the
+full gather path. Window time is additional to scheduling and device latency;
+neither logical record bytes nor a selection budget bounds physical flush bytes.
 
-The slice weighed three forms. Idle-immediate requires no wire/client changes and is chosen to meet lane83 seq558's lone-writer need. Per-request windows require protocol negotiation and changes to callers. Opening a window only when a second waiter arrives complicates the first waiter's close race. Historical measured serial medians at0/1/50ms were0.98/2.56/51.6ms and the earlier3070-row burst used294syncs/15.106s; those measurements came from different builds. The new source-bound run is in e6 act-work/F-E6-20/final-window/window.json, comparing3065rows (one59499-byte row), idle rows and93rows/minute with runtime38c195f journal folding at500lines. Idle latency removes intentional window time, not OSsync or scheduling cost. Logical byte/call counters do not measure physical-device traffic.
+Batch validates the full request before item admission and remains non-atomic.
+Distinct keys overlap through at most 32 scoped helpers; same-key operations and
+reply entries retain input order. Only one batch executes per Store; another
+batch refuses busy before admitting its items. Individual mutations and reads
+do not take the batch gate. Cross-key revision assignment is not ordered by
+input position.
 
-Distinct batch keys overlap using at mostmin(32,distinctkeys)scoped helpers; one batch executes per Store. Simultaneous batches return busy6 before any item admission. Same-key items and replies keep input order; cross-key version assignment has no ordering promise and batches remain non-atomic. A poisoned batch gate also returns busy until restart; a mutation panic may already make the store unusable. The batch gate never participates in gets/individualwrites. Store drops close and join its five durable workers. Partial appends fence their stripe, so no complete record follows a torn tail. Sync failure permanently fences the stripe's flush owner: late queued waiters receive uncertain error16 without another sync attempt, and durable admissions become read_only10. Committed gets use only the memory map: no append/queue/batch/flush lock or file I/O. HEALTH/IO_METRICS may wait for an append log lock and have no such get-latency guarantee.
+A partial append fences its stripe so later records cannot follow a torn tail.
+Sync failure fences that stripe's flush work; late waiters receive uncertain
+I/O failure (16), and new durable admissions become read-only (10). A complete
+record left by failed I/O can still replay. Preserve uncertainty and stable
+operation identity. Committed GET reads use memory without append/flush locks
+or file I/O; HEALTH and metrics can wait for a log lock. Store teardown joins
+its durable workers.
 
-The8GiB cap counts stripe logs only, including overwrite/tombstone records. Resident epoch/heartbeat sidecars are excluded and their independent bounded replacement policy belongs to F-E6-21. F-E6-21 owns --state-limit-bytes CLI wiring. Lowering the cap below existing replay bytes keeps reads available and refuses durable writes. A record that can never fit a configured stripe queue receives busy6 repeatedly; retry alone cannot fix that configuration. mem opt-in requests temporarily charge the same stripe slots.
+## Diagnostics and test controls
 
-Path-valued test environment variables MEMBUS_TEST_PAUSE_PARTIAL and MEMBUS_TEST_PAUSE_SYNC create a marker and pause at partial append or sync-worker entry. Leave unset in normal operation. The sync marker proves a worker boundary before the sync call, not residence within Windows FlushFileBuffers; those historical markers do not bracket the Windows call. The explicit Cargo feature sync-witness builds a separate test binary, with MEMBUS_SYNC_WITNESS naming entering/returned marker files immediately around the actual FlushFileBuffers call, without sleeping between them. Ordinary release builds omit this code and environment lookup. Completed returned marks record call duration in nanoseconds; killed calls cannot record their full duration. The harness writes megabytes of OS-acknowledged extent, kills between marks, replays acknowledged IDs/values, and records both successful brackets and misses in e6 act-work/F-E6-20/sync-kills.json. A user-space marker bracket is not a captured kernel stack; pre-call and post-return scheduling gaps remain uncertainty.
+Opcode 9 IO_METRICS has the common deadline/operation ID/namespace prefix and no
+suffix. Its reply contains three little-endian u64 values: current-process
+logical data-log append bytes, actual data-log `File::write` calls (including
+interrupted attempts), and accounted data-log syncs. The sync counter includes
+flush-worker attempts and syncs of successfully closed and published chunks.
+It omits failed close syncs and data syncs followed by failed catalogue Close
+publication. Partial append bytes count even on uncertain outcomes. Epoch,
+heartbeat, catalogue marker/frame/rewrite I/O, replay reporting, replay reads and
+transport I/O are excluded. These counters cannot establish all-storage sync
+cost or physical-device utilization. Older servers return unsupported (2).
 
-Measurement and located dispositions are under the F-E6-20 report and REVIEW-DISPOSITION.md. Same-key order and reply order, covering flush groups, complete-record state cap, empty-value queue bounds and previous protocol/replay behavior have Rust regression checks.
+`tests/grouped.rs` covers covering groups, hot reads, queue/disk bounds, batch
+ordering and exclusion, delayed notices and sync failure. Library tests cover
+idle-immediate and overlapping notice classification and reuse of covered
+extents. These are available controls, not a performance certification.
 
-Historical e4 source ffe865f measured3070flush rows in15.106s with294sync attempts and equal acknowledged/replayed sets; final batch times0.565–0.669s. This follows the explicitly initial timing above and is a separate measurement window. That e4 source/binary binding is in research/87_operations_representation/claude6-eco/runs/e4/act-work/F-E6-20/REPORT.md and SOURCE-BINDING.json. Current e6 source859423d and authoritative single-window comparison are in runs/e6/act-work/F-E6-20/final-window/window.json and SOURCE-BINDING.json; merged binding is recorded after parent authorization.
-
-Measured e6 policy prototypes (std-only artifact copies of source859423d, same Python transport/encoding): idle-immediate: serial median1.132ms,128rowbatch0.618468s/13syncs; per-request-window: serial median51.565ms,128rowbatch0.629238s/12syncs; per-request-window-zero: serial median1.084ms,128rowbatch0.015133s/16syncs; second-arrival-window: serial median1.074ms,128rowbatch0.619232s/13syncs. The per-request prototype emulates fixed50/0ms request selections in the worker; timings exclude new wire fields/negotiation, which is not implemented. The second-arrival prototype checks for a second queued notice before first group closure; its close race and interface are not claimed production-ready. Idle-immediate is retained: it meets the lone serial writer without changing callers. These are fixed-window serial subcase and inherited-busy-path costs; mixed per-request windows and isolated second-arrival activation are unmeasured. Full cases/hashes/raw samples are in runs/e6/act-work/F-E6-20/policy-forms.json.
-
-Parallel low-rate writers can overlap: a notice during another sync retains a full gather window after worker receipt. The e6 client workloads are serial; this is documented behavior, not a measured parallel latency claim. At93/minute, one sync/row means1.55syncs/s on average; the501row mixed-call sample measured750.85syncs/s over summed membus call time and145.76/s over mixed wall time; sustained membus-only/device limits and physical drive load are unknown. Source logic removes intentional idle window/spacing, not scheduler or actual sync latency; raw tails are reported. Journal uses the live500line setting, whose pinned runtime folds only after>500lines:501idle appends include one fold; cadence starts with499recorded tail lines and folds on its second append, intentionally sampling a boundary rather than estimating long-run amortization from93rows.
-
-The initial harness abort at sync-attempt-0 is one unclassified kill attempt without a completed replay check. It is retained separately from three verified c57b088 kills and the final source859423d bracket run; every run and count is listed in sync-kills.json. OS cache survival does not prove interrupted kernel I/O or power-loss safety, and the extent has no earlier explicit sync rather than proven dirty pages. Failed witness marker writes are logged and never change the actual sync result; invalid-path verification confirms continued flush acknowledgements.
-
-The128row prototype at50ms saves3of16syncs (about19%) while taking about40times the zero-window elapsed time. No physical-load benefit or optimum is established; existing --flush-ms0 is an owner option whose3065row result is unmeasured here. Prototype source paths/hashes and non-isolated subcase limits are recorded in policy-forms.json. The notice-order test forces first-sender preemption but was not mutation-tested; a late second-thread schedule could mask lock removal. The owner coverage seam checks one receive branch and cannot be produced by wire admission; grouped32write coverage remains separately tested.
+`MEMBUS_TEST_PAUSE_PARTIAL` and `MEMBUS_TEST_PAUSE_SYNC` are path-valued pause
+seams; leave them unset during operation. The latter marks worker entry before
+sync. The optional Cargo feature `sync-witness` brackets actual Windows
+FlushFileBuffers with entering/returned markers selected by
+`MEMBUS_SYNC_WITNESS`. Ordinary releases omit that feature's marker code.
+User-space brackets do not prove kernel interruption, dirty-page state or
+power-loss survival. Historical measurements and policy comparisons are
+available through Git history; they are not current latency guarantees.
