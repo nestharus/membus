@@ -193,18 +193,18 @@ impl Wire {
         r.end().unwrap();
         version
     }
-    fn remove(&mut self, key: &str, version: u64) -> u64 {
-        let mut p = Self::prefix("remove-exact", "quota");
+    fn remove(&mut self, key: &str, version: u64) -> Result<u64, u16> {
+        let mut p = Self::prefix(&format!("remove-{version}"), "quota");
         membus::lp(&mut p, key.as_bytes());
         p.push(1);
         p.extend(version.to_le_bytes());
-        let b = self.call(membus::REMOVE, &p).unwrap();
+        let b = self.call(membus::REMOVE, &p)?;
         let mut r = Cursor::new(&b);
         let v = r.u64().unwrap();
         assert!(v > version);
         assert_eq!(r.u8().unwrap(), 1);
         r.end().unwrap();
-        v
+        Ok(v)
     }
 }
 fn subscribe(
@@ -489,7 +489,6 @@ fn complete_private_subscription_server_encounters() {
     println!("baseline no_subscribers_io={baseline_io:?}->{baseline_after:?} expected_record_bytes={baseline_expected}");
     let mut l = ChangeListener::bind(&sink("filter"), membus::MAX_FRAME).unwrap();
     let s = subscribe(&mut c, l.endpoint(), "event/", true, None);
-    let initial = s.cursor;
     put(
         &mut c,
         "other",
@@ -620,7 +619,11 @@ fn complete_private_subscription_server_encounters() {
         None,
         false,
     );
-    let removed = w.remove("remove/x", created.version);
+    let remove_head = bounded(&mut w)[0];
+    assert_eq!(w.remove("remove/x", created.version + 1), Err(12));
+    assert_eq!(bounded(&mut w)[0], remove_head);
+    quiet(&mut key_l, &key_s, "remove/");
+    let removed = w.remove("remove/x", created.version).unwrap();
     exact(
         &receive(&mut key_l, &key_s, "remove/"),
         &key_s,
@@ -664,6 +667,22 @@ fn complete_private_subscription_server_encounters() {
         bounded(&mut w)
     );
     drop(slow_pipe);
+    // Establish a currently usable cursor immediately before the only pressure
+    // writes. A long-stale earlier cursor would not discriminate namespace scope.
+    let retention = subscribe(&mut c, &sink("retention-probe"), "event/", true, None);
+    let initial = retention.cursor;
+    c.unsubscribe("quota", &retention.token, "cancel-retention", deadline())
+        .unwrap();
+    let valid = subscribe(
+        &mut c,
+        &sink("retention-valid"),
+        "event/",
+        true,
+        Some(initial),
+    );
+    c.unsubscribe("quota", &valid.token, "cancel-valid", deadline())
+        .unwrap();
+    let retention_before = bounded(&mut w);
     for i in 0..33 {
         put(&mut c, "noise", "k", b"noise", &format!("age-{i}"));
     }
@@ -682,27 +701,52 @@ fn complete_private_subscription_server_encounters() {
         ),
         Err(Error::Refused(Refusal { code: 23, .. }))
     ));
+    let retention_after = bounded(&mut w);
+    assert_eq!(retention_after[0] - retention_before[0], 33);
+    assert!(retention_after[1] > sequence(&initial));
     println!(
         "global cross-namespace retention old cursor refused23 usage={:?}",
         bounded(&mut w)
     );
     let overflow_endpoint = sink("overflow");
-    let mut overflow_pipe = unread(&overflow_endpoint);
-    let overflow = subscribe(&mut c, &overflow_endpoint, "overflow/", true, None);
-    put(
-        &mut c,
+    let overflow_anchor = subscribe(&mut c, &sink("overflow-anchor"), "overflow/", true, None);
+    let overflow_cursor = overflow_anchor.cursor;
+    c.unsubscribe(
         "quota",
-        "overflow/prime",
-        b"connected",
-        "overflow-prime",
+        &overflow_anchor.token,
+        "cancel-overflow-anchor",
+        deadline(),
+    )
+    .unwrap();
+    let payload = vec![b'z'; 262144];
+    // A successful, bounded retained catch-up seeds nearly the entire admitted
+    // queue before the live write. This exposes byte-budget overflow without
+    // pretending that a timed-out delivery alone proves that limit was reached.
+    for i in 0..31 {
+        put(
+            &mut c,
+            "quota",
+            "overflow/k",
+            &payload,
+            &format!("overflow-{i:02}"),
+        );
+    }
+    let mut overflow_pipe = unread(&overflow_endpoint);
+    let overflow = subscribe(
+        &mut c,
+        &overflow_endpoint,
+        "overflow/",
+        true,
+        Some(overflow_cursor),
     );
     overflow_pipe.connect_until(deadline().local).unwrap();
-    status(&mut c, &overflow, |x| x.active && x.written == 1);
-    let payload = vec![b'z'; 262144];
-    let mut max_queued = 0;
-    let mut max_charge = 0;
+    let seeded = status(&mut c, &overflow, |x| x.active && x.queued >= 30);
+    assert!(seeded.charged_bytes >= 30 * 262144);
+    assert!(seeded.charged_bytes <= limits.subscription_bytes);
+    let mut max_queued = seeded.queued;
+    let mut max_charge = seeded.charged_bytes;
     let mut last_overflow = 0;
-    for i in 0..36 {
+    for i in 31..36 {
         last_overflow = put(
             &mut c,
             "quota",
@@ -719,6 +763,7 @@ fn complete_private_subscription_server_encounters() {
         bounded(&mut w);
     }
     let over = status(&mut c, &overflow, |x| !x.active && x.failed + x.dropped > 0);
+    assert_eq!(over.status, 3, "live byte-budget overflow must be observed as dropped, distinct from endpoint failure: {over:?}");
     assert!(
         max_queued >= 2 && max_charge >= 2 * 262144,
         "queue pressure was not exposed: {max_queued}/{max_charge}/{over:?}"
@@ -761,6 +806,15 @@ fn complete_private_subscription_server_encounters() {
     let mut c = connect(&endpoint);
     let mut w = Wire::start(&endpoint);
     assert_ne!(c.negotiated().epoch, epoch);
+    assert!(matches!(
+        c.subscription_status("quota", &s.token, "old-token", deadline()),
+        Err(Error::Refused(Refusal { code: 24, .. }))
+    ));
+    assert_eq!(
+        c.get("quota", "event/memory", "memory-not-replayed", deadline())
+            .unwrap(),
+        None
+    );
     assert_eq!(
         c.get("quota", "event/reopen", "preserved", deadline())
             .unwrap()
