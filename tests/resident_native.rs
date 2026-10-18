@@ -102,9 +102,13 @@ fn raw(pipe: &str) -> Pipe {
     }
 }
 fn put(c: &mut Client<Pipe>, key: &str, value: &[u8], ack: Ack) -> Result<MutationReply, Error> {
+    // Preserve the original producer's 36-byte UUID identity charge. In cap mode
+    // the first complete record is 207 bytes: above high-water, below refusal.
+    let operation_id = format!("{:0>36}", format!("resident-{key}"));
+    assert_eq!(operation_id.len(), 36);
     let mut attempt = c
         .prepare(MutationRequest {
-            operation_id: format!("resident-{key}"),
+            operation_id,
             namespace: "resident".into(),
             key: key.into(),
             value: value.into(),
