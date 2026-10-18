@@ -278,11 +278,15 @@ Default namespace quota is 500000 live keys. Default global index cap is 917000
 slots including tombstones and expiry summaries. Reservations count at admission.
 A remove frees a live namespace slot at commit but its tombstone retains an index
 slot until no other retained chunk can contradict it. Expiry summaries occupy
-index slots for 30 days. Values, retained 32-byte retry comparators and reservations
-share a 256 MiB logical capacity budget; an overwrite reserves replacement bytes
-while the old value remains visible. Queue admission charges the complete canonical
-mutation representation plus value length plus 128 bytes, independently of the
-comparator size; durable disk admission reserves the complete MBK1 record.
+index slots for 30 days. The default logical capacity setting is 256 MiB. Before
+admission, its check adds the incoming value and 32-byte comparator to existing
+committed-value, retained-comparator and reservation charges. Admission then adds
+the larger full queue charge to reservations while the old value remains visible.
+That increment can put the combined pending account above the capacity setting;
+the current check does not enforce an instantaneous ceiling on that sum.
+Queue admission independently charges the complete canonical mutation
+representation plus value length plus 128 bytes; durable disk admission reserves
+the complete MBK1 record.
 Identifiers, outcomes and bookkeeping still consume per-operation memory.
 Queue/snapshot/signal/timer budgets are additional,
 not a measured RSS ceiling. Retained data defaults to 8 GiB, with the executable

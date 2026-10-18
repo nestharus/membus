@@ -38,7 +38,7 @@ Byte options use bytes; time options use milliseconds.
 | `--retry-ms` | 86400000 | Bounded mutation outcome retention horizon |
 | `--quota` | 500000 | Live keys per namespace, including admission reservations |
 | `--index-cap` | 917000 | Global index slots, including tombstones and expiry summaries |
-| `--capacity` | 268435456 | Logical value/dedup/reservation byte budget |
+| `--capacity` | 268435456 | Logical byte admission setting; see reservation behavior below |
 | `--queue-bytes` | 67108864 | Charged queued representations, divided across four stripes |
 | `--dedup-cap` | 262144 | Active outcomes and bounded retired-ID ring capacity |
 | `--snapshot-bytes` | 268435456 | Aggregate conservative retained snapshot charge |
@@ -74,8 +74,12 @@ encoding, worker metadata and OS pipe buffers all contribute. Large scan pages
 and concurrent responses add transient memory beyond snapshot accounting. All
 committed values remain in memory; there is no cache/tiering controller.
 Comparator compaction does not compact complete queued mutation representations,
-disk records, identifiers or bookkeeping. The capacity account includes retained
-comparators separately from full in-flight reservations; see
+disk records, identifiers or bookkeeping. The capacity check includes existing
+value, retained-comparator and reservation charges plus the incoming value and
+comparator. After that check, admission adds the larger full queue charge to
+in-flight reservations. Combined pending charges can therefore exceed
+`--capacity`; it is not an instantaneous ceiling on that sum. Independent queue
+limits still apply. See [KV1.md](KV1.md) for the accounting distinction and
 [RETRY_RETENTION.md](RETRY_RETENTION.md) for encoding/collision and resource limits.
 
 ## Health and bounded reports
