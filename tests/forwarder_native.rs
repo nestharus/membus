@@ -92,17 +92,26 @@ impl Server {
     }
 }
 fn put(c: &mut Client<Pipe>, key: &str, value: &[u8]) -> MutationReply {
+    put_as(c, key, value, Ack::Os)
+}
+fn put_as(c: &mut Client<Pipe>, key: &str, value: &[u8], ack: Ack) -> MutationReply {
     let mut a = c
         .prepare(MutationRequest {
             operation_id: unique(),
             namespace: "owned".into(),
             key: key.into(),
             value: value.to_vec(),
-            ack: Ack::Os,
+            ack,
             expected: None,
         })
         .unwrap();
     c.mutate(&mut a, d()).unwrap()
+}
+fn exact_row(row: &(String, CommittedValue), key: &str, bytes: &[u8], reply: &MutationReply) {
+    assert_eq!(row.0, key);
+    assert_eq!(row.1.bytes, bytes);
+    assert_eq!(row.1.version, reply.version);
+    assert_eq!(row.1.ack, reply.achieved);
 }
 fn listen() -> ChangeListener {
     ChangeListener::bind(
@@ -145,12 +154,13 @@ fn physical_values_resume_floor_gap_restart_and_range_view() {
     assert_eq!(one.version, first.version);
     c.unsubscribe("owned", &s.token, &unique(), d()).unwrap();
     l.close();
-    put(&mut c, "event/2", b"second");
-    put(&mut c, "event/3", b"third");
+    let second_bytes = [0, 255, 7, 19];
+    let second = put_as(&mut c, "event/2", &second_bytes, Ack::Flush);
+    let third = put(&mut c, "event/3", b"third");
     let mut l = listen();
     let s = sub(&mut c, &l, "event/", Some(one.cursor), true).unwrap(); // floor is valid
     for (key, value) in [
-        ("event/2", b"second".as_slice()),
+        ("event/2", second_bytes.as_slice()),
         ("event/3", b"third".as_slice()),
     ] {
         let v = l.receive(&s, "owned", "event/", d().local).unwrap();
@@ -178,7 +188,8 @@ fn physical_values_resume_floor_gap_restart_and_range_view() {
             d(),
         )
         .unwrap();
-    assert_eq!(page.items[0].0, "event/1");
+    assert_eq!(page.items.len(), 1);
+    exact_row(&page.items[0], "event/1", b"original", &first);
     assert!(!page.done);
     assert!(matches!(
         c.scan_range(
@@ -194,7 +205,8 @@ fn physical_values_resume_floor_gap_restart_and_range_view() {
         ),
         Err(Error::Refused(Refusal { code: 21, .. }))
     ));
-    put(&mut c, "event/4", b"after-view");
+    let replacement = put_as(&mut c, "event/2", b"replacement", Ack::Os);
+    let fourth = put(&mut c, "event/4", b"after-view");
     let page = c
         .scan_range(
             "owned",
@@ -213,6 +225,29 @@ fn physical_values_resume_floor_gap_restart_and_range_view() {
         ["event/2", "event/3"]
     );
     assert!(page.done);
+    exact_row(&page.items[0], "event/2", &second_bytes, &second);
+    exact_row(&page.items[1], "event/3", b"third", &third);
+    let fresh = c.snapshot_open("owned", &unique(), d()).unwrap();
+    let current = c
+        .scan_range(
+            "owned",
+            "event/1",
+            "event0",
+            &fresh,
+            &[],
+            10,
+            65536,
+            &unique(),
+            d(),
+        )
+        .unwrap();
+    assert!(current.done);
+    assert_eq!(current.items.len(), 4);
+    exact_row(&current.items[0], "event/1", b"original", &first);
+    exact_row(&current.items[1], "event/2", b"replacement", &replacement);
+    exact_row(&current.items[2], "event/3", b"third", &third);
+    exact_row(&current.items[3], "event/4", b"after-view", &fourth);
+    c.snapshot_release("owned", &fresh, &unique(), d()).unwrap();
     c.snapshot_release("owned", &snap, &unique(), d()).unwrap();
     assert!(matches!(
         c.scan_range(
@@ -465,9 +500,23 @@ fn physical_timer_generation_status_cancel_and_live_only_values() {
     replacement.period_ms = 60000;
     replacement.jitter_low_ms = -9000;
     replacement.jitter_high_ms = 9000;
+    let expected_replacement = replacement.clone();
     let mut b = c.prepare_timer_set(replacement).unwrap();
     let next = c.timer_set(&mut b, d()).unwrap();
     assert!(next > generation);
+    let replaced = c
+        .timer_status("owned", "reopen", &unique(), d())
+        .unwrap()
+        .unwrap();
+    assert_eq!(replaced.generation, next);
+    assert_eq!(replaced.schedule.namespace, expected_replacement.namespace);
+    assert_eq!(replaced.schedule.timer_id, expected_replacement.timer_id);
+    assert_eq!(replaced.schedule.key, expected_replacement.key);
+    assert_eq!(replaced.schedule.anchor_ms, expected_replacement.anchor_ms);
+    assert_eq!(replaced.schedule.period_ms, 60000);
+    assert_eq!(replaced.schedule.jitter_low_ms, -9000);
+    assert_eq!(replaced.schedule.jitter_high_ms, 9000);
+    assert_eq!(replaced.schedule.payload, expected_replacement.payload);
     assert!(matches!(
         c.timer_set(&mut a, d()),
         Err(Error::Refused(Refusal { code: 12, .. }))

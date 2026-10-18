@@ -24,7 +24,11 @@ pub struct SubscriptionStatus {
     pub dropped: u64,
     pub cursor: [u8; 16],
 }
-/// A notification is a hint; re-read the committed key before using its state.
+/// A notification is a hint, not receiver receipt or useful-work completion.
+/// KV included bytes belong to this publication; a later GET reads current state
+/// and may name another revision. Timer wakes instead carry MBT1 envelopes: the
+/// outer version is configuration generation and no public KV value is created
+/// at the signal key. Reconcile those envelopes with timer status.
 #[derive(Clone, Debug)]
 pub struct Change {
     pub subscription: [u8; 16],

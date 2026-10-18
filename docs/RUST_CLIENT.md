@@ -47,8 +47,12 @@ The caller retains release, total-work bounds and reconciliation responsibility.
 On Windows, `ChangeListener::bind` owns a caller-selected local first-instance
 pipe and rejects remote clients. Create it before subscribing. `receive` checks
 the token, namespace, prefix and cursor epoch. Quiet timeout preserves a clean
-stream; partial-frame timeout, truncation or malformed/foreign input retires the
-connection. `cancel`/`close` release the endpoint after canceled I/O is drained.
+stream. Complete buffered frames remain readable after writer closure; this
+requires full decoding and association, never success inferred from an OS error.
+Partial-frame timeout, truncation or malformed/foreign input retires the
+connection. A failed native reset closes the handle; subsequent receive is Closed
+and the caller must explicitly bind another listener. Successful reset allows
+another writer on the same endpoint. `cancel`/`close` release the endpoint after canceled I/O is drained.
 These methods require exclusive mutable access; they are not an asynchronous
 cross-thread cancellation channel. A listener does not cancel a server token.
 
@@ -74,6 +78,15 @@ buffering hints during capture, periodic refresh and cancellation. Creation is
 never retried automatically: a lost reply can leave an unknown remote token.
 Known tokens require a continuing cleanup owner; tokens alone are not durable
 cleanup across owner loss. Change hints establish no receipt or native authority.
+
+KV included bytes belong to the indicated publication; a later GET can observe
+a newer revision. Timer signal keys instead carry MBT1 envelopes and create no
+public KV value at that key; use the envelope and timer-status reconciliation.
+Neither publication, GET, status nor an attempted command establishes useful
+duty completion. Connection admission carries the resident's shared local-principal
+powers. HELLO identity, tokens, generations and frame association do not authenticate
+application actors or peers. Endpoint authenticity, effective OS security and any
+required separation between admitted actors remain caller/deployment concerns.
 
 `connect_pipe` uses an explicit local Windows pipe. `connect_tcp` uses an explicit
 socket address for foreground tests. A caller-supplied `Transport` must enforce
@@ -152,12 +165,36 @@ CURRENT/HISTORY/bus/STATE publication order stays in slots.
 
 ## Qualification
 
-`cargo test --offline --locked` includes independent expected-frame controls in
-`tests/client.rs` and a Windows physical fixture in `tests/client_native.rs`.
-The latter starts only this package's resident binary on fresh state and a unique
-owned pipe, checks legacy19/scan22, reads, OS/flush PUT/CAS, duplicate outcomes,
-conflict12/pending19, actual pipe timeout, explicit same-epoch reconciliation,
-and restart epoch refusal/replay. Its children use NoWindow and are directly
-stopped/waited/reaped; run it under the project's finite owned Job runner.
-Set `MEMBUS_CLIENT_TEST_ROOT` to the qualification scratch directory to retain
-fixture logs/state. Otherwise it uses the ignored `target/client-fixtures`.
+After supplying the Windows fixture inputs below, `cargo test --offline --locked`
+runs the independent expected-frame controls in `tests/client.rs` and
+`tests/client_forwarder.rs`, package-resident tests in `tests/client_native.rs`,
+and original-resident tests in `tests/forwarder_native.rs` and the listener's
+library regression module. The latter records a test-only count of actual native
+error-232 acceptance, independently of unsubscribe timing. Complete-frame reads,
+empty/partial input, clean idle receiving, terminal reset, closure and endpoint
+reuse have distinct assertions. This does not claim that a timing-only test
+observed a cancellation/completion race.
+
+The original-resident controls require both inputs, including for library tests:
+
+- `MEMBUS_FORWARDER_TEST_ROOT`: fresh private qualification storage, retained
+  with the run's logs and state.
+- `MEMBUS_FORWARDER_TEST_SERVER`: absolute path to the explicitly selected,
+  source-pinned original resident executable. This is a qualification input,
+  not installed or default operating configuration.
+
+Select/build and preserve that original image before the run. Record its exact
+source revision, compiler/target, build command and SHA-256. Also record the
+candidate source/tree and lockfile, native fixture inputs, finite runner/resource
+admission, results, and direct-wait/empty-Job evidence. The package-resident suite
+uses this package's candidate binary; the externally selected original image has
+a separate implementation identity. Neither image proves installed compatibility.
+
+The package-resident suite checks legacy19/scan22, reads, OS/flush PUT/CAS,
+duplicate outcomes, conflict12/pending19, pipe timeout, explicit same-epoch
+reconciliation and restart refusal/replay. `MEMBUS_CLIENT_TEST_ROOT` remains
+optional for that suite; otherwise it retains fixtures under the ignored
+`target/client-fixtures`. Every resident child starts suspended with NoWindow,
+enters an owned Job before resume, is directly waited and requires empty-Job
+settlement. Run the suites under finite native custody and actual resource
+admission.

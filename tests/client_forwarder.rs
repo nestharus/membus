@@ -399,3 +399,37 @@ fn timer_envelope_validation_keeps_signed_draw_and_due_identity() {
     bad[at..at + 8].fill(0);
     assert!(TimerEnvelope::decode(&bad).is_err());
 }
+
+#[test]
+fn timer_set_complete_wire_preserves_independent_signed_jitter_contract() {
+    let (mut c, out) = connect(
+        (1..=25).collect(),
+        true,
+        true,
+        true,
+        vec![frame(21, 2, &17u64.to_le_bytes())],
+        86400000,
+    );
+    let before = out.lock().unwrap().len();
+    let mut attempt = c.prepare_timer_set(set()).unwrap();
+    assert_eq!(c.timer_set(&mut attempt, d()).unwrap(), 17);
+    // Fixed independent contract data, not a call to any production encoder.
+    let mut payload = 123456u64.to_le_bytes().to_vec();
+    blob(&mut payload, b"ns/reopen/new");
+    blob(&mut payload, b"ns");
+    blob(&mut payload, b"reopen");
+    payload.extend(0u64.to_le_bytes());
+    blob(&mut payload, b"timer/reopen");
+    payload.extend(10000u64.to_le_bytes());
+    payload.extend(60000u64.to_le_bytes());
+    payload.extend((-9000i64).to_le_bytes());
+    payload.extend(9000i64.to_le_bytes());
+    blob(&mut payload, b"tick");
+    payload.push(2);
+    let mut body = vec![1, 0, 0, 0, 21];
+    body.extend(2u64.to_le_bytes());
+    body.extend(payload);
+    let mut expected = (body.len() as u32).to_le_bytes().to_vec();
+    expected.extend(body);
+    assert_eq!(&out.lock().unwrap()[before..], expected.as_slice());
+}

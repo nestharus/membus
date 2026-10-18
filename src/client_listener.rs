@@ -34,6 +34,8 @@ pub struct ChangeListener {
     pipe: Option<crate::pipe_io::Pipe>,
     connected: bool,
     max_frame: usize,
+    #[cfg(test)]
+    closing_accepts: usize,
 }
 impl ChangeListener {
     pub fn bind(endpoint: &str, max_frame: usize) -> Result<Self> {
@@ -75,6 +77,8 @@ impl ChangeListener {
             )),
             connected: false,
             max_frame,
+            #[cfg(test)]
+            closing_accepts: 0,
         })
     }
     pub fn endpoint(&self) -> &str {
@@ -89,12 +93,15 @@ impl ChangeListener {
         self.close();
     }
     fn retire(&mut self) {
-        if let Some(p) = &self.pipe {
-            unsafe {
-                DisconnectNamedPipe(p.raw_handle());
-            }
-        }
+        let reset = self
+            .pipe
+            .as_ref()
+            .is_some_and(|p| unsafe { DisconnectNamedPipe(p.raw_handle()) != 0 });
         self.connected = false;
+        // A failed reset cannot promise that this handle accepts a new writer.
+        if !reset {
+            self.pipe.take();
+        }
     }
     fn read_part(
         &mut self,
@@ -137,7 +144,9 @@ impl ChangeListener {
         }
         Ok(())
     }
-    /// Partial frames retire their connection; callers reconcile/resubscribe.
+    /// Complete buffered frames can be read after their writer closes. Terminal
+    /// input errors retire the connection, or close it if reset fails. Remote
+    /// subscription cleanup and reconciliation remain caller responsibilities.
     pub fn receive(
         &mut self,
         subscription: &Subscription,
@@ -150,11 +159,19 @@ impl ChangeListener {
         }
         if !self.connected {
             if let Err(e) = self.pipe.as_mut().unwrap().connect_until(until) {
-                return Err(if e.kind() == io::ErrorKind::TimedOut {
-                    ReceiveError::QuietTimeout
+                if e.raw_os_error() == Some(232) {
+                    // ERROR_NO_DATA can leave complete buffered frames. It is
+                    // not a successful Change: normal bounded decode follows.
+                    #[cfg(test)]
+                    {
+                        self.closing_accepts += 1;
+                    }
+                } else if e.kind() == io::ErrorKind::TimedOut {
+                    return Err(ReceiveError::QuietTimeout);
                 } else {
-                    ReceiveError::Interrupted(e)
-                });
+                    self.retire();
+                    return Err(ReceiveError::Interrupted(e));
+                }
             }
             self.connected = true;
         }
@@ -184,3 +201,6 @@ impl ChangeListener {
         result
     }
 }
+#[cfg(test)]
+#[path = "../tests/support/listener_regression.rs"]
+mod regression;
