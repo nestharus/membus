@@ -295,6 +295,8 @@ pub struct Config {
     pub fail_after_append: bool,
     pub fail_partial_append: bool,
     pub fail_sync: bool,
+    /// Test seam: refuse the data-file barrier during startup, independently of live flushes.
+    pub fail_recovery_sync: bool,
     /// Chunk rotation (CHUNK-RETIREMENT.md 5.2): a chunk closes past `chunk_bytes`, and a finite class's chunk
     /// also past `rotation_ms`; the idle tick runs every `tick_ms`.
     pub chunk_bytes: u64,
@@ -346,6 +348,7 @@ impl Default for Config {
             fail_after_append: false,
             fail_partial_append: false,
             fail_sync: false,
+            fail_recovery_sync: false,
             chunk_bytes: 8 * 1024 * 1024,
             rotation_ms: 3_600_000,
             tick_ms: 1000,
@@ -514,8 +517,19 @@ fn sync_file(file: &File) -> io::Result<()> {
     #[link(name = "kernel32")]
     extern "system" {
         fn FlushFileBuffers(handle: *mut c_void) -> i32;
+        fn GetFinalPathNameByHandleW(handle: *mut c_void, path: *mut u16, size: u32, flags: u32) -> u32;
     }
     let marks = std::env::var_os("MEMBUS_SYNC_WITNESS").map(std::path::PathBuf::from);
+    let witness = marks.as_ref().map(|_| {
+        let mut target = vec![0u16; 1024];
+        let mut n = unsafe { GetFinalPathNameByHandleW(file.as_raw_handle(), target.as_mut_ptr(), target.len() as u32, 0) };
+        if n as usize >= target.len() {
+            target.resize(n as usize + 1, 0);
+            n = unsafe { GetFinalPathNameByHandleW(file.as_raw_handle(), target.as_mut_ptr(), target.len() as u32, 0) };
+        }
+        target.truncate((n as usize).min(target.len()));
+        (target, file.metadata().map(|m| m.len()).ok())
+    });
     if let Some(path) = &marks {
         if let Err(error) = fs::write(path.with_extension("entering"), b"entering") {
             eprintln!("sync-witness entering mark failed: {error}");
@@ -536,12 +550,32 @@ fn sync_file(file: &File) -> io::Result<()> {
         ) {
             eprintln!("sync-witness returned mark failed: {error}");
         }
+        if let Some((target, bytes)) = witness {
+            // Append evidence for the actual retained file handle, not merely the last
+            // catalogue/epoch sync. Normal releases contain none of this diagnostic.
+            static LOG: Mutex<()> = Mutex::new(());
+            let _guard = LOG.lock().unwrap();
+            let record = format!("{{\"call_ns\":{elapsed},\"ok\":{},\"target_utf16\":{target:?},\"bytes\":{}}}\n", ok != 0,
+                bytes.map_or_else(|| "null".into(), |n| n.to_string()));
+            if let Err(error) = OpenOptions::new().create(true).append(true).open(path.with_extension("calls"))
+                .and_then(|mut f| f.write_all(record.as_bytes())) {
+                eprintln!("sync-witness calls mark failed: {error}");
+            }
+        }
     }
     result
 }
 #[cfg(not(all(windows, feature = "sync-witness")))]
 fn sync_file(file: &File) -> io::Result<()> {
     file.sync_all()
+}
+
+fn recovery_sync(path: &Path, config: &Config) -> io::Result<()> {
+    if config.fail_recovery_sync {
+        return Err(io::Error::other(format!("test injected recovery sync failure: {}", path.display())));
+    }
+    OpenOptions::new().write(true).open(path).and_then(|file| sync_file(&file))
+        .map_err(|e| io::Error::new(e.kind(), format!("recovery data sync {}: {e}", path.display())))
 }
 
 // Test-only kill checkpoints, enabled explicitly by a path-valued environment
@@ -1644,6 +1678,9 @@ fn import_legacy(path: &Path, config: &Config, clock: &chunks::Clock, epoch: u64
     let utc = clock.utc_ms();
     let mut listed = Vec::new();
     for (_, p) in &files {
+        // The import can later graft original retry outcomes from its immutable
+        // backup. Cover those source records before publishing/making it read-only.
+        recovery_sync(p, config)?;
         let name = p.file_name().unwrap().to_string_lossy().into_owned();
         listed.push((name, fs::metadata(p)?.len(), chunks::sha256_file(p)?));
     }
@@ -2583,6 +2620,22 @@ impl Store {
         #[cfg(test)]
         if config.stop_after_replay_truncation {
             return Err(io::Error::other("test stop after replay truncation"));
+        }
+        // A complete record records the requested acknowledgement, not proof of a
+        // covering live sync. Establish that prerequisite before any recovered
+        // value/outcome is exposed or an open chunk's Close is published. Closed
+        // chunks are included: an older startup may have closed one without it.
+        let mut recovered: Vec<PathBuf> = rp.chunks.table.values()
+            .filter(|c| c.bytes != 0 && matches!(c.state, chunks::ChunkState::Open | chunks::ChunkState::Closed)
+                && c.id != chunks::LEGACY_CHUNK && c.path.exists())
+            .map(|c| c.path.clone()).collect();
+        recovered.extend(legacy_files(path).into_iter().map(|(_, p)| p));
+        recovered.sort();
+        recovered.dedup();
+        for p in recovered {
+            if let Err(e) = recovery_sync(&p, &config) {
+                return Err(refuse(e, rp.report.clone()));
+            }
         }
         let mut cs = std::mem::replace(&mut rp.chunks, chunks::ChunkStore::new(path.join("chunks")));
         let mut catalogue = chunks::Catalogue::open(&cat_path)?;
