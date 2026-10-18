@@ -818,16 +818,22 @@ fn complete_private_subscription_server_encounters() {
     assert_eq!(
         c.get("quota", "event/reopen", "preserved", deadline())
             .unwrap()
-            .unwrap()
-            .version,
-        r.version
+            .unwrap(),
+        CommittedValue {
+            version: r.version,
+            ack: r.achieved,
+            bytes: a.request().value.clone(),
+        }
     );
     assert_eq!(
         c.get("quota", "overflow/k", "preserved-overflow", deadline())
             .unwrap()
-            .unwrap()
-            .bytes,
-        payload
+            .unwrap(),
+        CommittedValue {
+            version: last_overflow,
+            ack: Ack::Os,
+            bytes: payload.clone(),
+        }
     );
     assert_eq!(
         c.get("quota", "remove/x", "preserved-remove", deadline())
