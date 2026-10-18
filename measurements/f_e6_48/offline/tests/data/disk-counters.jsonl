@@ -1,0 +1,4 @@
+{"at":"2025-01-01T00:00:20Z","collector_pid":1,"physical_device":"fixture-device","raw":{"CurrentDiskQueueLength":2,"DiskWriteBytesPersec":3000,"DiskWritesPersec":30,"Frequency_PerfTime":10,"Timestamp_PerfTime":200}}
+{"at":"2025-01-01T00:00:05Z","collector_pid":2,"physical_device":"fixture-device","raw":{"CurrentDiskQueueLength":99,"DiskWriteBytesPersec":9000000,"DiskWritesPersec":9000,"Frequency_PerfTime":10,"Timestamp_PerfTime":50}}
+{"at":"2025-01-01T00:00:00Z","collector_pid":1,"physical_device":"fixture-device","raw":{"CurrentDiskQueueLength":0,"DiskWriteBytesPersec":0,"DiskWritesPersec":0,"Frequency_PerfTime":10,"Timestamp_PerfTime":0}}
+{"at":"2025-01-01T00:00:10Z","collector_pid":1,"physical_device":"fixture-device","raw":{"CurrentDiskQueueLength":1,"DiskWriteBytesPersec":1000,"DiskWritesPersec":10,"Frequency_PerfTime":10,"Timestamp_PerfTime":100}}
