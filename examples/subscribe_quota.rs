@@ -1,14 +1,19 @@
 //! Value-bearing quota change waiter using the public resident client.
 //!
-//! Windows: `cargo run --example subscribe_quota -- <resident-pipe> <listener-pipe>`.
-//! Both endpoints are explicit; this example starts no service. Add `--events N`
+//! Windows: `cargo run --example subscribe_quota -- <resident-pipe> <listener-prefix>`.
+//! Both endpoint locations are explicit; this example starts no service. Each
+//! registration uses a fresh name below the listener prefix. Add `--events N`
 //! for a finite run, or `--cursor HEX` to resume a previously printed cursor.
 //! Successful output handling precedes cursor advancement. Persist that cursor in
 //! a real application's own durable checkpoint after its useful work succeeds.
 //!
 //! A gap starts a live subscription before observing `quota/open` and
 //! `quota/resets`. These separate GETs are current state, not an atomic snapshot
-//! or recovery of every missed event. Quiet time alone is not a disconnect.
+//! or recovery of every missed event. Quiet time alone is not a disconnect:
+//! every quiet interval renews a known registration, so a vanished or inactive
+//! subscription cannot strand the waiter silently. `--quiet-ms N` sets that
+//! interval (default 60000). Known cleanup is retried through a fresh connection
+//! before another registration; an unrecognized old token remains an obligation.
 //! Unknown registration stops automatic attempts. Failed known-token cleanup is
 //! retained across reconnects; endpoint closure never proves remote settlement.
 #[cfg(windows)]
@@ -20,7 +25,7 @@ pub mod quota {
     use std::{
         io::Write,
         path::Path,
-        time::{Duration, Instant},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
     const NAMESPACE: &str = "quota";
@@ -71,6 +76,7 @@ pub mod quota {
     #[derive(Debug, PartialEq, Eq)]
     pub enum End {
         Complete,
+        Renew,
         Reconnect(String),
         Stop(String),
     }
@@ -79,6 +85,16 @@ pub mod quota {
         pub end: End,
         pub cleanup: Cleanup,
         pub handled: usize,
+        pub quiet_timeouts: usize,
+    }
+    #[derive(Clone, Copy)]
+    pub struct Limits {
+        pub quiet: Duration,
+        pub budget: Duration,
+        pub events: Option<usize>,
+        /// Optional finite qualification-owner bound. Ordinary waiting has no
+        /// total deadline; every individual I/O is still bounded.
+        pub until: Option<Instant>,
     }
 
     fn register<T: Transport>(
@@ -109,10 +125,9 @@ pub mod quota {
         listener: &mut ChangeListener,
         cursor: &mut Option<[u8; 16]>,
         output: &mut impl Write,
-        quiet: Duration,
-        budget: Duration,
-        events: Option<usize>,
+        limits: Limits,
     ) -> Report {
+        let budget = limits.budget;
         let mut gap = false;
         let registration = match register(client, listener, *cursor, budget) {
             Err(Error::Refused(r)) if r.code == 23 && cursor.is_some() => {
@@ -139,6 +154,7 @@ pub mod quota {
                     end: End::Stop(format!("registration: {error}")),
                     cleanup,
                     handled: 0,
+                    quiet_timeouts: 0,
                 };
             }
         };
@@ -146,12 +162,14 @@ pub mod quota {
         // a refused resume. No change cursor is accepted before handler success.
         *cursor = Some(sub.cursor);
         let mut handled = 0;
+        let mut quiet_timeouts = 0;
         let action = (|| -> Result<End, Box<dyn std::error::Error>> {
             writeln!(
                 output,
-                "registered token={} cursor={} live",
+                "registered token={} cursor={} live endpoint={}",
                 hex(&sub.token),
-                hex(&sub.cursor)
+                hex(&sub.cursor),
+                listener.endpoint()
             )?;
             output.flush()?;
             if gap {
@@ -163,8 +181,14 @@ pub mod quota {
                 )?;
                 output.flush()?;
             }
-            while events.is_none_or(|limit| handled < limit) {
-                match listener.receive(&sub, NAMESPACE, PREFIX, Instant::now() + quiet) {
+            while limits.events.is_none_or(|limit| handled < limit) {
+                if limits.until.is_some_and(|end| Instant::now() >= end) {
+                    return Ok(End::Stop("session deadline".into()));
+                }
+                let receive_until = limits.until.map_or(Instant::now() + limits.quiet, |end| {
+                    end.min(Instant::now() + limits.quiet)
+                });
+                match listener.receive(&sub, NAMESPACE, PREFIX, receive_until) {
                     Ok(change) => {
                         writeln!(
                             output,
@@ -178,7 +202,18 @@ pub mod quota {
                         *cursor = Some(change.cursor);
                         handled += 1;
                     }
-                    Err(ReceiveError::QuietTimeout) => continue,
+                    Err(ReceiveError::QuietTimeout) => {
+                        quiet_timeouts += 1;
+                        if limits.until.is_some_and(|end| Instant::now() >= end) {
+                            return Ok(End::Stop("session deadline".into()));
+                        }
+                        if limits.until == Some(receive_until) {
+                            continue; // A rounded I/O timeout can precede the owner bound.
+                        }
+                        // Quiet is not proof of failure. End this known lifetime
+                        // explicitly, then resume on a fresh registration.
+                        return Ok(End::Renew);
+                    }
                     Err(ReceiveError::Interrupted(error)) => {
                         return Ok(End::Reconnect(error.to_string()))
                     }
@@ -208,14 +243,44 @@ pub mod quota {
                 .unwrap_or_else(|error| End::Stop(format!("handling/reconciliation: {error}"))),
             cleanup,
             handled,
+            quiet_timeouts,
         }
+    }
+
+    /// A positive unsubscribe confirms settlement. Refusal24 alone does not
+    /// prove that a replacement resident settles the original endpoint's history.
+    fn retry_known_cleanup(
+        client: &mut Client<membus::pipe_io::Pipe>,
+        obligations: &mut Vec<Cleanup>,
+        budget: Duration,
+    ) -> Result<(), String> {
+        let mut at = 0;
+        while at < obligations.len() {
+            match &obligations[at] {
+                Cleanup::KnownUnresolved { token, .. } => {
+                    match client.unsubscribe(NAMESPACE, token, "quota-retry-cleanup", deadline(budget)) {
+                        Ok(()) => {
+                            eprintln!("remote cleanup confirmed after reconnect: {:?}", obligations.remove(at));
+                            continue;
+                        }
+                        Err(Error::Refused(r)) if r.code == 24 => {}
+                        Err(error) => return Err(format!("known cleanup retry: {error}; retained obligations={obligations:?}")),
+                    }
+                }
+                Cleanup::UnknownRegistration { .. } => return Err(format!("unknown registration forbids automatic retry; retained obligations={obligations:?}")),
+                _ => {}
+            }
+            at += 1;
+        }
+        Ok(())
     }
 
     pub fn main() -> Result<(), String> {
         let mut args = std::env::args().skip(1);
-        let usage = "usage: subscribe_quota <resident-pipe> <listener-pipe> [--events N] [--cursor 32-hex-digits]";
+        let usage = "usage: subscribe_quota <resident-pipe> <listener-prefix> [--events N] [--cursor 32-hex-digits] [--quiet-ms N]";
         let resident = args.next().ok_or(usage)?;
-        let endpoint = args.next().ok_or(usage)?;
+        let listener_prefix = args.next().ok_or(usage)?;
+        let mut quiet_ms = 60_000;
         let mut remaining = None;
         let mut cursor = None;
         while let Some(flag) = args.next() {
@@ -238,11 +303,22 @@ pub mod quota {
                     }
                     cursor = Some(bytes);
                 }
+                "--quiet-ms" => {
+                    quiet_ms = value.parse::<u64>().map_err(|_| usage)?;
+                    if !(1..=3_600_000).contains(&quiet_ms) {
+                        return Err("--quiet-ms must be between 1 and 3600000".into());
+                    }
+                }
                 _ => return Err(usage.into()),
             }
         }
         let budget = Duration::from_secs(5);
         let mut obligations = Vec::new();
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_nanos();
+        let mut generation = 0u64;
         loop {
             let mut client = match connect(Path::new(&resident), budget) {
                 Ok(c) => c,
@@ -262,6 +338,14 @@ pub mod quota {
                     ))
                 }
             };
+            retry_known_cleanup(&mut client, &mut obligations, budget)?;
+            generation = generation
+                .checked_add(1)
+                .ok_or("listener generation exhausted")?;
+            let endpoint = format!(
+                "{listener_prefix}-{}-{stamp}-{generation}",
+                std::process::id()
+            );
             let mut listener = ChangeListener::bind(&endpoint, membus::MAX_FRAME)
                 .map_err(|error| format!("bind: {error}; retained obligations={obligations:?}"))?;
             let report = session(
@@ -269,9 +353,12 @@ pub mod quota {
                 &mut listener,
                 &mut cursor,
                 &mut std::io::stdout().lock(),
-                Duration::from_secs(60),
-                budget,
-                remaining,
+                Limits {
+                    quiet: Duration::from_millis(quiet_ms),
+                    budget,
+                    events: remaining,
+                    until: None,
+                },
             );
             eprintln!(
                 "local listener closed; remote cleanup={:?}; checkpoint={}",
@@ -293,6 +380,11 @@ pub mod quota {
                 }
                 End::Stop(error) => {
                     return Err(format!("{error}; unresolved obligations={obligations:?}"))
+                }
+                End::Renew => {
+                    eprintln!("quiet; continuing through known-registration renewal; retained obligations={obligations:?}");
+                    drop(client);
+                    std::thread::sleep(Duration::from_secs(1));
                 }
                 End::Reconnect(error) => {
                     eprintln!("interrupted: {error}; retained obligations={obligations:?}");

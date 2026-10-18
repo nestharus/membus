@@ -19,7 +19,21 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 const BUDGET: Duration = Duration::from_secs(5);
-const QUIET: Duration = Duration::from_millis(25);
+fn limits(events: Option<usize>) -> quota::Limits {
+    quota::Limits {
+        quiet: Duration::from_secs(2),
+        budget: BUDGET,
+        events,
+        until: Some(Instant::now() + Duration::from_secs(8)),
+    }
+}
+fn assert_delivery(line: &str, key: &str, value: &[u8]) {
+    assert!(line.contains(&format!("key={key} ")), "wrong key: {line}");
+    assert!(
+        line.contains(&format!("value=Some({value:?})")),
+        "wrong/missing bytes: {line}"
+    );
+}
 struct Fixture {
     root: PathBuf,
     pipe: String,
@@ -180,8 +194,22 @@ fn quiet_delivery_handler_failure_resume_and_restart_gap_use_actual_example() {
     let mut cursor = None;
     let mut c = f.client();
     let mut listener = f.listener();
+    let mut quiet_limits = limits(Some(1));
+    quiet_limits.quiet = Duration::from_millis(25);
+    let quiet = quota::session(
+        &mut c,
+        &mut listener,
+        &mut cursor,
+        &mut Vec::new(),
+        quiet_limits,
+    );
+    assert_eq!(quiet.end, End::Renew);
+    assert_eq!(quiet.quiet_timeouts, 1);
+    assert_eq!(quiet.handled, 0);
+    assert!(matches!(quiet.cleanup, Cleanup::Confirmed { .. }));
+    // Continue the same cursor after actual quiet-time maintenance.
+    let mut listener = f.listener();
     let (mut out, rx) = Output::channel();
-    let started = Instant::now();
     let report = std::thread::scope(|scope| {
         let worker = scope.spawn(|| {
             quota::session(
@@ -189,23 +217,19 @@ fn quiet_delivery_handler_failure_resume_and_restart_gap_use_actual_example() {
                 &mut listener,
                 &mut cursor,
                 &mut out,
-                QUIET,
-                BUDGET,
-                Some(1),
+                limits(Some(1)),
             )
         });
         assert!(line(&rx).contains("live"));
-        // Several real quiet deadlines pass before the sole publication.
-        std::thread::sleep(Duration::from_millis(150));
         let committed = put(&mut writer, "event/first", b"first", "first");
         let delivered = line(&rx);
+        assert_delivery(&delivered, "event/first", b"first");
         assert!(
             delivered.contains("key=event/first")
                 && delivered.contains(&format!("version={}", committed.version))
         );
         worker.join().unwrap()
     });
-    assert!(started.elapsed() >= Duration::from_millis(150));
     assert_eq!(report.end, End::Complete);
     let token = match report.cleanup {
         Cleanup::Confirmed { token } => token,
@@ -231,9 +255,7 @@ fn quiet_delivery_handler_failure_resume_and_restart_gap_use_actual_example() {
         &mut listener,
         &mut cursor,
         &mut out,
-        QUIET,
-        BUDGET,
-        Some(1),
+        limits(Some(1)),
     );
     assert!(line(&rx).contains("live"));
     assert!(matches!(failed.end, End::Stop(ref e) if e.contains("authored handler flush failure")));
@@ -248,12 +270,10 @@ fn quiet_delivery_handler_failure_resume_and_restart_gap_use_actual_example() {
         &mut listener,
         &mut cursor,
         &mut out,
-        QUIET,
-        BUDGET,
-        Some(1),
+        limits(Some(1)),
     );
     assert!(line(&rx).contains("live"));
-    assert!(line(&rx).contains("key=event/second"));
+    assert_delivery(&line(&rx), "event/second", b"second");
     assert_eq!(resumed.end, End::Complete);
     assert_ne!(cursor, handled_cursor);
     drop(c);
@@ -264,20 +284,11 @@ fn quiet_delivery_handler_failure_resume_and_restart_gap_use_actual_example() {
     let mut listener = f.listener();
     let (mut out, rx) = Output::channel();
     let interrupted = std::thread::scope(|scope| {
-        let worker = scope.spawn(|| {
-            quota::session(
-                &mut c,
-                &mut listener,
-                &mut cursor,
-                &mut out,
-                QUIET,
-                BUDGET,
-                None,
-            )
-        });
+        let worker = scope
+            .spawn(|| quota::session(&mut c, &mut listener, &mut cursor, &mut out, limits(None)));
         assert!(line(&rx).contains("live"));
         put(&mut writer, "event/third", b"third", "third");
-        assert!(line(&rx).contains("key=event/third"));
+        assert_delivery(&line(&rx), "event/third", b"third");
         f.stop();
         worker.join().unwrap()
     });
@@ -305,15 +316,13 @@ fn quiet_delivery_handler_failure_resume_and_restart_gap_use_actual_example() {
                 &mut listener,
                 &mut cursor,
                 &mut out,
-                QUIET,
-                BUDGET,
-                Some(1),
+                limits(Some(1)),
             )
         });
         // This flushed registration is produced before the example enters GET.
         assert!(line(&rx).contains("live"));
-        put(&mut writer, "open", b"after-live-open", "open-after-live");
-        put(
+        let open = put(&mut writer, "open", b"after-live-open", "open-after-live");
+        let resets = put(
             &mut writer,
             "resets",
             b"after-live-resets",
@@ -322,12 +331,21 @@ fn quiet_delivery_handler_failure_resume_and_restart_gap_use_actual_example() {
         put(&mut writer, "event/during-reconcile", b"covered", "during");
         release.send(()).unwrap();
         let current = line(&rx);
-        assert!(
-            current.contains("reconcile current-state")
-                && current.contains(&format!("{:?}", b"after-live-open".to_vec()))
-                && current.contains(&format!("{:?}", b"after-live-resets".to_vec()))
+        let open = Some(CommittedValue {
+            version: open.version,
+            ack: Ack::Os,
+            bytes: b"after-live-open".to_vec(),
+        });
+        let resets = Some(CommittedValue {
+            version: resets.version,
+            ack: Ack::Os,
+            bytes: b"after-live-resets".to_vec(),
+        });
+        assert_eq!(
+            current,
+            format!("reconcile current-state open={open:?} resets={resets:?}\n")
         );
-        assert!(line(&rx).contains("key=event/during-reconcile"));
+        assert_delivery(&line(&rx), "event/during-reconcile", b"covered");
         worker.join().unwrap()
     });
     assert_eq!(reconciled.end, End::Complete);
@@ -405,9 +423,7 @@ fn unknown_registration_stops_without_retry_and_retains_endpoint() {
         &mut listener,
         &mut cursor,
         &mut Vec::new(),
-        QUIET,
-        BUDGET,
-        Some(1),
+        limits(Some(1)),
     );
     assert!(matches!(report.end, End::Stop(_)));
     assert_eq!(registrations.load(Ordering::SeqCst), 1);
@@ -447,14 +463,12 @@ fn failed_known_cleanup_retains_identity_even_when_reply_loss_can_hide_effect() 
                 &mut listener,
                 &mut cursor,
                 &mut out,
-                QUIET,
-                BUDGET,
-                Some(1),
+                limits(Some(1)),
             )
         });
         assert!(line(&rx).contains("live"));
         put(&mut writer, "event/cleanup", b"handled", "cleanup");
-        assert!(line(&rx).contains("key=event/cleanup"));
+        assert_delivery(&line(&rx), "event/cleanup", b"handled");
         worker.join().unwrap()
     });
     assert_eq!(report.end, End::Complete);
@@ -475,15 +489,242 @@ fn failed_known_cleanup_retains_identity_even_when_reply_loss_can_hide_effect() 
     };
     // The request can settle remotely despite caller uncertainty; only an
     // independent later status establishes that, not the local endpoint close.
-    assert!(
-        !writer
+    let until = Instant::now() + BUDGET;
+    loop {
+        let active = writer
             .subscription_status(
                 "quota",
                 &token,
                 "independent-cleanup",
-                quota::deadline(BUDGET)
+                quota::deadline(BUDGET),
             )
             .unwrap()
-            .active
-    );
+            .active;
+        if !active {
+            break;
+        }
+        assert!(
+            Instant::now() < until,
+            "written unsubscribe did not settle within the observed bound"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn absent_expected_delivery_has_a_finite_session_owner_bound() {
+    let f = Fixture::new();
+    let mut c = f.client();
+    let mut listener = f.listener();
+    let mut cursor = None;
+    let mut bounds = limits(Some(1));
+    bounds.until = Some(Instant::now() + Duration::from_millis(100));
+    let report = quota::session(&mut c, &mut listener, &mut cursor, &mut Vec::new(), bounds);
+    assert!(matches!(report.end, End::Stop(ref error) if error == "session deadline"));
+    assert_eq!(report.handled, 0);
+    assert!(report.quiet_timeouts > 0);
+    assert!(matches!(report.cleanup, Cleanup::Confirmed { .. }));
+}
+
+struct ExampleProcess {
+    owner: child::Owned,
+    stdout: PathBuf,
+    stderr: PathBuf,
+}
+impl ExampleProcess {
+    fn start(f: &Fixture, name: &str, events: usize) -> Self {
+        let image = PathBuf::from(
+            std::env::var_os("MEMBUS_QUOTA_EXAMPLE_EXE")
+                .expect("explicit separately built example image"),
+        );
+        assert!(image.is_absolute());
+        let stdout = f.root.join(format!("{name}.stdout"));
+        let stderr = f.root.join(format!("{name}.stderr"));
+        let mut command = Command::new(image);
+        command
+            .arg(&f.pipe)
+            .arg(&f.listener)
+            .args(["--events", &events.to_string(), "--quiet-ms", "250"])
+            .stdin(Stdio::null())
+            .stdout(fs::File::create(&stdout).unwrap())
+            .stderr(fs::File::create(&stderr).unwrap());
+        Self {
+            owner: child::Owned::spawn(&mut command).unwrap(),
+            stdout,
+            stderr,
+        }
+    }
+    fn output(&mut self, ready: impl Fn(&str) -> bool) -> String {
+        let until = Instant::now() + Duration::from_secs(8);
+        loop {
+            let text = fs::read_to_string(&self.stdout).unwrap();
+            if ready(&text) {
+                return text;
+            }
+            if let Some(status) = self.owner.child.try_wait().unwrap() {
+                panic!(
+                    "example exited before required output: {status}; {}",
+                    fs::read_to_string(&self.stderr).unwrap()
+                );
+            }
+            assert!(
+                Instant::now() < until,
+                "example output deadline; stdout={text}; stderr={}",
+                fs::read_to_string(&self.stderr).unwrap()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    fn finish(&mut self, expected: i32) -> (String, String) {
+        let (status, stopped) = self.owner.wait(Duration::from_secs(20)).unwrap();
+        assert!(!stopped, "example required forced stop");
+        assert_eq!(status.code(), Some(expected));
+        println!(
+            "example pid={} natural_exit={status} directwait=true Jobsettled=true",
+            self.owner.child.id()
+        );
+        (
+            fs::read_to_string(&self.stdout).unwrap(),
+            fs::read_to_string(&self.stderr).unwrap(),
+        )
+    }
+}
+fn printed_token(line: &str) -> [u8; 16] {
+    let text = line
+        .split_whitespace()
+        .find_map(|word| word.strip_prefix("token="))
+        .unwrap();
+    assert_eq!(text.len(), 32);
+    let mut token = [0; 16];
+    for (i, byte) in token.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[i * 2..i * 2 + 2], 16).unwrap();
+    }
+    token
+}
+
+#[test]
+#[ignore = "requires MEMBUS_QUOTA_EXAMPLE_EXE selecting a separately built example"]
+fn actual_executable_recovers_terminal_and_never_connected_registrations_and_keeps_obligations() {
+    // A real same-resident terminal registration, before any writer connected.
+    // This does not pretend to reproduce the scheduler-dependent overflow path.
+    {
+        let f = Fixture::new();
+        let mut writer = f.client();
+        let mut cli = ExampleProcess::start(&f, "terminal", 1);
+        let first = cli.output(|text| text.contains("registered token="));
+        let token = printed_token(
+            first
+                .lines()
+                .find(|l| l.starts_with("registered "))
+                .unwrap(),
+        );
+        writer
+            .unsubscribe(
+                "quota",
+                &token,
+                "independent-terminal",
+                quota::deadline(BUDGET),
+            )
+            .unwrap();
+        assert!(
+            !writer
+                .subscription_status(
+                    "quota",
+                    &token,
+                    "terminal-confirmed",
+                    quota::deadline(BUDGET)
+                )
+                .unwrap()
+                .active
+        );
+        let committed = put(
+            &mut writer,
+            "event/terminal",
+            b"terminal-value",
+            "terminal-value",
+        );
+        cli.output(|text| text.contains("change key=event/terminal "));
+        let (stdout, stderr) = cli.finish(0);
+        assert!(stdout.matches("registered token=").count() >= 2);
+        let delivered = stdout
+            .lines()
+            .find(|l| l.starts_with("change key=event/terminal "))
+            .unwrap();
+        assert_delivery(delivered, "event/terminal", b"terminal-value");
+        assert!(delivered.contains(&format!("version={}", committed.version)));
+        assert!(stderr.contains("quiet; continuing through known-registration renewal"));
+        assert!(!stderr.contains("unresolved obligations="));
+    }
+    // First restart occurs before any signal writer exists. A second restart
+    // follows handled work, exercising the executable's remaining-event count,
+    // automatic reconnect and cursor preservation, not manually composed calls.
+    {
+        let mut f = Fixture::new();
+        let mut writer = f.client();
+        let mut cli = ExampleProcess::start(&f, "restart", 2);
+        let first = cli.output(|text| text.contains("registered token="));
+        let first_token = printed_token(
+            first
+                .lines()
+                .find(|l| l.starts_with("registered "))
+                .unwrap(),
+        );
+        f.stop();
+        drop(writer);
+        f.start();
+        writer = f.client();
+        put(&mut writer, "open", b"cli-open", "cli-open");
+        put(&mut writer, "resets", b"cli-resets", "cli-resets");
+        cli.output(|text| text.contains("reconcile current-state"));
+        let first_value = put(&mut writer, "event/cli-first", b"cli-first", "cli-first");
+        let text = cli.output(|text| text.contains("change key=event/cli-first "));
+        let next_token = printed_token(
+            text.lines()
+                .filter(|l| l.starts_with("registered "))
+                .last()
+                .unwrap(),
+        );
+        f.stop();
+        drop(writer);
+        f.start();
+        writer = f.client();
+        cli.output(|text| text.matches("reconcile current-state").count() >= 2);
+        let second_value = put(&mut writer, "event/cli-second", b"cli-second", "cli-second");
+        cli.output(|text| text.contains("change key=event/cli-second "));
+        // Historical cleanup remains uncertain: a new epoch is not silently
+        // promoted to proof of original endpoint/state continuity.
+        let (stdout, stderr) = cli.finish(1);
+        assert_eq!(stdout.matches("change key=").count(), 2);
+        for (key, bytes, version) in [
+            ("event/cli-first", &b"cli-first"[..], first_value.version),
+            ("event/cli-second", &b"cli-second"[..], second_value.version),
+        ] {
+            let delivered = stdout
+                .lines()
+                .find(|l| l.starts_with(&format!("change key={key} ")))
+                .unwrap();
+            assert_delivery(delivered, key, bytes);
+            assert!(delivered.contains(&format!("version={version}")));
+        }
+        assert!(stderr.contains("unresolved obligations=[KnownUnresolved"));
+        assert!(stderr.contains(&format!("token: {first_token:?}")));
+        assert!(stderr.contains(&format!("token: {next_token:?}")));
+        assert!(stderr.contains("error: \""));
+        assert!(stderr.contains("checkpoint="));
+        let endpoints: Vec<_> = stdout
+            .lines()
+            .filter(|l| l.starts_with("registered "))
+            .map(|l| {
+                l.split_whitespace()
+                    .find(|w| w.starts_with("endpoint="))
+                    .unwrap()
+            })
+            .collect();
+        let unique: std::collections::BTreeSet<_> = endpoints.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            endpoints.len(),
+            "each lifetime needs its own endpoint"
+        );
+    }
 }
