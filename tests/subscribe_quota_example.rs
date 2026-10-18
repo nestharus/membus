@@ -232,9 +232,12 @@ fn quiet_delivery_handler_failure_resume_and_restart_gap_use_actual_example() {
         let committed = put(&mut writer, "event/first", b"first", "first");
         let delivered = line(&rx);
         assert_delivery(&delivered, "event/first", b"first");
-        assert!(
-            delivered.contains("key=event/first")
-                && delivered.contains(&format!("version={}", committed.version))
+        assert_eq!(
+            delivered
+                .split_whitespace()
+                .filter(|field| field.starts_with("version="))
+                .collect::<Vec<_>>(),
+            vec![format!("version={}", committed.version)]
         );
         worker.join().unwrap()
     });
@@ -689,9 +692,15 @@ fn actual_executable_renews_healthy_lifetimes_and_stops_at_store_uncertainty() {
             .find(|l| l.starts_with("change key=event/terminal "))
             .unwrap();
         assert_delivery(delivered, "event/terminal", b"terminal-value");
-        assert!(delivered.contains(&format!("version={}", committed.version)));
+        assert_eq!(
+            delivered
+                .split_whitespace()
+                .filter(|field| field.starts_with("version="))
+                .collect::<Vec<_>>(),
+            vec![format!("version={}", committed.version)]
+        );
         assert!(stderr.contains("quiet; continuing through known-registration renewal"));
-        assert!(!stderr.contains("unresolved obligations="));
+        assert!(!stderr.contains("unresolved obligation="));
     }
     // Same-epoch continuation must keep the latest HANDLED cursor, not the
     // initial cursor or the later global head from a nonmatching mutation.
