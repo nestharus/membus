@@ -446,3 +446,166 @@ fn actual_resident_legacy_reads_os_flush_put_cas_pending_timeout_and_restart() {
     fs::write(root.join("custody.txt"),"two explicitly spawned NoWindow resident children stopped, directly waited and reaped; inherited finite enclosing Job; no production endpoint/state\n").unwrap();
     println!("physical resident: legacy19, scan22, GET/GET_MANY, OS/flush PUT/CAS, dedup, conflict12, pending19, real pipe timeout, same-epoch retry, restart epoch refusal/replay passed");
 }
+
+/// The recorded-shape burst uses the real batch dispatcher and process restart.
+/// Transport is a private Windows pipe; this is not a rerun of the historical
+/// Python/TCP timing measurement or a qualification of Python's client encoder.
+#[test]
+fn actual_grouped_flush_burst_survives_kill_and_full_replay() {
+    use membus::{
+        frame, lp, read_frame, Cursor, BATCH, CONDITIONAL_PUT, HEALTH, HELLO, IO_METRICS,
+    };
+    use std::{io::Write, os::windows::fs::OpenOptionsExt};
+
+    // Test-local packets exercise BATCH, which has no public SDK method. Replay
+    // uses the supported SDK, not another implementation of committed reads.
+    fn exchange(pipe: &mut Pipe, op: u8, id: u64, body: &[u8]) -> Vec<u8> {
+        let until = d(30_000).local;
+        pipe.set_deadline(until).unwrap();
+        pipe.write_all(&frame(op, id, body)).unwrap();
+        pipe.set_deadline(until).unwrap();
+        let reply = read_frame(pipe).unwrap();
+        let mut c = Cursor::new(&reply);
+        assert_eq!(c.u16().unwrap(), 1);
+        assert_eq!(c.u16().unwrap(), 0);
+        assert_eq!(c.u8().unwrap(), op | 128);
+        assert_eq!(c.u64().unwrap(), id);
+        assert_eq!(c.u16().unwrap(), 0, "operation {op} refused");
+        reply[15..].to_vec()
+    }
+    fn prefix(id: &str) -> Vec<u8> {
+        let mut body = (membus::now_ms() + 30_000).to_le_bytes().to_vec();
+        lp(&mut body, id.as_bytes());
+        lp(&mut body, b"ledger");
+        body
+    }
+    fn row(seq: usize) -> (String, Vec<u8>) {
+        let size = match seq {
+            1533 => 59_499,
+            3066..=3070 => 16,
+            _ if seq % 2 == 1 => 1039,
+            _ => 1311,
+        };
+        let mut value = format!("op-{seq}:").into_bytes();
+        value.resize(size, b'x');
+        (format!("row/{seq:016}"), value)
+    }
+
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = fixture_base().join(format!("flush-burst-{}-{stamp}", std::process::id()));
+    fs::create_dir_all(&root).unwrap();
+    let pipe_name = format!(
+        r"\\.\pipe\membus-flush-burst-{}-{stamp}",
+        std::process::id()
+    );
+    let mut server = Server::start_with(&root, &pipe_name, 0, 1, &["--flush-ms", "50"]);
+    let ready = connect(&pipe_name);
+    let epoch = ready.negotiated().epoch;
+    drop(ready);
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(0x40000000)
+        .open(&pipe_name)
+        .unwrap();
+    let mut wire = Pipe::new(file, 30_000);
+    let mut hello = (membus::MAX_FRAME as u32).to_le_bytes().to_vec();
+    hello.push(0);
+    lp(&mut hello, b"rust-flush-burst");
+    let hello = exchange(&mut wire, HELLO, 1, &hello);
+    assert_eq!(Cursor::new(&hello).u64().unwrap(), epoch);
+
+    let started = Instant::now();
+    let mut acknowledged = Vec::new();
+    let mut batch_seconds = Vec::new();
+    for offset in (0..3070).step_by(128) {
+        let end = (offset + 128).min(3070);
+        let mut body = prefix(&format!("flush-batch-{offset}"));
+        body.extend(((end - offset) as u16).to_le_bytes());
+        let rows: Vec<_> = (offset + 1..=end).map(row).collect();
+        for (seq, (key, value)) in (offset + 1..=end).zip(&rows) {
+            body.push(CONDITIONAL_PUT);
+            lp(&mut body, format!("flush-op-{seq}").as_bytes());
+            lp(&mut body, key.as_bytes());
+            body.push(Ack::Flush as u8);
+            body.extend(0u64.to_le_bytes());
+            lp(&mut body, value);
+        }
+        let tick = Instant::now();
+        let reply = exchange(&mut wire, BATCH, 2 + offset as u64, &body);
+        batch_seconds.push(tick.elapsed().as_secs_f64());
+        let mut c = Cursor::new(&reply);
+        assert_eq!(c.u16().unwrap() as usize, rows.len(), "batch reply count");
+        for (key, value) in rows {
+            assert_eq!(c.u16().unwrap(), 0, "batch item {key} refused");
+            let version = c.u64().unwrap();
+            assert_ne!(version, 0, "batch item {key} has no committed revision");
+            assert_eq!(c.u8().unwrap(), Ack::Flush as u8, "batch item {key}");
+            acknowledged.push((key, value, version));
+        }
+        c.end().unwrap();
+    }
+    let seconds = started.elapsed().as_secs_f64();
+    assert_eq!(acknowledged.len(), 3070);
+    assert_eq!(acknowledged[1532].1.len(), 59_499);
+    assert!(acknowledged[3065..].iter().all(|row| row.1.len() == 16));
+    let health = exchange(&mut wire, HEALTH, 4000, &prefix("burst-health"));
+    let mut c = Cursor::new(&health);
+    let health_counts: Vec<_> = (0..6).map(|_| c.u64().unwrap()).collect();
+    let high_water = (c.u8().unwrap(), c.u8().unwrap());
+    c.end().unwrap();
+    assert_eq!(health_counts[3], 3070);
+    let io = exchange(&mut wire, IO_METRICS, 4001, &prefix("burst-io"));
+    let mut c = Cursor::new(&io);
+    let io_counts = (c.u64().unwrap(), c.u64().unwrap(), c.u64().unwrap());
+    c.end().unwrap();
+    drop(wire);
+    // Zero-duration Owned::wait terminates the resident Job, waits its direct
+    // child and requires an empty Job. No graceful-store shutdown substitutes.
+    server.stop();
+
+    let mut restarted = Server::start_with(&root, &pipe_name, 0, 2, &["--flush-ms", "50"]);
+    let mut client = Client::connect_pipe(
+        std::path::Path::new(&pipe_name),
+        Options::new("rust-flush-burst-replay", membus::MAX_FRAME),
+        d(5000).local,
+    )
+    .unwrap();
+    let replay_epoch = client.negotiated().epoch;
+    assert_ne!(replay_epoch, epoch);
+    let mut replayed = Vec::new();
+    for (page, rows) in acknowledged.chunks(128).enumerate() {
+        let keys: Vec<_> = rows.iter().map(|(key, _, _)| key.as_str()).collect();
+        let values = client
+            .get_many("ledger", &keys, &format!("replay-{page}"), d(5000))
+            .unwrap();
+        assert_eq!(values.len(), rows.len(), "complete replay reply count");
+        for ((key, expected, version), value) in rows.iter().zip(values) {
+            let value = value.unwrap_or_else(|| panic!("missing acknowledged key {key}"));
+            assert_eq!(value.ack, Ack::Flush, "replay acknowledgement {key}");
+            assert_eq!(value.version, *version, "replay revision {key}");
+            assert_eq!(&value.bytes, expected, "replay bytes {key}");
+            replayed.push(key.as_str());
+        }
+    }
+    assert_eq!(replayed.len(), 3070);
+    let keys: Vec<_> = acknowledged
+        .iter()
+        .map(|(key, _, _)| key.as_str())
+        .collect();
+    assert_eq!(replayed, keys);
+    fs::write(root.join("acknowledged-flush-keys.txt"), keys.join("\n")).unwrap();
+    fs::write(root.join("replayed-flush-keys.txt"), replayed.join("\n")).unwrap();
+    drop(client);
+    restarted.stop();
+    println!(
+        "burst: acknowledged=3070 replayed=3070 max_batch=128 flush_ms=50 \
+         epoch_before={epoch} epoch_after={replay_epoch} seconds={seconds} \
+         batch_seconds={batch_seconds:?} health_counts={health_counts:?} \
+         high_water={high_water:?} io_append_bytes_write_calls_sync_attempts={io_counts:?}; \
+         physical_device_bytes=unmeasured; no historical timing threshold"
+    );
+}
