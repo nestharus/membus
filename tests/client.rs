@@ -491,3 +491,37 @@ fn m3_malformed_replies_poison_without_later_send() {
         .is_err());
     assert!(!c.is_usable());
 }
+#[test]
+fn mutation_preflight_uses_same_encoder_without_sending_or_changing_prepare() {
+    let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut c = Client::handshake(
+        CountScript(
+            Script::new(vec![
+                hello(51, 19),
+                wire(133, 2, Some(0), &success(Ack::Os)),
+            ]),
+            count.clone(),
+        ),
+        Options::new("preflight", 65536),
+        deadline().local,
+    )
+    .unwrap();
+    let m = mutation(Ack::Os, Some(0));
+    let before = count.load(std::sync::atomic::Ordering::SeqCst);
+    let size = c.validate_mutation(&m).unwrap();
+    assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), before);
+    let mut a = c.prepare(m).unwrap();
+    c.mutate(&mut a, deadline()).unwrap();
+    assert_eq!(
+        count.load(std::sync::atomic::Ordering::SeqCst) - before,
+        size + 4
+    );
+    let mut big = mutation(Ack::Os, None);
+    big.value = vec![0; 65536];
+    assert!(c.prepare(big.clone()).is_ok());
+    assert!(matches!(
+        c.validate_mutation(&big),
+        Err(Error::Invalid("frame limit"))
+    ));
+    assert!(c.is_usable());
+}

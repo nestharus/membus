@@ -488,6 +488,35 @@ impl<T: Transport> Client<T> {
             retry_window_ms: self.negotiated.retry_window_ms,
         })
     }
+    fn mutation_payload(&self, m: &MutationRequest, d: Deadline) -> Result<Vec<u8>> {
+        identifier(&m.key)?;
+        if m.value.len() > self.negotiated.max_value {
+            return Err(Error::Invalid("value limit"));
+        }
+        let mut p = self.prefix(&m.operation_id, &m.namespace, d)?;
+        lp(&mut p, m.key.as_bytes());
+        p.push(m.ack as u8);
+        if let Some(expected) = m.expected {
+            p.extend(expected.to_le_bytes());
+        }
+        lp(&mut p, &m.value);
+        Ok(p)
+    }
+    /// Pure preflight using the actual mutation encoder. No send or readiness claim.
+    pub fn validate_mutation(&self, request: &MutationRequest) -> Result<usize> {
+        let p = self.mutation_payload(
+            request,
+            Deadline {
+                unix_ms: 0,
+                local: Instant::now(),
+            },
+        )?;
+        let size = p.len() + 13;
+        if size > self.negotiated.max_frame {
+            return Err(Error::Invalid("frame limit"));
+        }
+        Ok(size)
+    }
     /// No retry, reconnect, new identity or backing-state fallback is performed.
     /// Reusing an Attempt is allowed only in its original epoch and conservative retry window.
     pub fn mutate(&mut self, attempt: &mut Attempt, d: Deadline) -> Result<MutationReply> {
@@ -504,13 +533,7 @@ impl<T: Transport> Client<T> {
             return Err(Error::RetryWindowExpired);
         }
         let m = &attempt.request;
-        let mut p = self.prefix(&m.operation_id, &m.namespace, d)?;
-        lp(&mut p, m.key.as_bytes());
-        p.push(m.ack as u8);
-        if let Some(expected) = m.expected {
-            p.extend(expected.to_le_bytes());
-        }
-        lp(&mut p, &m.value);
+        let p = self.mutation_payload(m, d)?;
         let op = if m.expected.is_some() {
             CONDITIONAL_PUT
         } else {

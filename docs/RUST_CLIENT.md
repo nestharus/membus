@@ -10,6 +10,9 @@ unconditional PUT and conditional PUT. OS and flush acknowledgments are explicit
 `Ack` values; a successful mutation must report exactly the selected mode and a
 nonzero revision. Committed values retain revision, achieved mode and bytes.
 GET_MANY preserves input order and validates the exact returned count.
+`validate_mutation` performs a no-send frame/value/identifier check using the same
+encoder as mutation entry. It reports encoded body bytes, without establishing
+transport readiness or changing the existing `prepare`/Attempt retry contract.
 
 `Options::new(identity, max_frame)` supplies the caller identity and ingress
 bound. Baseline negotiation validates all original 19 refusal names/classes,

@@ -10,6 +10,11 @@ use std::{
     sync::{Arc, Barrier},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+fn fixture_base() -> PathBuf {
+    std::env::var_os("MEMBUS_CLIENT_TEST_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/client-fixtures"))
+}
 struct Server {
     child: Child,
     stopped: bool,
@@ -103,9 +108,7 @@ fn actual_pinned_scan_and_subscription_failure_are_distinct_from_absence() {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let root =
-        PathBuf::from(std::env::var_os("MEMBUS_CLIENT_TEST_ROOT").expect("owned fixture root"))
-            .join(format!("scan-{stamp}"));
+    let root = fixture_base().join(format!("scan-{stamp}"));
     fs::create_dir_all(&root).unwrap();
     let pipe = format!(r"\\.\pipe\membus-m3-owned-{stamp}");
     let mut server = Server::start(&root, &pipe, 0, 1);
@@ -202,25 +205,50 @@ fn actual_zero_retention_negotiation_and_active_cancellation() {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = PathBuf::from(std::env::var_os("MEMBUS_CLIENT_TEST_ROOT").unwrap())
-            .join(format!("zero-{stamp}"));
+        let root = fixture_base().join(format!("zero-{stamp}"));
         fs::create_dir_all(&root).unwrap();
         let pipe = format!(r"\\.\pipe\m3-zero-{stamp}");
         let mut server = Server::start_with(&root, &pipe, 0, 1, &[flag, "0"]);
         let mut o = Options::new("zero-retention-control", 65536);
         o.subscriptions = true;
         let mut c = Client::connect_pipe(std::path::Path::new(&pipe), o, d(5000).local).unwrap();
+        let endpoint = format!(r"\\.\pipe\quiet-{stamp}");
+        let mut sink = receiver(&endpoint);
         let s = c
-            .subscribe(
-                "owned",
-                "",
-                &format!(r"\\.\pipe\quiet-{stamp}"),
-                "live-only",
-                d(2000),
-            )
+            .subscribe("owned", "", &endpoint, "live-only", d(2000))
             .unwrap();
         assert!(
             c.subscription_status("owned", &s.token, "active", d(2000))
+                .unwrap()
+                .active
+        );
+        let mut a = c
+            .prepare(MutationRequest {
+                operation_id: "zero-live".into(),
+                namespace: "owned".into(),
+                key: "live".into(),
+                value: b"zero-live".to_vec(),
+                ack: Ack::Os,
+                expected: Some(0),
+            })
+            .unwrap();
+        let published = c.mutate(&mut a, d(2000)).unwrap();
+        sink.connect().unwrap();
+        use std::io::Read;
+        let mut size = [0; 4];
+        sink.read_exact(&mut size).unwrap();
+        let n = u32::from_le_bytes(size) as usize;
+        assert!(n <= 65536);
+        let mut body = vec![0; n];
+        sink.read_exact(&mut body).unwrap();
+        let hint = Change::decode(&body).unwrap();
+        assert_eq!(hint.key, "live");
+        assert_eq!(hint.version, published.version);
+        assert_eq!(hint.subscription, s.token);
+        assert_eq!(hint.namespace, "owned");
+        assert_eq!(hint.ack, Ack::Os);
+        assert!(
+            c.subscription_status("owned", &s.token, "delivered-active", d(2000))
                 .unwrap()
                 .active
         );
@@ -233,6 +261,37 @@ fn actual_zero_retention_negotiation_and_active_cancellation() {
         drop(c);
         server.stop();
     }
+}
+fn receiver(endpoint: &str) -> Pipe {
+    use std::os::windows::io::FromRawHandle;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateNamedPipeW(
+            n: *const u16,
+            a: u32,
+            m: u32,
+            i: u32,
+            o: u32,
+            b: u32,
+            t: u32,
+            s: *mut std::ffi::c_void,
+        ) -> *mut std::ffi::c_void;
+    }
+    let n: Vec<_> = endpoint.encode_utf16().chain(Some(0)).collect();
+    let h = unsafe {
+        CreateNamedPipeW(
+            n.as_ptr(),
+            1 | 0x40000000,
+            0,
+            1,
+            65536,
+            65536,
+            1000,
+            std::ptr::null_mut(),
+        )
+    };
+    assert_ne!(h as isize, -1);
+    Pipe::new(unsafe { fs::File::from_raw_handle(h) }, 5000)
 }
 #[test]
 fn actual_resident_legacy_reads_os_flush_put_cas_pending_timeout_and_restart() {
