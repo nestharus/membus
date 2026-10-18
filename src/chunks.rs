@@ -226,7 +226,8 @@ pub enum Rec {
 }
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct Import {
-    /// Per legacy stripe log: (file name, size, sha256 hex).
+    /// Per retained import input: (file name, size, sha256 hex). Older imports
+    /// list only stripe logs; new imports also name an optional policy file.
     pub files: Vec<(String, u64, String)>,
     pub keys: u64,
     pub bytes: u64,

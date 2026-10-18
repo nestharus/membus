@@ -4,6 +4,7 @@ pub mod chunks;
 mod signals;
 mod timers;
 pub use chunks::{Class, ManualClock, POLICY_NS};
+pub mod client;
 #[cfg(windows)]
 pub mod pipe_io;
 use std::{
@@ -395,6 +396,8 @@ pub struct Store {
     class_reservations: Arc<Mutex<HashMap<Class, usize>>>,
     #[cfg(test)]
     policy_after_commit: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+    #[cfg(test)]
+    policy_join_observed: Mutex<Option<mpsc::Sender<()>>>,
     pub config: Config,
     pub epoch: u64,
     _owner: File,
@@ -1499,14 +1502,11 @@ fn read_legacy(files: &[(usize, PathBuf)], config: &Config, now: u64) -> io::Res
 }
 /// The policies an import applies before it writes: `state/import-policies.txt`, one `NS<TAB>PREFIX<TAB>CLASS` a
 /// line (CLASS forever, latest or expire:MS; PREFIX may be empty); `#` starts a comment line.
-fn import_policies(path: &Path, config: &Config) -> io::Result<Vec<(String, String, Class)>> {
-    let p = path.join("import-policies.txt");
-    if !p.exists() {
-        return Ok(Vec::new());
-    }
+fn import_policies(bytes: &[u8], config: &Config) -> io::Result<Vec<(String, String, Class)>> {
+    let text = std::str::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let mut out = Vec::new();
     let mut check = chunks::Policies::default();
-    for (n, line) in fs::read_to_string(&p)?.lines().enumerate() {
+    for (n, line) in text.lines().enumerate() {
         let line = line.trim_end_matches('\r');
         if line.trim().is_empty() || line.trim_start().starts_with('#') {
             continue;
@@ -1592,9 +1592,15 @@ impl ImportWriter {
 fn move_legacy(path: &Path, import: &chunks::Import) -> io::Result<()> {
     let to = path.join(&import.legacy_dir);
     fs::create_dir_all(&to)?;
-    for (name, _, _) in &import.files {
+    for (name, size, sha) in &import.files {
         let from = path.join(name);
         if from.exists() {
+            if to.join(name).exists() {
+                return Err(corrupt(format!("import input at source and backup; both retained: {name}")));
+            }
+            if fs::metadata(&from)?.len() != *size || chunks::sha256_file(&from)? != *sha {
+                return Err(corrupt(format!("import input changed before backup move; source retained: {name}")));
+            }
             fs::rename(&from, to.join(name))?;
         }
         let dest = to.join(name);
@@ -1640,6 +1646,35 @@ fn import_legacy(path: &Path, config: &Config, clock: &chunks::Clock, epoch: u64
         let name = p.file_name().unwrap().to_string_lossy().into_owned();
         listed.push((name, fs::metadata(p)?.len(), chunks::sha256_file(p)?));
     }
+    // The same bytes select classes and supply their Import.files provenance. On
+    // Windows keep the input open without write/delete sharing through the switch;
+    // incompatible outstanding writers refuse before constructing the replacement.
+    let policy_path = path.join("import-policies.txt");
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.share_mode(1); // FILE_SHARE_READ only
+    }
+    let mut policy_input = match options.open(&policy_path) {
+        Ok(file) => Some(file),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    };
+    let mut policy_bytes = Vec::new();
+    if let Some(file) = &mut policy_input {
+        file.read_to_end(&mut policy_bytes)?;
+        let mut hash = chunks::Sha256::new();
+        hash.update(&policy_bytes);
+        listed.push(("import-policies.txt".into(), policy_bytes.len() as u64, hash.hex()));
+    }
+    let selected_policies = import_policies(&policy_bytes, config)?;
+    for (name, _, _) in &listed {
+        if path.join(format!("legacy-{epoch}")).join(name).try_exists()? {
+            return Err(corrupt(format!("import backup input already exists; source retained: {name}")));
+        }
+    }
     let legacy = read_legacy(&files, config, now_ms())?;
     let dir = path.join("chunks.import");
     if dir.exists() {
@@ -1659,7 +1694,7 @@ fn import_legacy(path: &Path, config: &Config, clock: &chunks::Clock, epoch: u64
         }
         let mut synthetic = HashMap::new();
         // The policies first, as policy records at new versions, so each imported key takes its class.
-        for (n, (ns, prefix, class)) in import_policies(path, config)?.into_iter().enumerate() {
+        for (n, (ns, prefix, class)) in selected_policies.into_iter().enumerate() {
             policies.set(&ns, &prefix, Some(class));
             let key = chunks::policy_key(&ns, &prefix).map_err(|_| io::Error::other("policy key"))?;
             let mut salt = 0u64;
@@ -1763,6 +1798,11 @@ fn import_legacy(path: &Path, config: &Config, clock: &chunks::Clock, epoch: u64
         if let Some(f) = first {
             return Err(io::Error::new(io::ErrorKind::InvalidData, format!("import refused, legacy logs left in place: {f}")));
         }
+        // In particular, a newly supplied file cannot silently turn an originally
+        // absent input into an unrecorded policy choice during construction.
+        if policy_input.is_none() && policy_path.try_exists()? {
+            return Err(corrupt("import policy input appeared during construction; source retained".into()));
+        }
         let import = chunks::Import {
             files: listed,
             keys: legacy.latest.len() as u64,
@@ -1785,13 +1825,17 @@ fn import_legacy(path: &Path, config: &Config, clock: &chunks::Clock, epoch: u64
         fs::rename(&chunks_dir, path.join(format!("chunks.pre-import-{epoch}")))?;
     }
     fs::rename(&dir, &chunks_dir)?;
+    // Release the Windows source guard only after the switch. Backup movement
+    // checks the named bytes again; arbitrary filesystem writers are not fenced
+    // by the cooperative state-directory owner lock.
+    drop(policy_input);
     move_legacy(path, &import)?;
     let torn: Vec<String> = legacy.torn.iter().map(|(f, o, b)| format!("{f} offset {o} ({b} B torn tail, left in place)")).collect();
     let line = format!(
         "imported {} keys ({written} B) of {} legacy records from {} legacy logs into chunks/; legacy logs in {}{}",
         import.keys,
         legacy.records,
-        import.files.len(),
+        files.len(),
         import.legacy_dir,
         if torn.is_empty() { String::new() } else { format!("; {}", torn.join("; ")) }
     );
@@ -1985,7 +2029,7 @@ fn replay_into(rp: &mut Replayed, path: &Path, dir: &Path, legacy: bool, config:
     }
     if let (true, Some(import)) = (legacy, rp.chunks.import.clone()) {
         // A stop between the switch and the move: finish the move.
-        if !legacy_files(path).is_empty() {
+        if import.files.iter().any(|(name, _, _)| path.join(name).exists()) {
             move_legacy(path, &import)?;
         }
         let ldir = path.join(&import.legacy_dir);
@@ -2821,6 +2865,8 @@ impl Store {
             class_reservations,
             #[cfg(test)]
             policy_after_commit: Mutex::new(None),
+            #[cfg(test)]
+            policy_join_observed: Mutex::new(None),
             config,
             epoch,
             _owner: owner,
@@ -3234,6 +3280,8 @@ impl Store {
             }
             let wait = deadline.saturating_sub(now_ms());
             if wait == 0 { return Outcome::error(if state.dedup.contains_key(&id) { 17 } else { 5 }); }
+            #[cfg(test)]
+            if let Some(entered) = self.policy_join_observed.lock().unwrap().take() { let _ = entered.send(()); }
             state = self.done.wait_timeout(state, Duration::from_millis(wait)).unwrap().0;
             drop(state);
         };
@@ -4359,9 +4407,9 @@ mod receiving_correction_tests {
         let b=s.clone();let(finished,result)=mpsc::channel();let setter=std::thread::spawn(move||{
             let r=b.set_policy("race","p/",Some(Class::expire(3*DAY)),now_ms()+10000);finished.send(r).unwrap();
         });
-        let early=result.recv_timeout(Duration::from_millis(100));resume.send(()).unwrap();
+        let early=result.recv_timeout(Duration::from_secs(5));resume.send(()).unwrap();
         assert_eq!(writer.join().unwrap().code,0);setter.join().unwrap();
-        let got=early.unwrap_or_else(|_|result.recv().unwrap());
+        let got=early.expect("competing policy admission must complete while selected append remains paused");
         assert_eq!(got.code,7,"an already selected X must not disappear while Y is admitted");
         let mut classes=s.policies.read().unwrap().classes();classes.extend(s.chunks.lock().unwrap().table.values()
             .filter(|c|c.state!=chunks::ChunkState::Retired).map(|c|c.class));assert_eq!(classes.len(),64);
@@ -4436,6 +4484,31 @@ mod receiving_correction_tests {
         assert_eq!(s.policies().iter().find(|r|r.0=="projection").unwrap().2,Class::LATEST);
         drop(s);let reopened=Store::open(&path,config).unwrap();
         assert_eq!(reopened.set_policy_with_id("projection","",Some(Class::LATEST),"A",0),original);
+    }
+    #[test]
+    fn pending_policy_duplicate_joins_successfully_before_its_longer_deadline() {
+        let(path,_,config)=fixture("policy-successful-join");
+        let s=Arc::new(Store::open(&path,config.clone()).unwrap());
+        let(reached,committed)=mpsc::channel();let(resume,resumed)=mpsc::channel();
+        *s.policy_after_commit.lock().unwrap()=Some((reached,resumed));
+        let first=s.clone();let original=std::thread::spawn(move||policy(&first,"join","",Some(Class::LATEST),"A"));
+        committed.recv_timeout(Duration::from_secs(5)).unwrap();
+        let(entered,observed)=mpsc::channel();*s.policy_join_observed.lock().unwrap()=Some(entered);
+        let other=s.clone();let(sent,result)=mpsc::channel();let duplicate=std::thread::spawn(move||{
+            let out=other.set_policy_with_id("join","",Some(Class::LATEST),"A",now_ms()+10_000);
+            sent.send(out.clone()).unwrap();out
+        });
+        let entry=observed.recv_timeout(Duration::from_secs(5));
+        let while_held=result.recv_timeout(Duration::from_millis(50));
+        let next=s.next_issued.load(Ordering::SeqCst);
+        resume.send(()).unwrap();let original=original.join().unwrap();let joined=duplicate.join().unwrap();
+        assert!(entry.is_ok(),"the duplicate must actually reach its pending wait");
+        assert!(matches!(while_held,Err(mpsc::RecvTimeoutError::Timeout)),"no outcome before publication: {while_held:?}");
+        assert_eq!(joined,original);assert_eq!(joined.code,0);
+        assert_eq!(s.next_issued.load(Ordering::SeqCst),next);
+        assert_eq!(s.policies().iter().find(|r|r.0=="join").unwrap().2,Class::LATEST);
+        drop(s);let reopened=Store::open(&path,config).unwrap();
+        assert_eq!(reopened.set_policy_with_id("join","",Some(Class::LATEST),"A",0),original);
     }
     #[test]
     fn prospective_policy_class_survives_durable_wait_and_failure_cleans_it() {

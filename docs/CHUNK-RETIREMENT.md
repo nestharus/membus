@@ -375,10 +375,17 @@ records. Its owner-visible cost is about 0.56 MB written once, plus 8.26 MB kept
 
 **Migration and backup plan** (the three points lane 87's answer requires):
 1. **The legacy files stay unmodified and read-only, as the rollback.** The import opens `stripe-N.log` for reading
-   only. Before writing any chunk it records each file's size and sha256 in the catalogue's `import` record. After the
-   move to `state/legacy-<epoch>/`, it sets each file read-only. The 24 h dedup replay (above) reads them read-only. At
-   every start, replay checks the sizes and sha256 in the `import` record; on a mismatch it starts read_only with
-   `storage_error`.
+   only. The optional `import-policies.txt` is read once: those exact bytes are parsed and hashed, and its name, size
+   and sha256 join the stripe entries in the existing catalogue `import` record. On Windows its open handle denies
+   write/delete sharing through the switch; an incompatible outstanding writer refuses before switching. After the
+   move to `state/legacy-<epoch>/`, each input is read-only. The policy file is retained evidence, never a data stripe
+   or a policy reapplied on restart. Recovery finishes its outstanding move even when all stripes already moved.
+   Without a policy file, imported data keeps the existing forever default and no policy input entry is recorded.
+   Older imports without that entry remain readable with policy-input provenance unknown. The 24 h dedup replay
+   (above) reads stripe logs read-only. At
+   every start, replay checks the retained inputs' sizes and sha256; a changed or missing backup starts read_only
+   with `storage_error`. A conflicting outstanding move refuses while retaining its source and backup. Arbitrary
+   state-directory writers and non-Windows input locking are outside this ownership guarantee.
 2. **The import is checked against a replay of the legacy records before membus switches to it.** The import writes
    the new chunks and catalogue into `state/chunks.import/`, then replays them alone and compares them with the legacy
    replay held in memory. The comparison covers every key's latest value, version and tombstone flag; each namespace's
@@ -579,12 +586,19 @@ The build itself is one Act's work under lane 87's one build at a time (seq 1083
   interpretation in 5.1, quoting the founder's words with their source. Lane 88's reading of its class governs if it
   differs.
 
-**To lane 88 (tooling):**
-- Which class each key family takes (section 5.1's table), including capacity `event/` and `quota-test`.
-- Whether any reader of `event/` keys needs them past 3 days. quotafwd's prune, when turned on, removes them after 7
-  days (`quotafwd.py`:49).
-- Whether lane 88's reopen-timer replace and the pillar successor write are live as fenced lease adopters (5.8).
-- Which of section 6's heartbeat flags its watchers read, and whether HEALTH2's fields are the ones it needs.
+**Tooling's received operating boundaries:**
+- Its quota/slots/capacity event families and quota-test take three-day expiry; the named quota state families and
+  slots default take latest. The longest event prefix overrides the slots default. Other namespaces remain their
+  owners' choices. Tooling uses cooperative namespace ownership, not an authenticated POLICY_SET principal.
+- Its event reader needs no key older than three days. Quotafwd reconciles from its last handled key less two minutes;
+  longer downtime has the file-backed event delivery path. Its seven-day prune remains disabled. The named writers
+  use fresh unconditional keys rather than retrying old expired keys.
+- Fleet reads the documented storage/pressure flags. Additional HEALTH2 fields are not a tooling swap prerequisite.
+  A stopped swap requires ten minutes' notice, no current pressure warning, one swap at a time and no leases hold.
+  Receiving requires Running/ok, forwarder epoch change followed by forwarding, and no membus-refused within two
+  monitoring passes. This documents conditions, not a completed swap or another namespace's acceptance.
+- Fenced reopen-timer/pillar adoption, combined leases, recovery and post-switch rollback reconciliation retain
+  their separate operating owners and qualification boundaries (5.8 and 9).
 
 ## 13. As built (e18, CR1-CR4)
 

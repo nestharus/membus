@@ -287,6 +287,8 @@ fn t11_injected_difference_leaves_the_legacy_logs() {
 fn t11_rollback_restores_the_legacy_logs() {
     let p = path("t11-rollback");
     legacy_state(&p);
+    policies(&p);
+    let policy_bytes=fs::read(p.join("import-policies.txt")).unwrap();
     let before = shas(&p);
     let clock = ManualClock::new(now_ms());
     {
@@ -304,16 +306,18 @@ fn t11_rollback_restores_the_legacy_logs() {
         assert_eq!(s.mutate(m).code, 0);
     }
     // The rollback steps (5.6, 3): chunks/ aside, the legacy files back, read-only cleared after the move.
+    let imported_inputs=import_record(&p).files;
     fs::rename(p.join("chunks"), p.join("chunks.rolled-back-8")).unwrap();
-    for name in before.keys() {
-        fs::rename(p.join("legacy-8").join(name), p.join(name)).unwrap();
-        let f = p.join(name);
+    for (name,_,_) in imported_inputs {
+        fs::rename(p.join("legacy-8").join(&name), p.join(&name)).unwrap();
+        let f = p.join(&name);
         let mut perm = fs::metadata(&f).unwrap().permissions();
         #[allow(clippy::permissions_set_readonly_false)]
         perm.set_readonly(false);
         fs::set_permissions(&f, perm).unwrap();
     }
     assert_eq!(shas(&p), before, "the restored legacy logs are the originals");
+    assert_eq!(fs::read(p.join("import-policies.txt")).unwrap(),policy_bytes);
     println!("T11: rollback restored the legacy logs byte for byte (the previous binary's run is in import_production.py)");
 }
 
@@ -356,4 +360,107 @@ fn imported_policy_does_not_displace_superseded_legacy_operation_identity() {
         if let Some(original)=&separate {assert_eq!(&result,original)} else {separate=Some(result);}
         assert_eq!(shas(&p.join("legacy-8")),before);
     }
+}
+
+fn import_record(p: &Path) -> chunks::Import {
+    chunks::read_catalogue(&p.join("chunks/catalogue.log")).unwrap().0.into_iter()
+        .find_map(|r| match r.rec { chunks::Rec::Import(i) => Some(i), _ => None }).unwrap()
+}
+fn writable(p: &Path) {
+    let mut permissions=fs::metadata(p).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(false);
+    fs::set_permissions(p,permissions).unwrap();
+}
+#[test]
+fn import_retains_exact_policy_input_and_longest_prefix_classes() {
+    let p=path("policy-provenance");let(model,_)=legacy_state(&p);policies(&p);
+    let bytes=fs::read(p.join("import-policies.txt")).unwrap();
+    let sha=chunks::sha256_file(&p.join("import-policies.txt")).unwrap();let stripes=shas(&p);
+    let clock=ManualClock::new(now_ms());let s=Store::open(&p,config(&clock)).unwrap();
+    let record=import_record(&p);
+    assert_eq!(record.files.iter().find(|(n,_,_)|n=="import-policies.txt"),
+        Some(&("import-policies.txt".into(),bytes.len() as u64,sha.clone())));
+    assert_eq!(record.files.len(),5);assert!(!p.join("import-policies.txt").exists());
+    let retained=p.join("legacy-8/import-policies.txt");assert_eq!(fs::read(&retained).unwrap(),bytes);
+    assert_eq!(chunks::sha256_file(&retained).unwrap(),sha);assert!(fs::metadata(&retained).unwrap().permissions().readonly());
+    assert_eq!(shas(&p.join("legacy-8")),stripes);assert_eq!(s.replay_report().legacy.len(),4);
+    let mut selected=chunks::Policies::default();for(ns,prefix,class)in s.policies(){selected.set(&ns,&prefix,Some(class));}
+    assert_eq!(selected.resolve("slots","event/1").0,Class::expire(3*DAY));
+    assert_eq!(selected.resolve("slots","gpu").0,Class::LATEST);
+    check_model(&s,&model);drop(s);let s=reopen(&p,config(&clock));check_model(&s,&model);
+    assert_eq!(s.metrics().0,0);assert!(!s.storage_error());assert_eq!(s.replay_report().legacy.len(),4);
+}
+#[test]
+fn import_without_policy_input_preserves_historical_forever_default() {
+    let p=path("no-policy-provenance");let(model,_)=legacy_state(&p);let clock=ManualClock::new(now_ms());
+    let s=Store::open(&p,config(&clock)).unwrap();let record=import_record(&p);
+    assert_eq!(record.files.len(),4);assert!(!record.files.iter().any(|(n,_,_)|n=="import-policies.txt"));
+    assert!(s.policies().is_empty());assert!(s.chunk_rows().iter().all(|r|r.2=="forever"));
+    check_model(&s,&model);drop(s);let s=reopen(&p,config(&clock));check_model(&s,&model);assert!(!s.storage_error());
+}
+#[test]
+fn recovery_finishes_policy_move_after_every_stripe_already_moved() {
+    let p=path("policy-only-move");let(model,_)=legacy_state(&p);policies(&p);let clock=ManualClock::new(now_ms());
+    let s=Store::open(&p,config(&clock)).unwrap();let original_policies=s.policies();drop(s);
+    let retained=p.join("legacy-8/import-policies.txt");let bytes=fs::read(&retained).unwrap();writable(&retained);
+    fs::rename(&retained,p.join("import-policies.txt")).unwrap();assert!(!p.join("stripe-0.log").exists());
+    let s=reopen(&p,config(&clock));assert!(!p.join("import-policies.txt").exists());
+    assert_eq!(fs::read(&retained).unwrap(),bytes);assert!(fs::metadata(&retained).unwrap().permissions().readonly());
+    assert_eq!(s.policies(),original_policies);assert!(!s.storage_error());assert_eq!(s.metrics().0,0);check_model(&s,&model);
+}
+#[test]
+fn changed_or_missing_retained_policy_input_is_a_storage_error() {
+    for missing in [false,true] {
+        let p=path(if missing{"policy-backup-missing"}else{"policy-backup-changed"});legacy_state(&p);policies(&p);
+        let clock=ManualClock::new(now_ms());drop(Store::open(&p,config(&clock)).unwrap());
+        let retained=p.join("legacy-8/import-policies.txt");writable(&retained);
+        if missing{fs::remove_file(&retained).unwrap()}else{fs::write(&retained,b"quota\t\tforever\n").unwrap()}
+        let s=reopen(&p,config(&clock));assert!(s.storage_error());assert!(s.health2().read_only);
+        assert!(s.replay_report().storage_errors.iter().any(|e|e.contains("import-policies.txt")));
+    }
+}
+#[test]
+fn older_import_without_policy_provenance_remains_readable_without_inventing_it() {
+    let p=path("historical-policy-provenance");let(model,_)=legacy_state(&p);policies(&p);let clock=ManualClock::new(now_ms());
+    let s=Store::open(&p,config(&clock)).unwrap();let original=s.policies();drop(s);
+    let cat=p.join("chunks/catalogue.log");let mut records=chunks::read_catalogue(&cat).unwrap().0;
+    for r in &mut records{if let chunks::Rec::Import(i)=&mut r.rec{i.files.retain(|(n,_,_)|n!="import-policies.txt");}}
+    chunks::Catalogue::open(&cat).unwrap().rewrite(&records).unwrap();
+    let retained=p.join("legacy-8/import-policies.txt");writable(&retained);fs::write(&retained,b"not an original policy input").unwrap();
+    let s=reopen(&p,config(&clock));assert!(!s.storage_error());assert_eq!(s.policies(),original);check_model(&s,&model);
+    assert!(!import_record(&p).files.iter().any(|(n,_,_)|n=="import-policies.txt"));assert_eq!(s.replay_report().legacy.len(),4);
+}
+#[test]
+fn refused_import_preserves_policy_input_and_legacy_sources() {
+    let p=path("policy-provenance-refusal");legacy_state(&p);policies(&p);let before=shas(&p);
+    let bytes=fs::read(p.join("import-policies.txt")).unwrap();let clock=ManualClock::new(now_ms());
+    assert!(Store::open(&p,Config{import_inject_difference:true,..config(&clock)}).is_err());
+    assert_eq!(shas(&p),before);assert_eq!(fs::read(p.join("import-policies.txt")).unwrap(),bytes);
+    assert_eq!(fs::read(p.join("epoch")).unwrap(),7u64.to_le_bytes());assert!(!p.join("legacy-8").exists());
+    assert!(!p.join("chunks.import").exists());
+}
+#[cfg(windows)]
+#[test]
+fn an_outstanding_policy_writer_refuses_before_the_import_switch() {
+    use std::{fs::OpenOptions,os::windows::fs::OpenOptionsExt};
+    let p=path("policy-writer-refusal");legacy_state(&p);policies(&p);let before=shas(&p);
+    let bytes=fs::read(p.join("import-policies.txt")).unwrap();let clock=ManualClock::new(now_ms());
+    let writer=OpenOptions::new().write(true).share_mode(3).open(p.join("import-policies.txt")).unwrap();
+    assert!(Store::open(&p,config(&clock)).is_err());drop(writer);
+    assert_eq!(shas(&p),before);assert_eq!(fs::read(p.join("import-policies.txt")).unwrap(),bytes);
+    assert_eq!(fs::read(p.join("epoch")).unwrap(),7u64.to_le_bytes());assert!(!p.join("chunks.import").exists());
+    assert!(!p.join("legacy-8").exists());assert!(!p.join("chunks/catalogue.log").exists());
+    assert!(!reopen(&p,config(&clock)).storage_error());
+}
+#[test]
+fn existing_backup_input_refuses_before_switch_without_overwriting_either_copy() {
+    let p=path("policy-backup-collision");legacy_state(&p);policies(&p);let before=shas(&p);
+    let bytes=fs::read(p.join("import-policies.txt")).unwrap();let clock=ManualClock::new(now_ms());
+    fs::create_dir_all(p.join("legacy-8")).unwrap();let retained=p.join("legacy-8/import-policies.txt");
+    fs::write(&retained,b"independent retained input").unwrap();
+    assert!(Store::open(&p,config(&clock)).is_err());
+    assert_eq!(shas(&p),before);assert_eq!(fs::read(p.join("import-policies.txt")).unwrap(),bytes);
+    assert_eq!(fs::read(&retained).unwrap(),b"independent retained input");
+    assert_eq!(fs::read(p.join("epoch")).unwrap(),7u64.to_le_bytes());assert!(!p.join("chunks/catalogue.log").exists());
 }

@@ -51,6 +51,15 @@ pub struct Pipe {
     idle_ms: u32,
 }
 impl Pipe {
+    /// Set the remaining whole-call budget before each bounded I/O operation.
+    pub fn set_deadline(&mut self, deadline: std::time::Instant) -> io::Result<()> {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "pipe deadline"));
+        }
+        self.idle_ms = remaining.as_millis().clamp(1, u32::MAX as u128 - 1) as u32;
+        Ok(())
+    }
     pub fn new(file: File, idle_ms: u32) -> Self {
         Self { file, idle_ms }
     }
