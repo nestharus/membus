@@ -4,18 +4,25 @@
 //! Both endpoint locations are explicit; this example starts no service. Each
 //! registration uses a fresh name below the listener prefix. Add `--events N`
 //! for a finite run, or `--cursor HEX` to resume a previously printed cursor.
+//! The caller must establish that the cursor belongs to the intended store and
+//! finish any outstanding reconciliation; numeric cursor bytes prove neither.
 //! Successful output handling precedes cursor advancement. Persist that cursor in
 //! a real application's own durable checkpoint after its useful work succeeds.
 //!
 //! A gap starts a live subscription before observing `quota/open` and
 //! `quota/resets`. These separate GETs are current state, not an atomic snapshot
 //! or recovery of every missed event. Quiet time alone is not a disconnect:
-//! every quiet interval renews a known registration, so a vanished or inactive
-//! subscription cannot strand the waiter silently. `--quiet-ms N` sets that
-//! interval (default 60000). Known cleanup is retried through a fresh connection
-//! before another registration; an unrecognized old token remains an obligation.
-//! Unknown registration stops automatic attempts. Failed known-token cleanup is
-//! retained across reconnects; endpoint closure never proves remote settlement.
+//! with responsive output, each quiet interval closes and cancels the known
+//! lifetime before renewal on the SAME control connection. `--quiet-ms N` sets
+//! that interval (default 10000). Control idle limits must allow the intervening
+//! output and work; synchronous writes/flushes have no example-owned deadline.
+//! Control loss or failed cleanup stops automatic continuation. A new store at
+//! the same address can reuse token/cursor bytes, so this CLI never retries them
+//! through a new connection. Unknown registration also stops automatic attempts.
+//! The caller receives unresolved identities/failures and owes their continuing
+//! disposition; printed diagnostics are not durable custody. Local endpoint
+//! closure never proves remote settlement. A printed starting checkpoint before
+//! failed gap reconciliation is not proof of completed application restoration.
 #[cfg(windows)]
 pub mod quota {
     use membus::client::{
@@ -92,8 +99,8 @@ pub mod quota {
         pub quiet: Duration,
         pub budget: Duration,
         pub events: Option<usize>,
-        /// Optional finite qualification-owner bound. Ordinary waiting has no
-        /// total deadline; every individual I/O is still bounded.
+        /// Optional receive-phase bound. Client exchanges have separate budgets;
+        /// synchronous handler writes and flushing have no supplied deadline.
         pub until: Option<Instant>,
     }
 
@@ -118,7 +125,8 @@ pub mod quota {
     }
 
     /// One registration lifetime. The caller retains the cursor and every
-    /// unresolved cleanup report, including when starting another connection.
+    /// unresolved cleanup report. Reusing a cursor requires intended store lineage;
+    /// a fresh control connection does not establish that relationship.
     /// `output` is this example's handler: write AND flush must both succeed.
     pub fn session<T: Transport>(
         client: &mut Client<T>,
@@ -215,7 +223,7 @@ pub mod quota {
                         return Ok(End::Renew);
                     }
                     Err(ReceiveError::Interrupted(error)) => {
-                        return Ok(End::Reconnect(error.to_string()))
+                        return Ok(End::Reconnect(error.to_string()));
                     }
                     Err(error) => return Ok(End::Stop(format!("listener: {error}"))),
                 }
@@ -247,32 +255,29 @@ pub mod quota {
         }
     }
 
-    /// A positive unsubscribe confirms settlement. Refusal24 alone does not
-    /// prove that a replacement resident settles the original endpoint's history.
-    fn retry_known_cleanup(
-        client: &mut Client<membus::pipe_io::Pipe>,
-        obligations: &mut Vec<Cleanup>,
-        budget: Duration,
-    ) -> Result<(), String> {
-        let mut at = 0;
-        while at < obligations.len() {
-            match &obligations[at] {
-                Cleanup::KnownUnresolved { token, .. } => {
-                    match client.unsubscribe(NAMESPACE, token, "quota-retry-cleanup", deadline(budget)) {
-                        Ok(()) => {
-                            eprintln!("remote cleanup confirmed after reconnect: {:?}", obligations.remove(at));
-                            continue;
-                        }
-                        Err(Error::Refused(r)) if r.code == 24 => {}
-                        Err(error) => return Err(format!("known cleanup retry: {error}; retained obligations={obligations:?}")),
-                    }
-                }
-                Cleanup::UnknownRegistration { .. } => return Err(format!("unknown registration forbids automatic retry; retained obligations={obligations:?}")),
-                _ => {}
-            }
-            at += 1;
+    /// The CLI's outer policy. `true` permits another lifetime on the same
+    /// connection only; an unresolved report is returned intact in the error.
+    pub fn continue_on_original(
+        report: &Report,
+        remaining: &mut Option<usize>,
+    ) -> Result<bool, String> {
+        if report.cleanup.unresolved() {
+            return Err(format!(
+                "automatic continuation stopped; end={:?}; unresolved obligation={:?}",
+                report.end, report.cleanup
+            ));
         }
-        Ok(())
+        if let Some(left) = remaining.as_mut() {
+            *left -= report.handled;
+        }
+        match &report.end {
+            End::Complete => Ok(false),
+            End::Renew => Ok(true),
+            End::Stop(error) => Err(error.clone()),
+            End::Reconnect(error) => Err(format!(
+                "interrupted: {error}; automatic continuation stopped; no fresh control connection opened"
+            )),
+        }
     }
 
     pub fn main() -> Result<(), String> {
@@ -280,7 +285,7 @@ pub mod quota {
         let usage = "usage: subscribe_quota <resident-pipe> <listener-prefix> [--events N] [--cursor 32-hex-digits] [--quiet-ms N]";
         let resident = args.next().ok_or(usage)?;
         let listener_prefix = args.next().ok_or(usage)?;
-        let mut quiet_ms = 60_000;
+        let mut quiet_ms = 10_000;
         let mut remaining = None;
         let mut cursor = None;
         while let Some(flag) = args.next() {
@@ -313,32 +318,16 @@ pub mod quota {
             }
         }
         let budget = Duration::from_secs(5);
-        let mut obligations = Vec::new();
+        // Keep this exact connection for every permitted registration lifetime.
+        // Reopening the same address cannot authenticate issuing-store continuity.
+        let mut client = connect(Path::new(&resident), budget)
+            .map_err(|error| format!("connect: {error}; no registration attempted"))?;
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|e| e.to_string())?
             .as_nanos();
         let mut generation = 0u64;
         loop {
-            let mut client = match connect(Path::new(&resident), budget) {
-                Ok(c) => c,
-                Err(Error::Transport(error)) => {
-                    eprintln!("connect: {error}; waiting before reconnect; cursor={cursor:?}");
-                    std::thread::sleep(Duration::from_secs(1));
-                    continue;
-                }
-                Err(Error::Invalid("connect deadline")) => {
-                    eprintln!("resident unavailable; waiting before reconnect; cursor={cursor:?}; retained obligations={obligations:?}");
-                    std::thread::sleep(Duration::from_secs(1));
-                    continue;
-                }
-                Err(error) => {
-                    return Err(format!(
-                        "connect: {error}; retained obligations={obligations:?}"
-                    ))
-                }
-            };
-            retry_known_cleanup(&mut client, &mut obligations, budget)?;
             generation = generation
                 .checked_add(1)
                 .ok_or("listener generation exhausted")?;
@@ -347,7 +336,7 @@ pub mod quota {
                 std::process::id()
             );
             let mut listener = ChangeListener::bind(&endpoint, membus::MAX_FRAME)
-                .map_err(|error| format!("bind: {error}; retained obligations={obligations:?}"))?;
+                .map_err(|error| format!("bind: {error}; no new registration attempted"))?;
             let report = session(
                 &mut client,
                 &mut listener,
@@ -365,33 +354,12 @@ pub mod quota {
                 report.cleanup,
                 cursor.as_ref().map(hex).unwrap_or_else(|| "none".into())
             );
-            if report.cleanup.unresolved() {
-                obligations.push(report.cleanup);
+            if !continue_on_original(&report, &mut remaining)? {
+                return Ok(());
             }
-            if let Some(left) = remaining.as_mut() {
-                *left -= report.handled;
-            }
-            match report.end {
-                End::Complete if obligations.is_empty() => return Ok(()),
-                End::Complete => {
-                    return Err(format!(
-                        "handled requested events; unresolved obligations={obligations:?}"
-                    ))
-                }
-                End::Stop(error) => {
-                    return Err(format!("{error}; unresolved obligations={obligations:?}"))
-                }
-                End::Renew => {
-                    eprintln!("quiet; continuing through known-registration renewal; retained obligations={obligations:?}");
-                    drop(client);
-                    std::thread::sleep(Duration::from_secs(1));
-                }
-                End::Reconnect(error) => {
-                    eprintln!("interrupted: {error}; retained obligations={obligations:?}");
-                    drop(client);
-                    std::thread::sleep(Duration::from_secs(1));
-                }
-            }
+            eprintln!(
+                "quiet; continuing through known-registration renewal on original control connection"
+            );
         }
     }
 }
