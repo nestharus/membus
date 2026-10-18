@@ -1,5 +1,8 @@
 # Membus
 
+[Mutation retry retention](docs/RETRY_RETENTION.md) describes the bounded retained
+comparator, unchanged queue/disk accounting and its collision-resistance assumption.
+
 Read-only [retirement inspection](docs/RETIREMENT-INSPECTION.md) exposes selected
 HEALTH2 counters and exact chunk states from a stopped store's catalogue for
 qualification. These commands grant no lease or receiver authority.

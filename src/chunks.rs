@@ -1141,7 +1141,7 @@ impl Sha256 {
         }
         self.buf.extend(d);
     }
-    pub fn hex(mut self) -> String {
+    pub fn finish(mut self) -> [u8; 32] {
         let bits = self.len * 8;
         let mut pad = vec![0x80u8];
         while (self.buf.len() + pad.len()) % 64 != 56 {
@@ -1151,7 +1151,14 @@ impl Sha256 {
         let len = self.len;
         self.update(&pad);
         self.len = len;
-        self.state.iter().map(|x| format!("{x:08x}")).collect()
+        let mut bytes = [0; 32];
+        for (word, out) in self.state.iter().zip(bytes.chunks_exact_mut(4)) {
+            out.copy_from_slice(&word.to_be_bytes());
+        }
+        bytes
+    }
+    pub fn hex(self) -> String {
+        self.finish().iter().map(|x| format!("{x:02x}")).collect()
     }
 }
 

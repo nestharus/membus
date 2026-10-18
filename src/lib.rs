@@ -230,7 +230,7 @@ impl Outcome {
 }
 #[derive(Clone)]
 struct Dedup {
-    fingerprint: Vec<u8>,
+    fingerprint: [u8; 32],
     at: u64,
     outcome: Option<Outcome>,
 }
@@ -2485,8 +2485,12 @@ fn mutation_bytes(m: &Mutation, version: u64, at: u64) -> Vec<u8> {
     lp(&mut b, &m.bytes);
     b
 }
-fn fingerprint(m: &Mutation) -> Vec<u8> {
-    mutation_bytes(m, 0, 0)
+fn fingerprint(m: &Mutation) -> [u8; 32] {
+    // The durable representation remains complete. Only the in-memory retry
+    // comparator is compact; replay derives the same digest from retained records.
+    let mut hash = chunks::Sha256::new();
+    hash.update(&mutation_bytes(m, 0, 0));
+    hash.finish()
 }
 fn dedup_identity(m: &Mutation) -> Key {
     // The existing policy target key carries its caller namespace; retain the literal operation ID.
@@ -3386,14 +3390,15 @@ impl Store {
         let fp = fingerprint(&m);
         let at = now_ms();
         let log_index = stripe(&m.ns, &m.key);
+        let representation_bytes = mutation_bytes(&m, 0, 0).len();
         let disk_bytes = if m.ack == 0 {
             0
         } else {
-            (16 + mutation_bytes(&m, 0, 0).len()) as u64
+            (16 + representation_bytes) as u64
         };
         // Charge complete queued representation, not just value payloads. Empty
         // values still consume queue slots and framing/identifier memory.
-        let queue_charge = fp.len() + m.bytes.len() + 128;
+        let queue_charge = representation_bytes + m.bytes.len() + 128;
         let mut state = self.state.lock().unwrap();
         if let Some(d) = state.dedup.get(&id).filter(|_|deduplicate) {
             if d.fingerprint != fp {
