@@ -303,7 +303,7 @@ pub struct Config {
     /// The retirement pass (5.4).
     pub retire_ms: u64,
     pub catalogue_rewrite_bytes: u64,
-    /// Expiry summaries are kept this long (5.3; PLAN.md section 5: 30 days).
+    /// Retain expiry summaries for this many milliseconds; the default is 30 days.
     pub summary_ms: u64,
     /// Ordinary admissions refuse with 7 at state_limit_bytes less this reserve; catalogue, retirement and
     /// import writes may use it (5.5). The library default is 0; the server sets 1 GiB.
