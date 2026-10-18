@@ -7,6 +7,8 @@ version and admission time set to zero. Namespace, key, operation ID, expected
 revision, acknowledgement level, removal flag and value participate; the caller's
 deadline does not. Equality relies on SHA-256 collision resistance. This is not a
 mathematical guarantee of byte equality for arbitrary colliding inputs.
+The existing encoding also uses the same expected-revision sentinel for `None`
+and `Some(u64::MAX)`; comparator compaction does not change that encoding alias.
 
 The existing namespace-scoped operation identity, pending-operation join, original
 outcome and retry horizon remain in force. Replay and legacy import derive the

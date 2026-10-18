@@ -121,7 +121,9 @@ fn compact_comparator_does_not_relax_full_payload_queue_admission() {
     let s = Store::open(
         &path("queue"),
         Config {
-            queue_bytes: 4 * (2 * 4096 + 128) - 4,
+            // Two payload copies and 128 bytes alone fit; complete canonical
+            // framing and identifiers must make this admission refuse.
+            queue_bytes: 4 * (2 * 4096 + 128 + 1),
             flush_ms: 0,
             ..Config::default()
         },
