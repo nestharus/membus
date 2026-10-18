@@ -130,6 +130,10 @@ impl Collection {
     pub fn schema(&self) -> &Schema {
         &self.schema
     }
+    /// Validate and measure the exact encoded record before publication.
+    pub fn encoded_len(&self, record: &Record) -> Result<usize> {
+        Ok(self.encode(record)?.len())
+    }
     fn key(&self, tail: &str) -> String {
         format!("x/{}/{tail}", self.name)
     }
