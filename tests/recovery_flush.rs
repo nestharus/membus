@@ -162,6 +162,69 @@ fn refused_recovery_retains_missing_file_evidence_already_found_by_replay() {
     );
 }
 
+#[test]
+fn corrupt_closed_chunk_refusal_retains_the_prior_unregistered_file_observation() {
+    let path = fixture("replay-error-report");
+    let store = open(
+        &path,
+        Config {
+            flush_ms: 0,
+            ..Config::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        store
+            .mutate(mutation("original", b"public API record"))
+            .code,
+        0
+    );
+    drop(store);
+    // Successful reopening closes the original public mutation's chunk.
+    drop(open(&path, Config::default()).unwrap());
+    let files = chunks::list_chunk_files(&path.join("chunks")).unwrap();
+    assert_eq!(files.len(), 1);
+    let (_, stripe, id, original) = &files[0];
+    let unregistered = chunks::chunk_path(
+        &path.join("chunks"),
+        membus::Class::FOREVER,
+        *stripe,
+        id + 1000,
+    );
+    fs::copy(original, &unregistered).unwrap();
+    let len = fs::metadata(original).unwrap().len();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(original)
+        .unwrap()
+        .set_len(len - 1)
+        .unwrap();
+    let files_before = data_hashes(&path);
+    let catalogue_before = chunks::sha256_file(&path.join("chunks/catalogue.log")).unwrap();
+    let epoch_before = fs::read(path.join("epoch")).unwrap();
+    let error = open(&path, Config::default())
+        .err()
+        .expect("corruption refuses startup");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("torn tail in a closed chunk"));
+    let report = fs::read_to_string(path.join("replay.json")).unwrap();
+    assert!(report.contains("\"stage\":\"refused\""));
+    assert!(report.contains("\"ready_ms\":0"));
+    assert!(report.contains("interior-corrupt"));
+    assert!(report.contains("torn tail in a closed chunk"));
+    let observation = format!("chunk file with no open record: {}", unregistered.display());
+    assert!(
+        report.contains(&format!("{observation:?}")),
+        "the refused report must retain the specific earlier observation: {report}"
+    );
+    assert_eq!(data_hashes(&path), files_before);
+    assert_eq!(
+        chunks::sha256_file(&path.join("chunks/catalogue.log")).unwrap(),
+        catalogue_before
+    );
+    assert_eq!(fs::read(path.join("epoch")).unwrap(), epoch_before);
+}
+
 #[cfg(windows)]
 #[test]
 fn actual_recovery_write_open_denial_refuses_flush_publication_and_preserves_data() {

@@ -1898,7 +1898,11 @@ impl Replayed {
 fn replay(path: &Path, config: &Config, clock: &chunks::Clock) -> Result<Replayed, (io::Error, chunks::ReplayReport)> {
     let dir = path.join("chunks");
     let mut rp = Replayed::empty(dir.clone());
-    match replay_into(&mut rp, path, &dir, true, config, clock) {
+    let result = replay_into(&mut rp, path, &dir, true, config, clock);
+    // Keep observations already collected by replay in both successful and
+    // refused startup reports, even when a later file prevents replay finishing.
+    rp.report.storage_errors = rp.storage_errors.clone();
+    match result {
         Ok(()) => Ok(rp),
         Err(e) => Err((e, rp.report)),
     }
@@ -2586,9 +2590,6 @@ impl Store {
             Ok(rp) => rp,
             Err((e, report)) => return Err(refuse(e, report)),
         };
-        // Preserve replay's already located losses in every later startup report,
-        // including an early required-sync refusal or truncation checkpoint.
-        rp.report.storage_errors = rp.storage_errors.clone();
         if let Some((_, line)) = imported {
             rp.report.import = Some(format!("{line}; {}", rp.report.import.take().unwrap_or_default()));
         }
