@@ -8,7 +8,7 @@ mod child;
 use membus::{client::*, pipe_io::Pipe, Cursor};
 use std::{
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::Write,
     os::windows::{
         fs::OpenOptionsExt,
         io::{AsRawHandle, FromRawHandle},
@@ -293,7 +293,9 @@ fn chunk_bytes(root: &Path) -> u64 {
             for f in fs::read_dir(class.path()).unwrap() {
                 let f = f.unwrap();
                 if f.path().extension().is_some_and(|e| e == "log") {
-                    sum += f.metadata().unwrap().len();
+                    // Windows directory enumeration can retain an open writer's old
+                    // length. Query the actual file handle, not its directory entry.
+                    sum += File::open(f.path()).unwrap().metadata().unwrap().len();
                 }
             }
         }
