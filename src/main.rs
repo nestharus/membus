@@ -386,6 +386,9 @@ fn main() -> io::Result<()> {
     if env::var_os("MEMBUS_TEST_IMPORT_DIFFERENCE").is_some() {
         config.import_inject_difference = true;
     }
+    // Explicit owned-fixture seams; neither is enabled by an ordinary launch.
+    config.fail_after_append = env::var_os("MEMBUS_TEST_FAIL_AFTER_APPEND").is_some();
+    config.fail_recovery_sync = env::var_os("MEMBUS_TEST_FAIL_RECOVERY_SYNC").is_some();
     // Ordinary admissions stop at the limit less a 1 GiB maintenance reserve (CHUNK-RETIREMENT.md 5.5); a limit
     // under 8 GiB keeps an eighth, so a small test limit still admits.
     config.maintenance_reserve_bytes =
