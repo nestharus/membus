@@ -149,6 +149,12 @@ Neither timer status nor change transport establishes an effect receipt or lease
 `src/signals.rs` unit tests, `tests/client_native.rs`,
 `tests/client_forwarder.rs`, `tests/forwarder_native.rs` and listener regression
 controls exercise bounded delivery and failure handling. The existing
-`tests/subscribe_native.py` is an additional native harness. Test code and
+`tests/subscribe_server_native.rs` runs with
+`cargo test --offline --locked --jobs 1 --test subscribe_server_native -- --test-threads=1 --nocapture`.
+It exercises private subscription-server behavior through Rust participants,
+including explicit epoch comparison after restart. `tests/subscribe_native.py`
+retains physical Python encoding/listener and existing-client automatic
+`EpochChanged` reconnect coverage; these are separate participant contracts.
+Test code and
 historical measurements do not certify arbitrary endpoint security, complete
 receipt or a universal delivery deadline.
