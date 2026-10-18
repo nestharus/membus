@@ -1,45 +1,154 @@
-# Epoch-scoped change delivery, F-E6-33
+# Epoch-scoped change subscriptions
 
-Implemented std-only Windows slice for quota subscribers. It adds kv/1 operations without changing MBK1, legacy hello/health layouts, mutation admission, or os/flush durability boundaries. An appended client identity feature `subscribe=1` opts into refusal codes23/24 and a46byte hello extension. The legacy exact `;scans=1` suffix still returns exactly22codes; other legacy identities19. Python sends `python-stdlib;subscribe=1;scans=1`, preserving scan discovery against the old server. `resume_gap`23 advertises this subscription capability; an old server omits it and Python refuses unsupported before registration. The resident refuses opcodes16–19with unsupported2unless subscribe was negotiated.
+Subscriptions send bounded change hints to explicit local Windows named-pipe
+endpoints. A complete pipe write is transport progress, not receiver receipt,
+durable work acknowledgment or permission to execute an effect. Subscriptions,
+status and history are memory-only and disappear on resident restart.
 
-After the refusal list, a subscribe-enabled hello appends LEu16change protocol version1, LEu32maximum frame16MiB, LEu64history count limit, LEu64history byte budget, LEu16status slot limit64, LEu16queued count limit256, LEu64per-subscription byte budget8MiB, LEu64global queue budget16MiB, LEu32write deadline100ms. `Client.signal_limits` exposes these fields. Legacy and scan-only hellos have no extension.
+## Discovery and controls
 
-Every request retains the normal deadline/op_id/namespace prefix. These control operations do not deduplicate by op_id. A lost subscribe reply must not be automatically retried: the first registration may exist. Explicit retry can create a second registration, bounded by64slots, until it is unsubscribed or an endpoint fails. There is no lease/idle expiry for quiet subscriptions. The caller owns its endpoint and cleanup.
+HELLO identity feature `;subscribe=1` selects codes 1..24 and a 46-byte extension
+after the refusal list. Combine with final `;scans=1` for scan discovery against
+older servers. The extension is little endian:
 
-| Opcode | Request suffix | Success suffix |
+```text
+u16 change_version=1; u32 max_frame=16777216;
+u64 history_items; u64 history_bytes; u16 status_slots=64;
+u16 queued_items=256; u64 subscription_bytes=8388608;
+u64 global_queue_bytes=16777216; u32 write_ms=100
+```
+
+The resident gates opcodes 16..19 on subscription negotiation. Rust uses
+`Options.subscriptions`, reports `Negotiated.subscriptions`, and exposes typed
+`feature_limits().signals`. Zero retained history still permits live subscriptions.
+
+All requests use the [KV1](KV1.md) deadline/operation ID/namespace prefix.
+Subscription controls do not deduplicate operation IDs.
+
+| Opcode | Request suffix | Successful payload |
 |---|---|---|
-|16 subscribe|bound prefix; string endpoint; u8 include_value; bytes cursor; string protocol; u32 max_frame|bytes subscription; bytes starting_cursor|
-|17 unsubscribe|bytes subscription|empty|
-|18 subscription_status|bytes subscription|u8 active; u8 status; u32 queued; u64 charged_bytes; u64 written; u64 failed; u64 dropped; bytes last_written_cursor|
-|19 signal_usage|empty|nine LEu64: head, floor, history_count, history_bytes, queue_bytes, status_slots, history_max, history_budget, queue_budget|
-|20 capture_metrics|empty|seven LEu64 cumulative: captures, read_lock_wait_ns, charge_walk_ns, selection_walk_ns, namespace_copy_ns, read_lock_held_ns, sort_and_release_ns|
+| 16 SUBSCRIBE | bound prefix; text endpoint; u8 include_value; bytes cursor; text protocol; u32 max_frame | bytes subscription; bytes starting_cursor |
+| 17 UNSUBSCRIBE | bytes subscription | empty |
+| 18 SUBSCRIPTION_STATUS | bytes subscription | u8 active; u8 status; u32 queued; u64 charged_bytes; u64 written; u64 failed; u64 dropped; bytes last_written_cursor |
+| 19 SIGNAL_USAGE | empty | nine u64: head, floor, history_count, history_bytes, queue_bytes, status_slots, history_max, history_budget, queue_budget |
 
-`bound` permits an empty prefix; namespace is exact, prefix is UTF-8 byte prefix without normalization. Endpoint is a local `\\.\pipe\...` Windows named pipe, including LOCAL logon-session pipes. Empty/dot/dot-dot/trailing-dot/trailing-space path segments, slash, colon and NUL are rejected before opening; the open uses identification-level security QoS to prevent server impersonation. No remote transport, session adapter, provider envelope or receiver acknowledgement is built into membus. `include_value` is0/1. Protocol must be `membus.change/1` (others unsupported2), and max_frame is1024..16MiB, bounding the signal body excluding its four-byte length. Oversize replay returns too_large4before registration; an oversize live signal deactivates with dropped status. Token and cursor are16bytes, little-endian epoch/u64identity, treated as opaque by clients. Subscription token is namespace-bound; missing/evicted/old-epoch token gives24. Cursor is globally scoped and can be used with a changed filter; it does not certify that any receiver parsed every publication. An empty cursor starts at the current head, without replay.
+The namespace is exact and prefix is a UTF-8 byte prefix, permitting empty and
+without normalization. Protocol must be `membus.change/1`. include_value is 0/1.
+max_frame is 1024..16 MiB for the change body, separately selected from the
+request connection's ingress limit. An oversize replay refuses too_large before
+registration; an oversize live event deactivates/drops the subscription.
 
-Signal wire protocol **membus.change/1**: LEu32 body length, magic `MBC1`, LEu16 version1, sixteen-byte subscription token, sixteen-byte cursor, string namespace, string key, LEu64 revision, u8 achieved_ack, u8 removed, u8 include_value, then a bytes value only when included. A tombstone has removed1 and included empty bytes if values were requested. Revision is the mutation's admission token; cursor sequence orders successful committed publication and may differ from revision order when stripe I/O completes out of order. Signal id is epoch/sequence, shared across registrations of that same change. Mutations refused, idempotent retries, disposable mem writes and restart replay emit no change. Signals can arrive before the origin's reply.
+Endpoints must be local `\\.\pipe\...` paths. Empty, dot, dot-dot, trailing-dot
+or trailing-space segments, slash, colon and NUL are rejected. The writer opens
+with identification-level security QoS. Endpoint security and peer/application
+authenticity remain deployment concerns; protocol tokens do not authenticate actors.
 
-Publication holds the committed write lock while assigning a cursor and enqueueing matching signals; thus per-subscription FIFO matches committed publication order. It performs no endpoint I/O. A central condition-variable delivery thread picks subscriptions round-robin. It encodes a complete frame outside publication locks and writes through a persistent pipe connection for that subscription, reporting written only after the whole frame succeeds. Cached handles are bounded by the64slots and closed on deactivation/unsubscribe/Store drop; terminal cleanup wakes the worker even when no writes arrive. It never calls FlushFileBuffers/flush-to-reader on the pipe. The listener keeps the connection across successive receive calls, allowing small signals to buffer while its caller handles the previous event. A quiet timeout before any frame bytes preserves the connection; a partial timeout discards the connection and raises ConnectionError for cursor-based recovery. Buffered bytes after a writer closes can still be read when ConnectNamedPipe reports232. Busy pipe opens retry within the same100mswhole-frame deadline; missing pipes fail immediately. A receiver must drain large frames within that deadline, and a full kernel buffer can still trigger failure. Overlapped timeout cancels and drains completion before releasing kernel buffers/handles. Receivers discard incomplete frames and reconnect from their last fully parsed cursor.
+Tokens/cursors are opaque 16-byte little-endian epoch/ID pairs. Tokens are
+namespace-bound; missing, evicted or old-epoch tokens refuse subscription_missing
+(24). Cursors use a global publication sequence, can be reused with another
+filter, and do not certify complete processing by any receiver. Empty cursor
+starts at the current head without replay.
 
-**A pipe write is not a receipt.** Written means the complete payload reached the pipe transport, never that an agent read it or ran a hook. No process resurrection, transcript scan, automatic redelivery, durable ack, cross-user authentication or exactly-once receipt is claimed. A receiver needing receipt/dedup records its own cursor or request acknowledgement.
+## Change frames and publication order
 
-Retention: at most4096changes and16MiBconservative representation charge globally; startup `--signal-history`/`--signal-bytes` can change them (zero disables retention). Charge per change is256+namespace length+key length+value Vec capacity, even for key-only subscriptions. The ring stores Arc values and no signal records on disk. Count/byte pressure evicts oldest changes, advancing floor. There is no minimum time horizon. Cursor before floor, beyond head, or in another epoch returns23without registration; malformed nonempty cursor also returns23. Cursor at floor is valid. Resume queues retained matching changes and registers future changes under the same hub mutex, so replay/live transition loses none. Catch-up exceeding256queueditems,8MiBper-subscription or16MiBglobal queue gives busy6before registration, never a truncated stream. Use smaller cursors/catch-up windows or reconcile state; the maximum ring history does not guarantee one registration can queue all4096changes.
+A `membus.change/1` frame is:
 
-Status enum0queued,1written,2failed,3dropped,4cancelled. A fresh empty subscription has written status with counter0and starting cursor; no signal receipt is implied. Queue counts exclude the one delivery in flight; bytes count its charge. Each subscription allows256queuedchanges and8MiBincluding in-flight charge; all subscriptions share16MiB. One in-flight encoded buffer is additional at most MAX_VALUE+bounded identifiers/framing (about4MiB), with an additional temporary encoding copy of that size. Ring/queue charges are conservative logical accounting, not allocator-exact RSS.64status slots bound filters/endpoints and terminal records; inactive slots with no in-flight bytes may be evicted to admit another registration. IDs never reuse within an epoch. Live overflow marks dropped, deactivates and clears queued work while the KV write still commits; endpoint error marks failed and does the same. Counters describe this registration. Last_written_cursor is transport progress and must not replace the receiver's own last parsed cursor. No write is blocked waiting for a pipe.
+```text
+u32 body_length; magic MBC1; u16 version=1;
+16-byte subscription token; 16-byte cursor;
+text namespace; text key; u64 revision; u8 achieved_ack;
+u8 removed; u8 include_value; [bytes value when included]
+```
 
-Unsubscribe marks cancelled and removes queued work; a delivery already started may finish after the call returns. Its outcome updates counters but preserves cancelled/dropped terminal state. All worker resources close on Store drop; service process exit also closes them. Quiet endpoints cannot be proven dead until a delivery attempt, so callers must explicitly unsubscribe; no background endpoint polling is added.
+Included KV bytes belong to that publication; a later GET can see another value.
+A tombstone has removed=1 and included empty bytes when values were requested.
+The cursor orders committed publication, which can differ from revision admission
+order across stripes. The same publication has the same cursor across matching
+registrations. Signals can precede the origin's reply. Refused writes, retained
+idempotent retries, disposable mem writes and restart replay emit no KV changes.
 
-Restart discards all subscriptions/status/history. The flushed existing service epoch changes; old cursors get23and old tokens24. Committed KV values replay normally. There is deliberately no persistent-subscription option or durable change log in this slice: PLAN.md's eventual persistent endpoint/timer records remain later work. To reconcile after a gap, register a fresh live subscription before taking the current-state snapshot, consume queued/live changes and reconcile by revision so writes during capture are covered. For immutable event keys, ensure history/state policy retains the event records needed for application reconstruction. Registering only after a snapshot would leave a race. Clients persist their cursor only after parsing/handling the complete change. Reconnect may repeat changes after the receiver's last saved cursor; caller policy supplies deduplication.
+Publication assigns a cursor and enqueues under the committed write lock, giving
+per-subscription FIFO publication order without endpoint I/O there. One delivery
+worker picks registrations round-robin, encodes outside publication locks and
+writes through a persistent pipe connection. Written advances only after a
+complete frame; no FlushFileBuffers/flush-to-reader call is made on that pipe.
+Cached connections are bounded by status slots and closed on deactivation,
+unsubscribe or Store teardown.
 
-Timers will use the same bounded transport accepting encoded bytes, with their own signal schema/identity, persistence and catch-up policy. This slice implements neither timer records nor explicit opaque-envelope sends. It introduces no provider codec. Per-subscription order and bounded status policy remain useful to those future callers.
+The entire write has a 100 ms deadline, including busy-pipe open retries. Missing
+pipes fail immediately. A slow receiver or full kernel buffer can fail delivery.
+Cancellation drains overlapped completion before releasing buffers/handles.
+Receivers must discard partial frames and recover using their last fully parsed
+cursor. Complete buffered frames can remain readable after writer closure; an
+OS error alone cannot count as a decoded/associated event.
 
-Capture diagnostics separate two global-index traversals (charge/count; selection of borrowed namespace references) from namespace key/Arc copying under the same read lock, then sorting after release. The temporary selection references fit within the conservative128byteper-row charge. Counters describe completed captures; atomics are cumulative and concurrent reads are not a transactional metrics snapshot. Metrics include instrumentation and allocator costs. The same global index is walked even for a small namespace. No lock-free claim is made; writers can wait during capture.
+## Retention, queues and cleanup
 
-Python: `Client.subscribe(ns, listener.endpoint, prefix='', include_value=False, cursor=None, protocol='membus.change/1', max_frame=MAX_FRAME)` returns subscription/cursor; `subscription_status`/`unsubscribe` take the token. `Listener.receive(timeout)` returns the decoded change including exact bytes when requested; it creates no background process/thread. Close listeners and unsubscribe in finally. The example survives quiet timeouts, reconnects from its last handled cursor, and registers live before reconciliation on23. Its printed open/resets reads illustrate reconciliation; a complete quota/slots consumer also restores its own state/profile and slots state. Reconnect across an epoch continues to raise EpochChanged from Client; caller policy owns application state restoration.
+History defaults to 4096 changes and 16 MiB of conservative charge globally,
+configurable with `--signal-history` and `--signal-bytes`; zero disables retention.
+Charge is `256 + namespace bytes + key bytes + value Vec capacity`, even for
+key-only consumers. Oldest eviction advances floor. There is no minimum time
+horizon or disk change log. Resume before floor, beyond head, malformed, or in
+another epoch refuses resume_gap (23) without registration; a cursor at floor
+is valid.
 
-Provision the named signal budgets separately from the pre-existing value/dedup capacity:16MiBhistory +16MiBqueued representation + up to about8MiBencoding/in-flight copies, plus bounded subscription metadata and Windows pipe buffers. This is an additive bounded-memory policy, not a calibrated total RSS admission guarantee. Retention can be disabled with --signal-history0. Under many slow subscribers, the single worker can delay healthy subscriptions and global queue pressure may drop them; the under-one-second witness applies to the measured cases, not an arbitrary fanout guarantee. Quiet abandoned registrations have no automatic expiry, can consume the64slots and require explicit unsubscribe or service restart. These stated limits avoid adding a per-agent polling process or selecting an uncommissioned lease/lifecycle policy.
+Resume queues retained matching events and registers live changes under the
+same hub mutex. Catch-up exceeding 256 queued items, 8 MiB per registration or
+16 MiB globally refuses busy before registration rather than truncating. Full
+history capacity does not guarantee one subscriber can queue it all. During live
+overflow the subscription becomes dropped/inactive and queued work is cleared;
+the KV write still commits. Endpoint failure marks failed/inactive and clears
+queued work. Slow subscribers can delay others through the single worker and
+global pressure; there is no arbitrary-fanout latency guarantee.
 
-Verification artifacts, receipts and measured limits are under D:/projects/oulipoly/trunk/research/87_operations_representation/claude6-eco/runs/e8/act-work/F-E6-33/. Tests are tests/subscribe_native.py and signals.rs unit checks plus existing replay/flush/scan suites. Native tests own isolated state/pipes and stop every process. No production service is killed by a test; installation uses fleet services swap's stopped swap.
+Status is 0 queued, 1 written, 2 failed, 3 dropped, 4 cancelled. A fresh empty
+registration reports written with zero writes and its starting cursor; this is
+not a receipt. Queue count excludes the one delivery in flight, while charged
+bytes include it. Encoding/in-flight temporary buffers add memory beyond logical
+ring/queue charges. These are bounded representation accounts, not exact RSS.
 
-## Timer amendment (F-E6-41)
+At most 64 status slots retain active registrations and terminal records. Inactive
+slots with no in-flight charge can be evicted for another registration. IDs do not
+reuse within an epoch. Quiet registrations have no lease/idle expiry, and a quiet
+dead endpoint is not detected until delivery. Unsubscribe explicitly. It clears
+queued work but an already started delivery may finish after the call; terminal
+state remains cancelled/dropped while counters can still advance.
 
-The earlier future-timers paragraph now has an implemented slice: [TIMERS.md](TIMERS.md). Timer fires use this same bounded ring/queue and named pipe. With include_value, decode MBT1. They create no public KV key; MBC1 version is schedule generation, ack is configuration acceptance. Per-fire progress appends are exactly48 value bytes plus MBK1 framing/identifiers. Restart coalesces overdue dues into one catch-up with missed_count, draw and stable due identity. Subscriptions still disappear on restart: register live before status reconciliation; catch-up can precede a watcher. Duplicate or lost transport wakes remain possible around crash/delivery boundaries; due-id/lease governs effects.
+A lost subscribe reply can leave a registration whose token is unknown. Do not
+automatically retry creation or accumulate registrations; keep that uncertainty
+and a cleanup owner. Known tokens require explicit cleanup, and a token alone
+is not durable cleanup across owner loss. Closing a listener does not unsubscribe
+its server token. Restart clears every registration, status row and history.
+
+## Native client and reconciliation
+
+On Windows, bind `ChangeListener` before subscribing. `subscribe` requests no
+values/resume and uses the negotiated request frame bound. `subscribe_with` takes
+`SubscribeOptions { include_values, resume, max_frame }`. Receive checks token,
+namespace, prefix and epoch association. A quiet timeout preserves a clean stream;
+partial timeout, truncation, malformed or foreign input retires the connection.
+Failed reset closes the handle and requires an explicit new bind; successful
+reset accepts another writer. `cancel`/`close` release the endpoint after I/O
+drain. Exclusive mutable access is required; they are not cross-thread async
+cancellation calls. See [RUST_CLIENT.md](RUST_CLIENT.md).
+
+Track the receiver's last fully parsed/handled cursor separately from server
+last_written_cursor. Persisting after handling can repeat a change after receiver
+failure, so application deduplication remains necessary. On a gap/restart,
+register live first, then capture current state and reconcile buffered changes
+by their KV revisions. Registering after capture leaves a race. Immutable event
+consumers also need state/retention policy to retain their reconstruction data.
+Snapshot TTL, page bounds, periodic refresh and release remain caller obligations.
+
+[Timers](TIMERS.md) share the same transport with MBT1 values. They create no
+public KV signal-key value: MBC1 revision is timer configuration generation,
+not a KV revision at that key. Use a dedicated prefix, envelope due identity and
+timer-status/application reconciliation. Catch-up may precede watcher reconnect.
+Neither timer status nor change transport establishes an effect receipt or lease.
+
+`src/signals.rs` unit tests, `tests/client_native.rs`,
+`tests/client_forwarder.rs`, `tests/forwarder_native.rs` and listener regression
+controls exercise bounded delivery and failure handling. The existing
+`tests/subscribe_native.py` is an additional native harness. Test code and
+historical measurements do not certify arbitrary endpoint security, complete
+receipt or a universal delivery deadline.

@@ -1,6 +1,6 @@
 # Read-only retirement inspection
 
-`membus retirement-status PIPE` reads the existing HEALTH2 operation and emits
+On Windows, `membus retirement-status PIPE` reads the existing HEALTH2 operation and emits
 five named numeric fields: retire_blocked, retired_chunks, read_only,
 storage_error and expiry_degraded. It uses the maintained bounded exchange and
 negotiated frame limit. Missing, duplicate or malformed selected fields refuse
@@ -23,3 +23,7 @@ A Retiring record establishes initiation, while actual retire_blocked metrics
 establish failed deletion within their observed population. Neither proves a
 terminal record. Observe file disappearance and an actual Retired publication
 separately. These read-only observations grant no lease or receiver authority.
+
+The storage transitions and recovery limits are described in
+[CHUNK-RETIREMENT.md](CHUNK-RETIREMENT.md) and
+[CATALOGUE-APPEND-RECOVERY.md](CATALOGUE-APPEND-RECOVERY.md).
