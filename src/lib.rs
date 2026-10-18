@@ -2586,6 +2586,9 @@ impl Store {
             Ok(rp) => rp,
             Err((e, report)) => return Err(refuse(e, report)),
         };
+        // Preserve replay's already located losses in every later startup report,
+        // including an early required-sync refusal or truncation checkpoint.
+        rp.report.storage_errors = rp.storage_errors.clone();
         if let Some((_, line)) = imported {
             rp.report.import = Some(format!("{line}; {}", rp.report.import.take().unwrap_or_default()));
         }
@@ -2718,7 +2721,6 @@ impl Store {
         if !rp.storage_errors.is_empty() {
             flags.storage_error.store(true, Ordering::SeqCst);
         }
-        rp.report.storage_errors = rp.storage_errors.clone();
         let epoch_path = path.join("epoch");
         let previous = if epoch_path.exists() {
             let b = fs::read(&epoch_path)?;

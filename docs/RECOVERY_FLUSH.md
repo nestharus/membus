@@ -7,8 +7,11 @@ sync. Replaying its acknowledgement byte alone does not establish achieved Flush
 Before publishing recovered values or retry outcomes, startup synchronizes every
 present, nonempty active chunk, including closed chunks. This also covers chunks
 closed by an older startup. Truncation precedes the barrier; publishing recovered
-Close records follows it. A required sync failure refuses startup and records a
-non-ready replay report. It does not publish a successful Store or a new Close.
+Close records follows it. A required sync failure refuses startup and attempts to
+record a non-ready replay report, including storage errors already found by
+replay. Report publication can itself fail; startup still refuses, and an earlier
+ready report alone cannot establish current service availability. It does not
+publish a successful Store or a new Close.
 Missing-file storage errors and retiring/retired chunks retain their existing
 handling. Original mutation IDs, versions, contents, receipt clocks and retry
 outcomes are preserved; successful recovery can resolve an earlier uncertainty.
