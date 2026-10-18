@@ -6,13 +6,16 @@ coordinates covering extents per sink. [KV1.md](KV1.md) describes admission,
 visibility and uncertainty; [CHUNK-RETIREMENT.md](CHUNK-RETIREMENT.md) describes
 rotation and retained-byte accounting.
 
-Admission charges `fingerprint length + value length + 128` bytes per queued
-mutation, at most 1024 outstanding items and `queue_bytes / 4` charged bytes per
+Admission charges `canonical mutation representation length + value length + 128`
+bytes per queued mutation, at most 1024 outstanding items and `queue_bytes / 4` charged bytes per
 stripe, within `queue_bytes` globally. Saturation returns busy (6) before pending
 key, version or retry identity insertion. Empty values still consume resources.
 A record larger than the configured stripe queue can repeatedly refuse busy;
 retry alone cannot fix the configuration. Durable writes reserve their exact
 encoded data length under the ordinary state ceiling before acceptance.
+The retained retry comparator is separately 32 bytes; shrinking it does not
+shrink queue or disk charges, serialization or hashing work. See
+[RETRY_RETENTION.md](RETRY_RETENTION.md) for collision and encoding limits.
 
 OS writes publish after complete append. Flush writes publish after a sync
 covers their complete-record end offset. OS appends do not deliberately wait for
@@ -51,6 +54,12 @@ operation identity. Committed GET reads use memory without append/flush locks
 or file I/O; HEALTH and metrics can wait for a log lock. Store teardown joins
 its durable workers.
 
+Startup synchronizes present active recovered data before exposing recovered
+values or retry outcomes. A record's requested Flush byte is not a substitute
+for that barrier; failed required synchronization refuses startup. Closed chunks
+are included, with historical imported-backup limits stated in
+[RECOVERY_FLUSH.md](RECOVERY_FLUSH.md).
+
 ## Diagnostics and test controls
 
 Opcode 9 IO_METRICS has the common deadline/operation ID/namespace prefix and no
@@ -59,7 +68,8 @@ logical data-log append bytes, actual data-log `File::write` calls (including
 interrupted attempts), and accounted data-log syncs. The sync counter includes
 flush-worker attempts and syncs of successfully closed and published chunks.
 It omits failed close syncs and data syncs followed by failed catalogue Close
-publication. Partial append bytes count even on uncertain outcomes. Epoch,
+publication. Partial append bytes count even on uncertain outcomes. Startup
+recovery data-file syncs, epoch,
 heartbeat, catalogue marker/frame/rewrite I/O, replay reporting, replay reads and
 transport I/O are excluded. These counters cannot establish all-storage sync
 cost or physical-device utilization. Older servers return unsupported (2).
@@ -74,6 +84,9 @@ seams; leave them unset during operation. The latter marks worker entry before
 sync. The optional Cargo feature `sync-witness` brackets actual Windows
 FlushFileBuffers with entering/returned markers selected by
 `MEMBUS_SYNC_WITNESS`. Ordinary releases omit that feature's marker code.
+The feature's `.calls` diagnostic also records the actual handle target, extent
+and FlushFileBuffers result; [RECOVERY_FLUSH.md](RECOVERY_FLUSH.md) describes
+its recovery evidence scope.
 User-space brackets do not prove kernel interruption, dirty-page state or
 power-loss survival. Historical measurements and policy comparisons are
 available through Git history; they are not current latency guarantees.

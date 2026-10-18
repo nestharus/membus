@@ -6,7 +6,8 @@ boundary record. A failed append restores and flushes its previous boundary befo
 marker. If boundary restoration or marker resolution fails, further appends are fenced.
 
 Startup refuses catalogue replay while the marker exists, including when its contents are incomplete.
-It preserves the catalogue and chunk files and records the refusal in the replay report. A complete,
+It preserves the catalogue and chunk files and attempts to record the refusal in the replay report.
+Report publication can fail; an earlier ready report alone is not current availability evidence. A complete,
 valid trailing frame therefore cannot turn an unresolved failed retirement into permission to delete
 its chunk on restart.
 
@@ -51,3 +52,6 @@ reclamation; it does not implement cache eviction or a total RSS budget.
 
 See [chunk retirement](CHUNK-RETIREMENT.md) for the surrounding storage lifecycle
 and [read-only inspection](RETIREMENT-INSPECTION.md) for stopped-catalogue observation.
+The separate [recovered Flush prerequisite](RECOVERY_FLUSH.md) describes active
+data-file synchronization before recovered values and retry outcomes are exposed;
+catalogue synchronization alone does not establish that prerequisite.

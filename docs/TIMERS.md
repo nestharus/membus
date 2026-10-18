@@ -48,7 +48,9 @@ That no-rewind boundary depends on retained history. After history is gone,
 unconditional reuse can create a new generation. Timer control operation IDs
 share the reserved internal namespace across *all* caller namespaces: make them
 globally unique within the store and bind them to the intended timer. Changed
-namespace/id/content under the same ID refuses op_id_mismatch (14).
+namespace/id/content under the same ID is compared through the scalar store's
+[retained retry comparator](RETRY_RETENTION.md); a mismatch refuses
+op_id_mismatch (14), subject to its encoding and collision-resistance limits.
 
 `prepare_timer_set` and `prepare_timer_cancel` retain immutable typed requests,
 original epoch and conservative retry horizon. Explicit `timer_set`/`timer_cancel`

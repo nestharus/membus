@@ -19,7 +19,8 @@ Choose persistent storage independently of source checkouts and build output.
 `owner.lock` fences concurrent owners: Windows holds a share-denied handle for
 the resident lifetime, released on exit. On non-Windows the create-new lock
 requires operator cleanup after confirming the previous owner has stopped.
-The executable starts timer ownership after replay and writes its readiness
+The executable starts timer ownership after successful Store startup, including
+its recovered data-file sync barrier, and writes its readiness
 message before entering the selected transport. Transport/heartbeat checks are
 needed to establish that it can actually serve.
 
@@ -68,10 +69,14 @@ reservation: the server idle option is not a whole-frame or request deadline.
 Windows overlapped I/O cancellation drains completion before releasing buffers.
 
 Memory budgets are independent logical charges, not a calibrated process RSS
-limit. Values, exact dedup fingerprints, snapshots, history, queues, response
+limit. Values, retained 32-byte retry comparators, snapshots, history, queues, response
 encoding, worker metadata and OS pipe buffers all contribute. Large scan pages
 and concurrent responses add transient memory beyond snapshot accounting. All
 committed values remain in memory; there is no cache/tiering controller.
+Comparator compaction does not compact complete queued mutation representations,
+disk records, identifiers or bookkeeping. The capacity account includes retained
+comparators separately from full in-flight reservations; see
+[RETRY_RETENTION.md](RETRY_RETENTION.md) for encoding/collision and resource limits.
 
 ## Health and bounded reports
 
@@ -116,7 +121,16 @@ against a retained state copy. Preserve backups independently of the checkout.
 A changed epoch invalidates snapshots, subscriptions and resume history; reconcile
 uncertain writes and application state after reconnecting.
 
-Replay reconstructs committed state before service. Complete corruption refuses
+Replay reconstructs committed state before service. Before exposing recovered
+values or retry outcomes, startup synchronizes present, nonempty active chunks
+(including closed ones) and active legacy logs. An on-disk requested Flush byte
+alone cannot establish achieved Flush. A required barrier failure refuses startup
+and attempts a non-ready report that retains storage observations already found;
+report publication itself can fail, so an older ready report is not current
+availability evidence. [RECOVERY_FLUSH.md](RECOVERY_FLUSH.md) describes this
+ordering and the unchanged historical imported-backup boundary.
+
+Complete corruption refuses
 startup; only allowed incomplete open tails are truncated, with evidence written
 first. Missing/unaccounted chunk files can start read-only with storage_error.
 Unresolved catalogue appends refuse replay and require an independently

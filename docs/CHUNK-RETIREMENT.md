@@ -31,7 +31,8 @@ to discharge. Retired historical names do not consume a permanent lifetime slot.
 Policy setters persist with flush acknowledgment, then publish the routing
 projection before completing. Their operation IDs use the common caller namespace
 and bind prefix/class/clear content. Identical retained retries return the original
-version without reapplying an older projection; changed content refuses (14).
+version without reapplying an older projection; a comparator mismatch refuses (14).
+Comparison has the [retained retry encoding/collision limits](RETRY_RETENTION.md).
 Pending duplicates join through routing completion with their own deadline.
 Routing admission/publication is ordered without holding a routing lock over
 append or sync. A failed reply remains subject to mutation uncertainty.
@@ -126,6 +127,16 @@ refuses startup, including a complete corrupt final frame. Only short final
 headers/bodies in chunks open at the crash may be truncated; a torn closed chunk
 is corruption. Empty open chunks can be retired during startup.
 
+After allowed truncation and before exposing recovered values/retry outcomes,
+startup synchronizes present, nonempty active chunks, including closed chunks,
+and active legacy logs. Recovered Close publication follows that barrier.
+A required sync failure refuses startup without publishing a successful Store
+or a new Close; it attempts a non-ready report including storage errors already
+found. Report publication can fail and an older ready report cannot establish
+current availability. [RECOVERY_FLUSH.md](RECOVERY_FLUSH.md) retains the exact
+barrier and historical-backup limits; a requested Flush byte alone is not proof
+of achieved synchronization.
+
 Before truncation, a flushed replay report records `truncation_pending` with
 ready_ms=0. Failure to publish that report refuses the destructive step. Later
 readiness replaces the current report; the bounded replay log retains prior
@@ -148,7 +159,9 @@ deleting chunks destroys the recovery account.
 ## Legacy import
 
 For a legacy-only store, startup reads the old `stripe-N.log` inputs and constructs
-`chunks.import`. It copies latest records at original versions/timestamps into
+`chunks.import`. Before a new import switches or moves backups read-only, it
+synchronizes the original legacy logs, covering original retry history as well
+as copied latest values. It copies latest records at original versions/timestamps into
 selected classes. Optional `import-policies.txt` contains tab-separated
 `NAMESPACE`, `PREFIX`, `forever|latest|expire:MILLISECONDS` fields; those policies
 are persisted before copying data. Without it, ordinary imported keys use the
@@ -171,7 +184,11 @@ writers and non-Windows input locking are outside this ownership guarantee.
 
 Within the configured retry window after import (default 24 hours), legacy
 records supplement dedup only, never values. Later starts stop that dedup replay
-but still verify the retained inputs. A store already containing catalogued
+but still verify the retained inputs. These already imported read-only backups
+receive no new data-file sync witness; on Windows a read-only handle cannot flush
+them. Their existing bytes, permissions and retry grafting rules remain unchanged,
+so this barrier is not universal historical recovery-durability evidence. See
+[RECOVERY_FLUSH.md](RECOVERY_FLUSH.md). A store already containing catalogued
 chunks alongside old logs treats the old logs as a retained forever chunk rather
 than importing them again. There is no automatic backup-removal command.
 

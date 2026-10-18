@@ -87,6 +87,14 @@ deterministic key and embedded operation identity and make an explicit applicati
 decision. Fresh connection, identity or operation ID is not evidence of absence.
 These in-memory tokens are not a second journal or permanent exactly-once guarantee.
 
+The caller's Attempt still retains its full immutable request. The resident's
+retained retry comparison instead uses a 32-byte SHA-256 comparator, subject to
+collision resistance and the existing expected-revision sentinel alias; see
+[RETRY_RETENTION.md](RETRY_RETENTION.md). Successful startup requires the
+[recovered data-file sync barrier](RECOVERY_FLUSH.md) before exposing recovered
+values/retry outcomes, with the historical imported-backup limit stated there.
+Neither representation nor that barrier removes caller-owned uncertainty.
+
 ## Snapshots and subscription ownership
 
 Enable scans, open a snapshot, retain its token across every related query and

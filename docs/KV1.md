@@ -120,6 +120,15 @@ hardware/cache behavior still limit persistence evidence. An unacknowledged
 write may disappear or replay. A complete record left after I/O failure can
 replay even though the original result was uncertain.
 
+The acknowledgment byte in a recovered record states the requested mode, not
+proof that a covering live sync succeeded. Before exposing recovered values or
+retry outcomes, startup synchronizes present, nonempty active chunks, including
+closed chunks, and active legacy stripe logs. Truncation precedes this barrier;
+recovered Close publication follows it. Required sync failure refuses startup
+and attempts a non-ready report; report publication itself can fail. Already
+imported read-only backups do not receive a new data-file sync witness. See
+[RECOVERY_FLUSH.md](RECOVERY_FLUSH.md) for ordering and historical backup limits.
+
 Fresh mutation admission checks the absolute Unix-millisecond deadline
 immediately before reserving the key/version. Deadline (5) means this send was
 refused before admission. Clock conversion and a separate local monotonic budget
@@ -131,11 +140,18 @@ uncertainty. A later refusal never proves an earlier uncertain send had no effec
 
 ## Retry identity and refusals
 
-Ordinary mutation IDs are scoped to namespace and bind the complete mutation,
-including key, bytes, expected token, remove flag and ack, excluding deadline.
-Identical duplicates join/return the retained outcome; changed content refuses
-op_id_mismatch (14). Policy setter IDs retain the caller namespace scope; timer
-control IDs share one internal scope across all caller namespaces.
+Ordinary mutation IDs are scoped to namespace. The store retains a 32-byte
+SHA-256 comparator over the complete canonical mutation representation with
+generated version and admission time zeroed. Key, bytes, expected token, remove
+flag, ack, namespace and operation ID participate; deadline does not. Matching
+comparators join/return the retained outcome; a mismatch refuses op_id_mismatch
+(14). Equality relies on SHA-256 collision resistance, not retained full-payload
+byte equality. The existing encoding aliases expected `None` and
+`Some(u64::MAX)` through the same sentinel. Full durable records are unchanged;
+replay/import derive the same comparator. See
+[RETRY_RETENTION.md](RETRY_RETENTION.md) for encoding, collision and resource
+limits. Policy setter IDs retain the caller namespace scope; timer control IDs
+share one internal scope across all caller namespaces.
 
 The default horizon is 24 hours from admission (`--retry-ms`). Successful durable
 outcomes within the horizon are rebuilt from records on restart. Conflicts and
@@ -262,9 +278,13 @@ Default namespace quota is 500000 live keys. Default global index cap is 917000
 slots including tombstones and expiry summaries. Reservations count at admission.
 A remove frees a live namespace slot at commit but its tombstone retains an index
 slot until no other retained chunk can contradict it. Expiry summaries occupy
-index slots for 30 days. Values, exact dedup fingerprints and reservations share
-a 256 MiB logical capacity budget; an overwrite reserves replacement bytes while
-the old value remains visible. Queue/snapshot/signal/timer budgets are additional,
+index slots for 30 days. Values, retained 32-byte retry comparators and reservations
+share a 256 MiB logical capacity budget; an overwrite reserves replacement bytes
+while the old value remains visible. Queue admission charges the complete canonical
+mutation representation plus value length plus 128 bytes, independently of the
+comparator size; durable disk admission reserves the complete MBK1 record.
+Identifiers, outcomes and bookkeeping still consume per-operation memory.
+Queue/snapshot/signal/timer budgets are additional,
 not a measured RSS ceiling. Retained data defaults to 8 GiB, with the executable
 reserving part for maintenance; [RESIDENT.md](RESIDENT.md) lists options.
 

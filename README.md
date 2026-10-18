@@ -101,6 +101,8 @@ window. See [Rust client usage and uncertainty](docs/RUST_CLIENT.md).
 ## Documentation and checks
 
 - [Protocol, acknowledgments, refusals and snapshots](docs/KV1.md)
+- [Mutation retry comparators, encoding aliases and resource accounting](docs/RETRY_RETENTION.md)
+- [Recovered Flush prerequisites and historical backup limits](docs/RECOVERY_FLUSH.md)
 - [Grouped append and flush behavior](docs/GROUPED-FLUSH.md)
 - [Change subscriptions and receiver responsibilities](docs/SUBSCRIPTIONS.md)
 - [Persisted timer wakes and crash boundaries](docs/TIMERS.md)
@@ -113,11 +115,17 @@ Rust checks use `cargo test --offline --locked`; Windows listener/forwarder test
 need the explicit fixture inputs described in [RUST_CLIENT.md](docs/RUST_CLIENT.md).
 Tests create isolated state and some launch resident processes. Build and test
 commands here are usage instructions, not a claim that checks have run on your
-machine. Historical design and review documents remain accessible through Git history.
+machine. `tests/resident_native.rs` supplies native resident process controls;
+the former `tests/resident.py` is retired. Historical design and review documents
+remain accessible through Git history.
 
 OS acknowledgment covers completed appends and process restart, not power loss.
 Flush acknowledgment additionally synchronizes the covering file; actual
-persistence still depends on filesystem and hardware behavior. Snapshots and
+persistence still depends on filesystem and hardware behavior. Startup requires
+active recovered data-file synchronization before exposing values or retry
+outcomes; an on-disk acknowledgment byte alone does not prove achieved Flush.
+Already imported read-only legacy backups retain the historical limits described
+in [RECOVERY_FLUSH.md](docs/RECOVERY_FLUSH.md). Snapshots and
 change history are bounded. Subscriptions and timer wakes grant no lease,
 receiver receipt, or authority to execute an application effect. All committed
 values remain resident in memory; cache eviction, warm/cold tiers and replay

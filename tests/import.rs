@@ -65,6 +65,64 @@ fn write_legacy(dir: &Path, records: &[Rec]) -> HashMap<(String, String), (u64, 
     fs::write(dir.join("epoch"), 7u64.to_le_bytes()).unwrap();
     model
 }
+
+#[test]
+fn new_import_covers_original_flush_retry_history_before_readonly_backup_switch() {
+    let dir = path("import-flush-prerequisite");
+    let at = now_ms();
+    let records = [
+        Rec { ns: "ledger", key: "state".into(), op_id: "original-superseded".into(), at,
+            version: 11, ack: 2, remove: false, expected: None, bytes: b"original".to_vec() },
+        Rec { ns: "ledger", key: "state".into(), op_id: "current".into(), at,
+            version: 12, ack: 2, remove: false, expected: None, bytes: b"current".to_vec() },
+    ];
+    write_legacy(&dir, &records);
+    let originals: Vec<_> = (0..4).map(|i| {
+        let p = dir.join(format!("stripe-{i}.log"));
+        (fs::canonicalize(&p).unwrap(), fs::metadata(&p).unwrap().len(), chunks::sha256_file(&p).unwrap())
+    }).collect();
+    let failed = Store::open(&dir, Config { fail_recovery_sync: true, ..Config::default() });
+    assert!(failed.is_err(), "the source barrier must precede the import switch");
+    assert!(!dir.join("chunks").exists());
+    assert!(!dir.join("legacy-8").exists());
+    for (p, _, hash) in &originals {
+        assert_eq!(chunks::sha256_file(p).unwrap(), *hash);
+        assert!(!fs::metadata(p).unwrap().permissions().readonly());
+    }
+    #[cfg(not(windows))]
+    fs::remove_file(dir.join("owner.lock")).unwrap();
+    let store = Store::open(&dir, Config::default()).unwrap();
+    let latest = store.get("ledger", "state").unwrap();
+    assert_eq!((latest.version, latest.ack, latest.bytes.as_slice()), (12, 2, b"current".as_slice()));
+    let original = Mutation { ns: "ledger".into(), key: "state".into(), op_id: "original-superseded".into(),
+        deadline: now_ms() + 10_000, ack: 2, expected: None, bytes: b"original".to_vec(), remove: false };
+    let outcome = store.mutate(original.clone());
+    assert_eq!((outcome.code, outcome.version, outcome.ack), (0, 11, 2));
+    assert_eq!(store.get("ledger", "state").unwrap().version, 12);
+    assert_eq!(store.metrics().0, 0);
+    drop(store);
+    for (p, _, hash) in &originals {
+        let backup = dir.join("legacy-8").join(p.file_name().unwrap());
+        assert_eq!(chunks::sha256_file(&backup).unwrap(), *hash);
+        assert!(fs::metadata(&backup).unwrap().permissions().readonly());
+    }
+    #[cfg(all(windows, feature = "sync-witness"))]
+    if let Some(witness) = std::env::var_os("MEMBUS_SYNC_WITNESS") {
+        let calls = fs::read_to_string(PathBuf::from(witness).with_extension("calls")).unwrap();
+        use std::os::windows::ffi::OsStrExt;
+        for (p, bytes, _) in &originals {
+            if *bytes == 0 { continue; }
+            let target: Vec<u16> = p.as_os_str().encode_wide().collect();
+            assert!(calls.lines().any(|line| line.contains("\"ok\":true")
+                && line.contains(&format!("\"target_utf16\":{target:?}"))
+                && line.contains(&format!("\"bytes\":{bytes}}}"))),
+                "new import must sync the original superseded retry record source, not only its latest-value copy");
+        }
+    }
+    let store = reopen(&dir, Config::default());
+    assert_eq!(store.mutate(original), outcome);
+    assert_eq!(store.get("ledger", "state").unwrap().version, 12);
+}
 /// A production-shaped legacy state: lane 88's families, a ledger, a removed key; recent and older records.
 fn legacy_state(dir: &Path) -> (HashMap<(String, String), (u64, bool, Vec<u8>)>, Rec) {legacy_state_with_probe_id(dir,None)}
 fn legacy_state_with_probe_id(dir: &Path, probe_id: Option<&str>) -> (HashMap<(String, String), (u64, bool, Vec<u8>)>, Rec) {
