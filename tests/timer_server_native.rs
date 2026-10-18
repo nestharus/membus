@@ -326,6 +326,7 @@ struct Watcher {
     listener: ChangeListener,
     subscription: Subscription,
     prefix: String,
+    received: u64,
 }
 impl Watcher {
     fn new(c: &mut Client<Pipe>, pipe: &str, suffix: &str, prefix: &str, replay: bool) -> Self {
@@ -356,6 +357,7 @@ impl Watcher {
             listener,
             subscription,
             prefix: prefix.into(),
+            received: 0,
         }
     }
     fn receive(&mut self) -> (TimerEnvelope, u64) {
@@ -369,10 +371,41 @@ impl Watcher {
         assert_eq!(e.key, format!("timer/{}", w.timer_id));
         assert_eq!(e.ack, Ack::Os);
         assert!(!e.tombstone);
+        self.received += 1;
         println!("timer wake received_ms={received} {w:?}");
         (w, received)
     }
-    fn quiet(&mut self, ms: u64) {
+    fn healthy(&self, c: &mut Client<Pipe>) {
+        let until = d(2000).local;
+        loop {
+            let s = c
+                .subscription_status(NS, &self.subscription.token, "quiet-status", d(2000))
+                .unwrap();
+            assert!(
+                s.active && s.failed == 0 && s.dropped == 0 && s.queued == 0,
+                "quietness requires an exposed, healthy subscription: {s:?}"
+            );
+            assert!(
+                s.written <= self.received,
+                "unexpected unread delivery: {s:?}"
+            );
+            if s.written == self.received {
+                println!("quiet subscription received={} status={s:?}", self.received);
+                return;
+            }
+            assert!(
+                Instant::now() < until,
+                "delivery status did not settle: {s:?}"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    fn quiet(&mut self, c: &mut Client<Pipe>, ms: u64) {
+        assert!(
+            self.received > 0,
+            "quiet outcome requires actual associated delivery exposure"
+        );
+        self.healthy(c);
         assert!(
             matches!(
                 self.listener
@@ -381,6 +414,7 @@ impl Watcher {
             ),
             "unexpected wake or transport failure during quiet interval"
         );
+        self.healthy(c);
     }
     fn close(&mut self) {
         self.listener.close();
@@ -564,13 +598,24 @@ fn complete_private_timer_server_cohort() {
     println!(
         "isolated one-off stripe before={before} after_set={after_set} after_fire={after_fire}"
     );
-    a.quiet(150);
+    a.quiet(&mut c, 150);
     let mut b = Watcher::new(&mut c, &pipe, "b", "timer/", false);
     let anchor = membus::now_ms() + 350;
     let mut request = schedule("jitter", anchor, 200, b"periodic");
     request.jitter_low_ms = -30;
     request.jitter_high_ms = 30;
+    // Fixed-vector oracle from arbitrary-precision modulo-2^64 arithmetic for
+    // the version-one seed/index rejection rules. These are admitted operands,
+    // not fields copied from a delivered envelope or a checkpoint.
+    let expected_seed = ((membus::crc32(request.operation_id.as_bytes()) as u64) << 32)
+        | membus::crc32(format!("{NS}\0{}", request.timer_id).as_bytes()) as u64;
+    assert_eq!(expected_seed, 4_762_860_646_524_312_049);
+    let expected_draws = [-9, 9, -2, 21, 10, -12, 28, -5, 0, -25, 7, -1];
     let generation = set(&mut c, request);
+    assert_eq!(
+        status(&mut c, "jitter").unwrap().schedule.seed,
+        expected_seed
+    );
     for index in 0..12 {
         let w = pair(&mut a, &mut b);
         assert_eq!(
@@ -592,23 +637,26 @@ fn complete_private_timer_server_cohort() {
             )
         );
         assert!((-30..=30).contains(&w.draw_ms));
+        let expected_draw = expected_draws[index as usize];
+        assert_eq!(w.draw_ms, expected_draw);
         assert_eq!(
             w.due_ms,
             (anchor + index * 200)
-                .checked_add_signed(w.draw_ms)
+                .checked_add_signed(expected_draw)
                 .unwrap()
         );
         expected.push((epoch, w));
     }
     cancel(&mut c, "jitter", generation, "cancel-jitter").unwrap();
     assert!(status(&mut c, "jitter").is_none());
-    a.quiet(300);
-    b.quiet(300);
+    a.quiet(&mut c, 300);
+    b.quiet(&mut c, 300);
     let old = set(
         &mut c,
         schedule("replace", membus::now_ms() + 300, 0, b"old"),
     );
-    let mut replacement = schedule("replace", membus::now_ms() + 600, 0, b"new");
+    let replacement_anchor = membus::now_ms() + 600;
+    let mut replacement = schedule("replace", replacement_anchor, 0, b"new");
     replacement.operation_id = "replace-new".into();
     replacement.expected = TimerExpectation::Generation(old);
     let new = set(&mut c, replacement);
@@ -627,6 +675,10 @@ fn complete_private_timer_server_cohort() {
         ),
         ("replace", new, 0, &b"new"[..])
     );
+    assert_eq!(
+        (w.nominal_ms, w.due_ms, w.draw_ms),
+        (replacement_anchor, replacement_anchor, 0)
+    );
     settled_status(&mut c, "replace", 0);
     expected.push((epoch, w));
     let request = schedule("retry", membus::now_ms() + 200, 0, b"retry");
@@ -644,8 +696,8 @@ fn complete_private_timer_server_cohort() {
     assert!(!retried.active);
     assert_eq!(retried.next_index, completed.next_index);
     assert_eq!(retried.last, completed.last);
-    a.quiet(150);
-    b.quiet(150);
+    a.quiet(&mut c, 150);
+    b.quiet(&mut c, 150);
     let mut replacement = schedule("retry", membus::now_ms() + 10000, 0, b"future");
     replacement.operation_id = "retry-new".into();
     replacement.expected = TimerExpectation::Generation(one);
@@ -715,8 +767,8 @@ fn complete_private_timer_server_cohort() {
     }
     cancel(&mut c, "restart", generation, "cancel-restart").unwrap();
     assert!(status(&mut c, "restart").is_none());
-    a.quiet(300);
-    b.quiet(300);
+    a.quiet(&mut c, 300);
+    b.quiet(&mut c, 300);
     assert!(status(&mut c, "jitter").is_none());
     assert!(status(&mut c, "retry").is_none());
     for key in ["once", "jitter", "replace", "retry", "restart"] {
@@ -770,7 +822,7 @@ fn progress_preserves_small_ordinary_dedup_capacity_across_physical_restart() {
         expected.push((epoch, w));
     }
     cancel(&mut c, "fixed", generation, "cancel-fixed").unwrap();
-    a.quiet(150);
+    a.quiet(&mut c, 150);
     server.kill_wait();
     drop(c);
     a.close();
