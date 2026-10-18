@@ -77,6 +77,9 @@ pub(super) fn calculate(i: &Inputs, p: &Value, change: f64) -> Result<Value> {
         let rows = uint(row, "rows_last_24h")?;
         let rate = num(row, "rows_per_hour")?;
         let bytes = num(row, "publisher_upper_bytes_per_hour")?;
+        if rate < 0.0 || bytes < 0.0 {
+            return Err("negative per-loop publisher rate".into());
+        }
         let record = 58
             + 9
             + uint(row, "publisher_key_utf8_bytes")?

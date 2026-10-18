@@ -42,7 +42,10 @@ Numeric record coordinates must be exact nonnegative integers no larger than
 inputs fail before creating the output directory. An existing output location is
 refused. A write failure can leave a partial new directory; use a different fresh
 location after diagnosing it. Do not treat a directory without manifest.json as a
-completed result.
+completed result. A present manifest can itself be partial after interruption;
+successful completion requires the command's zero exit and a valid manifest with
+the complete output set and matching byte counts/hashes. Crash durability is not
+established by these checks.
 
 The library's public `regenerate` function follows the same file-loading and
 verification path as the executable. Input and report construction are internal;
@@ -60,7 +63,7 @@ render those same values. Zero growth produces null capacity dates. Signed
 negative key dates retain the meaning "threshold already exceeded".
 
 Required scans must contain namespace observations, integer live counts and
-family-count objects. A family absent from an otherwise complete scan means zero;
+family-count objects whose counts sum to the live count. A family absent from an otherwise complete scan means zero;
 a missing scan means missing evidence and is rejected. Impossible value/record
 sizes, checked-integer overflow and nonfinite derived arithmetic are errors before
 output creation; they never become unknown/null results.

@@ -132,12 +132,17 @@ fn optional_at(v: &Value, keys: &[&str], default: Value) -> Value {
 fn scan<'a>(endpoint: &'a Value, ns: &str) -> Result<&'a Value> {
     let scan = field(field(endpoint, "scans")?, ns)
         .map_err(|_| format!("missing required scan for namespace {ns}"))?;
-    uint(scan, "live_keys")?;
+    let live = uint(scan, "live_keys")?;
+    let mut counted = 0;
     for value in object(field(scan, "family_counts")?)?.values() {
-        value
+        let count = value
             .as_u64()
             .filter(|n| *n <= 1u64 << 53)
             .ok_or("malformed scan family count")?;
+        add(&mut counted, count, "scan family counts")?;
+    }
+    if counted != live {
+        return Err(format!("scan family counts disagree with live count: {ns}"));
     }
     Ok(scan)
 }

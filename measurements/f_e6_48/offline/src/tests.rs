@@ -145,6 +145,9 @@ fn missing_evidence_is_not_zero_and_zero_growth_is_not_nonfinite() {
     i.start["scans"]["slots"]["family_counts"] = Value::Null;
     assert!(calculate(&i, "2025-01-01T01:00:00Z").is_err());
     let mut i = fixture();
+    i.start["scans"]["slots"]["family_counts"] = json!({});
+    assert!(calculate(&i, "2025-01-01T01:00:00Z").is_err());
+    let mut i = fixture();
     i.start["scans"]["slots"]["family_counts"]
         .as_object_mut()
         .unwrap()
