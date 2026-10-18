@@ -109,6 +109,94 @@ fn write(c: &mut Client<membus::pipe_io::Pipe>, key: &str, bytes: Vec<u8>, op: &
     c.mutate(&mut a, d()).unwrap();
 }
 #[test]
+fn zero_encoded_budget_validates_empty_and_refuses_required_or_corrupt_records() {
+    let f = Fixture::new();
+    let mut c = f.client("zero-budget");
+    let col = Collection::new("empty", schema()).unwrap();
+    col.declare(&mut c, "fixture", "empty-schema", Ack::Os, d())
+        .unwrap();
+    let zero = Limits {
+        max_rows: 1,
+        max_bytes: 0,
+    };
+    let token = c.snapshot_open("fixture", "empty-open", d()).unwrap();
+    assert_eq!(
+        col.query(
+            &mut c,
+            "fixture",
+            &token,
+            &Query::All,
+            zero,
+            "empty-read",
+            d()
+        )
+        .unwrap()
+        .through,
+        0
+    );
+    assert!(col
+        .query(
+            &mut c,
+            "fixture",
+            &token,
+            &Query::All,
+            Limits {
+                max_rows: 0,
+                max_bytes: 0
+            },
+            "invalid-count",
+            d()
+        )
+        .is_err());
+    c.snapshot_release("fixture", &token, "empty-release", d())
+        .unwrap();
+    col.append(
+        &mut c,
+        "fixture",
+        &row(1, "one", "source", &[]),
+        "one",
+        Ack::Os,
+        d(),
+    )
+    .unwrap();
+    let token = c.snapshot_open("fixture", "one-open", d()).unwrap();
+    assert!(matches!(
+        col.query(
+            &mut c,
+            "fixture",
+            &token,
+            &Query::All,
+            zero,
+            "one-read",
+            d()
+        ),
+        Err(IndexError::Limit)
+    ));
+    c.snapshot_release("fixture", &token, "one-release", d())
+        .unwrap();
+    write(
+        &mut c,
+        "x/empty/head",
+        b"corrupt-boundary".to_vec(),
+        "corrupt-empty-head",
+    );
+    let token = c.snapshot_open("fixture", "bad-open", d()).unwrap();
+    assert!(matches!(
+        col.query(
+            &mut c,
+            "fixture",
+            &token,
+            &Query::All,
+            zero,
+            "bad-read",
+            d()
+        ),
+        Err(IndexError::Corrupt(_))
+    ));
+    c.snapshot_release("fixture", &token, "bad-release", d())
+        .unwrap();
+}
+#[test]
 fn actual_declared_queries_preserve_identity_history_and_pinned_boundary() {
     let f = Fixture::new();
     let mut c = f.client("indexed-native");

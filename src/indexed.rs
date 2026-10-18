@@ -362,7 +362,7 @@ impl Collection {
         op: &str,
         d: Deadline,
     ) -> Result<Read> {
-        if limits.max_rows == 0 || limits.max_bytes == 0 {
+        if limits.max_rows == 0 {
             return Err(Error::Invalid("query limits"));
         }
         let declaration = exact(

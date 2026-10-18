@@ -50,6 +50,10 @@ invalid encoding and exhausted query budgets refuse the whole query rather than
 returning a partial successful account. Resident frame/value/snapshot bounds also
 apply. Encoded records, including field values, must fit the existing value
 bound. The library never truncates a large row.
+An encoded-byte budget of zero can return an actually empty collection after
+validating its declaration and committed boundary. A required record still
+refuses; the row-count budget must remain positive. `encoded_len` validates and
+measures an exact record before publication.
 
 This is an append/publication contract for participating callers in an explicitly
 selected namespace, not an access-control boundary against arbitrary raw KV
