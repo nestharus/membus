@@ -6,6 +6,9 @@ storage_error and expiry_degraded. It uses the maintained bounded exchange and
 negotiated frame limit. Missing, duplicate or malformed selected fields refuse
 the command; arbitrary namespace text is never emitted as metric lines.
 The last three fields are validated as wire booleans and projected to 0 or 1.
+The endpoint must use the explicit local named-pipe prefix, and the opened handle
+must have pipe type before any request is sent. Ordinary files and remote paths
+are refused without writing HELLO bytes.
 
 `membus catalogue-state STOPPED_STATE_DIR ABSOLUTE_CHUNK_PATH` uses the public
 catalogue decoder and chunk-path association to print the latest recorded state

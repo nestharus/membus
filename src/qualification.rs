@@ -100,11 +100,14 @@ fn retirement_fields(body: &[u8]) -> io::Result<Vec<(&'static str, u64)>> {
 pub fn retirement_command(args: &[String]) -> io::Result<()> {
     use std::{
         fs,
-        os::windows::fs::OpenOptionsExt,
+        os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
         time::{Duration, Instant},
     };
     if args.len() != 1 {
         return Err(io::Error::other("usage: membus retirement-status PIPE"));
+    }
+    if !args[0].starts_with(r"\\.\pipe\") || args[0].len() == 9 || args[0].contains('\0') {
+        return Err(io::Error::other("explicit local named pipe required"));
     }
     let until = Instant::now() + Duration::from_secs(2);
     let file = loop {
@@ -121,6 +124,13 @@ pub fn retirement_command(args: &[String]) -> io::Result<()> {
             Err(e) => return Err(e),
         }
     };
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFileType(handle: *mut std::ffi::c_void) -> u32;
+    }
+    if unsafe { GetFileType(file.as_raw_handle()) } != 3 {
+        return Err(io::Error::other("endpoint is not a pipe; no request sent"));
+    }
     let mut pipe = membus::pipe_io::Pipe::new(file, 2000);
     let mut hello = (membus::MAX_FRAME as u32).to_le_bytes().to_vec();
     hello.push(0);
@@ -247,6 +257,8 @@ mod tests {
         let h = membus::Health2 {
             retire_blocked: 1,
             retired_chunks: 2,
+            read_only: true,
+            expiry_degraded: true,
             ..Default::default()
         };
         let fields = h.fields();
@@ -257,6 +269,19 @@ mod tests {
         let values = retirement_fields(&body).unwrap();
         assert_eq!(values[0], ("retire_blocked", 1));
         assert_eq!(values[1], ("retired_chunks", 2));
+        assert_eq!(
+            &values[2..],
+            &[
+                ("read_only", 1),
+                ("storage_error", 0),
+                ("expiry_degraded", 1)
+            ]
+        );
+        let mut complete_duplicate = body.clone();
+        let count = u16::from_le_bytes(body[..2].try_into().unwrap());
+        complete_duplicate[..2].copy_from_slice(&(count + 1).to_le_bytes());
+        membus::lp(&mut complete_duplicate, b"retire_blocked=9");
+        assert!(retirement_fields(&complete_duplicate).is_err());
         assert!(retirement_fields(&0u16.to_le_bytes()).is_err());
         for fields in [
             vec!["retire_blocked=1", "retire_blocked=2"],
@@ -270,5 +295,15 @@ mod tests {
         }
         body.push(0);
         assert!(retirement_fields(&body).is_err());
+    }
+    #[cfg(windows)]
+    #[test]
+    fn ordinary_file_is_refused_before_any_hello_write() {
+        let root = root();
+        let path = root.join("ordinary-file.bin");
+        let bytes = b"owned canary must remain exact";
+        std::fs::write(&path, bytes).unwrap();
+        assert!(retirement_command(&[path.to_string_lossy().into_owned()]).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
     }
 }
