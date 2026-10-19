@@ -1,0 +1,124 @@
+{
+  "binary_sha256": "fixture-image-identity",
+  "health": {
+    "quota": {
+      "bytes_written": 1100,
+      "flush_calls": 4,
+      "index_cap": 1000,
+      "keys": 3,
+      "namespace_keys": 1,
+      "namespace_quota": 1000
+    },
+    "slots": {
+      "namespace_keys": 2,
+      "namespace_quota": 100
+    }
+  },
+  "heartbeat": {
+    "epoch": 1,
+    "heartbeat_bytes": 200,
+    "pid": 1,
+    "unix_ms": 1735696800000.0
+  },
+  "hello_epoch": 1,
+  "logs": {
+    "a": {
+      "complete_bytes": 700,
+      "records": [
+        {
+          "at_ms": 1735689600000,
+          "bytes": 100,
+          "end": 100,
+          "family": "all",
+          "key": "all",
+          "namespace": "slots",
+          "offset": 0,
+          "removed": false,
+          "value_bytes": 50,
+          "version": 999999
+        },
+        {
+          "at_ms": 1735691400000,
+          "bytes": 200,
+          "end": 300,
+          "family": "resource",
+          "key": "cpu",
+          "namespace": "slots",
+          "offset": 100,
+          "removed": false,
+          "value_bytes": 150,
+          "version": 998199
+        },
+        {
+          "at_ms": 1735695000000,
+          "bytes": 300,
+          "end": 600,
+          "family": "resource",
+          "key": "cpu",
+          "namespace": "slots",
+          "offset": 300,
+          "removed": false,
+          "value_bytes": 250,
+          "version": 994599
+        },
+        {
+          "at_ms": 1735695600000,
+          "bytes": 100,
+          "end": 700,
+          "family": "resource",
+          "key": "cpu",
+          "namespace": "slots",
+          "offset": 600,
+          "removed": true,
+          "value_bytes": 50,
+          "version": 993999
+        }
+      ]
+    },
+    "b": {
+      "complete_bytes": 400,
+      "records": [
+        {
+          "at_ms": 1735693600000,
+          "bytes": 150,
+          "end": 150,
+          "family": "tokens/",
+          "key": "tokens/test",
+          "namespace": "quota",
+          "offset": 0,
+          "removed": false,
+          "value_bytes": 100,
+          "version": 995999
+        },
+        {
+          "at_ms": 1735694600000,
+          "bytes": 250,
+          "end": 400,
+          "family": "tokens/",
+          "key": "tokens/test",
+          "namespace": "quota",
+          "offset": 150,
+          "removed": false,
+          "value_bytes": 200,
+          "version": 994999
+        }
+      ]
+    }
+  },
+  "scans": {
+    "quota": {
+      "family_counts": {
+        "tokens/": 1
+      },
+      "live_keys": 1
+    },
+    "slots": {
+      "family_counts": {
+        "all": 1,
+        "resource": 0
+      },
+      "live_keys": 1
+    }
+  },
+  "unix_time": 1735696800.0
+}
