@@ -522,3 +522,83 @@ fn existing_backup_input_refuses_before_switch_without_overwriting_either_copy()
     assert_eq!(fs::read(&retained).unwrap(),b"independent retained input");
     assert_eq!(fs::read(p.join("epoch")).unwrap(),7u64.to_le_bytes());assert!(!p.join("chunks/catalogue.log").exists());
 }
+
+/// Verify actual imported record placement, independently of policy resolution and class presence.
+#[test]
+fn import_places_each_key_in_its_expected_physical_class_before_and_after_restart() {
+    let p = path("per-key-import-placement");
+    let expire = Class::expire(3 * DAY);
+    let cases = [
+        ("quota", "event/recent", expire),
+        ("slots", "event/recent", expire),
+        ("capacity", "event/recent", expire),
+        ("quota-test", "sample", expire),
+        ("quota", "state/sample", Class::LATEST),
+        ("quota", "open", Class::LATEST),
+        ("quota", "resets", Class::LATEST),
+        ("quota", "tokens/sample", Class::LATEST),
+        ("quota", "fit/sample/window", Class::LATEST),
+        ("slots", "gpu", Class::LATEST),
+        ("slots", "eventish", Class::LATEST),
+        ("quota", "eventish", Class::FOREVER),
+        ("capacity", "other", Class::FOREVER),
+        ("unselected", "kept", Class::FOREVER),
+        ("unselected", "gone", Class::FOREVER),
+    ];
+    let at = now_ms();
+    let mut records: Vec<_> = cases.iter().enumerate().map(|(i, (ns, key, _))| Rec {
+        ns,
+        key: (*key).into(),
+        op_id: format!("placement-{i}"),
+        at,
+        version: i as u64 + 1,
+        ack: 1,
+        remove: *key == "gone",
+        expected: None,
+        bytes: if *key == "gone" { Vec::new() } else { format!("value-{i}").into_bytes() },
+    }).collect();
+    // The physical import must contain the latest record, rather than its superseded predecessor.
+    records.push(Rec { ns: "quota", key: "event/recent".into(), op_id: "placement-latest".into(),
+        at, version: 100, ack: 2, remove: false, expected: None, bytes: b"latest".to_vec() });
+    let model = write_legacy(&p, &records);
+    let original = shas(&p);
+    let policy_bytes = b"quota\tevent/\texpire:259200000\nslots\tevent/\texpire:259200000\ncapacity\tevent/\texpire:259200000\nquota-test\t\texpire:259200000\nquota\tstate/\tlatest\nquota\topen\tlatest\nquota\tresets\tlatest\nquota\ttokens/\tlatest\nquota\tfit/\tlatest\nslots\t\tlatest\n";
+    fs::write(p.join("import-policies.txt"), policy_bytes).unwrap();
+    let expected: BTreeMap<_, _> = cases.iter().map(|(ns, key, class)| {
+        let key = ((*ns).to_string(), (*key).to_string());
+        let version = model[&key].0;
+        (key, (class.dir(), version))
+    }).collect();
+    let clock = ManualClock::new(at);
+    for encounter in ["import", "restart"] {
+        let store = reopen(&p, config(&clock));
+        check_model(&store, &model);
+        assert_eq!(store.policies().len(), 10);
+        assert!(!store.storage_error());
+        drop(store);
+        let mut actual = BTreeMap::new();
+        for (class, _, _, file) in chunks::list_chunk_files(&p.join("chunks")).unwrap() {
+            let mut input = fs::File::open(&file).unwrap();
+            let len = input.metadata().unwrap().len();
+            let mut offset = 0;
+            while offset < len {
+                let (payload, consumed) = match chunks::read_frame_at(
+                    &mut input, b"MBK1", offset, len, &file.display().to_string()).unwrap() {
+                    chunks::Frame::Whole(payload, consumed) => (payload, consumed),
+                    chunks::Frame::Torn(reason) => panic!("{encounter}: incomplete imported record: {reason}"),
+                };
+                let (ns, key, version) = chunks::record_key(&payload).unwrap();
+                let identity = (ns, key);
+                if identity.0 != chunks::POLICY_NS {
+                    assert!(model.contains_key(&identity), "{encounter}: unexpected imported key {identity:?}");
+                    assert!(actual.insert(identity.clone(), (class.clone(), version)).is_none(),
+                        "{encounter}: duplicate imported key {identity:?}");
+                }
+                offset += consumed;
+            }
+        }
+        assert_eq!(actual, expected, "{encounter}: each imported key must occupy its selected physical class");
+        assert_eq!(shas(&p.join("legacy-8")), original);
+        assert_eq!(fs::read(p.join("legacy-8/import-policies.txt")).unwrap(), policy_bytes);
+    }
+}
