@@ -23,7 +23,7 @@ use std::time::Instant;
 /// Retirement, expiry summaries, tombstone drops and the clock check (5.3, 5.4), shared with the tick thread.
 pub(super) struct Maint {
     pub(super) state: Arc<Mutex<State>>,
-    pub(super) committed: Arc<RwLock<HashMap<(String, String), Arc<Value>>>>,
+    pub(super) committed: Arc<RwLock<HashMap<Key, Arc<Value>>>>,
     pub(super) chunks: Arc<Mutex<chunks::ChunkStore>>,
     pub(super) router: Arc<ChunkRouter>,
     pub(super) flags: Arc<Flags>,
@@ -94,15 +94,7 @@ impl Maint {
                     .collect();
                 let next = self.next_issued.load(Ordering::SeqCst);
                 // Step 1: `retiring` with its horizons and the version high-water, flushed before anything changes.
-                if let Err(e) = cs.log(
-                    utc,
-                    chunks::Rec::Retiring {
-                        seq: id,
-                        next,
-                        horizons: horizons.clone(),
-                        expired: latest.clone(),
-                    },
-                ) {
+                if let Err(e) = cs.log_retiring(utc, id, next, &horizons, &latest) {
                     self.flags.storage_error.store(true, Ordering::SeqCst);
                     failure = Some(e);
                     break;
@@ -362,17 +354,12 @@ impl Maint {
     pub(super) fn rewrite_catalogue(&self) {
         let mut cs = self.chunks.lock().unwrap();
         let at = self.config.catalogue_rewrite_bytes;
-        if cs.cat.as_ref().is_some_and(|cat| cat.needs_rewrite(at)) {
-            let live = cs.live_list(self.clock.utc_ms(), self.next_issued.load(Ordering::SeqCst));
-            if let Some(cat) = cs.cat.as_mut() {
-                cs.rewrite_error = match cat.rewrite(&live) {
-                    Ok(()) => None,
-                    Err(error) => {
-                        self.flags.storage_error.store(true, Ordering::SeqCst);
-                        Some(error.to_string())
-                    }
-                };
-            }
+        if (cs.incomplete_retiring || cs.cat.as_ref().is_some_and(|cat| cat.needs_rewrite(at)))
+            && cs
+                .rewrite_live(self.clock.utc_ms(), self.next_issued.load(Ordering::SeqCst))
+                .is_err()
+        {
+            self.flags.storage_error.store(true, Ordering::SeqCst);
         }
     }
 }

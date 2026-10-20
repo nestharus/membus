@@ -1,6 +1,6 @@
 //! Read-only retirement inspection. See docs/RETIREMENT-INSPECTION.md.
 #![deny(clippy::all)]
-use membus::chunks::{chunk_path, read_catalogue, Rec};
+use membus::chunks::{chunk_path, committed_records, read_catalogue, Rec};
 use std::{io, path::Path};
 
 fn catalogue_state(state: &Path, target: &Path) -> io::Result<&'static str> {
@@ -18,7 +18,7 @@ fn catalogue_state(state: &Path, target: &Path) -> io::Result<&'static str> {
     }
     let mut selected = None;
     let mut status = "unknown";
-    for row in records {
+    for row in committed_records(records).0 {
         match row.rec {
             Rec::Open {
                 seq, stripe, class, ..
@@ -251,6 +251,53 @@ mod tests {
             .unwrap();
         assert!(catalogue_state(&root, &target).is_err());
     }
+    #[test]
+    fn stopped_catalogue_requires_all_retiring_parts() {
+        let root = root();
+        let path = root.join("chunks/catalogue.log");
+        let target = chunk_path(&root.join("chunks"), Class::LATEST, 0, 1);
+        let mut cat = Catalogue::open(&path).unwrap();
+        for rec in [
+            Rec::Open {
+                seq: 1,
+                stripe: 0,
+                class: Class::LATEST,
+                policy: String::new(),
+                next: 2,
+            },
+            Rec::Close {
+                seq: 1,
+                bytes: 10,
+                next: 2,
+            },
+        ] {
+            cat.append(&CatRecord { at_ms: 1, rec }).unwrap();
+        }
+        let part = |index| CatRecord {
+            at_ms: 2,
+            rec: Rec::RetiringPart {
+                seq: 1,
+                next: 2,
+                index,
+                count: 2,
+                horizons: vec![],
+                expired: vec![],
+            },
+        };
+        cat.append(&part(0)).unwrap();
+        assert_eq!(catalogue_state(&root, &target).unwrap(), "Closed");
+        cat.append(&CatRecord {
+            at_ms: 2,
+            rec: Rec::Next(2),
+        })
+        .unwrap();
+        cat.append(&part(1)).unwrap();
+        assert_eq!(catalogue_state(&root, &target).unwrap(), "Closed");
+        cat.append(&part(0)).unwrap();
+        cat.append(&part(1)).unwrap();
+        assert_eq!(catalogue_state(&root, &target).unwrap(), "Retiring");
+    }
+
     #[cfg(windows)]
     #[test]
     fn metrics_require_named_unique_fields() {

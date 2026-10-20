@@ -115,3 +115,224 @@
         assert_eq!(s.retry_retiring().unwrap(), 1);
         assert_eq!(s.state.lock().unwrap().persisted_bytes, before - ids.iter().map(|x| x.1).sum::<u64>());
     }
+use crate as bus;
+#[path = "../../tests/support/retirement_fixture.rs"]
+mod retiring_fixture;
+
+#[cfg(windows)]
+#[test]
+fn retiring_parts_crash_writer() {
+    let Ok(handoff) = std::env::var("MEMBUS_RETIRING_CRASH_HANDOFF") else {
+        return;
+    };
+    let f = retiring_fixture::Fixture::new("retiring-process-crash", 8100);
+    let s = f.open();
+    f.admit_policy(&s);
+    let before = s.chunks.lock().unwrap().cat_bytes();
+    s.chunks
+        .lock()
+        .unwrap()
+        .cat
+        .as_mut()
+        .unwrap()
+        .fail_after_once = Some(1);
+    assert!(s.maint.retire(None).is_err());
+    assert!(
+        s.chunks.lock().unwrap().cat_bytes() > before,
+        "the first part must be durable before termination"
+    );
+    f.assert_live(&s);
+    fs::write(handoff, f.path.to_str().unwrap()).unwrap();
+    // Terminate without Store::drop or thread teardown, between resolved part appends.
+    std::process::exit(0);
+}
+
+#[cfg(windows)]
+#[test]
+fn retiring_parts_abrupt_process_exit_replays_prefix_then_retires() {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    // This child runs the Store witness without helper processes. Keep its handle through
+    // every assertion so panic/timeout also terminates and reaps that process.
+    struct PartWriter(std::process::Child);
+    impl Drop for PartWriter {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let root = retiring_fixture::path("retiring-crash-handoff");
+    fs::create_dir_all(&root).unwrap();
+    let handoff = root.join("state-path.txt");
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "retirement_failure_tests::retiring_parts_crash_writer",
+            "--nocapture",
+        ])
+        .env("MEMBUS_RETIRING_CRASH_HANDOFF", &handoff)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    let mut child = PartWriter(command.creation_flags(0x08000000).spawn().unwrap());
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the crash witness exceeded its deadline"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(
+        status.success(),
+        "the part writer failed before its abrupt exit"
+    );
+    let f = retiring_fixture::Fixture::resume(
+        PathBuf::from(fs::read_to_string(handoff).unwrap()),
+        8100,
+    );
+    let s = f.open();
+    assert!(s.replay_report().retirements_finished.is_empty());
+    assert!(s.chunks.lock().unwrap().horizons.is_empty());
+    assert!(s.chunks.lock().unwrap().summaries.keys.is_empty());
+    assert_eq!(s.slots("aggregate").1, 8100);
+    assert_eq!(
+        s.chunk_rows().iter().find(|row| row.0 == 2).unwrap().3,
+        "Closed"
+    );
+    assert!(chunks::chunk_path(&f.path.join("chunks"), Class::expire(1000), 0, 2).exists());
+    f.assert_live(&s);
+    s.retirement_pass();
+    f.assert_expired(&s);
+    assert_eq!(
+        s.chunk_rows().iter().find(|row| row.0 == 2).unwrap().3,
+        "Retired"
+    );
+    println!("abrupt part-writer exit observed; direct child waited and reaped; prefix ignored and retirement retried");
+}
+
+#[test]
+fn retiring_parts_partial_failure_replays_without_effects_then_retries() {
+    let f = retiring_fixture::Fixture::new("retiring-partial", 8100);
+    assert!(chunks::encode(&f.transition(30_000)).len() - 16 > MAX_FRAME);
+    let s = f.open();
+    f.admit_policy(&s);
+    let before_bytes = s.chunks.lock().unwrap().cat_bytes();
+    let before_counts = s.state.lock().unwrap().namespace_counts.clone();
+    let before_slots = s.slots("aggregate");
+    let before_disk = s.state.lock().unwrap().persisted_bytes;
+    let before_next = s.state.lock().unwrap().next;
+    let file = chunks::chunk_path(&f.path.join("chunks"), Class::expire(1000), 0, 2);
+    let original = fs::read(&file).unwrap();
+    s.chunks
+        .lock()
+        .unwrap()
+        .cat
+        .as_mut()
+        .unwrap()
+        .fail_after_once = Some(1);
+    assert!(s.maint.retire(None).is_err());
+    assert!(
+        s.chunks.lock().unwrap().cat_bytes() > before_bytes,
+        "a durable first part must precede the interruption"
+    );
+    assert!(s.storage_error());
+    assert_eq!(
+        s.chunk_rows().iter().find(|row| row.0 == 2).unwrap().3,
+        "Closed"
+    );
+    assert_eq!(s.slots("aggregate"), before_slots);
+    assert_eq!(s.state.lock().unwrap().namespace_counts, before_counts);
+    assert_eq!(s.state.lock().unwrap().persisted_bytes, before_disk);
+    assert_eq!(s.state.lock().unwrap().next, before_next);
+    assert!(s.chunks.lock().unwrap().horizons.is_empty());
+    assert!(s.chunks.lock().unwrap().summaries.keys.is_empty());
+    assert_eq!(fs::read(&file).unwrap(), original);
+    f.assert_live(&s);
+    drop(s); // Model a process interruption between two complete, resolved catalogue appends.
+    let s = f.open();
+    assert_eq!(
+        s.chunk_rows().iter().find(|row| row.0 == 2).unwrap().3,
+        "Closed"
+    );
+    assert_eq!(s.slots("aggregate"), before_slots);
+    assert_eq!(s.state.lock().unwrap().namespace_counts, before_counts);
+    assert_eq!(s.state.lock().unwrap().persisted_bytes, before_disk);
+    assert_eq!(s.state.lock().unwrap().next, before_next);
+    assert!(s.chunks.lock().unwrap().horizons.is_empty());
+    assert!(s.chunks.lock().unwrap().summaries.keys.is_empty());
+    assert_eq!(fs::read(&file).unwrap(), original);
+    f.assert_live(&s);
+    let rewrite_path = f.path.join("chunks/catalogue.log.tmp");
+    fs::create_dir(&rewrite_path).unwrap();
+    assert!(s.maint.retire(None).is_err());
+    assert!(s.health2().catalogue_rewrite_error.is_some());
+    assert_eq!(
+        s.chunk_rows().iter().find(|row| row.0 == 2).unwrap().3,
+        "Closed"
+    );
+    assert_eq!(fs::read(&file).unwrap(), original);
+    f.assert_live(&s);
+    fs::remove_dir(&rewrite_path).unwrap();
+    s.retirement_pass();
+    assert!(s.health2().catalogue_rewrite_error.is_none());
+    f.assert_expired(&s);
+    assert_eq!(
+        s.chunk_rows().iter().find(|row| row.0 == 2).unwrap().3,
+        "Retired"
+    );
+    let records = chunks::read_catalogue(&f.path.join("chunks/catalogue.log"))
+        .unwrap()
+        .0;
+    // Only the complete retry remains: its abandoned prefix was compacted first,
+    // even with ordinary threshold-based catalogue rewrites disabled.
+    let parts = records
+        .iter()
+        .filter(|row| chunks::encode(row)[16] == 10)
+        .count();
+    assert_eq!(parts, 2);
+    drop(s);
+    f.assert_expired(&f.open());
+}
+
+#[test]
+fn retiring_parts_live_rewrite_preserves_complete_transition_and_age() {
+    let mut f = retiring_fixture::Fixture::new("retiring-rewrite", 8100);
+    f.config.retire_stop_after = 1;
+    f.config.catalogue_rewrite_bytes = 1;
+    let s = f.open();
+    f.admit_policy(&s);
+    let original_time = f.clock.utc_ms();
+    s.maint
+        .retire(None)
+        .expect("the large transition must publish completely");
+    f.assert_expired(&s);
+    assert_eq!(
+        s.chunk_rows().iter().find(|row| row.0 == 2).unwrap().3,
+        "Retiring"
+    );
+    let file = chunks::chunk_path(&f.path.join("chunks"), Class::expire(1000), 0, 2);
+    assert!(file.exists());
+    f.clock.advance(50);
+    s.maint.rewrite_catalogue();
+    assert!(s.health2().catalogue_rewrite_error.is_none());
+    let records = chunks::read_catalogue(&f.path.join("chunks/catalogue.log"))
+        .unwrap()
+        .0;
+    assert!(records
+        .iter()
+        .all(|row| chunks::encode(row).len() - 16 <= MAX_FRAME));
+    assert!(records
+        .iter()
+        .filter(|row| chunks::encode(row)[16] == 10)
+        .all(|row| row.at_ms == original_time));
+    drop(s);
+    let s = f.open();
+    f.assert_expired(&s);
+    assert!(s.replay_report().retirements_finished.contains(&2));
+    assert!(!file.exists());
+}

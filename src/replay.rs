@@ -75,7 +75,7 @@ impl Replayed {
     fn apply(&mut self, m: Mutation, v: u64, at: u64, chunk: u64, now: u64, config: &Config) {
         self.next = self.next.max(v + 1);
         let k = (m.ns.clone(), m.key.clone());
-        if self.committed.get(&k).map_or(true, |old| old.version < v) {
+        if self.committed.get(&k).is_none_or(|old| old.version < v) {
             self.committed.insert(
                 k.clone(),
                 Arc::new(Value {
@@ -103,6 +103,10 @@ impl Replayed {
         }
     }
     /// Replay one log file. `open_at_crash` allows a torn tail to be truncated; otherwise it refuses start.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Preserve the established file replay boundary."
+    )]
     fn replay_file(
         &mut self,
         p: &Path,
@@ -234,7 +238,7 @@ fn read_legacy(files: &[(usize, PathBuf)], config: &Config, now: u64) -> io::Res
                     }
                     l.next = l.next.max(v + 1);
                     let k = (m.ns.clone(), m.key.clone());
-                    if l.committed.get(&k).map_or(true, |old| old.version < v) {
+                    if l.committed.get(&k).is_none_or(|old| old.version < v) {
                         l.committed.insert(
                             k.clone(),
                             Arc::new(Value {
@@ -754,6 +758,10 @@ impl Replayed {
         }
     }
 }
+#[expect(
+    clippy::result_large_err,
+    reason = "Keep replay observations with startup failures."
+)]
 fn replay(
     path: &Path,
     config: &Config,
@@ -785,6 +793,8 @@ fn replay_into(
     let dir = dir.to_owned();
     fs::create_dir_all(&dir)?;
     let (records, torn) = chunks::read_catalogue(&dir.join("catalogue.log"))?;
+    let (records, incomplete_retiring) = chunks::committed_records(records);
+    rp.chunks.incomplete_retiring = incomplete_retiring;
     rp.report.catalogue_truncation = torn.map(|(o, b, r)| (o, b, r.to_string()));
     let mut next_hw = 0u64;
     let mut horizons: Vec<(String, String, u64)> = Vec::new();
@@ -858,6 +868,7 @@ fn replay_into(
             }
             Rec::Next(n) => next_hw = next_hw.max(*n),
             Rec::Resume => {}
+            Rec::RetiringPart { .. } => unreachable!("committed_records folds all parts"),
             Rec::Import(i) => {
                 rp.chunks.import = Some(i.clone());
                 rp.chunks.import_at = r.at_ms;

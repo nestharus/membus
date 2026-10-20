@@ -3,6 +3,7 @@
 //! Records keep the MBK1 frame. Each stripe has one open chunk per class; a chunk closes by size, by age and
 //! by the idle tick, and a closed chunk retires as a whole file when its class allows. The catalogue is an
 //! append-only log of `open`, `close`, `retiring` and `retired` records, each flushed before it takes effect.
+//! A split retirement waits for every part.
 use crate::{crc32, lp, Cursor, MAX_FRAME, MAX_ID};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -143,7 +144,7 @@ impl Policies {
             // Longest prefix: walk candidates from the longest down.
             let mut best: Option<(&String, &Class)> = None;
             for (prefix, class) in prefixes {
-                if key.starts_with(prefix.as_str()) && best.map_or(true, |(b, _)| prefix.len() > b.len()) {
+                if key.starts_with(prefix.as_str()) && best.is_none_or(|(b, _)| prefix.len() > b.len()) {
                     best = Some((prefix, class));
                 }
             }
@@ -215,6 +216,8 @@ pub enum Rec {
     Open { seq: u64, stripe: u8, class: Class, policy: String, next: u64 },
     Close { seq: u64, bytes: u64, next: u64 },
     Retiring { seq: u64, next: u64, horizons: Vec<(String, String, u64)>, expired: Vec<Key> },
+    /// Indexed parts of one retirement; only a complete consecutive set takes effect.
+    RetiringPart { seq: u64, next: u64, index: u32, count: u32, horizons: Vec<(String, String, u64)>, expired: Vec<Key> },
     Retired { seq: u64 },
     /// Carried by a rewrite: horizons still needed and expiry summaries still kept.
     Horizons(Vec<(String, String, u64)>),
@@ -262,6 +265,7 @@ pub fn encode(r: &CatRecord) -> Vec<u8> {
         Rec::Next(_) => 7,
         Rec::Resume => 8,
         Rec::Import(_) => 9,
+        Rec::RetiringPart { .. } => 10,
     };
     b.push(kind);
     b.extend(r.at_ms.to_le_bytes());
@@ -279,9 +283,14 @@ pub fn encode(r: &CatRecord) -> Vec<u8> {
             b.extend(bytes.to_le_bytes());
             b.extend(next.to_le_bytes());
         }
-        Rec::Retiring { seq, next, horizons, expired } => {
+        Rec::Retiring { seq, next, horizons, expired }
+        | Rec::RetiringPart { seq, next, horizons, expired, .. } => {
             b.extend(seq.to_le_bytes());
             b.extend(next.to_le_bytes());
+            if let Rec::RetiringPart { index, count, .. } = &r.rec {
+                b.extend(index.to_le_bytes());
+                b.extend(count.to_le_bytes());
+            }
             b.extend((horizons.len() as u32).to_le_bytes());
             for (ns, key, v) in horizons {
                 put_key(&mut b, &(ns.clone(), key.clone()));
@@ -353,9 +362,15 @@ fn decode_payload(b: &[u8]) -> Result<CatRecord, u16> {
             Rec::Open { seq, stripe, class, policy, next }
         }
         2 => Rec::Close { seq: c.u64()?, bytes: c.u64()?, next: c.u64()? },
-        3 => {
+        3 | 10 => {
             let seq = c.u64()?;
             let next = c.u64()?;
+            let part = if kind == 10 {
+                let index = c.u32()?;
+                let count = c.u32()?;
+                if count == 0 || index >= count { return Err(3); }
+                Some((index, count))
+            } else { None };
             let n = c.u32()? as usize;
             let mut horizons = Vec::new();
             for _ in 0..n {
@@ -367,7 +382,10 @@ fn decode_payload(b: &[u8]) -> Result<CatRecord, u16> {
             for _ in 0..m {
                 expired.push(take_key(&mut c)?);
             }
-            Rec::Retiring { seq, next, horizons, expired }
+            match part {
+                Some((index, count)) => Rec::RetiringPart { seq, next, index, count, horizons, expired },
+                None => Rec::Retiring { seq, next, horizons, expired },
+            }
         }
         4 => Rec::Retired { seq: c.u64()? },
         5 => {
@@ -411,6 +429,167 @@ fn decode_payload(b: &[u8]) -> Result<CatRecord, u16> {
     };
     c.end()?;
     Ok(CatRecord { at_ms, rec })
+}
+
+/// Encode a retirement using the legacy form when it fits, otherwise indexed bounded parts.
+/// Entry sizes include UTF-8 byte lengths and all length prefixes, not just key counts.
+fn retiring_records(
+    at_ms: u64,
+    seq: u64,
+    next: u64,
+    horizons: &[(String, String, u64)],
+    expired: &[Key],
+) -> Vec<CatRecord> {
+    let horizon_size = |(ns, key, _): &(String, String, u64)| 16 + ns.len() + key.len();
+    let key_size = |(ns, key): &Key| 8 + ns.len() + key.len();
+    let size = 33
+        + horizons.iter().map(horizon_size).sum::<usize>()
+        + expired.iter().map(key_size).sum::<usize>();
+    if size <= MAX_FRAME {
+        return vec![CatRecord {
+            at_ms,
+            rec: Rec::Retiring {
+                seq,
+                next,
+                horizons: horizons.to_vec(),
+                expired: expired.to_vec(),
+            },
+        }];
+    }
+    // Valid store keys are bounded by MAX_ID, so each entry fits on its own.
+    let mut lists = Vec::new();
+    let mut h = Vec::new();
+    let mut e = Vec::new();
+    let mut bytes = 41;
+    for item in horizons {
+        let size = horizon_size(item);
+        if bytes + size > MAX_FRAME && !h.is_empty() {
+            lists.push((std::mem::take(&mut h), std::mem::take(&mut e)));
+            bytes = 41;
+        }
+        h.push(item.clone());
+        bytes += size;
+    }
+    for item in expired {
+        let size = key_size(item);
+        if bytes + size > MAX_FRAME && (!h.is_empty() || !e.is_empty()) {
+            lists.push((std::mem::take(&mut h), std::mem::take(&mut e)));
+            bytes = 41;
+        }
+        e.push(item.clone());
+        bytes += size;
+    }
+    lists.push((h, e));
+    let count = u32::try_from(lists.len()).expect("retirement part count exceeds u32");
+    lists
+        .into_iter()
+        .enumerate()
+        .map(|(index, (horizons, expired))| CatRecord {
+            at_ms,
+            rec: Rec::RetiringPart {
+                seq,
+                next,
+                index: index as u32,
+                count,
+                horizons,
+                expired,
+            },
+        })
+        .collect()
+}
+
+/// Fold complete consecutive retirement sets into the legacy logical transition.
+/// Abandoned prefixes have no effect, including on the version and clock high-water marks.
+/// A new index zero always starts a new attempt, even if its other fields are identical.
+pub fn committed_records(records: Vec<CatRecord>) -> (Vec<CatRecord>, bool) {
+    let mut out = Vec::new();
+    let mut pending: Option<CatRecord> = None;
+    let mut incomplete = false;
+    for record in records {
+        if let Rec::RetiringPart {
+            seq,
+            next,
+            index,
+            count,
+            horizons,
+            expired,
+        } = record.rec
+        {
+            if index == 0 && count > 0 {
+                incomplete |= pending.take().is_some();
+                pending = Some(CatRecord {
+                    at_ms: record.at_ms,
+                    rec: Rec::RetiringPart {
+                        seq,
+                        next,
+                        index,
+                        count,
+                        horizons,
+                        expired,
+                    },
+                });
+            } else if let Some(CatRecord {
+                at_ms,
+                rec:
+                    Rec::RetiringPart {
+                        seq: p_seq,
+                        next: p_next,
+                        index: p_index,
+                        count: p_count,
+                        horizons: h,
+                        expired: e,
+                    },
+            }) = pending.as_mut()
+            {
+                if *at_ms == record.at_ms
+                    && *p_seq == seq
+                    && *p_next == next
+                    && *p_count == count
+                    && p_index.checked_add(1) == Some(index)
+                    && index < count
+                {
+                    *p_index = index;
+                    h.extend(horizons);
+                    e.extend(expired);
+                } else {
+                    pending = None;
+                    incomplete = true;
+                }
+            } else {
+                incomplete = true;
+            }
+            let complete = pending.as_ref().is_some_and(|r| {
+                matches!(&r.rec,
+                Rec::RetiringPart { index, count, .. } if index.checked_add(1) == Some(*count))
+            });
+            if complete {
+                let r = pending.take().unwrap();
+                if let Rec::RetiringPart {
+                    seq,
+                    next,
+                    horizons,
+                    expired,
+                    ..
+                } = r.rec
+                {
+                    out.push(CatRecord {
+                        at_ms: r.at_ms,
+                        rec: Rec::Retiring {
+                            seq,
+                            next,
+                            horizons,
+                            expired,
+                        },
+                    });
+                }
+            }
+        } else {
+            incomplete |= pending.take().is_some();
+            out.push(record);
+        }
+    }
+    incomplete |= pending.is_some();
+    (out, incomplete)
 }
 
 /// One frame read from a log: Ok(Some(payload, frame_len)), Ok(None) for a torn tail (short header or short
@@ -459,7 +638,8 @@ pub fn read_frame_at(f: &mut File, magic: &[u8; 4], offset: u64, len: u64, name:
 }
 
 /// The catalogue as read at start: its records, and a torn tail's offset when one was found.
-pub fn read_catalogue(path: &Path) -> io::Result<(Vec<CatRecord>, Option<(u64, u64, &'static str)>)> {
+pub type CatalogueRead = (Vec<CatRecord>, Option<(u64, u64, &'static str)>);
+pub fn read_catalogue(path: &Path) -> io::Result<CatalogueRead> {
     require_resolved_append(path)?;
     let mut out = Vec::new();
     if !path.exists() {
@@ -544,7 +724,7 @@ pub struct Catalogue {
 impl Catalogue {
     pub fn open(path: &Path) -> io::Result<Self> {
         require_resolved_append(path)?;
-        let file = OpenOptions::new().create(true).read(true).write(true).open(path)?;
+        let file = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(path)?;
         let bytes = file.metadata()?.len();
         Ok(Self {
             path: path.to_owned(), file, bytes, last_ms: 0, rewrite_base_bytes: 0, fail_writes: false, fenced: false,
@@ -961,6 +1141,8 @@ pub struct ChunkStore {
     pub last_tick: Option<(u64, u64)>,
     /// Last failed rewrite's cause, cleared by a successful rewrite.
     pub rewrite_error: Option<String>,
+    /// A partial retirement prefix needs discharge by a known-live rewrite before retry.
+    pub incomplete_retiring: bool,
 }
 impl ChunkStore {
     pub fn new(dir: PathBuf) -> Self {
@@ -980,6 +1162,7 @@ impl ChunkStore {
             stable_since: None,
             last_tick: None,
             rewrite_error: None,
+            incomplete_retiring: false,
         }
     }
     pub fn register(&mut self, id: u64, k: &Key, v: u64) {
@@ -996,6 +1179,42 @@ impl ChunkStore {
             Some(c) => c.append(&CatRecord { at_ms, rec }),
             None => Err(io::Error::other("catalogue not open")),
         }
+    }
+    /// Publish the entire transition before the caller applies any of its effects.
+    pub fn log_retiring(
+        &mut self,
+        at_ms: u64,
+        seq: u64,
+        next: u64,
+        horizons: &[(String, String, u64)],
+        expired: &[Key],
+    ) -> io::Result<()> {
+        if self.incomplete_retiring {
+            self.rewrite_live(at_ms, next)?;
+        }
+        let records = retiring_records(at_ms, seq, next, horizons, expired);
+        self.incomplete_retiring = records.len() > 1;
+        for record in records {
+            self.log(record.at_ms, record.rec)?;
+        }
+        self.incomplete_retiring = false;
+        Ok(())
+    }
+    /// The live list omits unapplied prefixes; a failed rewrite preserves their retry fence.
+    pub fn rewrite_live(&mut self, now: u64, next: u64) -> io::Result<()> {
+        let live = self.live_list(now, next);
+        let result = match self.cat.as_mut() {
+            Some(cat) => cat.rewrite(&live),
+            None => Err(io::Error::other("catalogue not open")),
+        };
+        match &result {
+            Ok(()) => {
+                self.incomplete_retiring = false;
+                self.rewrite_error = None;
+            }
+            Err(error) => self.rewrite_error = Some(error.to_string()),
+        }
+        result
     }
     pub fn cat_bytes(&self) -> u64 {
         self.cat.as_ref().map_or(0, |c| c.bytes)
@@ -1018,10 +1237,7 @@ impl ChunkStore {
                 out.push(CatRecord { at_ms: close, rec: Rec::Close { seq: c.id, bytes: c.bytes, next } });
             }
             if c.state == ChunkState::Retiring {
-                out.push(CatRecord {
-                    at_ms: c.retired_ms.unwrap_or(now),
-                    rec: Rec::Retiring { seq: c.id, next, horizons: c.horizons.clone(), expired: c.expired.clone() },
-                });
+                out.extend(retiring_records(c.retired_ms.unwrap_or(now), c.id, next, &c.horizons, &c.expired));
             }
         }
         // Payload: kind + at_ms + count, then length-prefixed UTF-8 pairs and versions.
@@ -1103,6 +1319,9 @@ const K: [u32; 64] = [
     0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
     0xc67178f2,
 ];
+impl Default for Sha256 {
+    fn default() -> Self { Self::new() }
+}
 impl Sha256 {
     pub fn new() -> Self {
         Self {
@@ -1133,8 +1352,8 @@ impl Sha256 {
             let t2 = s0.wrapping_add(maj);
             s = [t1.wrapping_add(t2), s[0], s[1], s[2], s[3].wrapping_add(t1), s[4], s[5], s[6]];
         }
-        for i in 0..8 {
-            self.state[i] = self.state[i].wrapping_add(s[i]);
+        for (state, value) in self.state.iter_mut().zip(s) {
+            *state = state.wrapping_add(value);
         }
     }
     pub fn update(&mut self, mut d: &[u8]) {
@@ -1166,7 +1385,7 @@ impl Sha256 {
         self.update(&pad);
         self.len = len;
         let mut bytes = [0; 32];
-        for (word, out) in self.state.iter().zip(bytes.chunks_exact_mut(4)) {
+        for (word, out) in self.state.iter().zip(bytes.as_chunks_mut::<4>().0) {
             out.copy_from_slice(&word.to_be_bytes());
         }
         bytes
@@ -1339,5 +1558,110 @@ mod catalogue_failure_tests {
         assert!(c.append(&record(2)).is_err());
         assert_eq!(fs::read(&c.path).unwrap(), before);
         assert_eq!(fs::read(append_pending_path(&c.path)).unwrap(), b"MBC");
+    }
+}
+
+#[cfg(test)]
+mod retiring_parts_tests {
+    use super::*;
+
+    fn part(index: u32, count: u32) -> CatRecord {
+        CatRecord {
+            at_ms: 123,
+            rec: Rec::RetiringPart {
+                seq: 2,
+                next: 50,
+                index,
+                count,
+                horizons: vec![("ns".into(), format!("h{index}"), 30 + index as u64)],
+                expired: vec![("ns".into(), format!("e{index}"))],
+            },
+        }
+    }
+
+    #[test]
+    fn retiring_parts_codec_and_utf8_sizes_are_bounded() {
+        let h = vec![("界".repeat(341), "é".repeat(512), 7); 9000];
+        let e = vec![("界".repeat(341), "é".repeat(512)); 9000];
+        let records = retiring_records(123, 2, 50, &h, &e);
+        assert!(records.len() > 2);
+        for row in &records {
+            let frame = encode_bounded(row).unwrap();
+            assert!(frame.len() - 16 <= MAX_FRAME);
+            assert_eq!(decode_payload(&frame[16..]).unwrap(), *row);
+        }
+        assert!(encode(&records[0]).len() - 16 > MAX_FRAME - 2100);
+        let (logical, incomplete) = committed_records(records);
+        assert!(!incomplete);
+        assert_eq!(
+            logical,
+            vec![CatRecord {
+                at_ms: 123,
+                rec: Rec::Retiring {
+                    seq: 2,
+                    next: 50,
+                    horizons: h,
+                    expired: e
+                }
+            }]
+        );
+        for invalid in [part(0, 0), part(2, 2)] {
+            assert!(decode_payload(&encode(&invalid)[16..]).is_err());
+        }
+        let old = retiring_records(123, 2, 50, &[], &[]);
+        assert!(matches!(old[0].rec, Rec::Retiring { .. }));
+        assert_eq!(committed_records(old.clone()), (old, false));
+    }
+
+    #[test]
+    fn retiring_parts_incomplete_sets_cannot_publish_or_mix_attempts() {
+        let other = CatRecord {
+            at_ms: 124,
+            rec: Rec::Next(90),
+        };
+        for bad in [
+            vec![part(0, 3)],
+            vec![part(1, 3), part(2, 3)],
+            vec![part(0, 3), part(2, 3)],
+            vec![part(0, 3), part(1, 3), part(1, 3), part(2, 3)],
+        ] {
+            assert_eq!(committed_records(bad), (vec![], true));
+        }
+        let mut changed_time = part(1, 2);
+        changed_time.at_ms += 1;
+        let mut changed_next = part(1, 2);
+        if let Rec::RetiringPart { next, .. } = &mut changed_next.rec {
+            *next += 1;
+        }
+        let mut changed_seq = part(1, 2);
+        if let Rec::RetiringPart { seq, .. } = &mut changed_seq.rec {
+            *seq += 1;
+        }
+        for mismatched in [changed_time, changed_next, changed_seq, part(1, 3)] {
+            assert_eq!(
+                committed_records(vec![part(0, 2), mismatched]),
+                (vec![], true)
+            );
+        }
+        assert_eq!(
+            committed_records(vec![part(0, 2), other.clone(), part(1, 2)]),
+            (vec![other], true)
+        );
+        let (complete, incomplete) = committed_records(vec![part(0, 2), part(0, 2), part(1, 2)]);
+        assert!(incomplete);
+        assert_eq!(complete.len(), 1);
+        match &complete[0].rec {
+            Rec::Retiring {
+                horizons, expired, ..
+            } => {
+                assert_eq!(
+                    horizons.len(),
+                    2,
+                    "the abandoned first part is not combined with the retry"
+                );
+                assert_eq!(expired.len(), 2);
+            }
+            _ => panic!("a complete set must become one retirement"),
+        }
     }
 }
