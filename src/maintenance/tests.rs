@@ -120,10 +120,6 @@ use crate as bus;
 mod retiring_fixture;
 
 #[cfg(windows)]
-#[path = "../../tests/support/child.rs"]
-mod retiring_child;
-
-#[cfg(windows)]
 #[test]
 fn retiring_parts_crash_writer() {
     let Ok(handoff) = std::env::var("MEMBUS_RETIRING_CRASH_HANDOFF") else {
@@ -154,7 +150,17 @@ fn retiring_parts_crash_writer() {
 #[cfg(windows)]
 #[test]
 fn retiring_parts_abrupt_process_exit_replays_prefix_then_retires() {
+    use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
+    // This child runs the Store witness without helper processes. Keep its handle through
+    // every assertion so panic/timeout also terminates and reaps that process.
+    struct PartWriter(std::process::Child);
+    impl Drop for PartWriter {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
     let root = retiring_fixture::path("retiring-crash-handoff");
     fs::create_dir_all(&root).unwrap();
     let handoff = root.join("state-path.txt");
@@ -169,9 +175,18 @@ fn retiring_parts_abrupt_process_exit_replays_prefix_then_retires() {
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    let mut child = retiring_child::Owned::spawn(&mut command).unwrap();
-    let (status, forced) = child.wait(Duration::from_secs(60)).unwrap();
-    assert!(!forced, "the crash witness exceeded its deadline");
+    let mut child = PartWriter(command.creation_flags(0x08000000).spawn().unwrap());
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the crash witness exceeded its deadline"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
     assert!(
         status.success(),
         "the part writer failed before its abrupt exit"
@@ -197,7 +212,7 @@ fn retiring_parts_abrupt_process_exit_replays_prefix_then_retires() {
         s.chunk_rows().iter().find(|row| row.0 == 2).unwrap().3,
         "Retired"
     );
-    println!("abrupt part-writer exit observed; child waited and Job settled; prefix ignored and retirement retried");
+    println!("abrupt part-writer exit observed; direct child waited and reaped; prefix ignored and retirement retried");
 }
 
 #[test]
