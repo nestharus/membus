@@ -959,6 +959,8 @@ pub struct ChunkStore {
     pub degraded: Option<String>,
     pub stable_since: Option<(u64, u64)>,
     pub last_tick: Option<(u64, u64)>,
+    /// Last failed rewrite's cause, cleared by a successful rewrite.
+    pub rewrite_error: Option<String>,
 }
 impl ChunkStore {
     pub fn new(dir: PathBuf) -> Self {
@@ -977,6 +979,7 @@ impl ChunkStore {
             degraded: None,
             stable_since: None,
             last_tick: None,
+            rewrite_error: None,
         }
     }
     pub fn register(&mut self, id: u64, k: &Key, v: u64) {
@@ -1021,9 +1024,20 @@ impl ChunkStore {
                 });
             }
         }
-        let horizons: Vec<_> = self.horizons.iter().map(|((n, k), v)| (n.clone(), k.clone(), *v)).collect();
-        if !horizons.is_empty() {
-            out.push(CatRecord { at_ms: now, rec: Rec::Horizons(horizons) });
+        // Payload: kind + at_ms + count, then length-prefixed UTF-8 pairs and versions.
+        let mut part = Vec::new();
+        let mut bytes = 13usize;
+        for ((ns, key), version) in &self.horizons {
+            let size = 16usize.saturating_add(ns.len()).saturating_add(key.len());
+            if !part.is_empty() && bytes.checked_add(size).is_none_or(|n| n > MAX_FRAME) {
+                out.push(CatRecord { at_ms: now, rec: Rec::Horizons(std::mem::take(&mut part)) });
+                bytes = 13;
+            }
+            bytes = bytes.saturating_add(size);
+            part.push((ns.clone(), key.clone(), *version));
+        }
+        if !part.is_empty() {
+            out.push(CatRecord { at_ms: now, rec: Rec::Horizons(part) });
         }
         for (at, keys) in &self.summaries.list {
             // Payload: kind + at_ms + retired_ms + count, then length-prefixed UTF-8 pairs.

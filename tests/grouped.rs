@@ -17,6 +17,39 @@ fn mutation(i: usize) -> Mutation {
     }
 }
 #[test]
+fn invalid_ack_refuses_whole_batch_before_admission() {
+    for invalid_op in [PUT, CONDITIONAL_PUT, REMOVE] {
+        for invalid_ack in [3, 255] {
+            for invalid_first in [false, true] {
+                let s = Store::open(&path("invalid-ack"), Config::default()).unwrap();
+                let mut payload = (now_ms() + 10_000).to_le_bytes().to_vec();
+                lp(&mut payload, b"batch");
+                lp(&mut payload, b"example");
+                payload.extend(2u16.to_le_bytes());
+                let valid = (PUT, "valid", "accepted", 1);
+                let invalid = (invalid_op, "invalid", "bad", invalid_ack);
+                let items = if invalid_first { [invalid, valid] } else { [valid, invalid] };
+                for (op, id, key, ack) in items {
+                    payload.push(op);
+                    lp(&mut payload, id.as_bytes());
+                    lp(&mut payload, key.as_bytes());
+                    payload.push(ack);
+                    if op != PUT { payload.extend(0u64.to_le_bytes()); }
+                    if op != REMOVE { lp(&mut payload, b"canary"); }
+                }
+                let reply = s.dispatch(&frame(BATCH, 1, &payload)[4..]);
+                assert_eq!(u16::from_le_bytes(reply[17..19].try_into().unwrap()), 3,
+                    "out-of-domain acknowledgment must refuse the request");
+                assert!(s.get("example", "accepted").is_none());
+                assert!(s.get("example", "bad").is_none());
+                assert_eq!(s.io_metrics(), (0, 0, 0));
+                assert_eq!(s.health2().dedup_entries, 0);
+                assert_eq!(s.slots("example"), (0, 0));
+            }
+        }
+    }
+}
+#[test]
 fn covering_flush_groups_and_hot_reads() {
     let s = Arc::new(Store::open(&path("cover"), Config::default()).unwrap());
     let start = Instant::now();

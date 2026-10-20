@@ -43,6 +43,50 @@ fn reopen(p: &Path, c: Config) -> Store {
     let _ = fs::remove_file(p.join("owner.lock"));
     Store::open(p, c).unwrap()
 }
+#[test]
+fn horizon_rewrite_splits_large_metadata_and_replays_both_forms() {
+    use membus::chunks::{CatRecord, Catalogue, ChunkStore, Rec};
+    let p = path("horizon-rewrite");
+    let dir = p.join("chunks");
+    fs::create_dir_all(&dir).unwrap();
+    let mut chunks = ChunkStore::new(dir.clone());
+    for n in 0..17_000 {
+        chunks.horizons.insert(("aggregate".into(), format!("{n:08}{}", "k".repeat(1016))), n + 1);
+    }
+    // UTF-8 byte sizes, including a key at the identifier limit.
+    chunks.horizons.insert(("aggregate".into(), "é".repeat(MAX_ID / 2)), 20_000);
+    let aggregate = CatRecord { at_ms: 10, rec: Rec::Horizons(chunks.horizons.iter()
+        .map(|((ns, key), v)| (ns.clone(), key.clone(), *v)).collect()) };
+    assert!(chunks::encode(&aggregate).len() - 16 > MAX_FRAME);
+    let live = chunks.live_list(20, 50_000);
+    let mut catalogue = Catalogue::open(&dir.join("catalogue.log")).unwrap();
+    catalogue.rewrite(&live).expect("accepted aggregate horizons must be rewritable");
+    drop(catalogue);
+    let (records, torn) = chunks::read_catalogue(&dir.join("catalogue.log")).unwrap();
+    assert!(torn.is_none());
+    let parts: Vec<_> = records.iter().filter_map(|r| match &r.rec {
+        Rec::Horizons(h) => Some(h), _ => None,
+    }).collect();
+    assert!(parts.len() > 1);
+    assert!(records.iter().all(|r| chunks::encode(r).len() - 16 <= MAX_FRAME));
+    let saved: Vec<_> = parts.iter().flat_map(|h| h.iter().cloned()).collect();
+    assert_eq!(chunks::horizon_set(&saved), chunks.horizons);
+    let clock = ManualClock::new(now_ms());
+    let s = reopen(&p, config(&clock));
+    assert_eq!(s.replay_report().horizons, chunks.horizons.len());
+    assert!(s.mutate(put("after", "after", b"live")).version >= 50_000);
+    drop(s);
+    // The original on-disk single-record representation remains readable.
+    let old = path("horizon-rewrite-single");
+    fs::create_dir_all(old.join("chunks")).unwrap();
+    let mut cat = Catalogue::open(&old.join("chunks/catalogue.log")).unwrap();
+    cat.append(&CatRecord { at_ms: 10, rec: Rec::Horizons(vec![("old".into(), "key".into(), 7)]) }).unwrap();
+    drop(cat);
+    let s = reopen(&old, config(&clock));
+    assert_eq!(s.replay_report().horizons, 1);
+    println!("{} horizons over {} bytes rewritten into {} bounded records and replayed; single-record replay passed",
+        chunks.horizons.len(), chunks::encode(&aggregate).len() - 16, parts.len());
+}
 fn row(s: &Store, id: u64) -> (u64, usize, String, String, u64) {
     s.chunk_rows().into_iter().find(|r| r.0 == id).unwrap()
 }

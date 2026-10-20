@@ -505,7 +505,7 @@ fn expiry_command(args: &[String]) -> io::Result<()> {
 /// `membus policy PIPE get NS | set NS PREFIX CLASS | clear NS PREFIX` (5.1), over POLICY_GET and POLICY_SET.
 #[cfg(windows)]
 fn policy_command(args: &[String]) -> io::Result<()> {
-    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
     let usage = || io::Error::other("usage: membus policy PIPE get NS | set NS PREFIX forever|latest|expire:MS | clear NS PREFIX");
     let (pipe_name, verb) = (args.first().ok_or_else(usage)?, args.get(1).ok_or_else(usage)?.as_str());
     let ns = args.get(2).ok_or_else(usage)?;
@@ -532,6 +532,14 @@ fn policy_command(args: &[String]) -> io::Result<()> {
             Err(error) => return Err(error),
         }
     };
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetNamedPipeServerProcessId(handle: *mut std::ffi::c_void, pid: *mut u32) -> i32;
+    }
+    let mut pid = 0;
+    if unsafe { GetNamedPipeServerProcessId(file.as_raw_handle(), &mut pid) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
     let mut pipe = pipe_io::Pipe::new(file, 2000);
     let mut payload = (membus::MAX_FRAME as u32).to_le_bytes().to_vec();
     payload.push(0);
@@ -608,6 +616,18 @@ fn health_exchange_limit<S: Read + Write>(stream: &mut S, op: u8, id: u64, paylo
 #[cfg(all(test, windows))]
 mod policy_reply_tests {
     use super::*;
+    #[test]
+    fn policy_get_refuses_ordinary_file_without_writing() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".test-output")
+            .join(format!("policy-file-{}-{}", std::process::id(), membus::now_ms()));
+        fs::create_dir_all(&root).unwrap();
+        let endpoint = root.join("endpoint");
+        let canary = vec![0x5a; 2048];
+        fs::write(&endpoint, &canary).unwrap();
+        let result = policy_command(&[endpoint.to_string_lossy().into_owned(), "get".into(), "example".into()]);
+        assert!(result.is_err(), "ordinary files must be refused");
+        assert_eq!(fs::read(&endpoint).unwrap(), canary, "refusal must precede every write");
+    }
     struct Peer(std::io::Cursor<Vec<u8>>);
     impl Read for Peer { fn read(&mut self,b:&mut[u8])->io::Result<usize>{self.0.read(b)} }
     impl Write for Peer {
