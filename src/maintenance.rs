@@ -1,0 +1,404 @@
+//! Retention, retirement, expiry summaries and the periodic maintenance worker.
+use crate::chunks;
+use crate::routing::ChunkRouter;
+use crate::store::Flags;
+use crate::store::Key;
+use crate::store::State;
+use crate::Config;
+use crate::Value;
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::fs;
+use std::io;
+use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::sync::mpsc;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::RwLock;
+use std::time::Duration;
+use std::time::Instant;
+
+/// Retirement, expiry summaries, tombstone drops and the clock check (5.3, 5.4), shared with the tick thread.
+pub(super) struct Maint {
+    pub(super) state: Arc<Mutex<State>>,
+    pub(super) committed: Arc<RwLock<HashMap<(String, String), Arc<Value>>>>,
+    pub(super) chunks: Arc<Mutex<chunks::ChunkStore>>,
+    pub(super) router: Arc<ChunkRouter>,
+    pub(super) flags: Arc<Flags>,
+    pub(super) clock: chunks::Clock,
+    pub(super) next_issued: Arc<AtomicU64>,
+    pub(super) config: Config,
+    pub(super) path: PathBuf,
+}
+impl Maint {
+    /// Retire closed chunks due by their class, or (forced) one chunk that holds no key's latest record.
+    /// Returns the chunks retired whole; a stopped, kept or held chunk is left out.
+    pub(super) fn retire(&self, forced: Option<u64>) -> io::Result<Vec<u64>> {
+        use chunks::ChunkState;
+        let utc = self.clock.utc_ms();
+        let mono = self.clock.mono_ms();
+        let mut gone: Vec<(Key, u64)> = Vec::new();
+        let mut started: Vec<(u64, PathBuf, u64, Vec<Key>)> = Vec::new();
+        let mut failure = None;
+        {
+            let mut state = self.state.lock().unwrap();
+            let mut cs = self.chunks.lock().unwrap();
+            if forced.is_none() && cs.degraded.is_some() {
+                return Ok(Vec::new());
+            }
+            let ids: Vec<u64> = match forced {
+                Some(id) => vec![id],
+                None => cs.table.keys().copied().collect(),
+            };
+            for id in ids {
+                let Some(c) = cs.table.get(&id) else { continue };
+                if id == chunks::LEGACY_CHUNK || c.state != ChunkState::Closed {
+                    continue;
+                }
+                let expire = forced.is_none() && c.class.kind == 2;
+                if forced.is_none() {
+                    let window = match c.class.kind {
+                        1 => self.config.retry_ms,
+                        2 => c.class.retention_ms,
+                        _ => continue,
+                    };
+                    let Some(close) = c.close_ms else { continue };
+                    // Never earlier than both clocks allow: UTC close time, and monotonic time within this run.
+                    if utc < close.saturating_add(window)
+                        || c.close_mono
+                            .is_some_and(|m| mono.saturating_sub(m) < window)
+                    {
+                        continue;
+                    }
+                }
+                if c.keys.keys().any(|k| state.pending.contains_key(k)) {
+                    continue;
+                }
+                let latest: Vec<Key> = c
+                    .keys
+                    .keys()
+                    .filter(|k| state.metadata.get(*k).is_some_and(|m| m.chunk == id))
+                    .cloned()
+                    .collect();
+                if !latest.is_empty() && !expire {
+                    continue;
+                }
+                let c = c.clone();
+                let horizons: Vec<(String, String, u64)> = c
+                    .keys
+                    .iter()
+                    .filter(|(k, _)| cs.holders.others(k, id).next().is_some())
+                    .map(|((n, k), (_, max))| (n.clone(), k.clone(), *max))
+                    .collect();
+                let next = self.next_issued.load(Ordering::SeqCst);
+                // Step 1: `retiring` with its horizons and the version high-water, flushed before anything changes.
+                if let Err(e) = cs.log(
+                    utc,
+                    chunks::Rec::Retiring {
+                        seq: id,
+                        next,
+                        horizons: horizons.clone(),
+                        expired: latest.clone(),
+                    },
+                ) {
+                    self.flags.storage_error.store(true, Ordering::SeqCst);
+                    failure = Some(e);
+                    break;
+                }
+                for (n, k, v) in &horizons {
+                    let h = cs.horizons.entry((n.clone(), k.clone())).or_insert(0);
+                    *h = (*h).max(*v);
+                }
+                // Step 2: an expired key leaves the index and frees its slots; a summary keeps it for 30 days.
+                for k in &latest {
+                    if let Some(m) = state.metadata.remove(k) {
+                        state.keys -= 1;
+                        state.committed_bytes -= m.bytes;
+                        if !m.tombstone {
+                            state.release_namespace(&k.0);
+                        }
+                        gone.push((k.clone(), m.version));
+                    }
+                }
+                if !latest.is_empty() {
+                    state.keys += cs.summaries.add(utc, latest.clone());
+                }
+                let info = cs.table.get_mut(&id).unwrap();
+                info.state = ChunkState::Retiring;
+                info.horizons = horizons;
+                info.expired = latest;
+                info.retired_ms = Some(utc);
+                if self.config.retire_stop_after == 1 {
+                    continue;
+                }
+                for k in c.keys.keys() {
+                    cs.holders.remove(k, id);
+                    state.tomb_candidates.insert(k.clone());
+                }
+                started.push((
+                    id,
+                    c.path.clone(),
+                    c.bytes,
+                    c.keys.keys().cloned().collect(),
+                ));
+            }
+        }
+        if !gone.is_empty() {
+            let mut committed = self.committed.write().unwrap();
+            for (k, v) in gone {
+                if committed.get(&k).is_some_and(|x| x.version == v) {
+                    committed.remove(&k);
+                }
+            }
+        }
+        // Steps 3 and 4: delete the file, then `retired`. A held delete stays retiring and is retried.
+        let mut done = Vec::new();
+        let mut freed = 0;
+        {
+            let mut cs = self.chunks.lock().unwrap();
+            for (id, p, bytes, keys) in started {
+                if failure.is_some() {
+                    break;
+                }
+                match fs::remove_file(&p) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(_) => {
+                        cs.table
+                            .get_mut(&id)
+                            .unwrap()
+                            .blocked_since
+                            .get_or_insert(utc);
+                        continue;
+                    }
+                }
+                if self.config.retire_stop_after == 2 {
+                    continue;
+                }
+                if let Err(e) = cs.log(utc, chunks::Rec::Retired { seq: id }) {
+                    self.flags.storage_error.store(true, Ordering::SeqCst);
+                    failure = Some(e);
+                    break;
+                }
+                let info = cs.table.get_mut(&id).unwrap();
+                info.state = ChunkState::Retired;
+                info.keys.clear();
+                info.blocked_since = None;
+                cs.retired_chunks += 1;
+                cs.retired_bytes += bytes;
+                freed += bytes;
+                done.push(id);
+                // A horizon whose key no retained chunk holds has nothing left to hide.
+                for k in keys {
+                    if !cs.holders.map.contains_key(&k) {
+                        cs.horizons.remove(&k);
+                    }
+                }
+            }
+        }
+        if freed > 0 {
+            let mut state = self.state.lock().unwrap();
+            state.persisted_bytes = state.persisted_bytes.saturating_sub(freed);
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(done),
+        }
+    }
+    /// Retry the held deletes; a retiring chunk's index work and horizons are already done.
+    pub(super) fn retry_retiring(&self) -> io::Result<usize> {
+        let mut cs = self.chunks.lock().unwrap();
+        let ids: Vec<u64> = cs
+            .table
+            .values()
+            .filter(|c| c.state == chunks::ChunkState::Retiring)
+            .map(|c| c.id)
+            .collect();
+        let mut done = 0;
+        let mut freed = 0;
+        let mut failure = None;
+        for id in ids {
+            let (p, bytes) = (cs.table[&id].path.clone(), cs.table[&id].bytes);
+            match fs::remove_file(&p) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(_) => continue,
+            }
+            let now = self.clock.utc_ms();
+            if let Err(e) = cs.log(now, chunks::Rec::Retired { seq: id }) {
+                self.flags.storage_error.store(true, Ordering::SeqCst);
+                failure = Some(e);
+                break;
+            }
+            let info = cs.table.get_mut(&id).unwrap();
+            info.state = chunks::ChunkState::Retired;
+            info.keys.clear();
+            info.blocked_since = None;
+            cs.retired_chunks += 1;
+            cs.retired_bytes += bytes;
+            freed += bytes;
+            done += 1;
+        }
+        drop(cs);
+        let mut state = self.state.lock().unwrap();
+        state.persisted_bytes = state.persisted_bytes.saturating_sub(freed);
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(done),
+        }
+    }
+    /// Drop tombstone index entries no other retained chunk can contradict (5.3), and expired summaries.
+    pub(super) fn drop_tombstones(&self) {
+        let utc = self.clock.utc_ms();
+        let mut gone = Vec::new();
+        {
+            let mut state = self.state.lock().unwrap();
+            let mut cs = self.chunks.lock().unwrap();
+            let freed = cs.summaries.expire(utc, self.config.summary_ms);
+            state.keys -= freed;
+            let candidates: Vec<Key> = state.tomb_candidates.drain().collect();
+            for k in candidates {
+                if state.pending.contains_key(&k) {
+                    state.tomb_candidates.insert(k);
+                    continue;
+                }
+                let Some(m) = state.metadata.get(&k) else {
+                    continue;
+                };
+                if !m.tombstone {
+                    continue;
+                }
+                let others: Vec<u64> = cs.holders.others(&k, m.chunk).collect();
+                if others.is_empty() {
+                    let m = state.metadata.remove(&k).unwrap();
+                    state.keys -= 1;
+                    state.committed_bytes -= m.bytes;
+                    gone.push((k, m.version));
+                } else if others.iter().all(|c| {
+                    *c != chunks::LEGACY_CHUNK && cs.table.get(c).is_some_and(|i| i.class.finite())
+                }) {
+                    // Older records in finite chunks retire in time; one in a forever chunk never does.
+                    state.tomb_candidates.insert(k);
+                }
+            }
+        }
+        if !gone.is_empty() {
+            let mut committed = self.committed.write().unwrap();
+            for (k, v) in gone {
+                if committed.get(&k).is_some_and(|x| x.version == v) {
+                    committed.remove(&k);
+                }
+            }
+        }
+    }
+    /// One tick's clock check (5.4): a stable run of a rotation age, or `expiry.resume`, ends a pause.
+    pub(super) fn clock_tick(&self) {
+        let utc = self.clock.utc_ms();
+        let mono = self.clock.mono_ms();
+        let mut cs = self.chunks.lock().unwrap();
+        match cs.last_tick {
+            Some((u0, m0)) => {
+                let drift = (utc as i128 - u0 as i128) - (mono as i128 - m0 as i128);
+                if drift.abs() <= 2000 {
+                    cs.stable_since.get_or_insert((utc, mono));
+                } else {
+                    cs.stable_since = None;
+                }
+            }
+            None => cs.stable_since = Some((utc, mono)),
+        }
+        cs.last_tick = Some((utc, mono));
+        let resume_file = self.path.join("expiry.resume");
+        let resume = resume_file.exists();
+        let stable = cs
+            .stable_since
+            .is_some_and(|(_, m)| mono.saturating_sub(m) >= self.config.rotation_ms);
+        if cs.degraded.is_some() && (resume || stable) && cs.log(utc, chunks::Rec::Resume).is_ok() {
+            cs.degraded = None;
+            self.flags.expiry_degraded.store(false, Ordering::SeqCst);
+        }
+        if resume {
+            let _ = fs::remove_file(resume_file);
+        }
+    }
+    /// The 10 s pass: held deletes, chunks due, tombstones and summaries.
+    pub(super) fn pass(&self) {
+        let _ = self.retry_retiring();
+        let _ = self.retire(None);
+        self.drop_tombstones();
+    }
+    pub(super) fn prune_discharged(&self) {
+        let state = self.state.lock().unwrap();
+        let mut cs = self.chunks.lock().unwrap();
+        let referenced: HashSet<u64> = state.metadata.values().map(|m| m.chunk).collect();
+        let ids: HashSet<u64> = cs
+            .table
+            .values()
+            .filter(|c| c.state == chunks::ChunkState::Retired && !referenced.contains(&c.id))
+            .map(|c| c.id)
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        // Retirement requires no pending key belonging to a closed chunk. Mutation keeps that
+        // reservation through append completion AND any delayed flush notice/result. Therefore a
+        // durably Retired sink has no outstanding Store waiter; Retiring/closed sinks are retained.
+        self.router
+            .table
+            .write()
+            .unwrap()
+            .retain(|id, _| !ids.contains(&(*id as u64)));
+        cs.table.retain(|id, _| !ids.contains(id));
+        cs.holders.map.retain(|_, holders| {
+            holders.retain(|id| !ids.contains(id));
+            !holders.is_empty()
+        });
+        let held: HashSet<_> = cs.holders.map.keys().cloned().collect();
+        cs.horizons.retain(|key, _| held.contains(key));
+    }
+    /// A catalogue past its size is rewritten to the live list (5.2).
+    pub(super) fn rewrite_catalogue(&self) {
+        let mut cs = self.chunks.lock().unwrap();
+        let at = self.config.catalogue_rewrite_bytes;
+        if cs.cat.as_ref().is_some_and(|cat| cat.needs_rewrite(at)) {
+            let live = cs.live_list(self.clock.utc_ms(), self.next_issued.load(Ordering::SeqCst));
+            if let Some(cat) = cs.cat.as_mut() {
+                cs.rewrite_error = match cat.rewrite(&live) {
+                    Ok(()) => None,
+                    Err(error) => {
+                        self.flags.storage_error.store(true, Ordering::SeqCst);
+                        Some(error.to_string())
+                    }
+                };
+            }
+        }
+    }
+}
+
+impl Maint {
+    pub(super) fn start(self: &Arc<Self>) -> (mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        let (tick_stop, tick_receiver) = mpsc::channel();
+        let tick_maint = self.clone();
+        let tick_every = Duration::from_millis(self.config.tick_ms.max(1));
+        let retire_every = Duration::from_millis(self.config.retire_ms);
+        let ticker = std::thread::spawn(move || {
+            let mut last_pass = Instant::now();
+            while matches!(
+                tick_receiver.recv_timeout(tick_every),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ) {
+                tick_maint.router.idle_close();
+                tick_maint.clock_tick();
+                if last_pass.elapsed() >= retire_every {
+                    last_pass = Instant::now();
+                    tick_maint.pass();
+                }
+                tick_maint.rewrite_catalogue();
+                tick_maint.prune_discharged();
+            }
+        });
+        (tick_stop, ticker)
+    }
+}
