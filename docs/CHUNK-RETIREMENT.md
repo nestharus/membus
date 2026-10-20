@@ -102,6 +102,32 @@ It selects closed eligible chunks, skips keys with pending operations, and:
 3. Deletes the file.
 4. Publishes Retired, then releases retained-byte accounting.
 
+Large Retiring transitions use indexed `RetiringPart` records (catalogue kind 10).
+Each payload is at most the 16 MiB frame bound, measured from encoded UTF-8 bytes
+including length prefixes. Every part carries the same chunk, revision high-water,
+retirement timestamp and part count, and consecutive indices starting at zero.
+The state/catalogue lock covers the whole append sequence. Each append must finish
+its sync and marker resolution before proceeding; only after the final part succeeds
+may horizons, summaries, index entries or chunk state change, or the file be deleted.
+Replay applies a complete consecutive set as one transition. A fresh index zero
+starts a new attempt; parts from different attempts are never combined. The old
+single-record Retiring form still replays unchanged and is used when it fits.
+Live-list rewrites also split retained Retiring transitions and preserve their age.
+Older binaries that do not recognize kind 10 cannot read these new catalogues.
+
+An incomplete set has no logical effect during replay, including on high-water
+marks. Its resolved frames remain on disk until a known-live catalogue rewrite
+omits them. Their physical cost is 57 bytes per part (16-byte frame header plus
+41-byte fixed payload), plus 16 + namespace bytes + key bytes per horizon and
+8 + namespace bytes + key bytes per expired key. These bytes count in catalogue
+size/growth, separately from the chunk-data limit. Before another retirement
+attempt the owner forces this rewrite, even with threshold rewrites disabled;
+the periodic rewrite also discharges a detected prefix. A failed rewrite keeps
+the prefix and its retry requirement, exposes the cause in HEALTH2, and admits
+no replacement transition. After a successful rewrite, the next pass can retry
+retirement from the unchanged live state. Unresolved append markers still refuse
+startup as described below; ignoring resolved partial sets does not bypass that fence.
+
 Selection/catalogue work holds the state and chunk locks; deletion holds the
 chunk lock. This is not a separate retirement I/O pool. Current reads/snapshots
 use memory, so they do not hold chunk file handles. External handles can still
