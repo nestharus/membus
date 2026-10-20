@@ -422,15 +422,12 @@ fn main() -> io::Result<()> {
 #[cfg(windows)]
 fn health_command(args: &[String]) -> io::Result<()> {
     use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
-    if args.len() != 1 && !(args.len() == 3 && args[1] == "--state-dir") {
+    if !(args.len() == 3 && args[1] == "--state-dir") {
         return Err(io::Error::other(
-            "usage: membus health PIPE [--state-dir PATH]",
+            "usage: membus health PIPE --state-dir PATH",
         ));
     }
-    let state = args
-        .get(2)
-        .map(String::as_str)
-        .unwrap_or("D:/projects/membus/state");
+    let state = args[2].as_str();
     let connect_until = std::time::Instant::now() + std::time::Duration::from_secs(2);
     let file = loop {
         match fs::OpenOptions::new()

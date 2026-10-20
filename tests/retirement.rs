@@ -269,7 +269,7 @@ fn t5_thousand_key_run_slots_and_retained_bytes() {
     let (keys, live) = s.slots("ledger");
     assert_eq!(live, 0);
     assert!(keys < base_keys + 1000, "{keys}");
-    println!("T5: 3,000 records; live slots 0 after removes; retained {before} B -> {after} B after retirement (F-E6-48: 680,000 B); tombstone entries left {}", keys - base_keys);
+    println!("T5: 3,000 records; live slots 0 after removes; retained {before} B -> {after} B after retirement (measured production baseline: 680,000 B); tombstone entries left {}", keys - base_keys);
 }
 
 #[test]

@@ -5,6 +5,5 @@ __pycache__/
 /target/
 **/target/
 **/__pycache__/
-/measurements/raw/
 *.bin
 /.test-output/

@@ -116,18 +116,19 @@ def copy_state(source, to):
             shutil.copyfile(source / name, to / name)
 
 
-def policies(latest):
-    """The first policies: lane 88's (claude6-eco row 2029 items 5-6), eco's test namespaces expire(1 d) (5.1), the
-    lease namespaces latest until the combined qualification (5.4). Everything else stays forever."""
-    lines = ['# lane 88 (claude6-eco row 2029 item 5)',
+def policies(latest, expiring=()):
+    """The first policies: the machine tools' quota, slots and capacity families; the caller-named test namespaces
+    expire(1 d); the lease namespaces latest until the combined qualification. Everything else stays forever.
+    expiring holds exact namespace names, or prefixes ending in '*'."""
+    lines = ['# machine tools: quota, slots and capacity',
              'quota\tevent/\texpire:259200000', 'slots\tevent/\texpire:259200000', 'capacity\tevent/\texpire:259200000',
              'quota-test\t\texpire:259200000',
              'quota\tstate/\tlatest', 'quota\topen\tlatest', 'quota\tresets\tlatest', 'quota\ttokens/\tlatest',
              'quota\tfit/\tlatest', 'slots\t\tlatest',
-             '# membus-leases (5.4)', 'lease-claims\t\tlatest', 'lease-control\t\tlatest',
-             '# eco test namespaces (5.1)']
+             '# membus-leases', 'lease-claims\t\tlatest', 'lease-control\t\tlatest',
+             '# test namespaces']
     for ns in sorted({k[0] for k in latest}):
-        if ns.startswith('e6-resident-restart-') or ns in ('e6-install-proof', 'F-E6-33-health'):
+        if any(ns.startswith(e[:-1]) if e.endswith('*') else ns == e for e in expiring):
             lines.append(f'{ns}\t\texpire:{DAY}')
     return '\n'.join(lines) + '\n'
 
@@ -142,6 +143,8 @@ def main():
     p.add_argument('--old-binary', required=True)
     p.add_argument('--state', required=True, help='the production state folder, read only')
     p.add_argument('--output', required=True)
+    p.add_argument('--expire-namespaces', nargs='*', default=[],
+                   help="test namespaces in the source state that get expire(1 d): exact names or prefixes ending in '*'")
     args = p.parse_args()
     out = pathlib.Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
@@ -152,7 +155,7 @@ def main():
     model_live = live_counts(latest)
     results = dict(source=args.state, legacy_files={n: (base / n).stat().st_size for n in original}, legacy_sha256=original,
                    records=len(records), keys=len(latest), live=sum(model_live.values()), namespaces=model_live)
-    policy_text = policies(latest)
+    policy_text = policies(latest, args.expire_namespaces)
     (out / 'import-policies.txt').write_text(policy_text, encoding='utf8')
 
     # Before: the previous binary serves the copy as the model reads it.

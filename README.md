@@ -31,8 +31,8 @@ Another terminal can check transport and heartbeat together:
 .\target\release\membus.exe health '\\.\pipe\membus-example' --state-dir $state
 ```
 
-Set `$state` to the same directory in that terminal. Always pass `--state-dir`
-to health so it inspects the intended instance. For loopback tests, the server
+Set `$state` to the same directory in that terminal. Health requires
+`--state-dir`, so it always inspects the intended instance. For loopback tests, the server
 also accepts `membus STATE_DIR tcp 127.0.0.1:PORT`. Windows named pipes reject
 remote clients and grant access to the resident's current user and LocalSystem.
 Loopback TCP provides no application authentication. Endpoint selection and

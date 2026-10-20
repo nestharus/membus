@@ -61,11 +61,11 @@ def run(args):
         c.put('quota','state/ignore',b'ignore')
         c.put('quota','event/mem',b'mem',ack=0)
         start=time.perf_counter()
-        v=c.put('quota','event/1791590000000-1',b'{"kind":"reopening","profile":"claude2"}',op_id='reopen-1')
+        v=c.put('quota','event/1791590000000-1',b'{"kind":"reopening","profile":"profile-a"}',op_id='reopen-1')
         event=l.receive(timeout=1)
         latency=(time.perf_counter()-start)*1000
         assert event['key']=='event/1791590000000-1' and event['version']==v['version']
-        assert event['subscription']==sub and event['namespace']=='quota' and event['value']==b'{"kind":"reopening","profile":"claude2"}' and latency<1000
+        assert event['subscription']==sub and event['namespace']=='quota' and event['value']==b'{"kind":"reopening","profile":"profile-a"}' and latency<1000
         c.put('quota','event/1791590000000-1',event['value'],op_id='reopen-1')
         assert status(c,sub,{'written'})['written']==1
         result['tests'].append(dict(name='filtered reopening under one second; mem/other-prefix/other-namespace/duplicate excluded',pass_condition='matching event only, unchanged write id not signalled twice, latency<1000ms',latency_ms=latency))
@@ -101,7 +101,7 @@ def run(args):
         c.unsubscribe('quota',r3['subscription']);l3.close()
         result['tests'].append(dict(name='key-only and remove',pass_condition='value absent, remove flag and version correct'))
         # Same writer path with a missing endpoint, then a connected but unread pipe.
-        dead=c.subscribe('quota',r'\\.\pipe\LOCAL\membus-F-E6-33-missing','bench/')['subscription']
+        dead=c.subscribe('quota',server.address+'-missing','bench/')['subscription']
         result['cases']['dead']=writers(c,'dead')
         result['cases']['dead']['status']={k:v for k,v in status(c,dead,{'failed'}).items() if k!='cursor'}
         slow=listener(); slow_sub=c.subscribe('quota',slow.endpoint,'bench/',include_value=True)['subscription']

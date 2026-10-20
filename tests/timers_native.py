@@ -165,9 +165,9 @@ def run(args):
             note='1440-fire extrapolation; decimal epoch/generation/index digits affect op_id lengths; setup/cancel extra; logical append not physical I/O')
         check('cancel persists across restart',c.timer_status('quota','jitter') is None)
         check('fire creates no quota KV event key',c.get('quota','timer/restart') is None and c.get('quota','timer/once') is None)
-        # Current lane88 source uses unchanged put/get/subscribe/scan/status calls on new build.
+        # The machine tools' current quota publisher and forwarder use unchanged put/get/subscribe/scan/status calls on the new build.
         os.environ.update(PILLARS_HOME=str(out/'pillars'),QUOTA_BUS_PIPE=restarted.address,QUOTA_BUS_TASK='',MEMBUS_PY=str(ROOT/'python'))
-        sys.path.insert(0,'D:/projects/machine-tools/trunk')
+        sys.path.insert(0,str(pathlib.Path(args.machine_tools)))
         import quotabus,quotafwd
         lr=listener();c.subscribe('quota',lr.endpoint,'event/',include_value=True)
         key=f'event/{int(time.time()*1000):016d}-private-1'
@@ -175,7 +175,7 @@ def run(args):
         got=[];forwarder=quotafwd.Forwarder(pipe=restarted.address,forward=True,notify=lambda kinds:got.append(kinds),state_path=out/'forwarder.json',log=lambda *a:None)
         forwarder.deliver([forwarder.take(event['key'],event['value'])],'pushed');forwarder.save()
         forwarder.scan_since(c)
-        check('lane88 actual publisher and forwarder calls',sent=='ok 1' and got==[['opened']],publisher=sent,notifications=got)
+        check('machine tools actual publisher and forwarder calls',sent=='ok 1' and got==[['opened']],publisher=sent,notifications=got)
         result['cases']['source_hashes']={str(path):hashlib.sha256(path.read_bytes()).hexdigest() for path in [ROOT/'python/membus.py',ROOT/'src/timers.rs',pathlib.Path(quotabus.__file__),pathlib.Path(quotafwd.__file__)]}
         small=start('dedup',flags=('--dedup-cap','3'))
         sc=small.client;sl=listener();sc.subscribe('test',sl.endpoint,'timer/',include_value=True)
@@ -211,4 +211,4 @@ def run(args):
         (out/'timers-native.json').write_text(json.dumps(result,indent=2,default=serial)+'\n',encoding='utf8')
     print(json.dumps(dict(passed=True,tests=len(result['tests']),output=str(out/'timers-native.json'))))
 if __name__=='__main__':
-    parser=argparse.ArgumentParser();parser.add_argument('--binary',required=True);parser.add_argument('--output',required=True);parser.add_argument('--old-client');parser.add_argument('--old-binary');run(parser.parse_args())
+    parser=argparse.ArgumentParser();parser.add_argument('--binary',required=True);parser.add_argument('--output',required=True);parser.add_argument('--old-client');parser.add_argument('--old-binary');parser.add_argument('--machine-tools',required=True,help='checkout holding the quota publisher (quotabus.py) and forwarder (quotafwd.py)');run(parser.parse_args())

@@ -123,7 +123,7 @@ fn new_import_covers_original_flush_retry_history_before_readonly_backup_switch(
     assert_eq!(store.mutate(original), outcome);
     assert_eq!(store.get("ledger", "state").unwrap().version, 12);
 }
-/// A production-shaped legacy state: lane 88's families, a ledger, a removed key; recent and older records.
+/// A production-shaped legacy state: the machine tools' quota and slots families, a ledger, a removed key; recent and older records.
 fn legacy_state(dir: &Path) -> (HashMap<(String, String), (u64, bool, Vec<u8>)>, Rec) {legacy_state_with_probe_id(dir,None)}
 fn legacy_state_with_probe_id(dir: &Path, probe_id: Option<&str>) -> (HashMap<(String, String), (u64, bool, Vec<u8>)>, Rec) {
     legacy_state_with_probe_ids(dir,probe_id,None)
@@ -171,7 +171,7 @@ fn legacy_state_with_probe_ids(dir: &Path, probe_id: Option<&str>, next_id: Opti
 fn policies(dir: &Path) {
     fs::write(
         dir.join("import-policies.txt"),
-        "# lane 88, claude6-eco row 2029 items 5-6\nquota\tevent/\texpire:259200000\nslots\tevent/\texpire:259200000\nquota\tstate/\tlatest\nquota\topen\tlatest\nslots\t\tlatest\n",
+        "# machine tools: quota and slots event retention\nquota\tevent/\texpire:259200000\nslots\tevent/\texpire:259200000\nquota\tstate/\tlatest\nquota\topen\tlatest\nslots\t\tlatest\n",
     )
     .unwrap();
 }
