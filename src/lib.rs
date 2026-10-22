@@ -27,6 +27,9 @@ use std::{
     time::{Duration, Instant},
 };
 mod append_owner;
+mod cache;
+mod value_disk;
+pub use cache::{CachePolicy, CacheRule, CacheStats};
 mod codec;
 mod flush_owner;
 mod heartbeat;
@@ -101,6 +104,10 @@ pub struct Log {
 }
 #[derive(Clone)]
 pub struct Config {
+    /// Resident value bytes plus cache bookkeeping; process admission also charges the index and retries.
+    pub cache_bytes: usize,
+    pub cache_policy: CachePolicy,
+    pub cache_rules: Vec<CacheRule>,
     pub signal_history: usize,
     pub signal_bytes: usize,
     pub snapshot_bytes: usize,
@@ -155,6 +162,9 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            cache_bytes: 128 * 1024 * 1024,
+            cache_policy: CachePolicy::default(),
+            cache_rules: cache::defaults(),
             signal_history: 4096,
             signal_bytes: 16 * 1024 * 1024,
             snapshot_bytes: 256 * 1024 * 1024,
@@ -163,7 +173,7 @@ impl Default for Config {
             state_limit_bytes: 8 * 1024 * 1024 * 1024,
             quota: 500_000,
             index_cap: 917_000,
-            capacity: 256 * 1024 * 1024,
+            capacity: 512 * 1024 * 1024,
             queue_bytes: 64 * 1024 * 1024,
             retry_ms: 24 * 3600 * 1000,
             dedup_cap: 262144,
@@ -197,11 +207,17 @@ impl Default for Config {
         }
     }
 }
+impl Config {
+    /// Admission margin for protocol buffers, timer schedules, threads and allocator bookkeeping.
+    pub(crate) fn memory_margin(&self) -> usize { (self.capacity / 8).min(32 * 1024 * 1024) }
+}
 pub struct Store {
     timers: timers::Shared,
     signals: signals::Hub,
     capture_metrics: [AtomicU64; 7],
-    committed: Arc<RwLock<HashMap<(String, String), Arc<Value>>>>,
+    committed: Arc<RwLock<HashMap<(String, String), Arc<value_disk::Entry>>>>,
+    cache: Arc<cache::Cache>,
+    cold_readers: (Mutex<usize>, Condvar),
     scans: Arc<Mutex<ScanState>>,
     scan_usage: Arc<ScanUsage>,
     scan_reaper: Option<(mpsc::Sender<()>, std::thread::JoinHandle<()>)>,
@@ -258,6 +274,9 @@ impl Drop for Store {
 /// HEALTH2 (opcode 27; CHUNK-RETIREMENT.md section 6): the store's state, limits and chunk retirement in one read.
 #[derive(Clone, Debug, Default)]
 pub struct Health2 {
+    pub cache: CacheStats,
+    pub memory_bytes: usize,
+    pub memory_budget: usize,
     pub state_bytes: u64,
     pub state_limit_bytes: u64,
     pub state_high_water: bool,
@@ -305,7 +324,14 @@ fn start_owners(logs: &[Arc<Mutex<Log>>], config: &Config) -> (Vec<AppendHandle>
     start_routed_owners(Arc::new(FixedRoute(logs.to_vec())), logs.len(), config)
 }
 impl Store {
-    pub fn open(path: &Path, config: Config) -> io::Result<Self> {
+    pub fn open(path: &Path, mut config: Config) -> io::Result<Self> {
+        // Change history is optional bounded retention, so it yields to a smaller process budget.
+        config.signal_bytes = config.signal_bytes.min(config.capacity / 8);
+        if config.cache_rules.len() > 64 || config.cache_rules.iter().any(|r| r.label.is_empty()
+            || r.label.len() > MAX_ID || r.label.contains(['=', '\n', '\r'])
+            || r.prefix.len() > MAX_ID || r.namespace.as_ref().is_some_and(|ns| ns.len() > MAX_ID)) {
+            return Err(io::Error::other("invalid cache rules or more than 64 rules"));
+        }
         if config.snapshot_ttl_ms == 0 {
             return Err(io::Error::other("snapshot lifetime must be positive"));
         }
@@ -342,6 +368,7 @@ impl Store {
         let next_issued = Arc::new(AtomicU64::new(next));
         let chunks = Arc::new(Mutex::new(cs));
         let router = Arc::new(ChunkRouter {
+            locations: Mutex::new(HashMap::new()),
             #[cfg(test)]
             selection_hook: Mutex::new(None),
             sinks: (0..4).map(|_| Mutex::new(HashMap::new())).collect(),
@@ -360,8 +387,12 @@ impl Store {
         });
         let (appenders, flush_owner) = start_routed_owners(router.clone(), 4, &config);
         let committed = Arc::new(RwLock::new(committed));
+        let cache = Arc::new(cache::Cache::new(&config, clock.clone()));
+        cache.trim(config.capacity.saturating_sub(state.committed_bytes + state.dedup_bytes
+            + chunks.lock().unwrap().index_bytes + config.memory_margin()));
         let state = Arc::new(Mutex::new(state));
         let maint = Arc::new(Maint {
+            cache: cache.clone(),
             state: state.clone(),
             committed: committed.clone(),
             chunks: chunks.clone(),
@@ -386,6 +417,8 @@ impl Store {
             signals: signals::Hub::new(epoch, &config),
             capture_metrics: std::array::from_fn(|_| AtomicU64::new(0)),
             committed,
+            cache,
+            cold_readers: (Mutex::new(0), Condvar::new()),
             scans,
             scan_usage: Arc::new(ScanUsage::default()),
             scan_reaper: Some((stop, reaper)),

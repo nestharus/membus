@@ -39,6 +39,7 @@ pub(super) struct State {
     pub(super) metadata: HashMap<(String, String), Meta>,
     pub(super) namespace_counts: HashMap<String, usize>,
     pub(super) keys: usize,
+    /// Resident latest-key index charges; payloads belong to the independently bounded cache.
     pub(super) committed_bytes: usize,
     pub(super) dedup_bytes: usize,
     pub(super) dedup: HashMap<(String, String), Dedup>,
@@ -49,6 +50,7 @@ pub(super) struct State {
     pub(super) expiry: VecDeque<((String, String), u64)>,
     pub(super) next: u64,
     pub(super) reserved_bytes: usize,
+    pub(super) memory_reserved: usize,
     pub(super) stripe_reserved: [usize; 4],
     pub(super) stripe_items: [usize; 4],
     pub(super) persisted_bytes: u64,
@@ -95,6 +97,12 @@ pub(super) struct Flags {
     pub(super) expiry_degraded: AtomicBool,
 }
 pub(super) type Key = (String, String);
+pub(super) fn index_charge(k: &Key) -> usize { 512 + 4 * (k.0.len() + k.1.len()) }
+pub(super) fn dedup_charge(k: &Key) -> usize { 256 + 3 * (k.0.len() + k.1.len()) }
+struct ColdReader<'a>(&'a (std::sync::Mutex<usize>, std::sync::Condvar));
+impl Drop for ColdReader<'_> {
+    fn drop(&mut self) { *self.0.0.lock().unwrap() -= 1; self.0.1.notify_one(); }
+}
 pub(super) fn fingerprint(m: &Mutation) -> [u8; 32] {
     // The durable representation remains complete. Only the in-memory retry
     // comparator is compact; replay derives the same digest from retained records.
@@ -115,13 +123,43 @@ impl Store {
     pub fn get(&self, ns: &str, key: &str) -> Option<Value> {
         self.get_handle(ns, key).map(|v| (*v).clone())
     }
+    /// Fallible committed read; storage errors stay distinct from absent keys.
+    pub fn try_get(&self, ns: &str, key: &str) -> io::Result<Option<Value>> {
+        Ok(self.get_handle_result(ns,key)?.map(|v| (*v).clone()))
+    }
     pub(super) fn get_handle(&self, ns: &str, key: &str) -> Option<Arc<Value>> {
-        self.committed
+        self.get_handle_result(ns,key).ok().flatten()
+    }
+    pub(super) fn get_handle_result(&self, ns: &str, key: &str) -> io::Result<Option<Arc<Value>>> {
+        let entry = self.committed
             .read()
             .unwrap()
             .get(&(ns.to_owned(), key.to_owned()))
             .filter(|v| !v.tombstone)
-            .cloned()
+            .cloned();
+        entry.map(|entry| self.read_entry(ns, key, &entry)).transpose()
+    }
+    pub(super) fn read_entry(&self, ns: &str, key: &str, entry: &crate::value_disk::Entry) -> io::Result<Arc<Value>> {
+        if let Some(v) = self.cache.get(entry.version) { return Ok(v); }
+        let mut readers = self.cold_readers.0.lock().unwrap();
+        while *readers >= 2 { readers = self.cold_readers.1.wait(readers).unwrap(); }
+        *readers += 1;
+        let _reader = ColdReader(&self.cold_readers);
+        drop(readers);
+        self.cache.cold();
+        let value = entry.read().inspect_err(|_| { self.flags.storage_error.store(true, Ordering::SeqCst); })?;
+        let (label, policy) = crate::cache::Cache::policy(&self.config, ns,key,entry.class);
+        self.cache.insert(value.clone(), label, policy, false, self.config.cache_bytes, &entry.cacheable);
+        Ok(value)
+    }
+    pub fn cache_stats(&self) -> crate::CacheStats { self.cache.stats() }
+    pub(super) fn cache_limit(&self, state: &State) -> usize {
+        self.config.capacity.saturating_sub(state.committed_bytes + state.dedup_bytes + state.memory_reserved
+            + self.scan_usage.bytes.load(Ordering::Acquire) + self.config.memory_margin()
+            + self.chunks.lock().unwrap().index_bytes + self.signals.memory_bytes())
+    }
+    pub(super) fn trim_cache(&self, state: &State) {
+        self.cache.trim(self.cache_limit(state));
     }
     pub fn metrics(&self) -> (u64, u64, usize) {
         let (b, _, f) = self.router.io();
@@ -204,6 +242,8 @@ impl Store {
         let utc = self.maint.clock.utc_ms();
         let c = &self.config;
         let mut h = Health2 {
+            cache: self.cache.stats(),
+            memory_budget: c.capacity,
             state_bytes: state.persisted_bytes,
             state_limit_bytes: c.state_limit_bytes,
             state_high_water: state.persisted_bytes
@@ -223,6 +263,9 @@ impl Store {
             retired_bytes: cs.retired_bytes,
             ..Health2::default()
         };
+        h.memory_bytes = h.cache.bytes + state.committed_bytes + state.dedup_bytes + state.memory_reserved
+            + self.scan_usage.bytes.load(Ordering::Acquire) + c.memory_margin() + cs.index_bytes
+            + self.signals.memory_bytes();
         let mut namespaces: Vec<(String, usize)> = state
             .namespace_counts
             .iter()
@@ -274,7 +317,7 @@ impl Store {
     }
     /// GET_STATUS (5.3): 0 live with its version, 1 expired (in a summary), 2 missing.
     pub fn get_status(&self, ns: &str, key: &str) -> (u8, u64) {
-        if let Some(v) = self.get_handle(ns, key) {
+        if let Some(v) = self.committed.read().unwrap().get(&(ns.to_owned(),key.to_owned())).filter(|v|!v.tombstone) {
             return (0, v.version);
         }
         let k = (ns.to_owned(), key.to_owned());
@@ -456,6 +499,7 @@ impl Store {
     }
     /// The idle tick's work, run now (tests use it with a manual clock).
     pub fn tick(&self) {
+        self.trim_cache(&self.state.lock().unwrap());
         self.router.idle_close();
         self.maint.clock_tick();
     }
@@ -514,6 +558,7 @@ impl Store {
         // Charge complete queued representation, not just value payloads. Empty
         // values still consume queue slots and framing/identifier memory.
         let queue_charge = representation_bytes + m.bytes.len() + 128;
+        let memory_charge = 2 * queue_charge + 2 * index_charge(&k) + 512;
         let mut state = self.state.lock().unwrap();
         if let Some(d) = state.dedup.get(&id).filter(|_| deduplicate) {
             if d.fingerprint != fp {
@@ -588,8 +633,8 @@ impl Store {
                 break;
             }
             state.expiry.pop_front();
-            if let Some(d) = state.dedup.remove(&key) {
-                state.dedup_bytes -= d.fingerprint.len();
+            if state.dedup.remove(&key).is_some() {
+                // Keep the identity's charge while the bounded expired-ID ring owns its strings.
                 state.retired_set.insert(key.clone());
                 state.retired.push_back(key);
             }
@@ -597,12 +642,19 @@ impl Store {
         while state.retired.len() > self.config.dedup_cap {
             let k = state.retired.pop_front().unwrap();
             state.retired_set.remove(&k);
+            state.dedup_bytes -= dedup_charge(&k);
         }
         if state.committed_bytes
             + state.dedup_bytes
-            + state.reserved_bytes
-            + m.bytes.len()
-            + if deduplicate { fp.len() } else { 0 }
+            + state.memory_reserved
+            + memory_charge
+            + if new { index_charge(&k) } else { 0 }
+            + index_charge(&k) * 2
+            + if deduplicate { dedup_charge(&id) } else { 0 }
+            + self.scan_usage.bytes.load(Ordering::Acquire)
+            + self.config.memory_margin()
+            + self.chunks.lock().unwrap().index_bytes
+            + self.signals.memory_bytes()
             > self.config.capacity
         {
             return Outcome::error(7);
@@ -643,7 +695,7 @@ impl Store {
             Meta {
                 version,
                 tombstone: m.remove,
-                bytes: m.bytes.len(),
+                bytes: index_charge(&k),
                 chunk: 0,
             },
         );
@@ -654,11 +706,13 @@ impl Store {
             *state.namespace_counts.entry(m.ns.clone()).or_default() += 1;
         }
         state.reserved_bytes += queue_charge;
+        state.memory_reserved += memory_charge;
         state.stripe_reserved[log_index] += queue_charge;
         state.stripe_items[log_index] += 1;
         state.pending_disk += disk_bytes;
+        if new { state.committed_bytes += index_charge(&k); }
         if deduplicate {
-            state.dedup_bytes += fp.len();
+            state.dedup_bytes += dedup_charge(&id);
             state.expiry.push_back((id.clone(), at));
             state.dedup.insert(
                 id.clone(),
@@ -670,6 +724,7 @@ impl Store {
             );
             self.done.notify_all();
         }
+        self.trim_cache(&state);
         drop(state);
         let result = if m.ack == 0 {
             Ok(0)
@@ -697,10 +752,19 @@ impl Store {
             }
         };
         // Publication precedes completion on every connection; readers never await log I/O.
+        let location = self.router.locations.lock().unwrap().remove(&version);
         if result.is_ok() && m.ack != 0 {
             let value = Arc::new(value);
+            let entry = Arc::new(crate::value_disk::Entry::new(&m, version, location.expect("append-complete location")));
             let mut committed = self.committed.write().unwrap();
-            let previous = committed.insert(k.clone(), value.clone());
+            let class = entry.class;
+            let previous = committed.insert(k.clone(), entry.clone());
+            if let Some(old) = &previous {
+                old.cacheable.store(false, Ordering::Release);
+                self.cache.remove(old.version, false);
+            }
+            let (label, policy) = crate::cache::Cache::policy(&self.config, &m.ns, &m.key, class);
+            self.cache.insert(value.clone(), label, policy, true, self.config.cache_bytes, &entry.cacheable);
             if m.ns != timers::NS {
                 self.signals.publish(&m.ns, &m.key, value);
             }
@@ -718,6 +782,7 @@ impl Store {
         };
         let mut state = self.state.lock().unwrap();
         state.reserved_bytes -= queue_charge;
+        state.memory_reserved -= memory_charge;
         state.stripe_reserved[log_index] -= queue_charge;
         state.stripe_items[log_index] -= 1;
         state.pending_disk -= disk_bytes;
@@ -728,14 +793,12 @@ impl Store {
         }
         state.pending.remove(&k);
         if let (Ok(chunk), true) = (&result, m.ack != 0) {
-            state.committed_bytes =
-                state.committed_bytes - old.as_ref().map_or(0, |v| v.bytes) + m.bytes.len();
             state.metadata.insert(
                 k.clone(),
                 Meta {
                     version,
                     tombstone: m.remove,
-                    bytes: m.bytes.len(),
+                    bytes: index_charge(&k),
                     chunk: *chunk,
                 },
             );
@@ -749,6 +812,7 @@ impl Store {
         } else {
             if new {
                 state.keys -= 1;
+                state.committed_bytes -= index_charge(&k);
             }
             if live_new {
                 state.release_namespace(&m.ns);
@@ -760,6 +824,7 @@ impl Store {
         if deduplicate {
             state.dedup.get_mut(&id).unwrap().outcome = Some(outcome.clone());
         }
+        self.trim_cache(&state);
         self.done.notify_all();
         outcome
     }

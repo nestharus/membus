@@ -77,3 +77,36 @@
             Some(4)
         );
     }
+
+    #[test]
+    fn blocked_cold_capture_releases_index_and_survives_retirement() {
+        let clock=ManualClock::new(now_ms());
+        let root=PathBuf::from(std::env::var("MEMBUS_TEST_OUTPUT").unwrap_or_else(|_|".test-output".into()))
+            .join(format!("cold-capture-{}-{}",std::process::id(),now_ms()));
+        let s=Arc::new(Store::open(&root,Config { clock:Some(clock.clone()),
+            retry_ms:10,rotation_ms:1,tick_ms:3_600_000,retire_ms:3_600_000,..Config::default() }).unwrap());
+        assert_eq!(s.set_policy("cold","",Some(Class::expire(20)),now_ms()+10000).code,0);
+        let mutation=|ns:&str,id:&str| Mutation { ns:ns.into(),key:"k".into(),op_id:id.into(),
+            deadline:now_ms()+10000,ack:1,expected:None,bytes:b"snapshot value".to_vec(),remove:false };
+        assert_eq!(s.mutate(mutation("cold","cold-put")).code,0);
+        clock.advance(2);s.tick();clock.advance(20);
+        let entry=s.committed.read().unwrap().get(&("cold".into(),"k".into())).unwrap().clone();
+        s.cache.remove(entry.version,false);
+        let blocked=entry.location.file.lock().unwrap();
+        let capture={let s=s.clone();std::thread::spawn(move||s.snapshot_open("cold").unwrap().1)};
+        let limit=Instant::now()+Duration::from_secs(2);
+        while *s.cold_readers.0.lock().unwrap()==0 { assert!(Instant::now()<limit);std::thread::yield_now(); }
+        let (tx,rx)=mpsc::channel();
+        let writer={let s=s.clone();std::thread::spawn(move|| {let o=s.mutate(mutation("hot","hot-put"));tx.send(o).unwrap();})};
+        let completed=rx.recv_timeout(Duration::from_secs(2));
+        // Always release the fixture's blocked file before asserting, so a failure cannot hang the suite.
+        if completed.is_ok() {s.retirement_pass();}
+        drop(blocked);
+        writer.join().unwrap();
+        let snapshot=capture.join().unwrap();
+        assert_eq!(completed.expect("cold capture held the write publication lock").code,0);
+        assert_eq!(s.get_status("cold","k"),(1,0));
+        assert_eq!(snapshot.rows[0].1.bytes,b"snapshot value");
+        assert!(!s.cache_stats().residency.iter().any(|(class,_,_)|class=="expire(20ms)"),
+            "a cold reader finishing after retirement must not reinsert the retired version");
+    }

@@ -5,7 +5,7 @@ use crate::store::Flags;
 use crate::store::Key;
 use crate::store::State;
 use crate::Config;
-use crate::Value;
+use crate::value_disk::Entry;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
@@ -22,8 +22,9 @@ use std::time::Instant;
 
 /// Retirement, expiry summaries, tombstone drops and the clock check (5.3, 5.4), shared with the tick thread.
 pub(super) struct Maint {
+    pub(super) cache: Arc<crate::cache::Cache>,
     pub(super) state: Arc<Mutex<State>>,
-    pub(super) committed: Arc<RwLock<HashMap<Key, Arc<Value>>>>,
+    pub(super) committed: Arc<RwLock<HashMap<Key, Arc<Entry>>>>,
     pub(super) chunks: Arc<Mutex<chunks::ChunkStore>>,
     pub(super) router: Arc<ChunkRouter>,
     pub(super) flags: Arc<Flags>,
@@ -141,7 +142,8 @@ impl Maint {
             let mut committed = self.committed.write().unwrap();
             for (k, v) in gone {
                 if committed.get(&k).is_some_and(|x| x.version == v) {
-                    committed.remove(&k);
+                    if let Some(entry) = committed.remove(&k) { entry.cacheable.store(false, Ordering::Release); }
+                    self.cache.remove(v, true);
                 }
             }
         }
@@ -275,12 +277,14 @@ impl Maint {
                     state.tomb_candidates.insert(k);
                 }
             }
+            cs.recount_index_bytes();
         }
         if !gone.is_empty() {
             let mut committed = self.committed.write().unwrap();
             for (k, v) in gone {
                 if committed.get(&k).is_some_and(|x| x.version == v) {
-                    committed.remove(&k);
+                    if let Some(entry) = committed.remove(&k) { entry.cacheable.store(false, Ordering::Release); }
+                    self.cache.remove(v, true);
                 }
             }
         }
@@ -349,6 +353,7 @@ impl Maint {
         });
         let held: HashSet<_> = cs.holders.map.keys().cloned().collect();
         cs.horizons.retain(|key, _| held.contains(key));
+        cs.recount_index_bytes();
     }
     /// A catalogue past its size is rewritten to the live list (5.2).
     pub(super) fn rewrite_catalogue(&self) {
@@ -378,6 +383,7 @@ impl Maint {
             ) {
                 tick_maint.router.idle_close();
                 tick_maint.clock_tick();
+                tick_maint.cache.sweep();
                 if last_pass.elapsed() >= retire_every {
                     last_pass = Instant::now();
                     tick_maint.pass();

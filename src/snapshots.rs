@@ -72,7 +72,7 @@ impl Store {
                 charge = charge
                     .checked_add(key.len())
                     .and_then(|n| n.checked_add(128))
-                    .and_then(|n| n.checked_add(value.bytes.capacity()))
+                    .and_then(|n| n.checked_add(value.len))
                     .ok_or(22u16)?;
                 count += 1;
             }
@@ -87,31 +87,38 @@ impl Store {
         if total > self.config.snapshot_bytes {
             return Err(22);
         }
+        let state = self.state.lock().unwrap();
+        if charge > self.cache_limit(&state) { return Err(22); }
         let id = scans.next;
         scans.next = id.checked_add(1).ok_or(22u16)?;
         // Reservation is serialized before any snapshot key/handle allocation.
         self.scan_usage.bytes.fetch_add(charge, Ordering::AcqRel);
         self.scan_usage.count.fetch_add(1, Ordering::AcqRel);
+        self.trim_cache(&state);
+        drop(state);
         let reservation = ScanCharge {
             usage: self.scan_usage.clone(),
             bytes: charge,
         };
         let selection_start = Instant::now();
         // Separate the second global index walk from namespace-owned copying.
-        // These borrowed references stay under the same committed read lock.
-        // The temporary pointers fit inside the conservative 128-byte row charge.
+        // Copy immutable locations under the committed read lock, then release it
+        // before loading any missing payload. The row charge covers both vectors.
         let selected: Vec<_> = committed
             .iter()
             .filter(|((namespace, _), value)| namespace == ns && !value.tombstone)
+            .map(|((_, key), value)| (key.clone(), value.clone()))
             .collect();
         let selection_end = Instant::now();
-        let mut rows = Vec::with_capacity(count);
-        for ((_, key), value) in selected {
-            rows.push((key.clone(), value.clone()));
-        }
         let copy_end = Instant::now();
         drop(committed);
         drop(scans);
+        let mut rows = Vec::with_capacity(count);
+        for (key, value) in selected {
+            let payload = self.read_entry(ns, &key, &value).map_err(|_| 16u16)?;
+            rows.push((key, payload));
+        }
+        let sort_start = Instant::now();
         rows.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         let sort_end = Instant::now();
         let times = [
@@ -121,7 +128,7 @@ impl Store {
             selection_end.duration_since(selection_start).as_nanos() as u64,
             copy_end.duration_since(selection_end).as_nanos() as u64,
             copy_end.duration_since(lock_acquired).as_nanos() as u64,
-            sort_end.duration_since(copy_end).as_nanos() as u64,
+            sort_end.duration_since(sort_start).as_nanos() as u64,
         ];
         for (metric, n) in self.capture_metrics.iter().zip(times) {
             metric.fetch_add(n, Ordering::Relaxed);

@@ -323,6 +323,12 @@ fn main() -> io::Result<()> {
     let mut reserve = None;
     let mut i = 4;
     while i < args.len() {
+        if args[i] == "--cache-policy" {
+            let text = args.get(i+1).ok_or_else(|| io::Error::other("missing cache policy"))?;
+            config.cache_rules.push(text.parse()?);
+            i += 2;
+            continue;
+        }
         if args[i] == "--allow-mem" {
             config.allow_mem = true;
             i += 1;
@@ -359,6 +365,7 @@ fn main() -> io::Result<()> {
             "--quota" => config.quota = n as usize,
             "--index-cap" => config.index_cap = n as usize,
             "--capacity" => config.capacity = n as usize,
+            "--cache-bytes" => config.cache_bytes = usize::try_from(n).map_err(io::Error::other)?,
             "--queue-bytes" => config.queue_bytes = n as usize,
             "--dedup-cap" => config.dedup_cap = n as usize,
             "--delay-ms" => config.write_delay_ms = n,
