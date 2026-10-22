@@ -244,6 +244,10 @@ impl Hub {
             self.ring_budget as u64, QUEUE_BYTES as u64] { p.extend(n.to_le_bytes()); }
         p
     }
+    pub(crate) fn memory_bytes(&self) -> usize {
+        let s = self.state.0.lock().unwrap();
+        s.ring_bytes + s.queue_bytes
+    }
     pub fn hello_limits(&self) -> Vec<u8> {
         let mut p = 1u16.to_le_bytes().to_vec(); // membus.change/1
         p.extend((crate::MAX_FRAME as u32).to_le_bytes());

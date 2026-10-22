@@ -455,7 +455,7 @@ impl Store {
                     let key = c.text()?;
                     c.end()?;
                     let mut p = Vec::new();
-                    encode_value(&mut p, self.get_handle(&ns, &key).as_deref());
+                    encode_value(&mut p, self.get_handle_result(&ns, &key).map_err(|_|16u16)?.as_deref());
                     Ok(p)
                 }
                 GET_MANY => {
@@ -470,7 +470,7 @@ impl Store {
                     c.end()?;
                     let mut p = (n as u16).to_le_bytes().to_vec();
                     for key in keys {
-                        let value = self.get_handle(&ns, &key);
+                        let value = self.get_handle_result(&ns, &key).map_err(|_|16u16)?;
                         if p.len() + value.as_ref().map_or(1, |v| 14 + v.bytes.len()) + 15
                             > max_frame
                         {

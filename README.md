@@ -111,6 +111,7 @@ window. See [Rust client usage and uncertainty](docs/RUST_CLIENT.md).
 - [Unresolved catalogue append recovery](docs/CATALOGUE-APPEND-RECOVERY.md)
 - [Read-only retirement inspection](docs/RETIREMENT-INSPECTION.md)
 - [Indexed append-only collections](docs/INDEXED_COLLECTIONS.md)
+- [Disk-backed values, bounded cache and cache policy](docs/VALUE_CACHE.md)
 
 Rust checks use `cargo test --offline --locked`; Windows listener/forwarder tests
 need the explicit fixture inputs described in [RUST_CLIENT.md](docs/RUST_CLIENT.md).
@@ -128,6 +129,7 @@ outcomes; an on-disk acknowledgment byte alone does not prove achieved Flush.
 Already imported read-only legacy backups retain the historical limits described
 in [RECOVERY_FLUSH.md](docs/RECOVERY_FLUSH.md). Snapshots and
 change history are bounded. Subscriptions and timer wakes grant no lease,
-receiver receipt, or authority to execute an application effect. All committed
-values remain resident in memory; cache eviction, warm/cold tiers and replay
-index checkpoints are not implemented.
+receiver receipt, or authority to execute an application effect. Committed values
+remain in chunk files with a bounded memory cache and cold reads by indexed
+offset. Replay rebuilds the index with an empty cache. Compressed archival tiers
+and replay index checkpoints are not implemented.

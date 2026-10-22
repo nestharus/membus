@@ -76,6 +76,7 @@ impl Route for FixedRoute {
     }
 }
 pub(super) struct OpenChunk {
+    pub(super) reader: Arc<Mutex<std::fs::File>>,
     pub(super) id: u64,
     pub(super) log: Arc<Mutex<Log>>,
     pub(super) opened_mono: u64,
@@ -88,6 +89,7 @@ pub(super) struct SinkEntry {
 /// Chunk files by stripe and class (CHUNK-RETIREMENT.md 5.2). Each stripe's open chunks are held under that
 /// stripe's lock while a record is written, so a close never meets a half-written record.
 pub(super) struct ChunkRouter {
+    pub(super) locations: Mutex<HashMap<u64, crate::value_disk::Location>>,
     #[cfg(test)]
     pub(super) selection_hook: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
     pub(super) sinks: Vec<Mutex<HashMap<Class, OpenChunk>>>,
@@ -131,6 +133,7 @@ impl ChunkRouter {
             fs::create_dir_all(parent)?;
         }
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let reader = Arc::new(Mutex::new(std::fs::File::open(&path)?));
         cs.table.insert(
             id,
             chunks::ChunkInfo {
@@ -168,6 +171,7 @@ impl ChunkRouter {
             },
         );
         Ok(OpenChunk {
+            reader,
             id,
             log,
             opened_mono: self.clock.mono_ms(),
@@ -315,6 +319,9 @@ impl Route for ChunkRouter {
         if result.is_err() {
             self.fence(stripe);
         } else {
+            self.locations.lock().unwrap().insert(version, crate::value_disk::Location {
+                class, file: c.reader.clone(), offset: end - record.len() as u64, record_len: record.len() as u64,
+            });
             let mut cs = self.chunks.lock().unwrap();
             cs.register(c.id, &(ns, key), version);
             if let Some(info) = cs.table.get_mut(&c.id) {

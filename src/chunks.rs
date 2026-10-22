@@ -1123,6 +1123,8 @@ impl Summaries {
 
 /// The chunk table, its catalogue and what retirement keeps: holders, horizons and expiry summaries.
 pub struct ChunkStore {
+    /// Conservative resident charge for retained chunk key references, separate from the latest-key index.
+    pub index_bytes: usize,
     pub dir: PathBuf,
     pub cat: Option<Catalogue>,
     pub table: BTreeMap<u64, ChunkInfo>,
@@ -1147,6 +1149,7 @@ pub struct ChunkStore {
 impl ChunkStore {
     pub fn new(dir: PathBuf) -> Self {
         Self {
+            index_bytes: 0,
             dir,
             cat: None,
             table: BTreeMap::new(),
@@ -1167,11 +1170,18 @@ impl ChunkStore {
     }
     pub fn register(&mut self, id: u64, k: &Key, v: u64) {
         if let Some(c) = self.table.get_mut(&id) {
+            if !c.keys.contains_key(k) { self.index_bytes += 2 * crate::store::index_charge(k); }
             let e = c.keys.entry(k.clone()).or_insert((v, v));
             e.0 = e.0.min(v);
             e.1 = e.1.max(v);
         }
         self.holders.add(k, id);
+    }
+    pub(crate) fn recount_index_bytes(&mut self) {
+        self.index_bytes = self.table.values().flat_map(|c| c.keys.keys()).map(crate::store::index_charge).sum::<usize>()
+            + self.holders.map.keys().map(crate::store::index_charge).sum::<usize>()
+            + self.summaries.keys.keys().map(crate::store::index_charge).sum::<usize>()
+            + self.horizons.keys().map(crate::store::index_charge).sum::<usize>();
     }
     /// Append and flush one catalogue record.
     pub fn log(&mut self, at_ms: u64, rec: Rec) -> io::Result<()> {

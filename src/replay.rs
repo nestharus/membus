@@ -20,7 +20,6 @@ use crate::Class;
 use crate::Config;
 use crate::Mutation;
 use crate::Outcome;
-use crate::Value;
 use crate::POLICY_NS;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -60,7 +59,7 @@ fn corrupt(text: String) -> io::Error {
 }
 /// What replay rebuilt, before any file is changed.
 struct Replayed {
-    committed: HashMap<(String, String), Arc<Value>>,
+    committed: HashMap<(String, String), Arc<crate::value_disk::Entry>>,
     chunk_of: HashMap<(String, String), u64>,
     dedup: HashMap<(String, String), Dedup>,
     next: u64,
@@ -72,18 +71,13 @@ struct Replayed {
     cat_last_ms: u64,
 }
 impl Replayed {
-    fn apply(&mut self, m: Mutation, v: u64, at: u64, chunk: u64, now: u64, config: &Config) {
+    fn apply(&mut self, m: Mutation, v: u64, at: u64, chunk: u64, now: u64, config: &Config, location: crate::value_disk::Location) {
         self.next = self.next.max(v + 1);
         let k = (m.ns.clone(), m.key.clone());
         if self.committed.get(&k).is_none_or(|old| old.version < v) {
             self.committed.insert(
                 k.clone(),
-                Arc::new(Value {
-                    version: v,
-                    ack: m.ack,
-                    bytes: m.bytes.clone(),
-                    tombstone: m.remove,
-                }),
+                Arc::new(crate::value_disk::Entry::new(&m, v, location)),
             );
             self.chunk_of.insert(k, chunk);
         }
@@ -118,6 +112,7 @@ impl Replayed {
         now: u64,
     ) -> io::Result<u64> {
         let mut f = File::open(p)?;
+        let reader = Arc::new(std::sync::Mutex::new(File::open(p)?));
         let len = f.metadata()?.len();
         let name = p.display().to_string();
         let mut offset = 0u64;
@@ -156,7 +151,10 @@ impl Replayed {
                         self.report.stripes[si].horizons_applied += 1;
                         self.next = self.next.max(v + 1);
                     } else {
-                        self.apply(m, v, at, chunk, now, config);
+                        self.apply(m, v, at, chunk, now, config, crate::value_disk::Location {
+                            class: self.chunks.table.get(&chunk).map_or(Class::FOREVER, |c| c.class),
+                            file: reader.clone(), offset, record_len: n,
+                        });
                     }
                     offset += n;
                 }
@@ -172,13 +170,13 @@ fn legacy_files(dir: &Path) -> Vec<(usize, PathBuf)> {
         .filter(|(_, p)| p.exists())
         .collect()
 }
-/// What the legacy logs hold, read without changing them: each key's latest record whole, and the dedup window.
+/// What the legacy logs hold: latest record locations and the dedup window, with no retained payloads.
 struct Legacy {
-    committed: HashMap<Key, Arc<Value>>,
+    committed: HashMap<Key, Arc<crate::value_disk::Entry>>,
     dedup: HashMap<Key, Dedup>,
     next: u64,
-    /// Each key's latest record: version, stripe, payload.
-    latest: HashMap<Key, (u64, usize, Vec<u8>)>,
+    /// Each key's latest record: version, stripe, location.
+    latest: HashMap<Key, (u64, usize, crate::value_disk::Location)>,
     /// Torn tails left in place: file, offset, bytes.
     torn: Vec<(String, u64, u64)>,
     records: u64,
@@ -218,6 +216,7 @@ fn read_legacy(files: &[(usize, PathBuf)], config: &Config, now: u64) -> io::Res
     };
     for (si, p) in files {
         let mut f = File::open(p)?;
+        let reader = Arc::new(std::sync::Mutex::new(File::open(p)?));
         let len = f.metadata()?.len();
         let name = p.display().to_string();
         let mut offset = 0u64;
@@ -239,16 +238,14 @@ fn read_legacy(files: &[(usize, PathBuf)], config: &Config, now: u64) -> io::Res
                     l.next = l.next.max(v + 1);
                     let k = (m.ns.clone(), m.key.clone());
                     if l.committed.get(&k).is_none_or(|old| old.version < v) {
+                        let location = crate::value_disk::Location {
+                            class: Class::FOREVER, file: reader.clone(), offset, record_len: n,
+                        };
                         l.committed.insert(
                             k.clone(),
-                            Arc::new(Value {
-                                version: v,
-                                ack: m.ack,
-                                bytes: m.bytes.clone(),
-                                tombstone: m.remove,
-                            }),
+                            Arc::new(crate::value_disk::Entry::new(&m, v, location.clone())),
                         );
-                        l.latest.insert(k, (v, *si, b));
+                        l.latest.insert(k, (v, *si, location));
                     }
                     if now.saturating_sub(at) <= config.retry_ms
                         && !timers::is_progress(&m.ns, &m.key)
@@ -533,9 +530,10 @@ fn import_legacy(
         };
         let mut policies = chunks::Policies::default();
         let mut used_ids: HashSet<Key> = legacy.dedup.keys().cloned().collect();
-        for (_, _, payload) in legacy.latest.values() {
+        for (_, _, location) in legacy.latest.values() {
+            let payload = location.payload()?;
             let (m, _, _) =
-                parse_record(payload).map_err(|_| corrupt("legacy import record".into()))?;
+                parse_record(&payload).map_err(|_| corrupt("legacy import record".into()))?;
             used_ids.insert(dedup_identity(&m));
         }
         let mut synthetic = HashMap::new();
@@ -596,15 +594,15 @@ fn import_legacy(
         let mut latest: Vec<_> = legacy.latest.iter().collect();
         latest.sort_by_key(|(_, (v, _, _))| *v);
         let mut leave_out = config.import_inject_difference;
-        for ((ns, key), (_, si, payload)) in latest {
+        for ((ns, key), (_, si, location)) in latest {
             if std::mem::take(&mut leave_out) {
                 continue;
             }
             let (class, label) = policies.resolve(ns, key);
-            w.write(*si, class, &label, payload)?;
+            w.write(*si, class, &label, &location.payload()?)?;
         }
         w.close_all()?;
-        // The check: the import replayed alone against the legacy replay held in memory.
+        // Compare the two indexed replays one value at a time, before publishing the import.
         let mut rp = Replayed::empty(dir.clone());
         replay_into(&mut rp, path, &dir, false, config, clock)?;
         let mut first: Option<String> = None;
@@ -612,13 +610,13 @@ fn import_legacy(
             match rp.committed.get(k) {
                 Some(x)
                     if x.version == v.version
-                        && x.bytes == v.bytes
+                        && x.read()?.bytes == v.read()?.bytes
                         && x.tombstone == v.tombstone
                         && x.ack == v.ack => {}
                 Some(x) => {
                     first.get_or_insert(format!(
                         "{}/{}: imported version {} tombstone {} {} B, legacy version {} tombstone {} {} B",
-                        k.0, k.1, x.version, x.tombstone, x.bytes.len(), v.version, v.tombstone, v.bytes.len()
+                        k.0, k.1, x.version, x.tombstone, x.len, v.version, v.tombstone, v.len
                     ));
                 }
                 None => {
@@ -634,7 +632,7 @@ fn import_legacy(
                 first.get_or_insert(format!("{}/{}: in the import only", k.0, k.1));
             }
         }
-        let live = |c: &HashMap<Key, Arc<Value>>| {
+        let live = |c: &HashMap<Key, Arc<crate::value_disk::Entry>>| {
             let mut counts = std::collections::BTreeMap::new();
             for (k, v) in c {
                 if !v.tombstone && k.0 != POLICY_NS {
@@ -1044,7 +1042,7 @@ pub(super) struct Recovered {
     pub(super) flags: Arc<Flags>,
     pub(super) chunks: chunks::ChunkStore,
     pub(super) next: u64,
-    pub(super) committed: HashMap<Key, Arc<Value>>,
+    pub(super) committed: HashMap<Key, Arc<crate::value_disk::Entry>>,
     pub(super) state: State,
     pub(super) timers: timers::Shared,
     pub(super) policies: chunks::Policies,
@@ -1087,12 +1085,14 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
             rp.report.import.take().unwrap_or_default()
         ));
     }
+    rp.chunks.recount_index_bytes();
     if rp.committed.len() > config.index_cap
-        || rp.committed.values().map(|v| v.bytes.len()).sum::<usize>()
+        || rp.committed.keys().map(crate::store::index_charge).sum::<usize>()
             + rp.dedup
-                .values()
-                .map(|d: &Dedup| d.fingerprint.len())
+                .iter()
+                .map(|(k, _)| crate::store::dedup_charge(k))
                 .sum::<usize>()
+            + rp.chunks.index_bytes + config.memory_margin()
             > config.capacity
         || rp.dedup.len() > config.dedup_cap
     {
@@ -1308,7 +1308,7 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
                 Meta {
                     version: v.version,
                     tombstone: v.tombstone,
-                    bytes: v.bytes.len(),
+                    bytes: crate::store::index_charge(k),
                     chunk: rp.chunk_of.get(k).copied().unwrap_or(0),
                 },
             )
@@ -1325,14 +1325,17 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
     let committed_bytes = metadata.values().map(|m| m.bytes).sum();
     let dedup = rp.dedup;
     let dedup_entries = dedup.len();
-    let dedup_bytes = dedup.values().map(|d| d.fingerprint.len()).sum();
+    let dedup_bytes = dedup.keys().map(crate::store::dedup_charge).sum();
     let mut expiry: Vec<_> = dedup.iter().map(|(k, d)| (k.clone(), d.at)).collect();
     expiry.sort_by_key(|(_, at)| *at);
-    let timers = timers::State::restore(&committed)?;
+    // Only control records need decoding into runtime state. Ordinary values stay on disk.
+    let control: HashMap<_,_> = committed.iter().filter(|(k,_)| k.0 == timers::NS)
+        .map(|(k,v)| Ok((k.clone(), v.read()?))).collect::<io::Result<_>>()?;
+    let timers = timers::State::restore(&control)?;
     let mut policies = chunks::Policies::default();
     for ((ns, key), v) in committed.iter() {
         if ns == chunks::POLICY_NS && !v.tombstone {
-            if let Some((pns, prefix, class)) = chunks::parse_policy(key, &v.bytes) {
+            if let Some((pns, prefix, class)) = chunks::parse_policy(key, &v.read()?.bytes) {
                 policies.set(&pns, &prefix, Some(class));
             }
         }
@@ -1351,6 +1354,7 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
         expiry: expiry.into(),
         next,
         reserved_bytes: 0,
+        memory_reserved: 0,
         stripe_reserved: [0; 4],
         stripe_items: [0; 4],
         persisted_bytes,
