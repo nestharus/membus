@@ -259,6 +259,9 @@ fn epoch_directory_sync_follows_rename_before_ready() {
     let seen = events.clone();
     let config = Config {
         recovery_dir_sync: Some(Arc::new(move |dir| {
+            if dir == expected.join("chunks") {
+                return Ok(()); // The catalogue namespace has its own pre-epoch controls.
+            }
             assert_eq!(dir, expected);
             assert_eq!(
                 fs::read(expected.join("epoch")).unwrap(),
@@ -280,9 +283,14 @@ fn epoch_directory_sync_follows_rename_before_ready() {
 #[test]
 fn epoch_directory_sync_failure_refuses_publication() {
     let f = Fixture::new();
+    let root = f.0.clone();
     let config = Config {
-        recovery_dir_sync: Some(Arc::new(|_| {
-            Err(io::Error::other("epoch directory sync failed"))
+        recovery_dir_sync: Some(Arc::new(move |dir| {
+            if dir == root {
+                Err(io::Error::other("epoch directory sync failed"))
+            } else {
+                Ok(())
+            }
         })),
         ..Config::default()
     };
@@ -585,4 +593,99 @@ fn equivalence_refusal_never_reaches_import_tree_publication() {
     assert!(error.to_string().contains("import refused"));
     assert_import_inputs_unchanged(&f.0, &inputs);
     assert!(!f.0.join("chunks.import").exists());
+}
+
+#[test]
+fn fresh_catalogue_directory_sync_failure_refuses_before_epoch_and_can_retry() {
+    let f = Fixture::new();
+    let root = f.0.clone();
+    let config = Config {
+        recovery_dir_sync: Some(Arc::new(move |dir| {
+            if dir == root.join("chunks") {
+                assert_eq!(fs::read(root.join("chunks/catalogue.log"))?, b"");
+                assert!(!root.join("epoch").exists());
+                return Err(io::Error::other("fresh catalogue directory sync failure"));
+            }
+            Ok(())
+        })),
+        ..Config::default()
+    };
+    let error = Store::open(&f.0, config)
+        .err()
+        .expect("a fresh catalogue name needs a directory barrier");
+    assert!(error
+        .to_string()
+        .contains("fresh catalogue directory sync failure"));
+    assert!(!f.0.join("epoch").exists());
+    assert!(!f.0.join("epoch.tmp").exists());
+    let report = fs::read_to_string(f.0.join("replay.json")).unwrap();
+    assert!(report.contains("\"stage\":\"refused\""));
+    assert!(report.contains("\"ready_ms\":0"));
+    f.unlock();
+    let store = Store::open(&f.0, Config::default()).unwrap();
+    assert_eq!(store.epoch, 1);
+    assert_eq!(store.replay_report().stage, "ready");
+}
+
+#[test]
+fn catalogue_directory_sync_failure_retains_observations_before_close_and_epoch() {
+    let f = Fixture::new();
+    let store = Store::open(&f.0, Config::default()).unwrap();
+    let mutation = Mutation {
+        ns: "caller".into(),
+        key: "key".into(),
+        op_id: "original".into(),
+        deadline: u64::MAX,
+        ack: 2,
+        expected: None,
+        bytes: b"original".to_vec(),
+        remove: false,
+    };
+    assert_eq!(store.mutate(mutation).code, 0);
+    drop(store);
+    f.unlock();
+    let files = chunks::list_chunk_files(&f.0.join("chunks")).unwrap();
+    assert_eq!(files.len(), 1);
+    let (_, si, id, original) = &files[0];
+    let unregistered = chunks::chunk_path(&f.0.join("chunks"), Class::FOREVER, *si, id + 1000);
+    fs::copy(original, &unregistered).unwrap();
+    let data = fs::read(original).unwrap();
+    let catalogue = fs::read(f.0.join("chunks/catalogue.log")).unwrap();
+    let epoch = fs::read(f.0.join("epoch")).unwrap();
+    let root = f.0.clone();
+    let config = Config {
+        recovery_dir_sync: Some(Arc::new(move |dir| {
+            if dir == root.join("chunks") {
+                return Err(io::Error::other("catalogue directory sync failure"));
+            }
+            Ok(())
+        })),
+        ..Config::default()
+    };
+    let error = Store::open(&f.0, config)
+        .err()
+        .expect("catalogue directory sync failure must refuse startup");
+    assert!(error
+        .to_string()
+        .contains("catalogue directory sync failure"));
+    assert_eq!(fs::read(original).unwrap(), data);
+    assert_eq!(
+        fs::read(f.0.join("chunks/catalogue.log")).unwrap(),
+        catalogue,
+        "the directory barrier must precede a recovered Close"
+    );
+    assert_eq!(fs::read(f.0.join("epoch")).unwrap(), epoch);
+    let report = fs::read_to_string(f.0.join("replay.json")).unwrap();
+    assert!(report.contains("\"stage\":\"refused\""));
+    assert!(report.contains("\"ready_ms\":0"));
+    let observation = format!("chunk file with no open record: {}", unregistered.display());
+    assert!(report.contains(&format!("{observation:?}")), "{report}");
+    f.unlock();
+    let store = Store::open(&f.0, Config::default()).unwrap();
+    assert_eq!(store.epoch, 2);
+    assert_eq!(store.get("caller", "key").unwrap().bytes, b"original");
+    assert!(
+        store.storage_error(),
+        "the observed unregistered copy remains reported"
+    );
 }

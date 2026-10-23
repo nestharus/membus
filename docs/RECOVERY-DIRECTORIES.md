@@ -18,6 +18,13 @@ bytes/permissions and epoch remain unchanged, so another startup can rebuild
 and retry. The directory operations use the same helper and OS error handling
 as the rename barriers below.
 
+Ordinary startup also synchronizes `chunks` after opening its catalogue, which
+may create `catalogue.log`. This precedes recovered Close/retirement records,
+epoch publication and runtime assembly. A failure refuses startup with collected
+replay observations and `ready_ms=0`. A fresh refusal consumes no epoch; after
+the barrier succeeds, the normal epoch/root barrier still covers the `chunks`
+directory entry in the state root.
+
 | Rename | Barrier before continuing |
 | --- | --- |
 | `chunks` to `chunks.pre-import-<epoch>` | State root, before publishing the replacement `chunks`. |
@@ -45,8 +52,9 @@ and `GetLastError`. These requirements motivate an actual barrier, rather than
 assuming that NTFS journaling makes directory flushing unnecessary. Unsupported
 directory flushes and access denials propagate; they are never treated as a
 successful no-op. Storage hardware and filesystems still determine actual media
-persistence. These barriers cover replacement-tree creation during import and
-the named recovery renames, not every creation or rename elsewhere in the store.
+persistence. These barriers cover replacement-tree creation during import, the
+startup catalogue namespace and the named recovery renames, not every creation
+or rename elsewhere in the store.
 
 Tests in `src/replay/durability_tests.rs` observe filesystem state at each barrier,
 inject failures, and verify both refusal and a subsequent successful retry.
@@ -57,6 +65,9 @@ at the class/root barriers, fail each barrier before the switch, verify refusal
 and successful retry, and cover a catalogue-only replacement. An equivalence
 refusal must not reach any of those publication barriers. These checks establish
 call/failure ordering, not physical power-loss behavior.
+Catalogue controls refuse both a fresh startup and a recovered open chunk before
+Close/epoch publication, preserve an already collected storage observation, and
+retry successfully with the same next epoch.
 
 The synthetic policy operation remains caller-scoped: `policy_key` embeds the
 caller namespace in the key, and `dedup_identity` projects a policy mutation back

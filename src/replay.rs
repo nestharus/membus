@@ -1195,6 +1195,9 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
     let mut catalogue = chunks::Catalogue::open(&cat_path)?;
     catalogue.last_ms = rp.cat_last_ms;
     cs.cat = Some(catalogue);
+    // Catalogue::open may create the file. Persist its name before recovery
+    // publishes Close records or runtime can acknowledge writes through it.
+    recovery_sync_dir(&cs.dir, config).map_err(|e| refuse(e, rp.report.clone()))?;
     let utc = clock.utc_ms();
     let mono = clock.mono_ms();
     let next = rp.next;
