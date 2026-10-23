@@ -4,6 +4,24 @@ Recovery synchronizes each rename's containing directory before performing the
 next dependent step. Synchronizing a file alone is not a directory publication
 barrier.
 
+Live chunk creation has a matching namespace prerequisite. The router first
+flushes the Open catalogue record, reserves its sequence, creates the class
+directory and prepares the empty file's writer and reader handles. It then
+synchronizes the class directory, covering the new chunk name, and `chunks`,
+covering a newly created class directory. Both barriers precede publication of
+the route or any first-frame write. Every new chunk, including rotation into
+an existing class directory, follows this order. A later Flush acknowledgement
+still requires the ordinary data-file synchronization; directory synchronization
+does not replace it.
+
+Either name-barrier failure returns the original OS error from route creation.
+The ordinary append-error path fences the stripe and refuses the mutation;
+it does not publish a value, a successful receipt or a route for that file.
+The flushed Open record and empty file remain as restart evidence, and the
+reserved catalogue sequence is not reused. Startup handles that interrupted
+Open normally; a later mutation can retry in a new chunk. After a failed
+rotation, the earlier flushed value remains readable and recoverable.
+
 Before the import's directory switch, startup also synchronizes the constructed
 replacement tree. After all data files and their Close records are synced, the
 replacement is independently replayed and checked for equivalence, and the

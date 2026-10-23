@@ -164,6 +164,9 @@ pub struct Config {
     /// Test seam: observe or refuse a startup report's directory barriers.
     #[cfg(test)]
     pub replay_report_dir_sync: Option<Arc<dyn Fn(&Path) -> io::Result<()> + Send + Sync>>,
+    /// Test seam: observe or refuse each live chunk-name directory barrier.
+    #[cfg(test)]
+    pub chunk_dir_sync: Option<Arc<dyn Fn(&Path) -> io::Result<()> + Send + Sync>>,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -214,6 +217,8 @@ impl Default for Config {
             recovery_dir_sync: None,
             #[cfg(test)]
             replay_report_dir_sync: None,
+            #[cfg(test)]
+            chunk_dir_sync: None,
         }
     }
 }

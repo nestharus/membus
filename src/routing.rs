@@ -20,6 +20,12 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
 
+fn sync_chunk_directory(path: &std::path::Path, _config: &Config) -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(hook) = &_config.chunk_dir_sync { hook(path)?; }
+    crate::log_io::sync_dir(path)
+}
+
 /// A selected route or admitted policy owns its class until a chunk or the published policy owns it.
 /// Coordination order: reservations -> policies -> chunks. None is held across queued I/O;
 /// router stripe/chunk/table locks and maintenance never acquire reservations in reverse.
@@ -112,6 +118,7 @@ impl ChunkRouter {
         stripe: usize,
         class: Class,
         policy: String,
+        config: &Config,
     ) -> io::Result<OpenChunk> {
         let mut cs = self.chunks.lock().unwrap();
         let id = cs.next_id;
@@ -134,6 +141,11 @@ impl ChunkRouter {
         }
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         let reader = Arc::new(Mutex::new(std::fs::File::open(&path)?));
+        // Persist the file name before its class-directory name, before a route
+        // or first frame can yield a successful acknowledgement. On failure,
+        // retain the durable Open and empty file for the ordinary replay path.
+        sync_chunk_directory(path.parent().unwrap(), config)?;
+        sync_chunk_directory(&cs.dir, config)?;
         cs.table.insert(
             id,
             chunks::ChunkInfo {
@@ -301,7 +313,7 @@ impl Route for ChunkRouter {
             open.remove(&class);
         }
         if !open.contains_key(&class) {
-            match self.open_chunk(stripe, class, policy) {
+            match self.open_chunk(stripe, class, policy, config) {
                 Ok(c) => {
                     open.insert(class, c);
                 }
@@ -348,3 +360,7 @@ pub(super) fn stripe(ns: &str, key: &str) -> usize {
     b.extend(key.as_bytes());
     crc32(&b) as usize % 4
 }
+
+#[cfg(test)]
+#[path = "routing/directory_tests.rs"]
+mod directory_tests;
