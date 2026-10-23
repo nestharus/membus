@@ -771,8 +771,8 @@ impl Catalogue {
         }
         let b = encode_bounded(r)?;
         let boundary = self.file.metadata()?.len();
-        if let Err(error) = begin_append(&self.path, boundary) {
-            // Marker creation/sync can fail after creating bytes. No catalogue append was attempted;
+        if let Err(error) = begin_append(&self.path, boundary).and_then(|_| self.sync_parent()) {
+            // Marker creation/file/directory sync can fail after creating bytes. No append was attempted;
             // retain all evidence and require an explicit rewrite rather than overwriting the marker.
             self.fenced = true;
             return Err(error);
@@ -1652,6 +1652,87 @@ mod catalogue_failure_tests {
         c.rewrite(&[record(2)]).unwrap();
         c.append(&record(3)).unwrap();
         assert_eq!(read_catalogue(&c.path).unwrap(), (vec![record(2), record(3)], None));
+    }
+
+    #[test]
+    fn append_marker_directory_sync_precedes_each_frame() {
+        let mut c = catalogue("marker-directory-order");
+        let path = c.path.clone();
+        let expected = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let before = expected.clone();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = seen.clone();
+        c.directory_sync = Some(Arc::new(move |dir| {
+            assert_eq!(dir, path.parent().unwrap());
+            let old = before.lock().unwrap();
+            assert_eq!(fs::read(&path)?, *old, "the frame must not precede its marker-name barrier");
+            let marker = fs::read(append_pending_path(&path))?;
+            assert_eq!(marker.len(), 20);
+            assert_eq!(&marker[..8], b"MBCP1\0\0\0");
+            let boundary = u64::from_le_bytes(marker[8..16].try_into().unwrap());
+            assert_eq!(boundary, old.len() as u64);
+            assert_eq!(u32::from_le_bytes(marker[16..].try_into().unwrap()), crc32(&marker[..16]));
+            observed.lock().unwrap().push(boundary);
+            Ok(())
+        }));
+        c.append(&record(1)).unwrap();
+        *expected.lock().unwrap() = fs::read(&c.path).unwrap();
+        c.append(&record(2)).unwrap();
+        assert_eq!(*seen.lock().unwrap(), vec![0, encode(&record(1)).len() as u64]);
+        assert!(!append_pending_path(&c.path).exists());
+        assert_eq!(read_catalogue(&c.path).unwrap(), (vec![record(1), record(2)], None));
+    }
+
+    #[test]
+    fn marker_directory_sync_failure_preserves_the_boundary_and_fences_until_rewrite() {
+        let mut c = catalogue("marker-directory-failure");
+        c.append(&record(1)).unwrap();
+        let before = fs::read(&c.path).unwrap();
+        let bytes = c.bytes;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        c.directory_sync = Some(Arc::new(move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            Err(io::Error::other("injected marker directory sync failure"))
+        }));
+        let error = c.append(&record(2)).err().expect("the marker name must be synced before writing a frame");
+        assert!(error.to_string().contains("marker directory sync failure"));
+        assert_eq!(fs::read(&c.path).unwrap(), before);
+        assert_eq!((c.bytes, c.last_ms), (bytes, 1));
+        assert!(append_pending_path(&c.path).exists());
+        assert!(c.append(&record(3)).unwrap_err().to_string().contains("fenced"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the fence must stop later writes before another marker attempt");
+        assert!(Catalogue::open(&c.path).err().unwrap().to_string().contains("append unresolved"));
+        assert!(read_catalogue(&c.path).unwrap_err().to_string().contains("append unresolved"));
+        c.directory_sync = None;
+        c.rewrite(&[record(1)]).unwrap();
+        c.append(&record(3)).unwrap();
+        assert_eq!(read_catalogue(&c.path).unwrap(), (vec![record(1), record(3)], None));
+    }
+
+    #[test]
+    fn marker_name_barrier_precedes_a_partial_write_and_boundary_recovery() {
+        let mut c = catalogue("marker-directory-partial");
+        c.append(&record(1)).unwrap();
+        let before = fs::read(&c.path).unwrap();
+        let expected = before.clone();
+        let path = c.path.clone();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        c.directory_sync = Some(Arc::new(move |_| {
+            assert_eq!(fs::read(&path)?, expected);
+            assert!(append_pending_path(&path).exists());
+            observed.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }));
+        c.fail_partial_once = Some(7);
+        assert!(c.append(&record(2)).unwrap_err().to_string().contains("partial catalogue append"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fs::read(&c.path).unwrap(), before);
+        assert!(!append_pending_path(&c.path).exists());
+        c.directory_sync = None;
+        c.append(&record(3)).unwrap();
+        assert_eq!(read_catalogue(&c.path).unwrap(), (vec![record(1), record(3)], None));
     }
 }
 
