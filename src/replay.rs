@@ -718,6 +718,15 @@ fn import_legacy(
             legacy_dir: format!("legacy-{epoch}"),
         };
         w.cs.log(utc, Rec::Import(import.clone()))?;
+        // File syncs cover contents, while these barriers publish their names.
+        // Persist each class's files before the root's class/catalogue entries,
+        // all before either directory swap or any legacy input is moved.
+        let parents: std::collections::BTreeSet<_> = rp.chunks.table.values()
+            .map(|chunk| chunk.path.parent().unwrap()).collect();
+        for parent in parents {
+            recovery_sync_dir(parent, config)?;
+        }
+        recovery_sync_dir(&dir, config)?;
         Ok((import, w.written))
     })();
     let (import, written) = match built {

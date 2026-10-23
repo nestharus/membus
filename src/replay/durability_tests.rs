@@ -90,6 +90,11 @@ fn import_observer(
     let seen = events.clone();
     let config = Config {
         recovery_dir_sync: Some(Arc::new(move |dir| {
+            // These witnesses count rename barriers; construction barriers have
+            // separate controls below and must complete before the first rename.
+            if dir.starts_with(root.join("chunks.import")) {
+                return Ok(());
+            }
             let mut seen = seen.lock().unwrap();
             seen.push(dir.to_owned());
             let n = seen.len();
@@ -378,4 +383,206 @@ fn policy_parser_preserves_order_and_rejects_unadmitted_input() {
         .map(|n| format!("caller\tp{n}/\texpire:{}\n", 100 + n))
         .collect();
     assert!(import_policies(many.as_bytes(), &config).is_err());
+}
+
+fn import_input_bytes(f: &Fixture, files: &[String]) -> Vec<(String, Vec<u8>)> {
+    files
+        .iter()
+        .map(|name| (name.clone(), fs::read(f.0.join(name)).unwrap()))
+        .collect()
+}
+fn assert_import_inputs_unchanged(root: &Path, inputs: &[(String, Vec<u8>)]) {
+    for (name, bytes) in inputs {
+        assert_eq!(fs::read(root.join(name)).unwrap(), *bytes);
+        assert!(!fs::metadata(root.join(name))
+            .unwrap()
+            .permissions()
+            .readonly());
+    }
+    assert_eq!(fs::read(root.join("epoch")).unwrap(), 7u64.to_le_bytes());
+    assert!(root.join("chunks").is_dir());
+    assert_eq!(fs::read_dir(root.join("chunks")).unwrap().count(), 0);
+    assert!(!root.join("chunks.pre-import-8").exists());
+    assert!(!root.join("legacy-8").exists());
+}
+fn assert_complete_tree_barriers(root: &Path, seen: &[PathBuf]) {
+    let tree = root.join("chunks.import");
+    assert_eq!(
+        seen.len(),
+        3,
+        "both class directories and the catalogue directory must sync"
+    );
+    assert_eq!(
+        seen.last(),
+        Some(&tree),
+        "children must sync before their parent"
+    );
+    let classes: std::collections::BTreeSet<_> = seen[..2].iter().cloned().collect();
+    assert_eq!(classes, [tree.join("forever"), tree.join("latest")].into());
+}
+
+#[test]
+fn import_tree_barriers_follow_complete_files_and_precede_the_first_rename() {
+    let f = Fixture::new();
+    let files = f.legacy(false);
+    let inputs = import_input_bytes(&f, &files);
+    let root = f.0.clone();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let observed = seen.clone();
+    let config = Config {
+        recovery_dir_sync: Some(Arc::new(move |dir| {
+            let tree = root.join("chunks.import");
+            let mut seen = observed.lock().unwrap();
+            if dir.starts_with(&tree) {
+                assert_import_inputs_unchanged(&root, &inputs);
+                let records = chunks::read_catalogue(&tree.join("catalogue.log"))?.0;
+                assert!(records
+                    .iter()
+                    .any(|r| matches!(r.rec, chunks::Rec::Import(_))));
+                let opens = records
+                    .iter()
+                    .filter(|r| matches!(r.rec, chunks::Rec::Open { .. }))
+                    .count();
+                let closes = records
+                    .iter()
+                    .filter(|r| matches!(r.rec, chunks::Rec::Close { .. }))
+                    .count();
+                assert_eq!(opens, 2);
+                assert_eq!(
+                    closes, opens,
+                    "complete data-file closes precede directory publication"
+                );
+                assert_eq!(chunks::list_chunk_files(&tree)?.len(), opens);
+                seen.push(dir.to_owned());
+                if dir == tree {
+                    assert_complete_tree_barriers(&root, &seen);
+                }
+            } else {
+                // Every rename barrier, including the first one, depends on the tree.
+                assert_complete_tree_barriers(&root, &seen);
+            }
+            Ok(())
+        })),
+        ..Config::default()
+    };
+    import_legacy(&f.0, &config, &Fixture::clock(), 8).unwrap();
+    assert_complete_tree_barriers(&f.0, &seen.lock().unwrap());
+    assert!(!f.0.join("chunks.import").exists());
+    let store = Store::open(&f.0, Config::default()).unwrap();
+    assert_eq!(store.get("caller", "key").unwrap().bytes, b"original");
+    assert!(!store.storage_error());
+}
+
+#[test]
+fn each_import_tree_sync_failure_refuses_before_switch_and_can_retry() {
+    for stop in 1..=3 {
+        let f = Fixture::new();
+        let files = f.legacy(false);
+        let inputs = import_input_bytes(&f, &files);
+        let tree = f.0.join("chunks.import");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let observed = seen.clone();
+        let config = Config {
+            recovery_dir_sync: Some(Arc::new(move |dir| {
+                if dir.starts_with(&tree) {
+                    let mut seen = observed.lock().unwrap();
+                    seen.push(dir.to_owned());
+                    if seen.len() == stop {
+                        return Err(io::Error::other(
+                            "injected import tree directory sync failure",
+                        ));
+                    }
+                }
+                Ok(())
+            })),
+            ..Config::default()
+        };
+        let error = Store::open(&f.0, config)
+            .err()
+            .expect("a failed tree barrier must refuse startup");
+        assert!(error
+            .to_string()
+            .contains("import tree directory sync failure"));
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            stop,
+            "stop at the first failed barrier"
+        );
+        assert_import_inputs_unchanged(&f.0, &inputs);
+        assert!(
+            !f.0.join("chunks.import").exists(),
+            "discard the unpublished replacement"
+        );
+        let report = fs::read_to_string(f.0.join("replay.json")).unwrap();
+        assert!(report.contains("\"stage\":\"refused\""));
+        assert!(report.contains("\"ready_ms\":0"));
+        f.unlock();
+        let store = Store::open(&f.0, Config::default()).unwrap();
+        assert_eq!(store.epoch, 8);
+        assert_eq!(store.get("caller", "key").unwrap().bytes, b"original");
+        assert!(!store.storage_error());
+        for (name, bytes) in &inputs {
+            let backup = f.0.join("legacy-8").join(name);
+            assert_eq!(fs::read(&backup).unwrap(), *bytes);
+            assert!(fs::metadata(backup).unwrap().permissions().readonly());
+        }
+    }
+}
+
+#[test]
+fn empty_import_syncs_the_catalogue_directory_before_switching() {
+    let f = Fixture::new();
+    fs::write(f.0.join("epoch"), 7u64.to_le_bytes()).unwrap();
+    fs::write(f.0.join("stripe-0.log"), b"").unwrap();
+    fs::create_dir(f.0.join("chunks")).unwrap();
+    let inputs = vec![("stripe-0.log".into(), Vec::new())];
+    let tree = f.0.join("chunks.import");
+    let config = Config {
+        recovery_dir_sync: Some(Arc::new(move |dir| {
+            if dir == tree {
+                assert!(chunks::list_chunk_files(&tree)?.is_empty());
+                let records = chunks::read_catalogue(&tree.join("catalogue.log"))?.0;
+                assert!(records
+                    .iter()
+                    .any(|r| matches!(&r.rec, chunks::Rec::Import(i) if i.keys == 0)));
+                return Err(io::Error::other("empty import directory sync failure"));
+            }
+            Ok(())
+        })),
+        ..Config::default()
+    };
+    let error = Store::open(&f.0, config)
+        .err()
+        .expect("even a catalogue-only import needs its directory barrier");
+    assert!(error
+        .to_string()
+        .contains("empty import directory sync failure"));
+    assert_import_inputs_unchanged(&f.0, &inputs);
+    assert!(!f.0.join("chunks.import").exists());
+    f.unlock();
+    let store = Store::open(&f.0, Config::default()).unwrap();
+    assert_eq!(store.epoch, 8);
+    assert!(store.chunk_rows().is_empty());
+    assert!(!store.storage_error());
+    assert!(f.0.join("legacy-8/stripe-0.log").exists());
+}
+
+#[test]
+fn equivalence_refusal_never_reaches_import_tree_publication() {
+    let f = Fixture::new();
+    let files = f.legacy(false);
+    let inputs = import_input_bytes(&f, &files);
+    let config = Config {
+        import_inject_difference: true,
+        recovery_dir_sync: Some(Arc::new(|_| {
+            panic!("refused content must not reach a directory barrier")
+        })),
+        ..Config::default()
+    };
+    let error = Store::open(&f.0, config)
+        .err()
+        .expect("the injected equivalence difference must refuse");
+    assert!(error.to_string().contains("import refused"));
+    assert_import_inputs_unchanged(&f.0, &inputs);
+    assert!(!f.0.join("chunks.import").exists());
 }

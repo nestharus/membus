@@ -1,8 +1,22 @@
-# Recovery rename durability
+# Recovery directory durability
 
 Recovery synchronizes each rename's containing directory before performing the
 next dependent step. Synchronizing a file alone is not a directory publication
 barrier.
+
+Before the import's directory switch, startup also synchronizes the constructed
+replacement tree. After all data files and their Close records are synced, the
+replacement is independently replayed and checked for equivalence, and the
+Import catalogue record is synced. Startup then synchronizes each distinct
+class directory, followed by `chunks.import` itself. This covers the chunk file
+names, class directory names and catalogue name before either swap rename or any
+legacy input move. A catalogue-only import still synchronizes `chunks.import`.
+
+Failure at one of these construction barriers discards the unpublished
+replacement and refuses startup. The original chunks directory, legacy input
+bytes/permissions and epoch remain unchanged, so another startup can rebuild
+and retry. The directory operations use the same helper and OS error handling
+as the rename barriers below.
 
 | Rename | Barrier before continuing |
 | --- | --- |
@@ -31,13 +45,18 @@ and `GetLastError`. These requirements motivate an actual barrier, rather than
 assuming that NTFS journaling makes directory flushing unnecessary. Unsupported
 directory flushes and access denials propagate; they are never treated as a
 successful no-op. Storage hardware and filesystems still determine actual media
-persistence. This change covers the named recovery renames, not every creation
-or rename elsewhere in the store.
+persistence. These barriers cover replacement-tree creation during import and
+the named recovery renames, not every creation or rename elsewhere in the store.
 
 Tests in `src/replay/durability_tests.rs` observe filesystem state at each barrier,
 inject failures, and verify both refusal and a subsequent successful retry.
 The hook is per-Config and compiled only for unit tests. Normal builds contain
 neither a global hook nor an environment-controlled bypass.
+The construction controls check complete catalogue records and unchanged inputs
+at the class/root barriers, fail each barrier before the switch, verify refusal
+and successful retry, and cover a catalogue-only replacement. An equivalence
+refusal must not reach any of those publication barriers. These checks establish
+call/failure ordering, not physical power-loss behavior.
 
 The synthetic policy operation remains caller-scoped: `policy_key` embeds the
 caller namespace in the key, and `dedup_identity` projects a policy mutation back
