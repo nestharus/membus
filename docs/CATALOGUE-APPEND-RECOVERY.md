@@ -17,6 +17,15 @@ is removed. Startup has no such live-state witness and does not remove the marke
 boundary. Recovery after that refusal needs an independently established retained-state account; it
 is not an automatic repair or a reason to delete the marker manually.
 
+The replacement's containing directory is synchronized after the rename and
+before an unresolved marker is cleared. If that barrier fails, the replacement
+may already be visible: the writer retains its handle on that image and fences
+further appends. Any existing unresolved marker remains, so replay/open still
+refuse it. A successful retry from the owner's known live list completes the
+barrier and marker resolution before clearing the fence or advancing the
+successful-rewrite baseline. A failure before replacement publication retains
+the prior image and handle, as before.
+
 The tests represent complete write followed by sync failure and boundary-recovery failure, partial
 markers, live-list recovery, retained chunk bytes on restart refusal, and still-readable values after
 a later retirement fails. They exercise process restart and injected I/O error branches. They do not

@@ -720,6 +720,8 @@ pub struct Catalogue {
     fail_reopen_once: bool,
     #[cfg(test)]
     pub(crate) fail_recovery_once: bool,
+    #[cfg(test)]
+    directory_sync: Option<Arc<dyn Fn(&Path) -> io::Result<()> + Send + Sync>>,
 }
 impl Catalogue {
     pub fn open(path: &Path) -> io::Result<Self> {
@@ -740,7 +742,16 @@ impl Catalogue {
             fail_reopen_once: false,
             #[cfg(test)]
             fail_recovery_once: false,
+            #[cfg(test)]
+            directory_sync: None,
         })
+    }
+    fn sync_parent(&self) -> io::Result<()> {
+        let parent = self.path.parent().filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        #[cfg(test)]
+        if let Some(hook) = &self.directory_sync { hook(parent)?; }
+        crate::log_io::sync_dir(parent)
     }
     /// Append and flush; the record takes effect only after this returns Ok.
     pub fn append(&mut self, r: &CatRecord) -> io::Result<()> {
@@ -828,10 +839,13 @@ impl Catalogue {
         fs::rename(&tmp, &self.path)?;
         self.file = replacement;
         self.bytes = bytes;
+        // A post-rename failure must keep the handle on the published image,
+        // fence appends and retain any unresolved marker until a rewrite retries.
+        self.fenced = true;
+        self.sync_parent()?;
         // A retained marker is cleared only after the caller's known live list has replaced the
         // uncertain catalogue. Any failure keeps replay fenced across process restart.
         let pending = append_pending_path(&self.path);
-        self.fenced = true;
         if pending.try_exists()? {
             resolve_append(&self.path)?;
         }
@@ -1568,6 +1582,76 @@ mod catalogue_failure_tests {
         assert!(c.append(&record(2)).is_err());
         assert_eq!(fs::read(&c.path).unwrap(), before);
         assert_eq!(fs::read(append_pending_path(&c.path)).unwrap(), b"MBC");
+    }
+
+    fn unresolved_catalogue(label: &str) -> Catalogue {
+        let mut c = catalogue(label);
+        c.append(&record(1)).unwrap();
+        c.fail_sync_once = true;
+        c.fail_recovery_once = true;
+        assert!(c.append(&record(2)).is_err());
+        assert!(append_pending_path(&c.path).exists());
+        c
+    }
+
+    #[test]
+    fn rewrite_directory_sync_follows_rename_before_marker_resolution() {
+        let mut c = unresolved_catalogue("rewrite-directory-order");
+        let path = c.path.clone();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = seen.clone();
+        c.directory_sync = Some(Arc::new(move |dir| {
+            assert_eq!(dir, path.parent().unwrap());
+            assert_eq!(fs::read(&path)?, encode(&record(1)), "replacement must already name the published path");
+            assert!(!path.with_extension("log.tmp").exists());
+            observed.lock().unwrap().push(append_pending_path(&path).exists());
+            Ok(())
+        }));
+        c.rewrite(&[record(1)]).unwrap();
+        assert_eq!(seen.lock().unwrap().first(), Some(&true),
+                   "the replacement directory barrier must precede clearing the recovery marker");
+        assert!(!append_pending_path(&c.path).exists());
+        assert_eq!(read_catalogue(&c.path).unwrap(), (vec![record(1)], None));
+    }
+
+    #[test]
+    fn rewrite_directory_sync_failure_keeps_the_marker_and_append_fence_until_retry() {
+        let mut c = unresolved_catalogue("rewrite-directory-failure");
+        c.directory_sync = Some(Arc::new(|_| Err(io::Error::other("injected replacement directory sync failure"))));
+        let error = c.rewrite(&[record(1)]).err().expect("replacement directory sync must be required");
+        assert!(error.to_string().contains("replacement directory sync failure"));
+        assert!(append_pending_path(&c.path).exists());
+        assert!(read_catalogue(&c.path).unwrap_err().to_string().contains("append unresolved"));
+        assert!(Catalogue::open(&c.path).err().unwrap().to_string().contains("append unresolved"));
+        assert!(c.append(&record(3)).unwrap_err().to_string().contains("fenced"));
+        assert_eq!(fs::read(&c.path).unwrap(), encode(&record(1)));
+        assert_eq!(c.rewrites, 0, "a failed barrier must not count as a successful rewrite");
+        c.directory_sync = None;
+        c.rewrite(&[record(1)]).unwrap();
+        c.append(&record(3)).unwrap();
+        assert_eq!(read_catalogue(&c.path).unwrap(), (vec![record(1), record(3)], None));
+    }
+
+    #[test]
+    fn failed_rewrite_directory_sync_keeps_the_handle_on_the_published_image() {
+        let mut c = catalogue("rewrite-directory-handle");
+        c.append(&record(1)).unwrap();
+        c.directory_sync = Some(Arc::new(|_| Err(io::Error::other("injected replacement directory sync failure"))));
+        assert!(c.rewrite(&[record(2)]).is_err(), "the directory failure must be returned");
+        let mut retained = c.file.try_clone().unwrap();
+        retained.seek(SeekFrom::Start(0)).unwrap();
+        let mut image = Vec::new();
+        retained.read_to_end(&mut image).unwrap();
+        assert_eq!(image, encode(&record(2)));
+        assert_eq!(image, fs::read(&c.path).unwrap(), "the retained handle must match the renamed path");
+        assert!(c.append(&record(3)).unwrap_err().to_string().contains("fenced"));
+        assert!(c.needs_rewrite(u64::MAX));
+        assert_eq!(c.rewrite_base_bytes, 0);
+        assert_eq!(c.rewrites, 0);
+        c.directory_sync = None;
+        c.rewrite(&[record(2)]).unwrap();
+        c.append(&record(3)).unwrap();
+        assert_eq!(read_catalogue(&c.path).unwrap(), (vec![record(2), record(3)], None));
     }
 }
 
