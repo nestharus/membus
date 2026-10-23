@@ -63,7 +63,16 @@ eventual epoch publication. A failed epoch admission consumes no epoch. Correcti
 the persisted input permits the normal import/recovery attempt; an exhausted
 epoch requires explicit state remediation and never wraps to zero.
 
+Errors while creating, writing, or synchronizing `epoch.tmp`, or replacing
+`epoch`, also attempt a refused report. That report retains observations already
+collected by replay; the original I/O error, including its OS code, is returned.
+The file-operation order and successful publication behavior stay the same.
+
 `tests/recovery_epoch.rs` covers malformed lengths, a real epoch read error,
 exhaustion without a panic, preservation of a torn tail and catalogue, replacement
 of a prior ready report, normal restart increments, and import/publication at the
 last available epoch. Its owned fixtures are synthetic and removed after use.
+The publication controls block the temporary file with a directory and, on
+Windows, deny replacement through a real file handle. They check refusal,
+preserved replay observations and successful retry without skipping an epoch;
+they do not simulate a physical write or sync failure.

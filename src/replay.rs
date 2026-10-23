@@ -1291,12 +1291,15 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
         flags.storage_error.store(true, Ordering::SeqCst);
     }
     let epoch_tmp = path.join("epoch.tmp");
-    {
-        let mut f = File::create(&epoch_tmp)?;
-        f.write_all(&epoch.to_le_bytes())?;
-        f.sync_all()?;
-    }
-    fs::rename(epoch_tmp, epoch_path)?;
+    let publication = (|| {
+        {
+            let mut f = File::create(&epoch_tmp)?;
+            f.write_all(&epoch.to_le_bytes())?;
+            f.sync_all()?;
+        }
+        fs::rename(epoch_tmp, epoch_path)
+    })();
+    publication.map_err(|e| refuse(e, rp.report.clone()))?;
     recovery_sync_dir(path, config).map_err(|e| refuse(e, rp.report.clone()))?;
     let mut committed = rp.committed;
     cs.summaries.expire(utc, config.summary_ms);

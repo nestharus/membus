@@ -248,3 +248,95 @@ fn last_available_epoch_is_used_consistently_for_import_and_publication() {
         b"retained value"
     );
 }
+
+#[test]
+fn blocked_epoch_temporary_file_refuses_with_replay_observations_and_can_retry() {
+    let fixture = Fixture::new();
+    let store = fixture.open().unwrap();
+    assert_eq!(
+        store
+            .mutate(Mutation {
+                ns: "epoch-fixture".into(),
+                key: "key".into(),
+                op_id: "original".into(),
+                deadline: u64::MAX,
+                ack: 2,
+                expected: None,
+                bytes: b"keep".to_vec(),
+                remove: false,
+            })
+            .code,
+        0
+    );
+    drop(store);
+    drop(fixture.open().unwrap());
+    let files = chunks::list_chunk_files(&fixture.0.join("chunks")).unwrap();
+    let (_, stripe, id, data) = &files[0];
+    let unregistered = chunks::chunk_path(
+        &fixture.0.join("chunks"),
+        membus::Class::FOREVER,
+        *stripe,
+        id + 1000,
+    );
+    fs::copy(data, &unregistered).unwrap();
+    let epoch_before = fs::read(fixture.0.join("epoch")).unwrap();
+    fs::create_dir(fixture.0.join("epoch.tmp")).unwrap();
+    let marker = fixture.0.join("epoch.tmp/retained-marker");
+    fs::write(&marker, b"keep").unwrap();
+    let expected_error = fs::File::create(fixture.0.join("epoch.tmp")).unwrap_err();
+    let error = fixture
+        .open()
+        .err()
+        .expect("blocked temporary epoch must refuse");
+    assert_eq!(error.kind(), expected_error.kind());
+    assert_eq!(error.raw_os_error(), expected_error.raw_os_error());
+    assert_eq!(fs::read(fixture.0.join("epoch")).unwrap(), epoch_before);
+    assert_eq!(fs::read(&marker).unwrap(), b"keep");
+    fixture.assert_refused(&error.to_string());
+    let report = fs::read_to_string(fixture.0.join("replay.json")).unwrap();
+    let observation = format!("chunk file with no open record: {}", unregistered.display());
+    assert!(report.contains(&format!("{observation:?}")), "{report}");
+
+    // Removing only the owned obstruction permits the same next epoch to publish.
+    fs::remove_file(marker).unwrap();
+    fs::remove_dir(fixture.0.join("epoch.tmp")).unwrap();
+    let store = fixture.open().unwrap();
+    assert_eq!(store.epoch, 3);
+    assert_eq!(store.get("epoch-fixture", "key").unwrap().bytes, b"keep");
+    assert_eq!(store.replay_report().stage, "ready");
+}
+
+#[cfg(windows)]
+#[test]
+fn denied_epoch_replacement_refuses_after_sync_and_retries_without_skipping_epoch() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let fixture = Fixture::new();
+    drop(fixture.open().unwrap());
+    let epoch_path = fixture.0.join("epoch");
+    let epoch_before = fs::read(&epoch_path).unwrap();
+    // Admit reads/writes, but deny the delete sharing required by replacement.
+    let guard = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(3)
+        .open(&epoch_path)
+        .unwrap();
+    let error = fixture
+        .open()
+        .err()
+        .expect("epoch replacement must be denied");
+    assert!(
+        error.raw_os_error().is_some(),
+        "preserve the original OS error"
+    );
+    assert_eq!(fs::read(&epoch_path).unwrap(), epoch_before);
+    assert_eq!(
+        fs::read(fixture.0.join("epoch.tmp")).unwrap(),
+        2u64.to_le_bytes()
+    );
+    fixture.assert_refused(&error.to_string());
+    drop(guard);
+    let store = fixture.open().unwrap();
+    assert_eq!(store.epoch, 2);
+    assert_eq!(store.replay_report().stage, "ready");
+    assert!(!fixture.0.join("epoch.tmp").exists());
+}
