@@ -51,7 +51,11 @@ before removing a torn tail. That stage has `ready_ms=0`: it records what was fo
 and planned, rather than claiming a successful truncation or ready service. A later
 ready report replaces the current JSON; the bounded replay log retains the earlier
 stage if startup stopped after truncation. Failure to publish this evidence refuses
-the destructive step. This ordering supports process-interruption evidence, without
+the destructive step. Report publication includes directory barriers after
+snapshot and history-rotation renames, and after flushing the appended history
+line, before recovery may truncate either input. The directory ordering and
+error behavior are described in [recovery directories](RECOVERY-DIRECTORIES.md).
+This ordering supports process-interruption evidence, without
 adding a power-loss or unlimited-history guarantee.
 
 Live-list rewrites retain original logical retirement times. Expiry summaries are

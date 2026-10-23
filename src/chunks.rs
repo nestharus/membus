@@ -989,8 +989,21 @@ impl ReplayReport {
             opt(&self.refusal),
         )
     }
-    /// Write replay.json (tmp, rename) and append one line to replay.log, kept to its last 256 lines at 1 MiB.
+    /// Publish replay.json and append bounded replay.log history, including their directory barriers.
     pub fn write(&self, state: &Path) -> io::Result<()> {
+        self.write_with_sync(state, crate::log_io::sync_dir)
+    }
+    pub(crate) fn write_startup(&self, state: &Path, _config: &crate::Config) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some(hook) = &_config.replay_report_dir_sync {
+            return self.write_with_sync(state, |dir| {
+                hook(dir)?;
+                crate::log_io::sync_dir(dir)
+            });
+        }
+        self.write(state)
+    }
+    fn write_with_sync(&self, state: &Path, mut sync: impl FnMut(&Path) -> io::Result<()>) -> io::Result<()> {
         let line = self.json();
         let tmp = state.join("replay.json.tmp");
         let mut pending = File::create(&tmp)?;
@@ -998,6 +1011,7 @@ impl ReplayReport {
         crate::sync_file(&pending)?;
         drop(pending);
         fs::rename(&tmp, state.join("replay.json"))?;
+        sync(state)?;
         let log = state.join("replay.log");
         if fs::metadata(&log).map(|m| m.len()).unwrap_or(0) > 1024 * 1024 {
             let text = fs::read_to_string(&log)?;
@@ -1009,10 +1023,14 @@ impl ReplayReport {
             crate::sync_file(&retained)?;
             drop(retained);
             fs::rename(&tmp, &log)?;
+            sync(state)?;
         }
         let mut f = OpenOptions::new().create(true).append(true).open(&log)?;
         f.write_all(format!("{line}\n").as_bytes())?;
         crate::sync_file(&f)?;
+        // Opening the history may have created its name. Persist it before a
+        // pending report permits repair or a ready report permits Store return.
+        sync(state)?;
         Ok(())
     }
     pub fn summary(&self) -> String {
@@ -1032,6 +1050,10 @@ impl ReplayReport {
         )
     }
 }
+
+#[cfg(test)]
+#[path = "replay_report_tests.rs"]
+mod replay_report_tests;
 
 /// The record fields replay and the retirement bookkeeping need: (ns, key, version) from an MBK1 payload.
 pub fn record_key(payload: &[u8]) -> Option<(String, String, u64)> {

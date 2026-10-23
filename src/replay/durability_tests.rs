@@ -689,3 +689,53 @@ fn catalogue_directory_sync_failure_retains_observations_before_close_and_epoch(
         "the observed unregistered copy remains reported"
     );
 }
+
+#[test]
+fn pending_report_directory_failure_preserves_both_torn_inputs_and_epoch() {
+    for stop in 1..=3 {
+        let f = Fixture::new();
+        let store = Store::open(&f.0, Config::default()).unwrap();
+        let mutation = Mutation {
+            ns: "caller".into(), key: "key".into(), op_id: "original".into(),
+            deadline: u64::MAX, ack: 2, expected: None,
+            bytes: b"original".to_vec(), remove: false,
+        };
+        assert_eq!(store.mutate(mutation).code, 0);
+        drop(store);
+        f.unlock();
+        let data = chunks::list_chunk_files(&f.0.join("chunks")).unwrap()[0].3.clone();
+        let catalogue = f.0.join("chunks/catalogue.log");
+        OpenOptions::new().append(true).open(&data).unwrap().write_all(b"MBK").unwrap();
+        OpenOptions::new().append(true).open(&catalogue).unwrap().write_all(b"MBC").unwrap();
+        let old_data = fs::read(&data).unwrap();
+        let old_catalogue = fs::read(&catalogue).unwrap();
+        let old_epoch = fs::read(f.0.join("epoch")).unwrap();
+        fs::write(f.0.join("replay.log"), "old history line\n".repeat(70_000)).unwrap();
+        let root = f.0.clone();
+        let seen = Arc::new(Mutex::new(0));
+        let observed = seen.clone();
+        let config = Config {
+            replay_report_dir_sync: Some(Arc::new(move |dir| {
+                assert_eq!(dir, root);
+                let json = fs::read_to_string(root.join("replay.json"))?;
+                assert!(json.contains("\"stage\":\"truncation_pending\""));
+                assert!(json.contains("\"ready_ms\":0"));
+                let mut calls = observed.lock().unwrap();
+                *calls += 1;
+                if *calls == stop { Err(io::Error::from_raw_os_error(5)) } else { Ok(()) }
+            })),
+            ..Config::default()
+        };
+        let error = recover(&f.0, &config).err().expect("report directory failure must precede truncation");
+        assert_eq!(error.raw_os_error(), Some(5));
+        assert_eq!(*seen.lock().unwrap(), stop);
+        assert_eq!(fs::read(&data).unwrap(), old_data);
+        assert_eq!(fs::read(&catalogue).unwrap(), old_catalogue);
+        assert_eq!(fs::read(f.0.join("epoch")).unwrap(), old_epoch);
+        let store = Store::open(&f.0, Config::default()).unwrap();
+        assert_eq!(store.epoch, 2);
+        assert_eq!(store.get("caller", "key").unwrap().bytes, b"original");
+        assert_eq!(fs::metadata(&data).unwrap().len(), old_data.len() as u64 - 3);
+        assert!(store.replay_report().catalogue_truncation.is_some());
+    }
+}

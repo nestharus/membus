@@ -161,6 +161,9 @@ pub struct Config {
     /// Test seam: observe or refuse each recovery directory barrier before the OS call.
     #[cfg(test)]
     pub recovery_dir_sync: Option<Arc<dyn Fn(&Path) -> io::Result<()> + Send + Sync>>,
+    /// Test seam: observe or refuse a startup report's directory barriers.
+    #[cfg(test)]
+    pub replay_report_dir_sync: Option<Arc<dyn Fn(&Path) -> io::Result<()> + Send + Sync>>,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -209,6 +212,8 @@ impl Default for Config {
             flush_covered_count: None,
             #[cfg(test)]
             recovery_dir_sync: None,
+            #[cfg(test)]
+            replay_report_dir_sync: None,
         }
     }
 }
@@ -416,7 +421,7 @@ impl Store {
         let (stop, reaper) = snapshots::start_reaper(scans.clone(), &config);
         report.ready_ms = now_ms();
         report.stage = "ready".into();
-        report.write(path)?;
+        report.write_startup(path, &config)?;
         Ok(Self {
             timers,
             signals: signals::Hub::new(epoch, &config),

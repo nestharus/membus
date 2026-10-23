@@ -1076,7 +1076,7 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
         report.stage = "refused".into();
         report.refusal = Some(e.to_string());
         // The replay record is written before exit; its own failure does not hide the refusal.
-        let _ = report.write(path);
+        let _ = report.write_startup(path, config);
         e
     };
     // Admit the next epoch before import moves inputs or replay repairs tails.
@@ -1147,7 +1147,7 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
         rp.report.stage = "truncation_pending".into();
         // Preserve what replay found before its source bytes disappear. A later successful
         // start can replace replay.json; the bounded replay.log retains this non-ready stage.
-        rp.report.write(path)?;
+        rp.report.write_startup(path, config)?;
     }
     for (p, offset) in &rp.truncate {
         OpenOptions::new().write(true).open(p)?.set_len(*offset)?;

@@ -25,6 +25,23 @@ replay observations and `ready_ms=0`. A fresh refusal consumes no epoch; after
 the barrier succeeds, the normal epoch/root barrier still covers the `chunks`
 directory entry in the state root.
 
+Replay evidence has its own publication barriers. After flushing and renaming
+`replay.json.tmp` to `replay.json`, the writer synchronizes the state directory
+before changing history. When history exceeds its size threshold, the retained
+`replay.log.tmp` image is flushed and renamed, then the state directory is
+synchronized before the new report line is appended. After that line is flushed,
+the directory is synchronized again, covering a newly created `replay.log` name.
+The public report writer and startup's pending, refused and ready reports use
+the same ordering. Original OS errors propagate; a refusal report remains a
+best-effort diagnostic and cannot replace the startup failure that caused it.
+
+A pending-report barrier failure stops recovery before either data or catalogue
+tail truncation and before epoch publication. Already completed report renames
+or appends are retained, so a visible report is not proof that all its barriers
+completed. A later startup can retry; history may contain a repeated report
+after a late failure. These barriers do not flush the parent of the state root
+or establish physical power-loss behavior for a particular storage device.
+
 | Rename | Barrier before continuing |
 | --- | --- |
 | `chunks` to `chunks.pre-import-<epoch>` | State root, before publishing the replacement `chunks`. |
