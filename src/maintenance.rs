@@ -18,7 +18,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
 use std::time::Duration;
-use std::time::Instant;
 
 /// Retirement, expiry summaries, tombstone drops and the clock check (5.3, 5.4), shared with the tick thread.
 pub(super) struct Maint {
@@ -374,9 +373,9 @@ impl Maint {
         let (tick_stop, tick_receiver) = mpsc::channel();
         let tick_maint = self.clone();
         let tick_every = Duration::from_millis(self.config.tick_ms.max(1));
-        let retire_every = Duration::from_millis(self.config.retire_ms);
+        let retire_every = self.config.retire_ms;
         let ticker = std::thread::spawn(move || {
-            let mut last_pass = Instant::now();
+            let mut last_pass = tick_maint.clock.mono_ms();
             while matches!(
                 tick_receiver.recv_timeout(tick_every),
                 Err(mpsc::RecvTimeoutError::Timeout)
@@ -384,8 +383,8 @@ impl Maint {
                 tick_maint.router.idle_close();
                 tick_maint.clock_tick();
                 tick_maint.cache.sweep();
-                if last_pass.elapsed() >= retire_every {
-                    last_pass = Instant::now();
+                if tick_maint.clock.mono_ms().saturating_sub(last_pass) >= retire_every {
+                    last_pass = tick_maint.clock.mono_ms();
                     tick_maint.pass();
                 }
                 tick_maint.rewrite_catalogue();

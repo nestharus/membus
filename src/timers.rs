@@ -1,5 +1,7 @@
 //! Persisted schedules, compact progress and one deadline owner. No payload execution.
-use crate::{lp, now_ms, Cursor, Mutation, Store, Value, MAX_ID};
+use crate::{lp, Cursor, Mutation, Store, Value, MAX_ID};
+#[cfg(test)]
+use crate::now_ms;
 use std::{collections::{BTreeSet, HashMap, HashSet}, io, sync::{Arc, Condvar, Mutex, Weak}, thread, time::Duration};
 
 pub(crate) const NS: &str = "__membus_timers_v1";
@@ -138,7 +140,7 @@ impl Store {
         let name=c.text()?;let id=identity(&ns,&name)?;
         let mut state=self.timers.0.lock().unwrap();
         // Admission rechecks deadline after serial timer lock wait.
-        if now_ms()>=deadline {return Err(5);}
+        if self.clock.utc_ms()>=deadline {return Err(5);}
         if op==crate::TIMER_STATUS {
             c.end()?;let Some(t)=state.timers.get(&id) else {return Ok(vec![0]);};
             let mut p=vec![1];p.extend(t.generation.to_le_bytes());p.push(t.active as u8);p.extend(t.error.to_le_bytes());
@@ -205,12 +207,13 @@ fn run(weak:Weak<Store>,shared:Shared) {
     loop {
         if s.stop {return;}
         let Some((due,id))=s.deadlines.first().cloned() else {s=shared.1.wait(s).unwrap();continue;};
-        let now=now_ms();
+        let Some(store)=weak.upgrade() else {return;};
+        let now=store.clock.utc_ms();
         if due>now {
+            drop(store);
             // One service owner rechecks wall-clock corrections at most once a second.
             s=shared.1.wait_timeout(s,Duration::from_millis((due-now).min(1000))).unwrap().0;continue;
         }
-        let Some(store)=weak.upgrade() else {return;};
         s.deadlines.remove(&(due,id.clone()));
         let t=s.timers.get_mut(&id).unwrap();
         let index=t.schedule.latest(t.next,now).unwrap();
@@ -231,7 +234,7 @@ fn publish_and_checkpoint(store:&Store,t:&Timer,progress:Progress,persist:impl F
         bytes:progress.signal(&t.schedule),tombstone:false}));
     let id=identity(&t.schedule.ns,&t.schedule.id).unwrap();
     let op_id=format!("tf-{}-{}-{}",store.epoch,t.generation,progress.index);
-    persist(Mutation {ns:NS.into(),key:format!("p/{id}"),op_id,deadline:now_ms().saturating_add(10000),
+    persist(Mutation {ns:NS.into(),key:format!("p/{id}"),op_id,deadline:store.clock.utc_ms().saturating_add(10000),
         ack:1,expected:None,bytes:progress.encode(),remove:false})
 }
 

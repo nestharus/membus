@@ -19,7 +19,6 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
-use std::time::Instant;
 
 #[derive(Default)]
 pub(super) struct ScanUsage {
@@ -38,7 +37,7 @@ impl Drop for ScanCharge {
 }
 pub(super) struct Snapshot {
     pub(super) ns: String,
-    pub(super) created: Instant,
+    pub(super) created: u64,
     pub(super) rows: Vec<(String, Arc<Value>)>,
     pub(super) cursor_hash: RandomState,
     // Charges survive release/expiry while a dispatcher still holds this Arc.
@@ -50,19 +49,19 @@ pub(super) struct ScanState {
 }
 impl Store {
     pub(super) fn purge_scans(&self, state: &mut ScanState) {
-        let ttl = Duration::from_millis(self.config.snapshot_ttl_ms);
-        state.snapshots.retain(|_, s| s.created.elapsed() < ttl);
+        let now = self.clock.mono_ms();
+        state.snapshots.retain(|_, s| now.saturating_sub(s.created) < self.config.snapshot_ttl_ms);
     }
     pub(super) fn snapshot_open(&self, ns: &str) -> Result<(Vec<u8>, Arc<Snapshot>), u16> {
-        let created = Instant::now();
+        let created = self.clock.mono_ms();
         let mut scans = self.scans.lock().unwrap();
         self.purge_scans(&mut scans);
         if self.scan_usage.count.load(Ordering::Acquire) >= self.config.snapshot_max {
             return Err(22);
         }
-        let lock_start = Instant::now();
+        let lock_start = self.clock.mono_ns();
         let committed = self.committed.read().unwrap();
-        let lock_acquired = Instant::now();
+        let lock_acquired = self.clock.mono_ns();
         let mut charge = 256usize.checked_add(ns.len()).ok_or(22u16)?;
         let mut count = 0;
         for ((namespace, key), value) in committed.iter() {
@@ -77,7 +76,7 @@ impl Store {
                 count += 1;
             }
         }
-        let charge_end = Instant::now();
+        let charge_end = self.clock.mono_ns();
         let total = self
             .scan_usage
             .bytes
@@ -100,7 +99,7 @@ impl Store {
             usage: self.scan_usage.clone(),
             bytes: charge,
         };
-        let selection_start = Instant::now();
+        let selection_start = self.clock.mono_ns();
         // Separate the second global index walk from namespace-owned copying.
         // Copy immutable locations under the committed read lock, then release it
         // before loading any missing payload. The row charge covers both vectors.
@@ -109,8 +108,8 @@ impl Store {
             .filter(|((namespace, _), value)| namespace == ns && !value.tombstone)
             .map(|((_, key), value)| (key.clone(), value.clone()))
             .collect();
-        let selection_end = Instant::now();
-        let copy_end = Instant::now();
+        let selection_end = self.clock.mono_ns();
+        let copy_end = self.clock.mono_ns();
         drop(committed);
         drop(scans);
         let mut rows = Vec::with_capacity(count);
@@ -118,17 +117,17 @@ impl Store {
             let payload = self.read_entry(ns, &key, &value).map_err(|_| 16u16)?;
             rows.push((key, payload));
         }
-        let sort_start = Instant::now();
+        let sort_start = self.clock.mono_ns();
         rows.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        let sort_end = Instant::now();
+        let sort_end = self.clock.mono_ns();
         let times = [
             1,
-            lock_acquired.duration_since(lock_start).as_nanos() as u64,
-            charge_end.duration_since(lock_acquired).as_nanos() as u64,
-            selection_end.duration_since(selection_start).as_nanos() as u64,
-            copy_end.duration_since(selection_end).as_nanos() as u64,
-            copy_end.duration_since(lock_acquired).as_nanos() as u64,
-            sort_end.duration_since(sort_start).as_nanos() as u64,
+            lock_acquired.saturating_sub(lock_start),
+            charge_end.saturating_sub(lock_acquired),
+            selection_end.saturating_sub(selection_start),
+            copy_end.saturating_sub(selection_end),
+            copy_end.saturating_sub(lock_acquired),
+            sort_end.saturating_sub(sort_start),
         ];
         for (metric, n) in self.capture_metrics.iter().zip(times) {
             metric.fetch_add(n, Ordering::Relaxed);
@@ -140,7 +139,7 @@ impl Store {
             cursor_hash: RandomState::new(),
             _charge: reservation,
         });
-        if snapshot.created.elapsed() >= Duration::from_millis(self.config.snapshot_ttl_ms) {
+        if self.clock.mono_ms().saturating_sub(snapshot.created) >= self.config.snapshot_ttl_ms {
             return Err(20);
         }
         self.scans
@@ -282,7 +281,7 @@ impl Store {
                     encode_value(&mut p, Some(value));
                 }
             }
-            if snapshot.created.elapsed() >= Duration::from_millis(self.config.snapshot_ttl_ms) {
+            if self.clock.mono_ms().saturating_sub(snapshot.created) >= self.config.snapshot_ttl_ms {
                 return Err(20);
             }
             Ok(p)
@@ -299,6 +298,7 @@ impl Store {
 pub(super) fn start_reaper(
     scans: Arc<Mutex<ScanState>>,
     config: &Config,
+    clock: crate::chunks::Clock,
 ) -> (mpsc::Sender<()>, std::thread::JoinHandle<()>) {
     let (stop, receiver) = mpsc::channel();
     let reaper_scans = scans;
@@ -313,7 +313,7 @@ pub(super) fn start_reaper(
                 .lock()
                 .unwrap()
                 .snapshots
-                .retain(|_, s| s.created.elapsed() < ttl);
+                .retain(|_, s| clock.mono_ms().saturating_sub(s.created) < ttl.as_millis() as u64);
         }
     });
     (stop, reaper)

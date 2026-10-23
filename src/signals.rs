@@ -51,7 +51,7 @@ struct State {
 type Connection = crate::pipe_io::Pipe;
 #[cfg(not(windows))]
 type Connection = ();
-type Sink = fn(&str, &[u8], u32, &mut Option<Connection>) -> io::Result<()>;
+type Sink = fn(&str, &[u8], u32, &mut Option<Connection>, &crate::chunks::Clock) -> io::Result<()>;
 pub struct Hub {
     epoch: u64,
     ring_max: usize,
@@ -94,10 +94,10 @@ fn encode(epoch: u64, id: u64, change: &Change, values: bool) -> Vec<u8> {
     frame
 }
 impl Hub {
-    pub fn new(epoch: u64, config: &Config) -> Self {
-        Self::with_sink(epoch, config, deliver)
+    pub fn new(epoch: u64, config: &Config, clock: crate::chunks::Clock) -> Self {
+        Self::with_sink(epoch, config, deliver, clock)
     }
-    fn with_sink(epoch: u64, config: &Config, sink: Sink) -> Self {
+    fn with_sink(epoch: u64, config: &Config, sink: Sink, clock: crate::chunks::Clock) -> Self {
         let state = Arc::new((Mutex::new(State { head: 0, floor: 0, next: 1,
             ring: VecDeque::new(), ring_bytes: 0, queue_bytes: 0,
             subs: Vec::new(), turn: 0, stop: false }), Condvar::new()));
@@ -129,7 +129,7 @@ impl Hub {
                 let (id, endpoint, values, change) = job;
                 // Encoding and all endpoint I/O are outside the publication/hub lock.
                 let result = sink(&endpoint, &encode(epoch, id, &change, values), WRITE_MS,
-                    connections.entry(id).or_default());
+                    connections.entry(id).or_default(), &clock);
                 let mut s = owner.0.lock().unwrap();
                 s.queue_bytes -= change.charge;
                 if let Some(sub) = s.subs.iter_mut().find(|sub| sub.id == id) {
@@ -278,17 +278,17 @@ fn wire_size(c: &Change, values: bool) -> usize {
     57 + c.ns.len() + c.key.len() + if values { 4 + c.value.bytes.len() } else { 0 }
 }
 #[cfg(windows)]
-fn deliver(endpoint: &str, payload: &[u8], timeout: u32, connection: &mut Option<Connection>) -> io::Result<()> {
+fn deliver(endpoint: &str, payload: &[u8], timeout: u32, connection: &mut Option<Connection>, clock: &crate::chunks::Clock) -> io::Result<()> {
     use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt};
     // CreateFile never waits for a missing/busy pipe. Overlapped writes share
     // one absolute deadline, including all partial chunks and cancellation.
-    let deadline = std::time::Instant::now() + Duration::from_millis(timeout as u64);
+    let deadline = clock.mono_ms().saturating_add(timeout as u64);
     if connection.is_none() {
       let file = loop {
         match OpenOptions::new().write(true).custom_flags(0x40000000)
             .security_qos_flags(0x100000 | 0x10000).open(endpoint) {
             Ok(file) => break file,
-            Err(error) if error.raw_os_error() == Some(231) && std::time::Instant::now() < deadline => {
+            Err(error) if error.raw_os_error() == Some(231) && clock.mono_ms() < deadline => {
                 thread::sleep(Duration::from_millis(1));
             }
             Err(error) => return Err(error),
@@ -296,23 +296,23 @@ fn deliver(endpoint: &str, payload: &[u8], timeout: u32, connection: &mut Option
       };
       *connection = Some(crate::pipe_io::Pipe::new(file, timeout));
     }
-    let result = connection.as_mut().unwrap().write_until(payload, deadline);
+    let result = connection.as_mut().unwrap().write_before(payload, deadline, clock);
     if result.is_err() { *connection = None; }
     result
 }
 #[cfg(not(windows))]
-fn deliver(_: &str, _: &[u8], _: u32, _: &mut Option<Connection>) -> io::Result<()> {
+fn deliver(_: &str, _: &[u8], _: u32, _: &mut Option<Connection>, _: &crate::chunks::Clock) -> io::Result<()> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "signals require Windows pipes"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn ok(_: &str, _: &[u8], _: u32, _: &mut Option<Connection>) -> io::Result<()> { Ok(()) }
+    fn ok(_: &str, _: &[u8], _: u32, _: &mut Option<Connection>, _: &crate::chunks::Clock) -> io::Result<()> { Ok(()) }
     fn value(n: u64) -> Arc<Value> { Arc::new(Value { version: n, ack: 1, bytes: vec![42], tombstone: false }) }
     #[test]
     fn retention_gap_and_filter_resume() {
-        let h = Hub::with_sink(7, &Config { signal_history: 2, ..Config::default() }, ok);
+        let h = Hub::with_sink(7, &Config { signal_history: 2, ..Config::default() }, ok, crate::chunks::Clock::new(None));
         h.publish("quota", "event/1", value(1));
         h.publish("other", "event/2", value(2));
         h.publish("quota", "state/3", value(3));
@@ -331,7 +331,7 @@ mod tests {
     }
     #[test]
     fn oversized_replay_is_explicit_and_endpoints_are_local() {
-        let h = Hub::with_sink(7, &Config::default(), ok);
+        let h = Hub::with_sink(7, &Config::default(), ok, crate::chunks::Clock::new(None));
         for n in 1..=257 { h.publish("quota", "event/x", value(n)); }
         assert_eq!(h.subscribe("quota", "".into(), r"\\.\pipe\test".into(), false, &token(7, 0), "membus.change/1", crate::MAX_FRAME).err(), Some(6));
         assert_eq!(h.subscribe("quota", "".into(), r"\\remote\pipe\x".into(), false, &[], "membus.change/1", crate::MAX_FRAME).err(), Some(3));

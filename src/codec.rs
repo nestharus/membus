@@ -1,6 +1,5 @@
 //! Wire framing, bounded decoding, durable payload encoding and opcode dispatch.
 use crate::chunks;
-use crate::now_ms;
 use crate::timers;
 use crate::Class;
 use crate::Mutation;
@@ -341,7 +340,7 @@ impl Store {
                 }
                 return Ok(o.bytes());
             }
-            if now_ms() >= deadline && op != POLICY_SET {
+            if self.clock.utc_ms() >= deadline && op != POLICY_SET {
                 return Err(5);
             }
             match op {

@@ -125,6 +125,13 @@ impl Clock {
             None => self.start.elapsed().as_millis() as u64,
         }
     }
+    /// High-resolution elapsed time for capture diagnostics, in the same clock domain.
+    pub(crate) fn mono_ns(&self) -> u64 {
+        match &self.manual {
+            Some(m) => m.mono.load(Ordering::SeqCst).saturating_mul(1_000_000),
+            None => self.start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+        }
+    }
 }
 
 /// Policies by namespace: (prefix, class) pairs; the longest matching prefix wins; no match is forever.
