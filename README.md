@@ -104,6 +104,7 @@ window. See [Rust client usage and uncertainty](docs/RUST_CLIENT.md).
 - [Protocol, acknowledgments, refusals and snapshots](docs/KV1.md)
 - [Mutation retry comparators, encoding aliases and resource accounting](docs/RETRY_RETENTION.md)
 - [Recovered Flush prerequisites and historical backup limits](docs/RECOVERY_FLUSH.md)
+- [Recovery rename directory barriers](docs/RECOVERY-DIRECTORIES.md)
 - [Grouped append and flush behavior](docs/GROUPED-FLUSH.md)
 - [Change subscriptions and receiver responsibilities](docs/SUBSCRIPTIONS.md)
 - [Persisted timer wakes and crash boundaries](docs/TIMERS.md)

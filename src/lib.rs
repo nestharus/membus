@@ -158,6 +158,9 @@ pub struct Config {
     pub stop_after_replay_truncation: bool,
     #[cfg(test)]
     pub flush_covered_count: Option<Arc<AtomicUsize>>,
+    /// Test seam: observe or refuse each recovery directory barrier before the OS call.
+    #[cfg(test)]
+    pub recovery_dir_sync: Option<Arc<dyn Fn(&Path) -> io::Result<()> + Send + Sync>>,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -204,6 +207,8 @@ impl Default for Config {
             stop_after_replay_truncation: false,
             #[cfg(test)]
             flush_covered_count: None,
+            #[cfg(test)]
+            recovery_dir_sync: None,
         }
     }
 }

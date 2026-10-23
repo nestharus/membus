@@ -57,6 +57,14 @@ fn recovery_sync(path: &Path, config: &Config) -> io::Result<()> {
 fn corrupt(text: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, text)
 }
+fn recovery_sync_dir(path: &Path, config: &Config) -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(hook) = &config.recovery_dir_sync { hook(path)?; }
+    #[cfg(not(test))]
+    let _ = config;
+    crate::log_io::sync_dir(path).map_err(|e| io::Error::new(e.kind(),
+        format!("recovery directory sync {}: {e}", path.display())))
+}
 /// What replay rebuilt, before any file is changed.
 struct Replayed {
     committed: HashMap<(String, String), Arc<crate::value_disk::Entry>>,
@@ -392,7 +400,7 @@ impl ImportWriter {
 }
 /// Move the legacy logs into legacy-<epoch>/, unmodified, and set them read-only (5.6, step 1). Run again after a
 /// stop between the switch and the move.
-fn move_legacy(path: &Path, import: &chunks::Import) -> io::Result<()> {
+fn move_legacy(path: &Path, import: &chunks::Import, config: &Config) -> io::Result<()> {
     let to = path.join(&import.legacy_dir);
     fs::create_dir_all(&to)?;
     for (name, size, sha) in &import.files {
@@ -412,6 +420,10 @@ fn move_legacy(path: &Path, import: &chunks::Import) -> io::Result<()> {
         }
         let dest = to.join(name);
         if dest.exists() {
+            // Persist the destination before the source removal. Retry these barriers even
+            // when an earlier attempt already renamed the input but failed before completion.
+            recovery_sync_dir(&to, config)?;
+            recovery_sync_dir(path, config)?;
             let mut permissions = fs::metadata(&dest)?.permissions();
             permissions.set_readonly(true);
             fs::set_permissions(&dest, permissions)?;
@@ -718,13 +730,15 @@ fn import_legacy(
     // The switch: chunks.import/ becomes chunks/; then the legacy logs move, unmodified and read-only.
     if chunks_dir.exists() {
         fs::rename(&chunks_dir, path.join(format!("chunks.pre-import-{epoch}")))?;
+        recovery_sync_dir(path, config)?;
     }
     fs::rename(&dir, &chunks_dir)?;
+    recovery_sync_dir(path, config)?;
     // Release the Windows source guard only after the switch. Backup movement
     // checks the named bytes again; arbitrary filesystem writers are not fenced
     // by the cooperative state-directory owner lock.
     drop(policy_input);
-    move_legacy(path, &import)?;
+    move_legacy(path, &import, config)?;
     let torn: Vec<String> = legacy
         .torn
         .iter()
@@ -987,14 +1001,9 @@ fn replay_into(
         }
     }
     if let (true, Some(import)) = (legacy, rp.chunks.import.clone()) {
-        // A stop between the switch and the move: finish the move.
-        if import
-            .files
-            .iter()
-            .any(|(name, _, _)| path.join(name).exists())
-        {
-            move_legacy(path, &import)?;
-        }
+        // A rename may have completed before its directory sync failed. No surviving source
+        // names does not prove those barriers completed: repeat them before trusting the backup.
+        move_legacy(path, &import, config)?;
         let ldir = path.join(&import.legacy_dir);
         let mut changed = Vec::new();
         for (name, size, sha) in &import.files {
@@ -1280,6 +1289,7 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
         f.sync_all()?;
     }
     fs::rename(epoch_tmp, epoch_path)?;
+    recovery_sync_dir(path, config).map_err(|e| refuse(e, rp.report.clone()))?;
     let mut committed = rp.committed;
     cs.summaries.expire(utc, config.summary_ms);
     // A tombstone no other retained chunk holds a record of leaves the index at start (5.3).
@@ -1385,3 +1395,7 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
         report,
     })
 }
+
+#[cfg(test)]
+#[path = "replay/durability_tests.rs"]
+mod durability_tests;

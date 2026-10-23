@@ -1,0 +1,47 @@
+# Recovery rename durability
+
+Recovery synchronizes each rename's containing directory before performing the
+next dependent step. Synchronizing a file alone is not a directory publication
+barrier.
+
+| Rename | Barrier before continuing |
+| --- | --- |
+| `chunks` to `chunks.pre-import-<epoch>` | State root, before publishing the replacement `chunks`. |
+| `chunks.import` to `chunks` | State root, before releasing the policy input guard and moving legacy inputs. |
+| Each legacy input into `legacy-<epoch>` | Backup directory, then state root, before setting the input read-only or moving the next one. |
+| `epoch.tmp` to `epoch` | State root, after the epoch file's own sync and before exposing reconstructed state or a ready report. |
+
+An unsuccessful directory barrier returns an error. Startup refuses; it does not
+continue to a ready Store or undo an already completed rename. An epoch barrier
+failure also writes a refused replay report with `ready_ms=0`. A later start
+retries backup directory barriers even if every original input name is already
+absent: absence alone cannot establish that an earlier attempt completed its
+barriers. Existing backup names are rechecked and made read-only after the
+barriers, while the catalogue continues to identify the exact imported inputs.
+
+On Unix, `log_io::sync_dir` opens the directory and calls `sync_all`. On Windows,
+it opens the directory with `FILE_FLAG_BACKUP_SEMANTICS`, `GENERIC_WRITE`, and
+read/write/delete sharing, then calls `FlushFileBuffers` on that handle.
+Microsoft's [CreateFileW directory-handle documentation](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew)
+requires the backup-semantics flag for opening directories. Its caching section
+also identifies rename operations as metadata changes subject to flushing.
+[FlushFileBuffers](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-flushfilebuffers)
+requires a handle with write access and reports failure through its return value
+and `GetLastError`. These requirements motivate an actual barrier, rather than
+assuming that NTFS journaling makes directory flushing unnecessary. Unsupported
+directory flushes and access denials propagate; they are never treated as a
+successful no-op. Storage hardware and filesystems still determine actual media
+persistence. This change covers the named recovery renames, not every creation
+or rename elsewhere in the store.
+
+Tests in `src/replay/durability_tests.rs` observe filesystem state at each barrier,
+inject failures, and verify both refusal and a subsequent successful retry.
+The hook is per-Config and compiled only for unit tests. Normal builds contain
+neither a global hook nor an environment-controlled bypass.
+
+The synthetic policy operation remains caller-scoped: `policy_key` embeds the
+caller namespace in the key, and `dedup_identity` projects a policy mutation back
+to that caller. Local tests force collisions with the unsalted and first salted
+import IDs and require the next salt, while preserving both original outcomes.
+The policy and timer control namespaces are refused as policy callers. No
+production identity rule changed.
