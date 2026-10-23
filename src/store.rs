@@ -5,7 +5,6 @@ use crate::codec::crc32;
 use crate::codec::mutation_bytes;
 use crate::codec::MAX_ID;
 use crate::codec::MAX_VALUE;
-use crate::now_ms;
 use crate::routing::stripe;
 use crate::routing::ClassReservation;
 use crate::timers;
@@ -32,6 +31,8 @@ use std::time::Duration;
 pub(super) struct Dedup {
     pub(super) fingerprint: [u8; 32],
     pub(super) at: u64,
+    /// Local retry cutoff. Recovery derives remaining time from the recorded UTC age once.
+    pub(super) until_mono: u64,
     pub(super) outcome: Option<Outcome>,
 }
 pub(super) struct State {
@@ -120,6 +121,8 @@ pub(super) fn dedup_identity(m: &Mutation) -> Key {
     (ns.to_owned(), m.op_id.clone())
 }
 impl Store {
+    /// The instance clock, shared by recovery and server runtime owners.
+    pub fn clock(&self) -> &chunks::Clock { &self.clock }
     pub fn get(&self, ns: &str, key: &str) -> Option<Value> {
         self.get_handle(ns, key).map(|v| (*v).clone())
     }
@@ -340,7 +343,7 @@ impl Store {
         let id = format!(
             "policy/{}/{}/{}",
             self.epoch,
-            now_ms(),
+            self.clock.utc_ms(),
             SEQ.fetch_add(1, Ordering::SeqCst)
         );
         self.set_policy_with_id(ns, prefix, class, &id, deadline)
@@ -378,7 +381,7 @@ impl Store {
                 if d.fingerprint != fp {
                     return Outcome::error(14);
                 }
-                if now_ms().saturating_sub(d.at) > self.config.retry_ms {
+                if self.clock.mono_ms() > d.until_mono {
                     return Outcome::error(13);
                 }
                 if !state.policy_publishing.contains(&id) {
@@ -402,7 +405,7 @@ impl Store {
                     Err(std::sync::TryLockError::Poisoned(_)) => return Outcome::error(10),
                 }
             }
-            let wait = deadline.saturating_sub(now_ms());
+            let wait = deadline.saturating_sub(self.clock.utc_ms());
             if wait == 0 {
                 return Outcome::error(if state.dedup.contains_key(&id) { 17 } else { 5 });
             }
@@ -422,7 +425,7 @@ impl Store {
             let id = dedup_identity(&m);
             state.dedup.contains_key(&id) || state.retired_set.contains(&id)
         };
-        if !retry && now_ms() >= deadline {
+        if !retry && self.clock.utc_ms() >= deadline {
             return Outcome::error(5);
         }
         let _prospective = if !retry {
@@ -547,7 +550,6 @@ impl Store {
         let k = (m.ns.clone(), m.key.clone());
         let id = dedup_identity(&m);
         let fp = fingerprint(&m);
-        let at = now_ms();
         let log_index = stripe(&m.ns, &m.key);
         let representation_bytes = mutation_bytes(&m, 0, 0).len();
         let disk_bytes = if m.ack == 0 {
@@ -560,18 +562,19 @@ impl Store {
         let queue_charge = representation_bytes + m.bytes.len() + 128;
         let memory_charge = 2 * queue_charge + 2 * index_charge(&k) + 512;
         let mut state = self.state.lock().unwrap();
+        let mono = self.clock.mono_ms();
         if let Some(d) = state.dedup.get(&id).filter(|_| deduplicate) {
             if d.fingerprint != fp {
                 return Outcome::error(14);
             }
-            if at.saturating_sub(d.at) > self.config.retry_ms {
+            if mono > d.until_mono {
                 return Outcome::error(13);
             }
             loop {
                 if let Some(o) = state.dedup.get(&id).and_then(|d| d.outcome.clone()) {
                     return o;
                 }
-                let wait = m.deadline.saturating_sub(now_ms());
+                let wait = m.deadline.saturating_sub(self.clock.utc_ms());
                 if wait == 0 {
                     return Outcome::error(17);
                 }
@@ -585,7 +588,7 @@ impl Store {
         if deduplicate && state.retired_set.contains(&id) {
             return Outcome::error(13);
         }
-        if now_ms() >= m.deadline {
+        if self.clock.utc_ms() >= m.deadline {
             return Outcome::error(5);
         }
         if state.warming {
@@ -624,7 +627,7 @@ impl Store {
             return Outcome::error(8);
         }
         while let Some((key, time)) = state.expiry.front().cloned() {
-            if at.saturating_sub(time) <= self.config.retry_ms {
+            if mono <= time {
                 break;
             }
             if state.policy_publishing.contains(&key)
@@ -678,7 +681,8 @@ impl Store {
             return Outcome::error(18);
         }
         // The clock check immediately precedes insertion: this is the admission point.
-        if now_ms() >= m.deadline {
+        let at = self.clock.utc_ms();
+        if at >= m.deadline {
             return Outcome::error(5);
         }
         let version = state.next;
@@ -713,12 +717,14 @@ impl Store {
         if new { state.committed_bytes += index_charge(&k); }
         if deduplicate {
             state.dedup_bytes += dedup_charge(&id);
-            state.expiry.push_back((id.clone(), at));
+            let until_mono = self.clock.mono_ms().saturating_add(self.config.retry_ms);
+            state.expiry.push_back((id.clone(), until_mono));
             state.dedup.insert(
                 id.clone(),
                 Dedup {
                     fingerprint: fp,
                     at,
+                    until_mono,
                     outcome: None,
                 },
             );

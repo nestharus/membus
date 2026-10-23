@@ -148,11 +148,17 @@ impl Pipe {
     }
     pub fn write_until(
         &mut self,
-        mut bytes: &[u8],
+        bytes: &[u8],
         deadline: std::time::Instant,
     ) -> io::Result<()> {
+        self.write_with_budget(bytes, || deadline.saturating_duration_since(std::time::Instant::now()))
+    }
+    pub(crate) fn write_before(&mut self, bytes: &[u8], deadline: u64, clock: &crate::chunks::Clock) -> io::Result<()> {
+        self.write_with_budget(bytes, || std::time::Duration::from_millis(deadline.saturating_sub(clock.mono_ms())))
+    }
+    fn write_with_budget(&mut self, mut bytes: &[u8], budget: impl Fn() -> std::time::Duration) -> io::Result<()> {
         while !bytes.is_empty() {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let remaining = budget();
             if remaining.is_zero() {
                 return Err(io::Error::new(io::ErrorKind::TimedOut, "signal deadline"));
             }

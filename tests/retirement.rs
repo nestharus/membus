@@ -13,20 +13,20 @@ fn path(label: &str) -> PathBuf {
     let p = std::env::var("MEMBUS_TEST_OUTPUT").unwrap_or_else(|_| ".test-output".into());
     PathBuf::from(p).join(format!("{label}-{}-{}", std::process::id(), now_ms()))
 }
-fn put(key: &str, id: &str, value: &[u8]) -> Mutation {
+fn put(s: &Store, key: &str, id: &str, value: &[u8]) -> Mutation {
     Mutation {
         ns: "ledger".into(),
         key: key.into(),
         op_id: id.into(),
-        deadline: now_ms() + 10000,
+        deadline: deadline(s),
         ack: 1,
         expected: None,
         bytes: value.to_vec(),
         remove: false,
     }
 }
-fn remove(key: &str, id: &str) -> Mutation {
-    Mutation { remove: true, bytes: Vec::new(), ..put(key, id, b"") }
+fn remove(s: &Store, key: &str, id: &str) -> Mutation {
+    Mutation { remove: true, bytes: Vec::new(), ..put(s, key, id, b"") }
 }
 /// A store on a hand-moved clock: no background tick or pass, rotation at 1 min.
 fn config(clock: &Arc<ManualClock>) -> Config {
@@ -74,7 +74,7 @@ fn horizon_rewrite_splits_large_metadata_and_replays_both_forms() {
     let clock = ManualClock::new(now_ms());
     let s = reopen(&p, config(&clock));
     assert_eq!(s.replay_report().horizons, chunks.horizons.len());
-    assert!(s.mutate(put("after", "after", b"live")).version >= 50_000);
+    assert!(s.mutate(put(&s, "after", "after", b"live")).version >= 50_000);
     drop(s);
     // The original on-disk single-record representation remains readable.
     let old = path("horizon-rewrite-single");
@@ -104,8 +104,9 @@ fn close_finite(s: &Store, clock: &ManualClock) -> u64 {
 fn retained(s: &Store) -> u64 {
     s.chunk_rows().iter().filter(|r| r.3 != "Retired").map(|r| r.4).sum()
 }
-fn deadline() -> u64 {
-    now_ms() + 10000
+fn deadline(s: &Store) -> u64 {
+    // This suite advances UTC by days between admissions.
+    s.clock().utc_ms() + 10000
 }
 
 #[test]
@@ -114,10 +115,10 @@ fn t2_expire_class_on_a_mocked_clock() {
     let clock = ManualClock::new(now_ms());
     let s = Store::open(&p, config(&clock)).unwrap();
     // A retention shorter than the 24 h retry window is refused (dedup must outlive a restart).
-    assert_eq!(s.set_policy("ledger", "e/", Some(Class::expire(HOUR)), deadline()).code, 3);
-    assert_eq!(s.set_policy("ledger", "e/", Some(Class::expire(2 * DAY)), deadline()).code, 0);
+    assert_eq!(s.set_policy("ledger", "e/", Some(Class::expire(HOUR)), deadline(&s)).code, 3);
+    assert_eq!(s.set_policy("ledger", "e/", Some(Class::expire(2 * DAY)), deadline(&s)).code, 0);
     let base = s.slots("ledger");
-    assert_eq!(s.mutate(put("e/1", "e1", b"x")).code, 0);
+    assert_eq!(s.mutate(put(&s, "e/1", "e1", b"x")).code, 0);
     let chunk = class_chunks(&s, "expire(172800000ms)")[0];
     let closed_at = close_finite(&s, &clock);
     assert_eq!(row(&s, chunk).3, "Closed");
@@ -128,7 +129,7 @@ fn t2_expire_class_on_a_mocked_clock() {
     assert!(file.exists());
     assert_eq!(s.get("ledger", "e/1").unwrap().bytes, b"x");
     // A record in an open chunk waits, however old its chunk's class says it may be.
-    assert_eq!(s.mutate(put("e/2", "e2", b"y")).code, 0);
+    assert_eq!(s.mutate(put(&s, "e/2", "e2", b"y")).code, 0);
     let open = *class_chunks(&s, "expire(172800000ms)").last().unwrap();
     assert_eq!(row(&s, open).3, "Open");
     // The first pass at close + retention retires it.
@@ -145,12 +146,12 @@ fn t2_expire_class_on_a_mocked_clock() {
     assert_eq!(after.1, base.1 + 1, "only e/2 is live");
     assert_eq!(after.0, base.0 + 2, "e/2 and e/1's summary");
     // A conditional put expecting 0 succeeds on the expired key.
-    let mut m = put("e/1", "e1-again", b"z");
+    let mut m = put(&s, "e/1", "e1-again", b"z");
     m.expected = Some(0);
     assert_eq!(s.mutate(m).code, 0);
     assert_eq!(s.get_status("ledger", "e/1").0, 0);
     // After the summary's 30 days, an expired key reads missing.
-    assert_eq!(s.mutate(put("e/3", "e3", b"x")).code, 0);
+    assert_eq!(s.mutate(put(&s, "e/3", "e3", b"x")).code, 0);
     close_finite(&s, &clock);
     clock.advance(2 * DAY + MIN);
     s.retirement_pass();
@@ -166,7 +167,7 @@ fn t3_latest_class() {
     let p = path("t3");
     let clock = ManualClock::new(now_ms());
     let s = Store::open(&p, config(&clock)).unwrap();
-    assert_eq!(s.set_policy("ledger", "l/", Some(Class::LATEST), deadline()).code, 0);
+    assert_eq!(s.set_policy("ledger", "l/", Some(Class::LATEST), deadline(&s)).code, 0);
     // a and b on different stripes, so each has its own chunk.
     let stripe = |k: &str| {
         let mut b = b"ledger\0".to_vec();
@@ -174,12 +175,12 @@ fn t3_latest_class() {
         crc32(&b) % 4
     };
     let b_key = (0..100).map(|i| format!("l/b{i}")).find(|k| stripe(k) != stripe("l/a")).unwrap();
-    assert_eq!(s.mutate(put("l/a", "a1", b"1")).code, 0);
-    assert_eq!(s.mutate(put(&b_key, "b1", b"1")).code, 0);
+    assert_eq!(s.mutate(put(&s, "l/a", "a1", b"1")).code, 0);
+    assert_eq!(s.mutate(put(&s, &b_key, "b1", b"1")).code, 0);
     let first = class_chunks(&s, "latest");
     assert_eq!(first.len(), 2);
     let closed_at = close_finite(&s, &clock);
-    assert_eq!(s.mutate(put("l/a", "a2", b"2")).code, 0);
+    assert_eq!(s.mutate(put(&s, "l/a", "a2", b"2")).code, 0);
     let a_chunk = first.iter().copied().find(|c| row(&s, *c).1 as u32 == stripe("l/a")).unwrap();
     let b_chunk = first.iter().copied().find(|c| *c != a_chunk).unwrap();
     // The superseded chunk retires only after close + 24 h.
@@ -195,7 +196,7 @@ fn t3_latest_class() {
     clock.advance(10 * DAY);
     s.retirement_pass();
     assert_eq!(row(&s, b_chunk).3, "Closed");
-    assert_eq!(s.mutate(put(&b_key, "b2", b"2")).code, 0);
+    assert_eq!(s.mutate(put(&s, &b_key, "b2", b"2")).code, 0);
     s.retirement_pass();
     assert_eq!(row(&s, b_chunk).3, "Retired");
     assert_eq!(s.get("ledger", &b_key).unwrap().bytes, b"2");
@@ -212,21 +213,21 @@ fn t4_removes_tombstones_versions_and_anti_resurrection() {
     let clock = ManualClock::new(now_ms());
     let s = Store::open(&p, Config { quota: 2, ..config(&clock) }).unwrap();
     // A remove frees its quota slot at commit; a put to the removed key takes it back.
-    assert_eq!(s.mutate(put("x", "x1", b"x")).code, 0);
-    assert_eq!(s.mutate(put("y", "y1", b"y")).code, 0);
-    assert_eq!(s.mutate(put("z", "z1", b"z")).code, 8);
+    assert_eq!(s.mutate(put(&s, "x", "x1", b"x")).code, 0);
+    assert_eq!(s.mutate(put(&s, "y", "y1", b"y")).code, 0);
+    assert_eq!(s.mutate(put(&s, "z", "z1", b"z")).code, 8);
     let (keys, live) = s.slots("ledger");
     assert_eq!(live, 2);
-    assert_eq!(s.mutate(remove("x", "x-rm")).code, 0);
+    assert_eq!(s.mutate(remove(&s, "x", "x-rm")).code, 0);
     assert_eq!(s.slots("ledger"), (keys, 1), "the tombstone keeps its index entry");
-    assert_eq!(s.mutate(put("z", "z2", b"z")).code, 0);
-    assert_eq!(s.mutate(put("x", "x2", b"x")).code, 8, "the namespace is full");
-    assert_eq!(s.mutate(remove("y", "y-rm")).code, 0);
-    assert_eq!(s.mutate(put("x", "x3", b"x")).code, 0);
+    assert_eq!(s.mutate(put(&s, "z", "z2", b"z")).code, 0);
+    assert_eq!(s.mutate(put(&s, "x", "x2", b"x")).code, 8, "the namespace is full");
+    assert_eq!(s.mutate(remove(&s, "y", "y-rm")).code, 0);
+    assert_eq!(s.mutate(put(&s, "x", "x3", b"x")).code, 0);
     assert_eq!(s.slots("ledger").1, 2);
     // A missing-key remove charges index_cap alone; with no older record retained its entry drops at the pass.
     let before = s.slots("ledger");
-    assert_eq!(s.mutate(remove("never", "never-rm")).code, 0);
+    assert_eq!(s.mutate(remove(&s, "never", "never-rm")).code, 0);
     assert_eq!(s.slots("ledger"), (before.0 + 1, before.1));
     // y's tombstone drops too: its older record shares the tombstone's chunk, so the two retire together and no
     // other retained chunk can bring y back.
@@ -239,10 +240,10 @@ fn t4_removes_tombstones_versions_and_anti_resurrection() {
     assert_eq!(s.slots("ledger"), (before.0 - 1, before.1), "replay drops the same tombstones at start");
     // A tombstone whose older record is in another retained chunk keeps its entry: w's put closes in a latest
     // chunk, its remove lands in the next one, and the entry drops only when the older chunk retires.
-    assert_eq!(s.set_policy("ledger", "w/", Some(Class::LATEST), deadline()).code, 0);
-    assert_eq!(s.mutate(put("w/1", "w1", b"w")).code, 0);
+    assert_eq!(s.set_policy("ledger", "w/", Some(Class::LATEST), deadline(&s)).code, 0);
+    assert_eq!(s.mutate(put(&s, "w/1", "w1", b"w")).code, 0);
     close_finite(&s, &clock);
-    assert_eq!(s.mutate(remove("w/1", "w1-rm")).code, 0);
+    assert_eq!(s.mutate(remove(&s, "w/1", "w1-rm")).code, 0);
     let held = s.slots("ledger");
     s.retirement_pass();
     assert_eq!(s.slots("ledger"), held, "the older record is still retained");
@@ -253,9 +254,9 @@ fn t4_removes_tombstones_versions_and_anti_resurrection() {
 
     // Anti-resurrection after a policy change that retires the newer chunk first.
     let s = reopen(&p, config(&clock));
-    let old = s.mutate(put("p/k", "pk1", b"old"));
-    assert_eq!(s.set_policy("ledger", "p/", Some(Class::expire(2 * DAY)), deadline()).code, 0);
-    let new = s.mutate(put("p/k", "pk2", b"new"));
+    let old = s.mutate(put(&s, "p/k", "pk1", b"old"));
+    assert_eq!(s.set_policy("ledger", "p/", Some(Class::expire(2 * DAY)), deadline(&s)).code, 0);
+    let new = s.mutate(put(&s, "p/k", "pk2", b"new"));
     assert!(new.version > old.version);
     close_finite(&s, &clock);
     clock.advance(2 * DAY);
@@ -263,9 +264,9 @@ fn t4_removes_tombstones_versions_and_anti_resurrection() {
     assert!(s.get("ledger", "p/k").is_none(), "the older value must not return");
     assert_eq!(s.get_status("ledger", "p/k"), (1, 0));
     // The highest-versioned record has now retired: a restart's next stays above every version issued.
-    let issued = s.mutate(put("q", "q1", b"q")).version;
-    assert_eq!(s.set_policy("ledger", "r/", Some(Class::expire(DAY)), deadline()).code, 0);
-    let top = s.mutate(put("r/top", "top", b"t")).version;
+    let issued = s.mutate(put(&s, "q", "q1", b"q")).version;
+    assert_eq!(s.set_policy("ledger", "r/", Some(Class::expire(DAY)), deadline(&s)).code, 0);
+    let top = s.mutate(put(&s, "r/top", "top", b"t")).version;
     assert!(top > issued);
     close_finite(&s, &clock);
     clock.advance(DAY);
@@ -277,7 +278,7 @@ fn t4_removes_tombstones_versions_and_anti_resurrection() {
     let report = s.replay_report();
     assert!(report.horizons >= 1, "{}", report.json());
     assert!(report.stripes.iter().map(|r| r.horizons_applied).sum::<u64>() >= 1);
-    assert!(s.mutate(put("after", "after", b"a")).version > top);
+    assert!(s.mutate(put(&s, "after", "after", b"a")).version > top);
     println!("T4: slots split; missing-key tombstone dropped; horizon hid p/k's older value across restart; next above {top}");
 }
 
@@ -286,17 +287,17 @@ fn t5_thousand_key_run_slots_and_retained_bytes() {
     let p = path("t5");
     let clock = ManualClock::new(now_ms());
     let s = Store::open(&p, Config { chunk_bytes: 64 * 1024, ..config(&clock) }).unwrap();
-    assert_eq!(s.set_policy("ledger", "s/", Some(Class::LATEST), deadline()).code, 0);
+    assert_eq!(s.set_policy("ledger", "s/", Some(Class::LATEST), deadline(&s)).code, 0);
     let (base_keys, _) = s.slots("ledger");
     let value = vec![b'v'; 150];
     for i in 0..1000 {
-        assert_eq!(s.mutate(put(&format!("s/{i}"), &format!("put{i}"), &value)).code, 0);
+        assert_eq!(s.mutate(put(&s, &format!("s/{i}"), &format!("put{i}"), &value)).code, 0);
     }
     for i in 0..1000 {
-        assert_eq!(s.mutate(put(&format!("s/{i}"), &format!("over{i}"), &value)).code, 0);
+        assert_eq!(s.mutate(put(&s, &format!("s/{i}"), &format!("over{i}"), &value)).code, 0);
     }
     for i in 0..1000 {
-        assert_eq!(s.mutate(remove(&format!("s/{i}"), &format!("rm{i}"))).code, 0);
+        assert_eq!(s.mutate(remove(&s, &format!("s/{i}"), &format!("rm{i}"))).code, 0);
     }
     // Slots return to 0 after the removes; the tombstones hold index entries until no older record is retained.
     assert_eq!(s.slots("ledger"), (base_keys + 1000, 0));
@@ -321,11 +322,11 @@ fn t8_dedup_across_retirement_and_restart() {
     let p = path("t8");
     let clock = ManualClock::new(now_ms());
     let s = Store::open(&p, config(&clock)).unwrap();
-    assert_eq!(s.set_policy("ledger", "d/", Some(Class::LATEST), deadline()).code, 0);
-    let first = put("d/k", "d-first", b"one");
+    assert_eq!(s.set_policy("ledger", "d/", Some(Class::LATEST), deadline(&s)).code, 0);
+    let first = put(&s, "d/k", "d-first", b"one");
     let original = s.mutate(first.clone());
     close_finite(&s, &clock);
-    assert_eq!(s.mutate(put("d/k", "d-second", b"two")).code, 0);
+    assert_eq!(s.mutate(put(&s, "d/k", "d-second", b"two")).code, 0);
     // Within the 24 h window: a restart rebuilds the dedup entry from the retained record.
     clock.advance(23 * HOUR);
     s.retirement_pass();
@@ -333,15 +334,15 @@ fn t8_dedup_across_retirement_and_restart() {
     let s = reopen(&p, config(&clock));
     assert_eq!(s.mutate(first.clone()), original);
     assert_eq!(s.metrics().0, 0, "a deduplicated retry writes nothing");
-    // Across the retirement within a run: the in-memory entry still answers.
+    // Across retirement, the original retry window still bounds the in-memory entry.
     let latest = class_chunks(&s, "latest");
     clock.advance(2 * HOUR);
     s.retirement_pass();
     assert!(latest.iter().any(|c| row(&s, *c).3 == "Retired"));
-    assert_eq!(s.mutate(first), original);
+    assert_eq!(s.mutate(first).code, 13);
     assert_eq!(s.metrics().0, 0);
     assert_eq!(s.get("ledger", "d/k").unwrap().bytes, b"two");
-    println!("T8: retry after restart returned version {} and wrote nothing; again after its chunk retired", original.version);
+    println!("T8: retry after restart returned version {} and wrote nothing; expired after elapsed time passed its original window", original.version);
 }
 
 #[test]
@@ -350,11 +351,11 @@ fn t10_clock_jumps() {
     let p = path("t10-forward");
     let clock = ManualClock::new(now_ms());
     let s = Store::open(&p, config(&clock)).unwrap();
-    assert_eq!(s.set_policy("ledger", "l/", Some(Class::LATEST), deadline()).code, 0);
-    assert_eq!(s.mutate(put("l/a", "a1", b"1")).code, 0);
+    assert_eq!(s.set_policy("ledger", "l/", Some(Class::LATEST), deadline(&s)).code, 0);
+    assert_eq!(s.mutate(put(&s, "l/a", "a1", b"1")).code, 0);
     let chunk = class_chunks(&s, "latest")[0];
     close_finite(&s, &clock);
-    assert_eq!(s.mutate(put("l/a", "a2", b"2")).code, 0);
+    assert_eq!(s.mutate(put(&s, "l/a", "a2", b"2")).code, 0);
     clock.jump_utc(DAY as i64 + MIN as i64);
     s.tick();
     s.retirement_pass();
@@ -371,11 +372,11 @@ fn t10_clock_jumps() {
     let chunk;
     {
         let s = Store::open(&p, config(&clock)).unwrap();
-        assert_eq!(s.set_policy("ledger", "l/", Some(Class::LATEST), deadline()).code, 0);
-        assert_eq!(s.mutate(put("l/a", "a1", b"1")).code, 0);
+        assert_eq!(s.set_policy("ledger", "l/", Some(Class::LATEST), deadline(&s)).code, 0);
+        assert_eq!(s.mutate(put(&s, "l/a", "a1", b"1")).code, 0);
         chunk = class_chunks(&s, "latest")[0];
         close_finite(&s, &clock);
-        assert_eq!(s.mutate(put("l/a", "a2", b"2")).code, 0);
+        assert_eq!(s.mutate(put(&s, "l/a", "a2", b"2")).code, 0);
     }
     clock.jump_utc(-(HOUR as i64));
     let s = reopen(&p, config(&clock));
@@ -423,11 +424,11 @@ fn t13_cold_restart_near_the_cap() {
     };
     {
         let s = Store::open(&p, c.clone()).unwrap();
-        assert_eq!(s.set_policy("ledger", "l/", Some(Class::LATEST), deadline()).code, 0);
+        assert_eq!(s.set_policy("ledger", "l/", Some(Class::LATEST), deadline(&s)).code, 0);
         let value = vec![b'v'; 400];
         let mut n = 0;
         loop {
-            let o = s.mutate(put("l/hot", &format!("hot{n}"), &value));
+            let o = s.mutate(put(&s, "l/hot", &format!("hot{n}"), &value));
             if o.code == 7 {
                 break;
             }
@@ -443,10 +444,10 @@ fn t13_cold_restart_near_the_cap() {
     // Start succeeds at the ceiling with retirement due.
     let s = reopen(&p, c);
     let value = vec![b'v'; 400];
-    assert_eq!(s.mutate(put("l/new", "new0", &value)).code, 7);
+    assert_eq!(s.mutate(put(&s, "l/new", "new0", &value)).code, 7);
     s.retirement_pass();
     assert!(s.state_bytes() < 4 * 1024, "{}", s.state_bytes());
-    assert_eq!(s.mutate(put("l/new", "new1", &value)).code, 0);
+    assert_eq!(s.mutate(put(&s, "l/new", "new1", &value)).code, 0);
     assert_eq!(s.get("ledger", "l/hot").unwrap().bytes.len(), 400);
     println!("T13: start at the 56 KiB ceiling, retirement wrote its catalogue records and freed the bytes, puts admitted again");
 }

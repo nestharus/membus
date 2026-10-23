@@ -9,6 +9,7 @@ use std::fs::File;
 use std::fs::OpenOptions;
 use std::io;
 use std::io::Write;
+use std::path::Path;
 #[cfg(all(windows, feature = "sync-witness"))]
 use std::sync::Mutex;
 
@@ -96,6 +97,29 @@ pub(super) fn sync_file(file: &File) -> io::Result<()> {
 #[cfg(not(all(windows, feature = "sync-witness")))]
 pub(super) fn sync_file(file: &File) -> io::Result<()> {
     file.sync_all()
+}
+
+/// Persist directory-entry changes. A file sync does not cover its containing directory.
+#[cfg(not(windows))]
+pub(super) fn sync_dir(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+/// CreateFileW requires BACKUP_SEMANTICS for directories; FlushFileBuffers requires
+/// GENERIC_WRITE. See docs/RECOVERY-DIRECTORIES.md for the Microsoft API references.
+#[cfg(windows)]
+pub(super) fn sync_dir(path: &Path) -> io::Result<()> {
+    use std::{ffi::c_void, fs::OpenOptions, os::windows::{fs::OpenOptionsExt, io::AsRawHandle}};
+    #[link(name = "kernel32")]
+    extern "system" { fn FlushFileBuffers(handle: *mut c_void) -> i32; }
+    let dir = OpenOptions::new().write(true).share_mode(7)
+        .custom_flags(0x02000000) // FILE_FLAG_BACKUP_SEMANTICS
+        .open(path)?;
+    if unsafe { FlushFileBuffers(dir.as_raw_handle()) } == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 pub(super) fn write_record(log: &mut Log, mut bytes: &[u8]) -> io::Result<()> {

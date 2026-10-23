@@ -1,11 +1,13 @@
 //! Replay, legacy import and ordered startup recovery before runtime assembly.
+#[cfg(test)]
+#[path = "replay/clock_tests.rs"]
+mod clock_tests;
 use crate::chunks;
 use crate::codec::crc32;
 use crate::codec::mutation_bytes;
 use crate::codec::parse_record;
 use crate::codec::MAX_ID;
 use crate::log_io::sync_file;
-use crate::now_ms;
 use crate::routing::stripe;
 use crate::store::dedup_identity;
 use crate::store::fingerprint;
@@ -57,6 +59,14 @@ fn recovery_sync(path: &Path, config: &Config) -> io::Result<()> {
 fn corrupt(text: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, text)
 }
+fn recovery_sync_dir(path: &Path, config: &Config) -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(hook) = &config.recovery_dir_sync { hook(path)?; }
+    #[cfg(not(test))]
+    let _ = config;
+    crate::log_io::sync_dir(path).map_err(|e| io::Error::new(e.kind(),
+        format!("recovery directory sync {}: {e}", path.display())))
+}
 /// What replay rebuilt, before any file is changed.
 struct Replayed {
     committed: HashMap<(String, String), Arc<crate::value_disk::Entry>>,
@@ -87,6 +97,7 @@ impl Replayed {
                 Dedup {
                     fingerprint: fingerprint(&m),
                     at,
+                    until_mono: 0, // Anchored to the instance clock after replay/import validation.
                     outcome: Some(Outcome {
                         code: 0,
                         version: v,
@@ -255,6 +266,7 @@ fn read_legacy(files: &[(usize, PathBuf)], config: &Config, now: u64) -> io::Res
                             Dedup {
                                 fingerprint: fingerprint(&m),
                                 at,
+                                until_mono: 0,
                                 outcome: Some(Outcome {
                                     code: 0,
                                     version: v,
@@ -392,7 +404,7 @@ impl ImportWriter {
 }
 /// Move the legacy logs into legacy-<epoch>/, unmodified, and set them read-only (5.6, step 1). Run again after a
 /// stop between the switch and the move.
-fn move_legacy(path: &Path, import: &chunks::Import) -> io::Result<()> {
+fn move_legacy(path: &Path, import: &chunks::Import, config: &Config) -> io::Result<()> {
     let to = path.join(&import.legacy_dir);
     fs::create_dir_all(&to)?;
     for (name, size, sha) in &import.files {
@@ -412,6 +424,10 @@ fn move_legacy(path: &Path, import: &chunks::Import) -> io::Result<()> {
         }
         let dest = to.join(name);
         if dest.exists() {
+            // Persist the destination before the source removal. Retry these barriers even
+            // when an earlier attempt already renamed the input but failed before completion.
+            recovery_sync_dir(&to, config)?;
+            recovery_sync_dir(path, config)?;
             let mut permissions = fs::metadata(&dest)?.permissions();
             permissions.set_readonly(true);
             fs::set_permissions(&dest, permissions)?;
@@ -510,7 +526,7 @@ fn import_legacy(
             )));
         }
     }
-    let legacy = read_legacy(&files, config, now_ms())?;
+    let legacy = read_legacy(&files, config, clock.utc_ms())?;
     let dir = path.join("chunks.import");
     if dir.exists() {
         // An import cut short starts again from the untouched legacy logs.
@@ -576,6 +592,7 @@ fn import_legacy(
                 Dedup {
                     fingerprint: fingerprint(&m),
                     at: utc,
+                    until_mono: 0,
                     outcome: Some(Outcome {
                         code: 0,
                         version,
@@ -706,6 +723,15 @@ fn import_legacy(
             legacy_dir: format!("legacy-{epoch}"),
         };
         w.cs.log(utc, Rec::Import(import.clone()))?;
+        // File syncs cover contents, while these barriers publish their names.
+        // Persist each class's files before the root's class/catalogue entries,
+        // all before either directory swap or any legacy input is moved.
+        let parents: std::collections::BTreeSet<_> = rp.chunks.table.values()
+            .map(|chunk| chunk.path.parent().unwrap()).collect();
+        for parent in parents {
+            recovery_sync_dir(parent, config)?;
+        }
+        recovery_sync_dir(&dir, config)?;
         Ok((import, w.written))
     })();
     let (import, written) = match built {
@@ -718,13 +744,15 @@ fn import_legacy(
     // The switch: chunks.import/ becomes chunks/; then the legacy logs move, unmodified and read-only.
     if chunks_dir.exists() {
         fs::rename(&chunks_dir, path.join(format!("chunks.pre-import-{epoch}")))?;
+        recovery_sync_dir(path, config)?;
     }
     fs::rename(&dir, &chunks_dir)?;
+    recovery_sync_dir(path, config)?;
     // Release the Windows source guard only after the switch. Backup movement
     // checks the named bytes again; arbitrary filesystem writers are not fenced
     // by the cooperative state-directory owner lock.
     drop(policy_input);
-    move_legacy(path, &import)?;
+    move_legacy(path, &import, config)?;
     let torn: Vec<String> = legacy
         .torn
         .iter()
@@ -787,7 +815,7 @@ fn replay_into(
     clock: &chunks::Clock,
 ) -> io::Result<()> {
     use chunks::{ChunkState, Rec};
-    let now = now_ms();
+    let now = clock.utc_ms();
     let dir = dir.to_owned();
     fs::create_dir_all(&dir)?;
     let (records, torn) = chunks::read_catalogue(&dir.join("catalogue.log"))?;
@@ -987,14 +1015,9 @@ fn replay_into(
         }
     }
     if let (true, Some(import)) = (legacy, rp.chunks.import.clone()) {
-        // A stop between the switch and the move: finish the move.
-        if import
-            .files
-            .iter()
-            .any(|(name, _, _)| path.join(name).exists())
-        {
-            move_legacy(path, &import)?;
-        }
+        // A rename may have completed before its directory sync failed. No surviving source
+        // names does not prove those barriers completed: repeat them before trusting the backup.
+        move_legacy(path, &import, config)?;
         let ldir = path.join(&import.legacy_dir);
         let mut changed = Vec::new();
         for (name, size, sha) in &import.files {
@@ -1051,21 +1074,42 @@ pub(super) struct Recovered {
 }
 pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
     let clock = chunks::Clock::new(config.clock.clone());
-    let start_ms = now_ms();
+    let start_ms = clock.utc_ms();
     let refuse = |e: io::Error, mut report: chunks::ReplayReport| -> io::Error {
         report.start_ms = start_ms;
         report.ready_ms = 0;
         report.stage = "refused".into();
         report.refusal = Some(e.to_string());
         // The replay record is written before exit; its own failure does not hide the refusal.
-        let _ = report.write(path);
+        let _ = report.write_startup(path, config);
         e
     };
-    let peek = fs::read(path.join("epoch"))
-        .ok()
-        .filter(|b| b.len() == 8)
-        .map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
-    let imported = match import_legacy(path, config, &clock, peek + 1) {
+    // Admit the next epoch before import moves inputs or replay repairs tails.
+    // Only an absent file means a new store; malformed/unreadable state refuses.
+    let epoch_path = path.join("epoch");
+    let previous = match fs::read(&epoch_path) {
+        Ok(b) if b.len() == 8 => u64::from_le_bytes(b.try_into().unwrap()),
+        Ok(_) => {
+            return Err(refuse(
+                io::Error::new(io::ErrorKind::InvalidData, "invalid epoch"),
+                chunks::ReplayReport::default(),
+            ));
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => 0,
+        Err(e) => {
+            return Err(refuse(
+                io::Error::new(e.kind(), format!("read epoch: {e}")),
+                chunks::ReplayReport::default(),
+            ));
+        }
+    };
+    let epoch = previous.checked_add(1).ok_or_else(|| {
+        refuse(
+            io::Error::other("epoch exhausted"),
+            chunks::ReplayReport::default(),
+        )
+    })?;
+    let imported = match import_legacy(path, config, &clock, epoch) {
         Ok(x) => x,
         Err(e) => {
             let report = chunks::ReplayReport {
@@ -1108,7 +1152,7 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
         rp.report.stage = "truncation_pending".into();
         // Preserve what replay found before its source bytes disappear. A later successful
         // start can replace replay.json; the bounded replay.log retains this non-ready stage.
-        rp.report.write(path)?;
+        rp.report.write_startup(path, config)?;
     }
     for (p, offset) in &rp.truncate {
         OpenOptions::new().write(true).open(p)?.set_len(*offset)?;
@@ -1144,6 +1188,8 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
         })
         .map(|c| c.path.clone())
         .collect();
+    let recovered_classes: std::collections::BTreeSet<PathBuf> = recovered.iter()
+        .map(|p| p.parent().unwrap().to_owned()).collect();
     recovered.extend(legacy_files(path).into_iter().map(|(_, p)| p));
     recovered.sort();
     recovered.dedup();
@@ -1152,10 +1198,19 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
             return Err(refuse(e, rp.report.clone()));
         }
     }
+    // Older writers may have flushed contents without persisting the file
+    // names. Establish each active class's names before Close or runtime
+    // publication; the later chunks/root barriers cover their parent entries.
+    for dir in recovered_classes {
+        recovery_sync_dir(&dir, config).map_err(|e| refuse(e, rp.report.clone()))?;
+    }
     let mut cs = std::mem::replace(&mut rp.chunks, chunks::ChunkStore::new(path.join("chunks")));
     let mut catalogue = chunks::Catalogue::open(&cat_path)?;
     catalogue.last_ms = rp.cat_last_ms;
     cs.cat = Some(catalogue);
+    // Catalogue::open may create the file. Persist its name before recovery
+    // publishes Close records or runtime can acknowledge writes through it.
+    recovery_sync_dir(&cs.dir, config).map_err(|e| refuse(e, rp.report.clone()))?;
     let utc = clock.utc_ms();
     let mono = clock.mono_ms();
     let next = rp.next;
@@ -1260,26 +1315,17 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
     if !rp.storage_errors.is_empty() {
         flags.storage_error.store(true, Ordering::SeqCst);
     }
-    let epoch_path = path.join("epoch");
-    let previous = if epoch_path.exists() {
-        let b = fs::read(&epoch_path)?;
-        if b.len() != 8 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid epoch"));
-        }
-        u64::from_le_bytes(b.try_into().unwrap())
-    } else {
-        0
-    };
-    let epoch = previous
-        .checked_add(1)
-        .ok_or_else(|| io::Error::other("epoch exhausted"))?;
     let epoch_tmp = path.join("epoch.tmp");
-    {
-        let mut f = File::create(&epoch_tmp)?;
-        f.write_all(&epoch.to_le_bytes())?;
-        f.sync_all()?;
-    }
-    fs::rename(epoch_tmp, epoch_path)?;
+    let publication = (|| {
+        {
+            let mut f = File::create(&epoch_tmp)?;
+            f.write_all(&epoch.to_le_bytes())?;
+            f.sync_all()?;
+        }
+        fs::rename(epoch_tmp, epoch_path)
+    })();
+    publication.map_err(|e| refuse(e, rp.report.clone()))?;
+    recovery_sync_dir(path, config).map_err(|e| refuse(e, rp.report.clone()))?;
     let mut committed = rp.committed;
     cs.summaries.expire(utc, config.summary_ms);
     // A tombstone no other retained chunk holds a record of leaves the index at start (5.3).
@@ -1323,10 +1369,18 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
     }
     let keys = metadata.len() + cs.summaries.charged;
     let committed_bytes = metadata.values().map(|m| m.bytes).sum();
-    let dedup = rp.dedup;
+    let mut dedup = rp.dedup;
+    // Persisted timestamps are UTC. Once recovered, retry bounds use only local elapsed time.
+    let retry_utc = clock.utc_ms();
+    let retry_mono = clock.mono_ms();
+    dedup.retain(|_, d| retry_utc.saturating_sub(d.at) <= config.retry_ms);
+    for d in dedup.values_mut() {
+        let remaining = config.retry_ms.saturating_sub(retry_utc.saturating_sub(d.at));
+        d.until_mono = retry_mono.saturating_add(remaining);
+    }
     let dedup_entries = dedup.len();
     let dedup_bytes = dedup.keys().map(crate::store::dedup_charge).sum();
-    let mut expiry: Vec<_> = dedup.iter().map(|(k, d)| (k.clone(), d.at)).collect();
+    let mut expiry: Vec<_> = dedup.iter().map(|(k, d)| (k.clone(), d.until_mono)).collect();
     expiry.sort_by_key(|(_, at)| *at);
     // Only control records need decoding into runtime state. Ordinary values stay on disk.
     let control: HashMap<_,_> = committed.iter().filter(|(k,_)| k.0 == timers::NS)
@@ -1385,3 +1439,7 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
         report,
     })
 }
+
+#[cfg(test)]
+#[path = "replay/durability_tests.rs"]
+mod durability_tests;
