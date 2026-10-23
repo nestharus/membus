@@ -1070,11 +1070,32 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
         let _ = report.write(path);
         e
     };
-    let peek = fs::read(path.join("epoch"))
-        .ok()
-        .filter(|b| b.len() == 8)
-        .map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
-    let imported = match import_legacy(path, config, &clock, peek + 1) {
+    // Admit the next epoch before import moves inputs or replay repairs tails.
+    // Only an absent file means a new store; malformed/unreadable state refuses.
+    let epoch_path = path.join("epoch");
+    let previous = match fs::read(&epoch_path) {
+        Ok(b) if b.len() == 8 => u64::from_le_bytes(b.try_into().unwrap()),
+        Ok(_) => {
+            return Err(refuse(
+                io::Error::new(io::ErrorKind::InvalidData, "invalid epoch"),
+                chunks::ReplayReport::default(),
+            ));
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => 0,
+        Err(e) => {
+            return Err(refuse(
+                io::Error::new(e.kind(), format!("read epoch: {e}")),
+                chunks::ReplayReport::default(),
+            ));
+        }
+    };
+    let epoch = previous.checked_add(1).ok_or_else(|| {
+        refuse(
+            io::Error::other("epoch exhausted"),
+            chunks::ReplayReport::default(),
+        )
+    })?;
+    let imported = match import_legacy(path, config, &clock, epoch) {
         Ok(x) => x,
         Err(e) => {
             let report = chunks::ReplayReport {
@@ -1269,19 +1290,6 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
     if !rp.storage_errors.is_empty() {
         flags.storage_error.store(true, Ordering::SeqCst);
     }
-    let epoch_path = path.join("epoch");
-    let previous = if epoch_path.exists() {
-        let b = fs::read(&epoch_path)?;
-        if b.len() != 8 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid epoch"));
-        }
-        u64::from_le_bytes(b.try_into().unwrap())
-    } else {
-        0
-    };
-    let epoch = previous
-        .checked_add(1)
-        .ok_or_else(|| io::Error::other("epoch exhausted"))?;
     let epoch_tmp = path.join("epoch.tmp");
     {
         let mut f = File::create(&epoch_tmp)?;

@@ -48,3 +48,22 @@ select the existing append fault and the separate startup fault in an owned
 resident fixture. Ordinary launches select neither. They introduce no protocol
 or caller-authority change. These tests simulate failure ordering; they do not
 demonstrate power-loss behavior or an observed production incident.
+
+## Startup epoch admission
+
+Startup reads and validates the persisted epoch before importing legacy logs or
+repairing replay tails. Only a missing epoch file starts at zero. A malformed
+file, a read error, or an exhausted `u64` epoch refuses startup before moving
+legacy inputs, truncating data, or appending recovered Close records. Refusal
+attempts to replace the replay report with stage `refused` and `ready_ms=0`;
+report-write failure cannot turn the refusal into success.
+
+The next epoch is checked once and shared by the import's backup name and the
+eventual epoch publication. A failed epoch admission consumes no epoch. Correcting
+the persisted input permits the normal import/recovery attempt; an exhausted
+epoch requires explicit state remediation and never wraps to zero.
+
+`tests/recovery_epoch.rs` covers malformed lengths, a real epoch read error,
+exhaustion without a panic, preservation of a torn tail and catalogue, replacement
+of a prior ready report, normal restart increments, and import/publication at the
+last available epoch. Its owned fixtures are synthetic and removed after use.
