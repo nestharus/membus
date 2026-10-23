@@ -42,6 +42,13 @@ completed. A later startup can retry; history may contain a repeated report
 after a late failure. These barriers do not flush the parent of the state root
 or establish physical power-loss behavior for a particular storage device.
 
+Before publishing the ready report, startup places all running workers in their
+Store owner. A report error therefore runs the normal stop-and-join sequence
+before returning the error and releasing the state-directory lock. The epoch
+may already have been published; a subsequent successful open uses the next
+epoch. A visible ready JSON after a late publication failure does not establish
+that a Store was returned or that a resident is serving requests.
+
 | Rename | Barrier before continuing |
 | --- | --- |
 | `chunks` to `chunks.pre-import-<epoch>` | State root, before publishing the replacement `chunks`. |

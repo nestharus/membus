@@ -421,8 +421,9 @@ impl Store {
         let (stop, reaper) = snapshots::start_reaper(scans.clone(), &config);
         report.ready_ms = now_ms();
         report.stage = "ready".into();
-        report.write_startup(path, &config)?;
-        Ok(Self {
+        // Own every worker before the last fallible publication. On error,
+        // Store::drop stops and joins them before releasing the directory owner.
+        let store = Self {
             timers,
             signals: signals::Hub::new(epoch, &config),
             capture_metrics: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -455,7 +456,9 @@ impl Store {
             config,
             epoch,
             _owner: owner,
-        })
+        };
+        store.report.lock().unwrap().write_startup(path, &store.config)?;
+        Ok(store)
     }
 }
 

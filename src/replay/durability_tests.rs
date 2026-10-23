@@ -739,3 +739,37 @@ fn pending_report_directory_failure_preserves_both_torn_inputs_and_epoch() {
         assert!(store.replay_report().catalogue_truncation.is_some());
     }
 }
+
+#[test]
+fn ready_report_failure_releases_all_worker_config_owners_before_returning() {
+    for stop in 1..=2 {
+        let f = Fixture::new();
+        let calls = Arc::new(AtomicU64::new(0));
+        let observed = calls.clone();
+        let root = f.0.clone();
+        let config = Config {
+            tick_ms: 3_600_000,
+            replay_report_dir_sync: Some(Arc::new(move |dir| {
+                assert_eq!(dir, root);
+                assert!(fs::read_to_string(root.join("replay.json"))?.contains("\"stage\":\"ready\""));
+                if observed.fetch_add(1, Ordering::SeqCst) + 1 == stop {
+                    Err(io::Error::from_raw_os_error(5))
+                } else {
+                    Ok(())
+                }
+            })),
+            ..Config::default()
+        };
+        // Append owners and maintenance retain Config clones. Their hook must
+        // be released by joined shutdown, not by a later detached thread exit.
+        let owners = Arc::downgrade(config.replay_report_dir_sync.as_ref().unwrap());
+        let error = Store::open(&f.0, config).err().expect("ready-report failure must refuse startup");
+        assert_eq!(error.raw_os_error(), Some(5));
+        assert_eq!(calls.load(Ordering::SeqCst), stop);
+        assert!(owners.upgrade().is_none(), "startup returned while a worker still retained its configuration");
+        f.unlock();
+        let store = Store::open(&f.0, Config::default()).unwrap();
+        assert_eq!(store.epoch, 2);
+        assert_eq!(store.replay_report().stage, "ready");
+    }
+}
