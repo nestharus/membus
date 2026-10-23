@@ -22,6 +22,16 @@ reserved catalogue sequence is not reused. Startup handles that interrupted
 Open normally; a later mutation can retry in a new chunk. After a failed
 rotation, the earlier flushed value remains readable and recoverable.
 
+Startup also establishes file-name durability for state written by an older
+writer. After synchronizing all required data files, it synchronizes each
+distinct parent class directory of the present, nonempty Open or Closed
+chunks. This precedes catalogue open/name publication, recovered Close records
+and the epoch. The later `chunks` barrier covers the class-directory names.
+A failure refuses startup with collected observations and no new Close or
+epoch; a later open can retry. It does not undo earlier reported tail truncation.
+Missing, retiring and retired chunks retain their existing handling. Imported historical
+read-only backups are outside this active-chunk prerequisite.
+
 Before the import's directory switch, startup also synchronizes the constructed
 replacement tree. After all data files and their Close records are synced, the
 replacement is independently replayed and checked for equivalence, and the
@@ -94,9 +104,10 @@ and `GetLastError`. These requirements motivate an actual barrier, rather than
 assuming that NTFS journaling makes directory flushing unnecessary. Unsupported
 directory flushes and access denials propagate; they are never treated as a
 successful no-op. Storage hardware and filesystems still determine actual media
-persistence. These barriers cover replacement-tree creation during import, the
-startup catalogue namespace and the named recovery renames, not every creation
-or rename elsewhere in the store.
+persistence. These barriers cover live chunk creation, active class directories
+at restart, replacement-tree creation during import, the startup catalogue and
+report namespaces, and the named recovery renames. They do not cover every
+creation, removal or rename elsewhere in the store.
 
 Tests in `src/replay/durability_tests.rs` observe filesystem state at each barrier,
 inject failures, and verify both refusal and a subsequent successful retry.
@@ -110,6 +121,15 @@ call/failure ordering, not physical power-loss behavior.
 Catalogue controls refuse both a fresh startup and a recovered open chunk before
 Close/epoch publication, preserve an already collected storage observation, and
 retry successfully with the same next epoch.
+
+`src/routing/directory_tests.rs` observes live creation barriers with the new
+file still empty and no published route, rejects either failure, checks new
+class creation and repeated rotation, retains the prior flushed value on failed
+rotation and tests restart retry without sequence reuse. Its observer is
+per-Config and compiled only for unit tests. The recovery controls also observe
+both open and already-closed active classes, retain collected file observations
+on either class-directory failure and stop before any name barrier when data
+sync fails.
 
 The synthetic policy operation remains caller-scoped: `policy_key` embeds the
 caller namespace in the key, and `dedup_identity` projects a policy mutation back

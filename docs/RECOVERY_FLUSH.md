@@ -12,6 +12,15 @@ record a non-ready replay report, including storage errors already found by
 replay. Report publication can itself fail; startup still refuses, and an earlier
 ready report alone cannot establish current service availability. It does not
 publish a successful Store or a new Close.
+
+After the data-file syncs, startup synchronizes each distinct class directory
+holding a present nonempty Open or Closed chunk, before the catalogue directory
+barrier, recovered Close records and epoch publication. This establishes the
+active chunk file-name prerequisite for older writers as well as the current
+writer's live creation barriers. A failed class-directory sync refuses startup
+and retains already collected observations. File contents and directory names
+remain separate prerequisites; neither synchronization substitutes for the other.
+
 Missing-file storage errors and retiring/retired chunks retain their existing
 handling. Original mutation IDs, versions, contents, receipt clocks and retry
 outcomes are preserved; successful recovery can resolve an earlier uncertainty.

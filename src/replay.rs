@@ -1188,6 +1188,8 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
         })
         .map(|c| c.path.clone())
         .collect();
+    let recovered_classes: std::collections::BTreeSet<PathBuf> = recovered.iter()
+        .map(|p| p.parent().unwrap().to_owned()).collect();
     recovered.extend(legacy_files(path).into_iter().map(|(_, p)| p));
     recovered.sort();
     recovered.dedup();
@@ -1195,6 +1197,12 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
         if let Err(e) = recovery_sync(&p, config) {
             return Err(refuse(e, rp.report.clone()));
         }
+    }
+    // Older writers may have flushed contents without persisting the file
+    // names. Establish each active class's names before Close or runtime
+    // publication; the later chunks/root barriers cover their parent entries.
+    for dir in recovered_classes {
+        recovery_sync_dir(&dir, config).map_err(|e| refuse(e, rp.report.clone()))?;
     }
     let mut cs = std::mem::replace(&mut rp.chunks, chunks::ChunkStore::new(path.join("chunks")));
     let mut catalogue = chunks::Catalogue::open(&cat_path)?;

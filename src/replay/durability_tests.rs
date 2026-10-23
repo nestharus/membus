@@ -773,3 +773,130 @@ fn ready_report_failure_releases_all_worker_config_owners_before_returning() {
         assert_eq!(store.replay_report().stage, "ready");
     }
 }
+
+fn seed_recovered_class_directories(f: &Fixture) -> Vec<PathBuf> {
+    let store = Store::open(&f.0, Config { tick_ms: 3_600_000, ..Config::default() }).unwrap();
+    store.policies.write().unwrap().set("finite", "", Some(Class::LATEST));
+    for ns in ["caller", "finite"] {
+        let mutation = Mutation { ns: ns.into(), key: "key".into(), op_id: format!("{ns}-original"),
+            deadline: u64::MAX, ack: 2, expected: None, bytes: ns.as_bytes().to_vec(), remove: false };
+        assert_eq!(store.mutate(mutation).code, 0);
+    }
+    drop(store);
+    f.unlock();
+    vec![f.0.join("chunks/forever"), f.0.join("chunks/latest")]
+}
+
+#[test]
+fn recovered_class_directory_barriers_precede_close_and_epoch_publication() {
+    let f = Fixture::new();
+    let mut expected = seed_recovered_class_directories(&f);
+    let catalogue = fs::read(f.0.join("chunks/catalogue.log")).unwrap();
+    let epoch = fs::read(f.0.join("epoch")).unwrap();
+    let root = f.0.clone();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let observed = seen.clone();
+    let config = Config {
+        recovery_dir_sync: Some(Arc::new(move |dir| {
+            if dir.starts_with(root.join("chunks")) {
+                assert_eq!(fs::read(root.join("chunks/catalogue.log"))?, catalogue, "Close depends on all namespace barriers");
+                assert_eq!(fs::read(root.join("epoch"))?, epoch);
+                observed.lock().unwrap().push(dir.to_owned());
+            }
+            Ok(())
+        })),
+        ..Config::default()
+    };
+    let store = Store::open(&f.0, config).unwrap();
+    expected.push(f.0.join("chunks"));
+    assert_eq!(*seen.lock().unwrap(), expected, "file names precede their class names and recovered Close publication");
+    assert_eq!(store.get("caller", "key").unwrap().bytes, b"caller");
+    assert_eq!(store.get("finite", "key").unwrap().bytes, b"finite");
+}
+
+#[test]
+fn each_recovered_class_directory_failure_refuses_before_close_and_can_retry() {
+    for stop in 0..2 {
+        let f = Fixture::new();
+        let parents = seed_recovered_class_directories(&f);
+        let files = chunks::list_chunk_files(&f.0.join("chunks")).unwrap();
+        let (_, si, id, original) = &files[0];
+        let unregistered = chunks::chunk_path(&f.0.join("chunks"), Class::FOREVER, *si, id + 1000);
+        fs::copy(original, &unregistered).unwrap();
+        let source: Vec<_> = chunks::list_chunk_files(&f.0.join("chunks")).unwrap().into_iter()
+            .map(|(_, _, _, p)| { let bytes = fs::read(&p).unwrap(); (p, bytes) }).collect();
+        let catalogue = fs::read(f.0.join("chunks/catalogue.log")).unwrap();
+        let epoch = fs::read(f.0.join("epoch")).unwrap();
+        let target = parents[stop].clone();
+        let root = f.0.clone();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let observed = seen.clone();
+        let config = Config {
+            recovery_dir_sync: Some(Arc::new(move |dir| {
+                if dir.starts_with(root.join("chunks")) {
+                    observed.lock().unwrap().push(dir.to_owned());
+                }
+                if dir == target { Err(io::Error::from_raw_os_error(5)) } else { Ok(()) }
+            })),
+            ..Config::default()
+        };
+        let error = Store::open(&f.0, config).err().expect("a recovered file-name sync failure must refuse startup");
+        assert_eq!(error.raw_os_error(), Some(5));
+        assert_eq!(*seen.lock().unwrap(), parents[..=stop]);
+        assert_eq!(fs::read(f.0.join("chunks/catalogue.log")).unwrap(), catalogue);
+        assert_eq!(fs::read(f.0.join("epoch")).unwrap(), epoch);
+        for (path, bytes) in source { assert_eq!(fs::read(path).unwrap(), bytes); }
+        let report = fs::read_to_string(f.0.join("replay.json")).unwrap();
+        assert!(report.contains("\"stage\":\"refused\"") && report.contains("\"ready_ms\":0"));
+        let observation = format!("chunk file with no open record: {}", unregistered.display());
+        assert!(report.contains(&format!("{observation:?}")), "{report}");
+        f.unlock();
+        let store = Store::open(&f.0, Config::default()).unwrap();
+        assert_eq!(store.epoch, 2);
+        assert_eq!(store.get("caller", "key").unwrap().bytes, b"caller");
+        assert_eq!(store.get("finite", "key").unwrap().bytes, b"finite");
+        assert!(store.storage_error(), "the unregistered-file observation remains");
+    }
+}
+
+#[test]
+fn recovered_closed_chunks_repeat_their_class_directory_barriers() {
+    let f = Fixture::new();
+    let parents = seed_recovered_class_directories(&f);
+    drop(Store::open(&f.0, Config::default()).unwrap());
+    f.unlock();
+    let root = f.0.join("chunks");
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let observed = seen.clone();
+    let config = Config {
+        recovery_dir_sync: Some(Arc::new(move |dir| {
+            if dir.starts_with(&root) && dir != root { observed.lock().unwrap().push(dir.to_owned()); }
+            Ok(())
+        })),
+        ..Config::default()
+    };
+    let store = Store::open(&f.0, config).unwrap();
+    assert_eq!(*seen.lock().unwrap(), parents, "older closed chunks need the same file-name prerequisite");
+    assert_eq!(store.epoch, 3);
+    assert_eq!(store.get("caller", "key").unwrap().bytes, b"caller");
+    assert_eq!(store.get("finite", "key").unwrap().bytes, b"finite");
+}
+
+#[test]
+fn recovery_data_sync_failure_never_reaches_class_directory_barriers() {
+    let f = Fixture::new();
+    seed_recovered_class_directories(&f);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let observed = seen.clone();
+    let config = Config {
+        fail_recovery_sync: true,
+        recovery_dir_sync: Some(Arc::new(move |dir| {
+            observed.lock().unwrap().push(dir.to_owned());
+            Ok(())
+        })),
+        ..Config::default()
+    };
+    let error = Store::open(&f.0, config).err().expect("data sync must precede namespace publication");
+    assert!(error.to_string().contains("recovery sync failure"));
+    assert!(seen.lock().unwrap().is_empty());
+}
