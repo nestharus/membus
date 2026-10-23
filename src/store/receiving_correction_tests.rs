@@ -223,6 +223,8 @@
     #[test]
     fn pending_policy_duplicate_observes_its_deadline_without_cancelling_original() {
         let(path,_,mut config)=fixture("policy-pending");
+        // This witness advances real time while I/O is held; use the live instance clock.
+        config.clock=None;
         let gate=Arc::new((Mutex::new((false,false)),Condvar::new()));config.sync_test_gate=Some(gate.clone());
         let s=Arc::new(Store::open(&path,config).unwrap());let first=s.clone();
         let original=std::thread::spawn(move||policy(&first,"deadline","",Some(Class::LATEST),"A"));
@@ -261,7 +263,8 @@
     }
     #[test]
     fn policy_duplicate_waits_for_projection_and_keeps_completed_outcome() {
-        let(path,_,config)=fixture("policy-projection"); let s=Arc::new(Store::open(&path,config.clone()).unwrap());
+        let(path,_,mut config)=fixture("policy-projection"); config.clock=None;
+        let s=Arc::new(Store::open(&path,config.clone()).unwrap());
         let(reached,committed)=mpsc::channel();let(resume,resumed)=mpsc::channel();
         *s.policy_after_commit.lock().unwrap()=Some((reached,resumed));
         let first=s.clone();let writer=std::thread::spawn(move||policy(&first,"projection","",Some(Class::LATEST),"A"));

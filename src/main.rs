@@ -672,10 +672,7 @@ fn start_heartbeat(path: PathBuf, store: Arc<Store>, interval_ms: u64) {
         let mut attempted_bytes = 0u64;
         let mut failures = 0u64;
         loop {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis();
+            let now = store.clock().utc_ms() as u128;
             attempts += 1;
             let health = store.health2();
             let format = |successful_bytes, tried_bytes| {

@@ -212,6 +212,7 @@ impl Config {
     pub(crate) fn memory_margin(&self) -> usize { (self.capacity / 8).min(32 * 1024 * 1024) }
 }
 pub struct Store {
+    clock: chunks::Clock,
     timers: timers::Shared,
     signals: signals::Hub,
     capture_metrics: [AtomicU64; 7],
@@ -312,8 +313,9 @@ fn start_routed_owners(
     route: Arc<dyn Route>,
     stripes: usize,
     config: &Config,
+    clock: chunks::Clock,
 ) -> (Vec<AppendHandle>, FlushHandle) {
-    let (flush_owner, ingress) = FlushOwner::start(route.clone(), config);
+    let (flush_owner, ingress) = FlushOwner::start(route.clone(), config, clock);
     let owners = (0..stripes)
         .map(|stripe| AppendOwner::start(stripe, route.clone(), config.clone(), ingress.clone()))
         .collect();
@@ -321,7 +323,7 @@ fn start_routed_owners(
 }
 #[cfg(test)]
 fn start_owners(logs: &[Arc<Mutex<Log>>], config: &Config) -> (Vec<AppendHandle>, FlushHandle) {
-    start_routed_owners(Arc::new(FixedRoute(logs.to_vec())), logs.len(), config)
+    start_routed_owners(Arc::new(FixedRoute(logs.to_vec())), logs.len(), config, chunks::Clock::new(config.clock.clone()))
 }
 impl Store {
     pub fn open(path: &Path, mut config: Config) -> io::Result<Self> {
@@ -385,7 +387,7 @@ impl Store {
             rotation_ms: config.rotation_ms,
             fail_sync: config.fail_sync,
         });
-        let (appenders, flush_owner) = start_routed_owners(router.clone(), 4, &config);
+        let (appenders, flush_owner) = start_routed_owners(router.clone(), 4, &config, clock.clone());
         let committed = Arc::new(RwLock::new(committed));
         let cache = Arc::new(cache::Cache::new(&config, clock.clone()));
         cache.trim(config.capacity.saturating_sub(state.committed_bytes + state.dedup_bytes
@@ -408,13 +410,14 @@ impl Store {
             next: 1,
             snapshots: HashMap::new(),
         }));
-        let (stop, reaper) = snapshots::start_reaper(scans.clone(), &config);
-        report.ready_ms = now_ms();
+        let (stop, reaper) = snapshots::start_reaper(scans.clone(), &config, clock.clone());
+        report.ready_ms = clock.utc_ms();
         report.stage = "ready".into();
         report.write(path)?;
         Ok(Self {
+            clock: clock.clone(),
             timers,
-            signals: signals::Hub::new(epoch, &config),
+            signals: signals::Hub::new(epoch, &config, clock.clone()),
             capture_metrics: std::array::from_fn(|_| AtomicU64::new(0)),
             committed,
             cache,

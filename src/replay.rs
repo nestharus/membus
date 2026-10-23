@@ -1,11 +1,13 @@
 //! Replay, legacy import and ordered startup recovery before runtime assembly.
+#[cfg(test)]
+#[path = "replay/clock_tests.rs"]
+mod clock_tests;
 use crate::chunks;
 use crate::codec::crc32;
 use crate::codec::mutation_bytes;
 use crate::codec::parse_record;
 use crate::codec::MAX_ID;
 use crate::log_io::sync_file;
-use crate::now_ms;
 use crate::routing::stripe;
 use crate::store::dedup_identity;
 use crate::store::fingerprint;
@@ -87,6 +89,7 @@ impl Replayed {
                 Dedup {
                     fingerprint: fingerprint(&m),
                     at,
+                    until_mono: 0, // Anchored to the instance clock after replay/import validation.
                     outcome: Some(Outcome {
                         code: 0,
                         version: v,
@@ -255,6 +258,7 @@ fn read_legacy(files: &[(usize, PathBuf)], config: &Config, now: u64) -> io::Res
                             Dedup {
                                 fingerprint: fingerprint(&m),
                                 at,
+                                until_mono: 0,
                                 outcome: Some(Outcome {
                                     code: 0,
                                     version: v,
@@ -510,7 +514,7 @@ fn import_legacy(
             )));
         }
     }
-    let legacy = read_legacy(&files, config, now_ms())?;
+    let legacy = read_legacy(&files, config, clock.utc_ms())?;
     let dir = path.join("chunks.import");
     if dir.exists() {
         // An import cut short starts again from the untouched legacy logs.
@@ -576,6 +580,7 @@ fn import_legacy(
                 Dedup {
                     fingerprint: fingerprint(&m),
                     at: utc,
+                    until_mono: 0,
                     outcome: Some(Outcome {
                         code: 0,
                         version,
@@ -787,7 +792,7 @@ fn replay_into(
     clock: &chunks::Clock,
 ) -> io::Result<()> {
     use chunks::{ChunkState, Rec};
-    let now = now_ms();
+    let now = clock.utc_ms();
     let dir = dir.to_owned();
     fs::create_dir_all(&dir)?;
     let (records, torn) = chunks::read_catalogue(&dir.join("catalogue.log"))?;
@@ -1051,7 +1056,7 @@ pub(super) struct Recovered {
 }
 pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
     let clock = chunks::Clock::new(config.clock.clone());
-    let start_ms = now_ms();
+    let start_ms = clock.utc_ms();
     let refuse = |e: io::Error, mut report: chunks::ReplayReport| -> io::Error {
         report.start_ms = start_ms;
         report.ready_ms = 0;
@@ -1323,10 +1328,18 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
     }
     let keys = metadata.len() + cs.summaries.charged;
     let committed_bytes = metadata.values().map(|m| m.bytes).sum();
-    let dedup = rp.dedup;
+    let mut dedup = rp.dedup;
+    // Persisted timestamps are UTC. Once recovered, retry bounds use only local elapsed time.
+    let retry_utc = clock.utc_ms();
+    let retry_mono = clock.mono_ms();
+    dedup.retain(|_, d| retry_utc.saturating_sub(d.at) <= config.retry_ms);
+    for d in dedup.values_mut() {
+        let remaining = config.retry_ms.saturating_sub(retry_utc.saturating_sub(d.at));
+        d.until_mono = retry_mono.saturating_add(remaining);
+    }
     let dedup_entries = dedup.len();
     let dedup_bytes = dedup.keys().map(crate::store::dedup_charge).sum();
-    let mut expiry: Vec<_> = dedup.iter().map(|(k, d)| (k.clone(), d.at)).collect();
+    let mut expiry: Vec<_> = dedup.iter().map(|(k, d)| (k.clone(), d.until_mono)).collect();
     expiry.sort_by_key(|(_, at)| *at);
     // Only control records need decoding into runtime state. Ordinary values stay on disk.
     let control: HashMap<_,_> = committed.iter().filter(|(k,_)| k.0 == timers::NS)

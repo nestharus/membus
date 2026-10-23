@@ -11,7 +11,6 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
-use std::time::Instant;
 
 pub(super) struct FlushWait {
     /// The sink to sync: a stripe's log, or a chunk id under the chunk route.
@@ -68,7 +67,7 @@ pub(super) struct FlushHandle {
     handle: std::thread::JoinHandle<()>,
 }
 impl FlushOwner {
-    pub(super) fn start(route: Arc<dyn Route>, config: &Config) -> (FlushHandle, FlushIngress) {
+    pub(super) fn start(route: Arc<dyn Route>, config: &Config, clock: crate::chunks::Clock) -> (FlushHandle, FlushIngress) {
         let (sender, receiver) = mpsc::channel();
         // Includes queued and currently syncing waiters. Classify at arrival,
         // not receipt: a notice queued during a sync must retain its gather policy.
@@ -83,6 +82,7 @@ impl FlushOwner {
             notice_gate,
         };
         let worker = Self {
+            clock,
             receiver,
             route,
             outstanding,
@@ -108,13 +108,14 @@ impl FlushHandle {
 }
 /// The receiver, operating context and continuing state live on the flush thread.
 pub(super) struct FlushOwner {
+    clock: crate::chunks::Clock,
     receiver: mpsc::Receiver<FlushWait>,
     route: Arc<dyn Route>,
     outstanding: Arc<AtomicUsize>,
     interval: u64,
     seams: TestSeam,
     pending: VecDeque<FlushWait>,
-    last: Option<Instant>,
+    last: Option<u64>,
     // Keyed by sink: a sync covers the earlier complete appends of its own file.
     covered: HashMap<usize, u64>,
     sync_failed: [bool; 4],
@@ -122,6 +123,7 @@ pub(super) struct FlushOwner {
 impl FlushOwner {
     fn run(self) {
         let Self {
+            clock,
             receiver: flush_recv,
             route: flush_route,
             outstanding: flush_outstanding,
@@ -177,10 +179,10 @@ impl FlushOwner {
                 }
                 // The gather window closes on elapsed time; bounds are enforced
                 // when selecting each handle's covering group below.
-                let until = std::time::Instant::now()
-                    + Duration::from_millis(if gather { interval } else { 0 });
-                while let Some(left) = until.checked_duration_since(std::time::Instant::now()) {
-                    match flush_recv.recv_timeout(left) {
+                let until = clock.mono_ms().saturating_add(if gather { interval } else { 0 });
+                while clock.mono_ms() < until {
+                    let left = until.saturating_sub(clock.mono_ms());
+                    match flush_recv.recv_timeout(Duration::from_millis(left)) {
                         Ok(w) => match settle(&w, &covered, &sync_failed) {
                             Some(r) => finish_flush(w, r, &flush_outstanding),
                             None => pending.push_back(w),
@@ -224,9 +226,9 @@ impl FlushOwner {
             }
             pending = retained;
             if let Some(previous) = last.filter(|_| gather) {
-                if let Some(delay) = Duration::from_millis(interval).checked_sub(previous.elapsed())
-                {
-                    std::thread::sleep(delay);
+                let delay = interval.saturating_sub(clock.mono_ms().saturating_sub(previous));
+                if delay > 0 {
+                    std::thread::sleep(Duration::from_millis(delay));
                 }
             }
             let (stripe, log) = match flush_route.sink(sink) {
@@ -246,7 +248,7 @@ impl FlushOwner {
                 (log.file.try_clone(), log.bytes)
             };
             let result = file.and_then(|f| seams.sync_selected_file(&f));
-            last = Some(std::time::Instant::now());
+            last = Some(clock.mono_ms());
             if result.is_ok() {
                 let c = covered.entry(sink).or_insert(0);
                 *c = (*c).max(through);

@@ -101,6 +101,7 @@ window. See [Rust client usage and uncertainty](docs/RUST_CLIENT.md).
 ## Documentation and checks
 
 - [Component ownership and runtime boundaries](docs/COMPONENTS.md)
+- [Instance clocks, deadlines and recovery windows](docs/CLOCK.md)
 - [Protocol, acknowledgments, refusals and snapshots](docs/KV1.md)
 - [Mutation retry comparators, encoding aliases and resource accounting](docs/RETRY_RETENTION.md)
 - [Recovered Flush prerequisites and historical backup limits](docs/RECOVERY_FLUSH.md)
