@@ -5,8 +5,17 @@ the frame, the writer creates and flushes `catalogue.log.append-pending`, contai
 boundary record, then synchronizes the containing directory before attempting the frame write.
 An intent-directory failure leaves the catalogue boundary unchanged, retains the marker and fences
 further appends; a known-live-state rewrite can retry the recovery. A failed append restores and
-flushes its previous boundary before removing that marker. If boundary restoration or marker
-resolution fails, further appends are fenced.
+flushes its previous boundary before removing that marker. Successful publication, completed rollback
+and recovery by rewrite each synchronize the containing directory after removing the marker.
+Neither append accounting nor the successful-rewrite baseline advances before that barrier completes.
+If boundary restoration or marker resolution fails, further appends are fenced.
+
+Before removing a marker, the writer retains its exact bytes for error recovery. If the removal's
+directory barrier fails, it attempts to recreate and flush those bytes and synchronize the directory
+again, then returns the original failure. This preserves restart refusal even when the unaccepted
+frame is complete. If marker restoration also fails, both errors are reported and the live writer
+stays fenced. A failed restoration barrier does not establish power-loss persistence of the marker;
+no automatic startup repair is inferred from such a failure.
 
 Startup refuses catalogue replay while the marker exists, including when its contents are incomplete.
 It preserves the catalogue and chunk files and attempts to record the refusal in the replay report.
@@ -36,15 +45,20 @@ establish filesystem behavior after power loss, a recovery deadline, or compatib
 binary that does not understand the marker. Do not open unresolved state with such an older binary.
 
 Run the Rust test suite with `cargo test --offline --locked`. `MEMBUS_TEST_OUTPUT` can select an isolated
-test output folder. The marker adds a separate file flush and directory barrier to each catalogue
-append; no throughput claim is made without a measurement for the selected storage and workload.
+test output folder. The marker adds a separate file flush and directory barriers for creation and
+removal to each catalogue append; no throughput claim is made without a measurement for the selected
+storage and workload.
 
 Local catalogue controls observe complete marker contents and the unchanged prior frame boundary
 at each intent barrier, reject an injected intent-directory failure before any frame write, and
 exercise partial-write rollback after a successful barrier. Replacement controls verify rename
 ordering, retained unresolved markers, append fencing and handle alignment after a failed directory
-barrier. The per-catalogue observer exists only in unit-test builds. These barriers cover marker
-creation and replacement publication; marker removal retains its existing unlink behavior.
+barrier. Resolution controls in `src/chunks.rs` cover successful publication,
+rollback, failed marker-removal barriers, exact marker restoration, repeated restoration failures
+and the replacement handle/baseline across rewrite retry. A Windows held-marker control exercises a
+real denied unlink before any resolution barrier. The per-catalogue observer exists only in
+unit-test builds. These checks establish operation and failure ordering, rather than physical
+power-loss behavior.
 
 Replay records a flushed `truncation_pending` stage in the existing replay evidence
 before removing a torn tail. That stage has `ready_ms=0`: it records what was found

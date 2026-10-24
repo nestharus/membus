@@ -732,10 +732,6 @@ fn begin_append(path: &Path, boundary: u64) -> io::Result<()> {
     crate::sync_file(&marker)
 }
 
-fn resolve_append(path: &Path) -> io::Result<()> {
-    fs::remove_file(append_pending_path(path))
-}
-
 pub struct Catalogue {
     pub path: PathBuf,
     file: File,
@@ -790,6 +786,28 @@ impl Catalogue {
         if let Some(hook) = &self.directory_sync { hook(parent)?; }
         crate::log_io::sync_dir(parent)
     }
+    fn resolve_append(&self) -> io::Result<()> {
+        let pending = append_pending_path(&self.path);
+        // Retain the exact recovery evidence before unlinking it. A directory
+        // error must not leave a complete, unaccepted frame looking resolved.
+        let marker_bytes = fs::read(&pending)?;
+        fs::remove_file(&pending)?;
+        if let Err(error) = self.sync_parent() {
+            let restored = (|| -> io::Result<()> {
+                let mut marker = OpenOptions::new().write(true).create_new(true).open(&pending)?;
+                marker.write_all(&marker_bytes)?;
+                crate::sync_file(&marker)?;
+                self.sync_parent()
+            })();
+            return match restored {
+                Ok(()) => Err(error),
+                Err(restoration) => Err(io::Error::other(format!(
+                    "{error}; catalogue marker restoration failed: {restoration}"
+                ))),
+            };
+        }
+        Ok(())
+    }
     /// Append and flush; the record takes effect only after this returns Ok.
     pub fn append(&mut self, r: &CatRecord) -> io::Result<()> {
         if self.fenced {
@@ -837,7 +855,7 @@ impl Catalogue {
                 }
                 self.file.set_len(boundary)?;
                 crate::sync_file(&self.file)?;
-                resolve_append(&self.path)
+                self.resolve_append()
             })();
             if let Err(recovery) = recovered {
                 self.fenced = true;
@@ -845,7 +863,7 @@ impl Catalogue {
             }
             return Err(error);
         }
-        if let Err(error) = resolve_append(&self.path) {
+        if let Err(error) = self.resolve_append() {
             self.fenced = true;
             return Err(io::Error::other(format!("catalogue publication unresolved: {error}")));
         }
@@ -881,10 +899,10 @@ impl Catalogue {
         self.fenced = true;
         self.sync_parent()?;
         // A retained marker is cleared only after the caller's known live list has replaced the
-        // uncertain catalogue. Any failure keeps replay fenced across process restart.
+        // uncertain catalogue. Its removal barrier must complete before clearing the live fence.
         let pending = append_pending_path(&self.path);
         if pending.try_exists()? {
-            resolve_append(&self.path)?;
+            self.resolve_append()?;
         }
         self.fenced = false;
         self.rewrite_base_bytes = self.bytes;
@@ -1538,6 +1556,7 @@ mod tests {
 #[cfg(test)]
 mod catalogue_failure_tests {
     use super::*;
+    use std::sync::{atomic::AtomicUsize, Mutex};
     fn catalogue(label: &str) -> Catalogue {
         let p = PathBuf::from(std::env::var("MEMBUS_TEST_OUTPUT").unwrap_or_else(|_| ".test-output".into()))
             .join(format!("catalogue-{label}-{}-{}", std::process::id(), crate::now_ms()));
@@ -1723,6 +1742,8 @@ mod catalogue_failure_tests {
         let observed = seen.clone();
         c.directory_sync = Some(Arc::new(move |dir| {
             assert_eq!(dir, path.parent().unwrap());
+            // This control observes intent creation; resolution has separate controls.
+            if !append_pending_path(&path).exists() { return Ok(()); }
             let old = before.lock().unwrap();
             assert_eq!(fs::read(&path)?, *old, "the frame must not precede its marker-name barrier");
             let marker = fs::read(append_pending_path(&path))?;
@@ -1779,6 +1800,8 @@ mod catalogue_failure_tests {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed = calls.clone();
         c.directory_sync = Some(Arc::new(move |_| {
+            // Keep observing the pre-frame intent barrier on this partial-write control.
+            if !append_pending_path(&path).exists() { return Ok(()); }
             assert_eq!(fs::read(&path)?, expected);
             assert!(append_pending_path(&path).exists());
             observed.fetch_add(1, Ordering::SeqCst);
@@ -1792,6 +1815,200 @@ mod catalogue_failure_tests {
         c.directory_sync = None;
         c.append(&record(3)).unwrap();
         assert_eq!(read_catalogue(&c.path).unwrap(), (vec![record(1), record(3)], None));
+    }
+
+    fn resolution_catalogue(label: &str) -> Catalogue {
+        let mut c = catalogue(label);
+        c.append(&record(1)).unwrap();
+        c
+    }
+
+    fn assert_refused(c: &mut Catalogue) {
+        assert!(c.append(&record(9)).unwrap_err().to_string().contains("fenced"));
+        assert!(read_catalogue(&c.path).unwrap_err().to_string().contains("append unresolved"));
+        assert!(Catalogue::open(&c.path).err().unwrap().to_string().contains("append unresolved"));
+    }
+
+    fn fail_resolution(c: &mut Catalogue) -> Arc<Mutex<Vec<bool>>> {
+        let path = c.path.clone();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed = events.clone();
+        c.directory_sync = Some(Arc::new(move |dir| {
+            assert_eq!(dir, path.parent().unwrap());
+            let pending = append_pending_path(&path).exists();
+            observed.lock().unwrap().push(pending);
+            if pending { Ok(()) } else { Err(io::Error::other("injected resolution directory failure")) }
+        }));
+        events
+    }
+
+    fn retry_from(c: &mut Catalogue, n: u64) {
+        c.directory_sync = None;
+        c.rewrite(&[record(n)]).unwrap();
+        c.append(&record(n + 2)).unwrap();
+        assert_eq!(read_catalogue(&c.path).unwrap(), (vec![record(n), record(n + 2)], None));
+    }
+
+    #[test]
+    fn append_resolution_directory_barrier_precedes_publication_and_reopen() {
+        let mut c = resolution_catalogue("append-order");
+        let path = c.path.clone();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed = events.clone();
+        c.directory_sync = Some(Arc::new(move |dir| {
+            assert_eq!(dir, path.parent().unwrap());
+            let pending = append_pending_path(&path).exists();
+            let expected = if pending { encode(&record(1)) } else {
+                [encode(&record(1)), encode(&record(2))].concat()
+            };
+            assert_eq!(fs::read(&path)?, expected, "the marker removal follows the flushed complete frame");
+            observed.lock().unwrap().push(pending);
+            Ok(())
+        }));
+        c.append(&record(2)).unwrap();
+        assert_eq!(*events.lock().unwrap(), vec![true, false], "success requires both directory barriers");
+        assert_eq!(c.last_ms, 2);
+        assert_eq!(c.bytes, fs::metadata(&c.path).unwrap().len());
+        let path = c.path.clone();
+        drop(c);
+        let _reopened = Catalogue::open(&path).unwrap();
+        assert_eq!(read_catalogue(&path).unwrap(), (vec![record(1), record(2)], None));
+    }
+
+    #[test]
+    fn rollback_resolution_directory_barrier_follows_durable_boundary_repair() {
+        let mut c = resolution_catalogue("rollback-order");
+        let path = c.path.clone();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed = events.clone();
+        c.directory_sync = Some(Arc::new(move |_| {
+            assert_eq!(fs::read(&path)?, encode(&record(1)), "rollback must precede marker resolution");
+            observed.lock().unwrap().push(append_pending_path(&path).exists());
+            Ok(())
+        }));
+        c.fail_partial_once = Some(7);
+        assert!(c.append(&record(2)).unwrap_err().to_string().contains("partial catalogue append"));
+        assert_eq!(*events.lock().unwrap(), vec![true, false], "rollback must also sync the marker unlink");
+        c.directory_sync = None;
+        c.append(&record(3)).unwrap();
+        assert_eq!(read_catalogue(&c.path).unwrap(), (vec![record(1), record(3)], None));
+    }
+
+    #[test]
+    fn append_resolution_directory_failure_restores_marker_and_refuses_reopen() {
+        let mut c = resolution_catalogue("append-failure");
+        let bytes = c.bytes;
+        let events = fail_resolution(&mut c);
+        let error = c.append(&record(2)).expect_err("publication must wait for its resolution directory sync");
+        assert!(error.to_string().contains("resolution directory failure"));
+        assert_eq!(*events.lock().unwrap(), vec![true, false, true], "restore the marker and its name on failure");
+        assert_eq!((c.bytes, c.last_ms), (bytes, 1));
+        assert_eq!(fs::read(&c.path).unwrap(), [encode(&record(1)), encode(&record(2))].concat());
+        let marker = fs::read(append_pending_path(&c.path)).unwrap();
+        assert_eq!(u64::from_le_bytes(marker[8..16].try_into().unwrap()), bytes);
+        assert_eq!(u32::from_le_bytes(marker[16..].try_into().unwrap()), crc32(&marker[..16]));
+        assert_refused(&mut c);
+        retry_from(&mut c, 1);
+    }
+
+    #[test]
+    fn rollback_resolution_directory_failure_restores_marker_and_keeps_fence() {
+        let mut c = resolution_catalogue("rollback-failure");
+        let bytes = c.bytes;
+        let events = fail_resolution(&mut c);
+        c.fail_sync_once = true;
+        let error = c.append(&record(2)).unwrap_err().to_string();
+        assert!(error.contains("catalogue sync failure"));
+        assert!(error.contains("resolution directory failure"), "rollback resolution must reach the directory sync");
+        assert!(error.contains("boundary recovery failed"));
+        assert_eq!(*events.lock().unwrap(), vec![true, false, true]);
+        assert_eq!(fs::read(&c.path).unwrap(), encode(&record(1)));
+        assert_eq!((c.bytes, c.last_ms), (bytes, 1));
+        assert_refused(&mut c);
+        retry_from(&mut c, 1);
+    }
+
+    #[test]
+    fn rewrite_resolution_directory_failure_preserves_replacement_handle_and_retry() {
+        let mut c = resolution_catalogue("rewrite-failure");
+        c.fail_sync_once = true;
+        c.fail_recovery_once = true;
+        assert!(c.append(&record(2)).is_err());
+        let marker = fs::read(append_pending_path(&c.path)).unwrap();
+        let events = fail_resolution(&mut c);
+        let error = c.rewrite(&[record(3)]).expect_err("rewrite must wait for marker resolution durability");
+        assert!(error.to_string().contains("resolution directory failure"));
+        assert_eq!(*events.lock().unwrap(), vec![true, false, true]);
+        assert_eq!(fs::read(append_pending_path(&c.path)).unwrap(), marker, "retain the exact original boundary evidence");
+        let mut handle = c.file.try_clone().unwrap();
+        handle.seek(SeekFrom::Start(0)).unwrap();
+        let mut retained = Vec::new();
+        handle.read_to_end(&mut retained).unwrap();
+        assert_eq!(retained, encode(&record(3)));
+        assert_eq!(retained, fs::read(&c.path).unwrap());
+        assert_eq!((c.rewrites, c.rewrite_base_bytes), (0, 0));
+        assert!(c.needs_rewrite(u64::MAX));
+        assert_refused(&mut c);
+        retry_from(&mut c, 3);
+    }
+
+    #[test]
+    fn repeated_resolution_and_restore_barrier_failures_keep_visible_refusal() {
+        let mut c = resolution_catalogue("restore-sync-failure");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        c.directory_sync = Some(Arc::new(move |_| {
+            match observed.fetch_add(1, Ordering::SeqCst) {
+                0 => Ok(()),
+                1 => Err(io::Error::other("injected resolution sync failure")),
+                _ => Err(io::Error::other("injected restoration sync failure")),
+            }
+        }));
+        let error = c.append(&record(2)).expect_err("a resolution failure must refuse publication").to_string();
+        assert!(error.contains("resolution sync failure"));
+        assert!(error.contains("restoration sync failure"));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_refused(&mut c);
+        retry_from(&mut c, 1);
+    }
+
+    #[test]
+    fn marker_recreation_failure_reports_both_errors_and_keeps_live_fence() {
+        let mut c = resolution_catalogue("restore-create-failure");
+        let path = append_pending_path(&c.path);
+        c.directory_sync = Some(Arc::new(move |_| {
+            if path.exists() { return Ok(()); }
+            // Make recreation fail deterministically without removing any retained evidence.
+            fs::create_dir(&path)?;
+            Err(io::Error::other("injected resolution failure before denied recreation"))
+        }));
+        let error = c.append(&record(2)).expect_err("failed resolution cannot authorize publication").to_string();
+        assert!(error.contains("resolution failure before denied recreation"));
+        assert!(error.contains("marker restoration failed"), "return restoration failure alongside the original error");
+        assert!(append_pending_path(&c.path).is_dir());
+        assert_refused(&mut c);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn held_marker_unlink_refuses_before_resolution_barrier() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let mut c = resolution_catalogue("held-marker");
+        let path = append_pending_path(&c.path);
+        let held = Arc::new(Mutex::new(None));
+        let slot = held.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        c.directory_sync = Some(Arc::new(move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            *slot.lock().unwrap() = Some(OpenOptions::new().read(true).share_mode(3).open(&path)?);
+            Ok(())
+        }));
+        assert!(c.append(&record(2)).unwrap_err().to_string().contains("publication unresolved"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "an unsuccessful unlink must not reach the resolution barrier");
+        assert_refused(&mut c);
+        drop(held.lock().unwrap().take());
+        retry_from(&mut c, 1);
     }
 }
 

@@ -4,6 +4,17 @@ Recovery synchronizes each rename's containing directory before performing the
 next dependent step. Synchronizing a file alone is not a directory publication
 barrier.
 
+Catalogue marker removal has the same namespace prerequisite. Successful append,
+completed boundary rollback and live-list rewrite synchronize the containing
+directory after unlinking `catalogue.log.append-pending`, before publishing
+success or clearing the live fence. On directory failure the writer attempts to
+restore and flush the exact original marker and its directory name, then returns
+the failure. Further appends stay fenced; append accounting and the successful
+rewrite baseline do not advance. A second restoration failure is reported alongside
+the original; it does not establish marker durability after power loss. A later known-live-list
+rewrite can retry. See [catalogue append recovery](CATALOGUE-APPEND-RECOVERY.md)
+for the refusal and qualification limits.
+
 Retirement completes its namespace work before publishing reclaimed bytes.
 After removing a chunk file, the live pass synchronizes the containing class
 directory before appending the Retired record or releasing that chunk's byte
