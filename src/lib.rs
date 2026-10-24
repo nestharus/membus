@@ -1,6 +1,8 @@
 //! membus.kv/1 slice 1: bounded framing, independent committed reads, durable replay.
 //! Chunk retirement (docs/CHUNK-RETIREMENT.md): chunk files by class, their catalogue, replay by version.
 pub mod chunks;
+#[cfg(test)]
+extern crate self as membus;
 mod signals;
 mod timers;
 pub use chunks::{Class, ManualClock, POLICY_NS};
@@ -524,6 +526,9 @@ mod retirement_failure_tests;
 #[cfg(test)]
 #[path = "store/receiving_correction_tests.rs"]
 mod receiving_correction_tests;
+
+#[cfg(test)]
+mod policy_recovery_tests;
 
 #[cfg(test)]
 #[path = "store/cold_load_tests.rs"]

@@ -385,6 +385,7 @@ impl Store {
         self.set_policy_with_id(ns, prefix, class, &id, deadline)
     }
     /// Caller-scoped POLICY_SET retry identity. A duplicate never reapplies an older projection.
+    /// Built-in classes are canonicalized; unsupported kinds and zero Expire refuse before mutation.
     pub fn set_policy_with_id(
         &self,
         ns: &str,
@@ -396,6 +397,13 @@ impl Store {
         let key = match chunks::policy_key(ns, prefix) {
             Ok(k) => k,
             Err(code) => return Outcome::error(code),
+        };
+        let class = match class {
+            Some(c) => match Class::from_wire(c.kind, c.retention_ms) {
+                Ok(canonical) => Some(canonical),
+                Err(code) => return Outcome::error(code),
+            },
+            None => None,
         };
         let m = Mutation {
             ns: POLICY_NS.into(),
