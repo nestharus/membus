@@ -270,12 +270,15 @@ impl Store {
     ) -> Result<Vec<u8>, u16> {
         let keys_only = matches!(op, SCAN_KEYS_PREFIX | SCAN_KEYS_RANGE);
         let is_range = matches!(op, SCAN_RANGE | SCAN_KEYS_RANGE);
-        let supplied = c.bytes(16)?.to_vec();
+        let supplied = c.bytes(16)?;
         let cursor = c.bytes(2 * MAX_ID + 48)?;
         let limit = c.u16()? as usize;
         let budget = (c.u32()? as usize).min(max_frame);
-        let lower = c.bound()?;
-        let upper = if is_range { c.bound()? } else { String::new() };
+        // Keep the original length-prefixed bounds for cursor binding. Neither
+        // selection nor authentication needs an owned copy of this request.
+        let bounds = c.remainder();
+        let lower = c.bound_ref()?;
+        let upper = if is_range { c.bound_ref()? } else { "" };
         c.end()?;
         if limit == 0
             || limit > MAX_BATCH
@@ -284,20 +287,17 @@ impl Store {
         {
             return Err(3);
         }
-        let mut query = vec![op];
-        lp(&mut query, lower.as_bytes());
-        if is_range {
-            lp(&mut query, upper.as_bytes());
-        }
+        let query_len = 1 + bounds.len();
         // A cursor must be accompanied by its snapshot, and binds the full
         // query plus an absolute index. Page size/budget can change on retry.
         let position = if cursor.is_empty() {
             None
         } else {
             if supplied.len() != 16
-                || cursor.len() != 32 + query.len()
-                || cursor[..16] != supplied
-                || cursor[24..cursor.len() - 8] != query
+                || cursor.len() != 32 + query_len
+                || &cursor[..16] != supplied
+                || cursor[24] != op
+                || &cursor[25..cursor.len() - 8] != bounds
             {
                 return Err(21);
             }
@@ -310,7 +310,7 @@ impl Store {
         let (token, snapshot) = if newly_opened {
             self.snapshot_open(ns)?
         } else {
-            (supplied.clone(), self.snapshot_get(ns, &supplied)?)
+            (supplied.to_vec(), self.snapshot_get(ns, supplied)?)
         };
         let result = (|| {
             if !cursor.is_empty() {
@@ -321,14 +321,14 @@ impl Store {
                 }
             }
             let rows = &snapshot.rows;
-            let start = rows.partition_point(|(k, _)| k < &lower);
+            let start = rows.partition_point(|(k, _)| k.as_str() < lower);
             let end = if !is_range {
                 // The matching block is contiguous under UTF-8 byte order.
-                start + rows[start..].partition_point(|(k, _)| k.starts_with(&lower))
+                start + rows[start..].partition_point(|(k, _)| k.starts_with(lower))
             } else if upper.is_empty() {
                 rows.len()
             } else {
-                rows.partition_point(|(k, _)| k < &upper)
+                rows.partition_point(|(k, _)| k.as_str() < upper)
             };
             let at = position.unwrap_or(start);
             if at < start || at > end {
@@ -339,7 +339,7 @@ impl Store {
             while next < end && next - at < limit {
                 let (key, value) = &rows[next];
                 let bytes = 4 + key.len() + if keys_only { 0 } else { 14 + value.entry.len };
-                let continuation = if next + 1 < end { 32 + query.len() } else { 0 };
+                let continuation = if next + 1 < end { 32 + query_len } else { 0 };
                 if 42 + item_bytes + bytes + continuation > budget {
                     if next == at {
                         return Err(4);
@@ -349,21 +349,23 @@ impl Store {
                 item_bytes += bytes;
                 next += 1;
             }
-            let mut continuation = Vec::new();
-            if next < end {
-                continuation.extend(&token);
-                continuation.extend((next as u64).to_le_bytes());
-                continuation.extend(&query);
-                let tag = snapshot.cursor_hash.hash_one(&continuation[..]);
-                continuation.extend(tag.to_le_bytes());
-            }
-            let payload_len = 27 + item_bytes + continuation.len();
+            let continuation_len = if next < end { 32 + query_len } else { 0 };
+            let payload_len = 27 + item_bytes + continuation_len;
             let mut p = match response_id {
                 Some(id) => reply_header(op, id, 0, payload_len),
                 None => Vec::with_capacity(payload_len),
             };
             lp(&mut p, &token);
-            lp(&mut p, &continuation);
+            p.extend((continuation_len as u32).to_le_bytes());
+            if continuation_len != 0 {
+                let start = p.len();
+                p.extend(&token);
+                p.extend((next as u64).to_le_bytes());
+                p.push(op);
+                p.extend(bounds);
+                let tag = snapshot.cursor_hash.hash_one(&p[start..]);
+                p.extend(tag.to_le_bytes());
+            }
             p.push((next == end) as u8);
             p.extend(((next - at) as u16).to_le_bytes());
             for (key, value) in &rows[at..next] {

@@ -39,6 +39,13 @@ before payload reads or cache changes. Fitting committed reads and snapshot page
 encode directly into their final response buffer. Request and cold-record
 identifiers are borrowed during validation; retained operations take owned copies.
 
+Snapshot scans also borrow validated UTF-8 bounds and their length-prefixed request
+bytes during dispatch. Continuations bind the opcode and those exact encoded
+bounds, and are written and authenticated directly in the final reply buffer.
+This avoids temporary bound, query and continuation buffers while preserving
+the wire layout, byte budgets and cursor validation. Request slices do not escape
+dispatch.
+
 Replay checks records one at a time and rebuilds locations and retry comparators.
 It starts with an empty value cache. Timer schedules and retention policies are
 decoded into their bounded control structures. The one-time legacy import also

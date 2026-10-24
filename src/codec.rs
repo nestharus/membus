@@ -148,8 +148,13 @@ impl<'a> Cursor<'a> {
     }
     /// Scan bounds may be empty; identifiers still use text().
     pub fn bound(&mut self) -> Result<String, u16> {
-        let b = self.bytes(MAX_ID)?;
-        Ok(std::str::from_utf8(b).map_err(|_| 3u16)?.to_owned())
+        Ok(self.bound_ref()?.to_owned())
+    }
+    pub(super) fn bound_ref(&mut self) -> Result<&'a str, u16> {
+        std::str::from_utf8(self.bytes(MAX_ID)?).map_err(|_| 3u16)
+    }
+    pub(super) fn remainder(&self) -> &'a [u8] {
+        &self.b[self.p..]
     }
     pub fn end(&self) -> Result<(), u16> {
         if self.p == self.b.len() {

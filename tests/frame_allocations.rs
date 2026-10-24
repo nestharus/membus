@@ -632,3 +632,145 @@ fn request_identifiers_keep_frozen_validation_and_owned_mutations() {
     assert_eq!(stored.bytes, b"value");
     assert_eq!(stored.ack, 1);
 }
+
+fn scan_query_request(op: u8, token: &[u8], cursor: &[u8], limit: u16, bounds: &[u8]) -> Vec<u8> {
+    let mut suffix = Vec::new();
+    membus::lp(&mut suffix, token);
+    membus::lp(&mut suffix, cursor);
+    suffix.extend(limit.to_le_bytes());
+    suffix.extend((MAX_FRAME as u32).to_le_bytes());
+    suffix.extend(bounds);
+    page_request(op, 0x1122334455667788, &suffix)
+}
+fn scan_query_cost(continuing: bool) {
+    let mut failures = Vec::new();
+    for op in [
+        membus::SCAN_PREFIX,
+        membus::SCAN_RANGE,
+        membus::SCAN_KEYS_PREFIX,
+        membus::SCAN_KEYS_RANGE,
+    ] {
+        let fixture = page_fixture(&format!("scan-query-{op}-{continuing}"));
+        let store = page_store(&fixture);
+        let prefix = "界".repeat(341);
+        let keys: Vec<_> = ['a', 'b', 'c']
+            .into_iter()
+            .map(|c| format!("{prefix}{c}"))
+            .collect();
+        let bytes = vec![0x71; 8192];
+        let mut versions = Vec::new();
+        for key in &keys {
+            let result = store.mutate(membus::Mutation {
+                ns: "page-buffers".into(),
+                key: key.clone(),
+                op_id: key.clone(),
+                deadline: membus::now_ms() + 30_000,
+                ack: 1,
+                expected: None,
+                bytes: bytes.clone(),
+                remove: false,
+            });
+            assert_eq!(result.code, 0);
+            versions.push(result.version);
+        }
+        let token = page_token(&store);
+        let range = matches!(op, membus::SCAN_RANGE | membus::SCAN_KEYS_RANGE);
+        let keys_only = matches!(op, membus::SCAN_KEYS_PREFIX | membus::SCAN_KEYS_RANGE);
+        let mut bounds = Vec::new();
+        membus::lp(
+            &mut bounds,
+            if range {
+                keys[0].as_bytes()
+            } else {
+                prefix.as_bytes()
+            },
+        );
+        if range {
+            membus::lp(&mut bounds, format!("{prefix}d").as_bytes());
+        }
+        let count = if continuing { 1 } else { 3 };
+        let mut request = scan_query_request(op, &token, &[], count, &bounds);
+        let first = store.dispatch(&request);
+        assert_eq!(&first[17..19], &[0, 0]);
+        let mut parsed = membus::Cursor::new(&first[19..]);
+        assert_eq!(parsed.bytes(16).unwrap(), token);
+        let continuation = parsed.bytes(2 * membus::MAX_ID + 48).unwrap().to_vec();
+        assert_eq!(parsed.u8().unwrap(), (!continuing) as u8);
+        assert_eq!(parsed.u16().unwrap(), count);
+        if continuing {
+            assert_eq!(&continuation[..16], token);
+            assert_eq!(
+                u64::from_le_bytes(continuation[16..24].try_into().unwrap()),
+                1
+            );
+            assert_eq!(continuation[24], op);
+            assert_eq!(&continuation[25..continuation.len() - 8], bounds);
+        } else {
+            assert!(continuation.is_empty());
+        }
+        let mut payload = Vec::new();
+        membus::lp(&mut payload, &token);
+        membus::lp(&mut payload, &continuation);
+        payload.push((!continuing) as u8);
+        payload.extend(count.to_le_bytes());
+        for i in 0..usize::from(count) {
+            membus::lp(&mut payload, keys[i].as_bytes());
+            if !keys_only {
+                payload.push(1);
+                payload.extend(versions[i].to_le_bytes());
+                payload.push(1);
+                membus::lp(&mut payload, &bytes);
+            }
+        }
+        let expected = original(op | 0x80, 0x1122334455667788, Some(0), &payload);
+        assert_eq!(first, expected);
+        let before = store.cache_stats();
+        let (output, calls, requested) = observed_above(1024, || store.dispatch(&request));
+        let after = store.cache_stats();
+        assert_eq!(
+            output, expected,
+            "frozen token, cursor, order, values and acknowledgment"
+        );
+        assert_eq!(
+            (after.hits, after.misses, after.cold_reads, after.bytes),
+            (before.hits, before.misses, before.cold_reads, before.bytes)
+        );
+        // The cursor is self-contained and valid after overwriting its old request.
+        if continuing {
+            request.fill(0xff);
+            let replay =
+                store.dispatch(&scan_query_request(op, &token, &continuation, 128, &bounds));
+            assert_eq!(&replay[17..19], &[0, 0]);
+            let mut c = membus::Cursor::new(&replay[19..]);
+            assert_eq!(c.bytes(16).unwrap(), token);
+            assert!(c.bytes(2 * membus::MAX_ID + 48).unwrap().is_empty());
+            assert_eq!(c.u8().unwrap(), 1);
+            assert_eq!(c.u16().unwrap(), 2);
+            for i in 1..3 {
+                assert_eq!(c.text().unwrap(), keys[i]);
+                if !keys_only {
+                    assert_eq!(c.u8().unwrap(), 1);
+                    assert_eq!(c.u64().unwrap(), versions[i]);
+                    assert_eq!(c.u8().unwrap(), 1);
+                    assert_eq!(c.bytes(bytes.len()).unwrap(), bytes);
+                }
+            }
+            c.end().unwrap();
+        }
+        if calls > 1 || requested > output.len() {
+            failures.push((op, calls, requested, output.len()));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "discarded scan query/continuation allocations: {failures:?}"
+    );
+}
+#[test]
+fn scan_query_final_pages_borrow_bounds_without_temporary_copies() {
+    scan_query_cost(false);
+}
+#[test]
+fn scan_query_continuations_are_encoded_in_the_final_output() {
+    scan_query_cost(true);
+}
