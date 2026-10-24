@@ -987,7 +987,7 @@ fn replay_into(
                 rp.chunks.summaries.add(*retired_ms, keys.clone());
             }
             Rec::Next(n) => next_hw = next_hw.max(*n),
-            Rec::Resume => {}
+            Rec::Resume | Rec::ResumeWithBasis(_) => rp.chunks.last_resume = Some(r.clone()),
             Rec::RetiringPart { .. } => unreachable!("committed_records folds all parts"),
             Rec::Import(i) => {
                 rp.chunks.import = Some(i.clone());
@@ -1215,6 +1215,19 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
         report.epoch = epoch;
         refuse(error, report)
     };
+    // Exclude public writers before import or replay can replace/truncate any state.
+    let cat_dir = path.join("chunks");
+    fs::create_dir_all(&cat_dir).map_err(|e| refuse(e, chunks::ReplayReport::default()))?;
+    let cat_path = cat_dir.join("catalogue.log");
+    let owner = chunks::Catalogue::acquire_owner(&cat_path)
+        .map_err(|e| refuse(e, chunks::ReplayReport::default()))?;
+    // Hold the old file too: a writable hardlink in another directory must not
+    // race the import switch. Delete sharing permits the owned directory rename.
+    let previous_catalogue = match chunks::Catalogue::writer_file(&cat_path, false) {
+        Ok(file) => Some(file),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(refuse(e, chunks::ReplayReport::default())),
+    };
     let imported = match import_legacy(path, config, &clock, epoch) {
         Ok(x) => x,
         Err(e) => {
@@ -1225,6 +1238,9 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
             return Err(refuse(e, report));
         }
     };
+    drop(previous_catalogue);
+    let mut catalogue = chunks::Catalogue::open_owned(&cat_path, owner)
+        .map_err(|e| refuse(e, chunks::ReplayReport::default()))?;
     let mut rp = match replay(path, config, &clock) {
         Ok(rp) => rp,
         Err((e, report)) => return Err(refuse(e, report)),
@@ -1271,12 +1287,8 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
             .and_then(|file| file.set_len(*offset))
             .map_err(|e| refuse(e, rp.report.clone()))?;
     }
-    let cat_path = path.join("chunks").join("catalogue.log");
     if let Some((offset, _, _)) = &rp.report.catalogue_truncation {
-        OpenOptions::new()
-            .write(true)
-            .open(&cat_path)
-            .and_then(|file| file.set_len(*offset))
+        catalogue.truncate(*offset)
             .map_err(|e| refuse(e, rp.report.clone()))?;
     }
     TestSeam::checkpoint("MEMBUS_TEST_PAUSE_REPLAY_TRUNCATED");
@@ -1320,8 +1332,6 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
         recovery_sync_dir(&dir, config).map_err(|e| refuse(e, rp.report.clone()))?;
     }
     let mut cs = std::mem::replace(&mut rp.chunks, chunks::ChunkStore::new(path.join("chunks")));
-    let mut catalogue = chunks::Catalogue::open(&cat_path)
-        .map_err(|e| refuse(e, rp.report.clone()))?;
     catalogue.last_ms = rp.cat_last_ms;
     cs.cat = Some(catalogue);
     // Catalogue::open may create the file. Persist its name before recovery

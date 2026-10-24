@@ -1,5 +1,13 @@
 # Unresolved catalogue appends
 
+`Catalogue::open` admits one cooperative writer per canonical catalogue directory.
+A persistent sibling `<directory>.catalogue-owner` file holds the lifetime lock,
+including while import replaces the directory or compaction replaces the log.
+The log handle also excludes writable hardlink aliases. `Catalogue::path()` exposes
+the immutable path; direct filesystem mutation and older noncooperating writers
+are outside this contract. Store acquires ownership before import and destructive
+replay; read-only catalogue snapshots remain available.
+
 Catalogue publication requires a flushed frame and resolution of its append marker. Before writing
 the frame, the writer creates and flushes `catalogue.log.append-pending`, containing a versioned
 boundary record, then synchronizes the containing directory before attempting the frame write.
@@ -24,7 +32,13 @@ valid trailing frame therefore cannot turn an unresolved failed retirement into 
 its chunk on restart.
 
 An existing owner with known in-memory live state can resolve the fence through the ordinary live-list
-rewrite. The replacement is flushed, its handle is prepared and its path published before the marker
+rewrite, including with growth compaction disabled. `Store::maintain_catalogue()`
+returns `Unchanged`, `Compacted`, or `Recovered { evidence }`, and propagates I/O
+errors. Before replacing uncertain state, it copies and flushes the exact log and
+any pending marker into a new `catalogue-recovery-*` directory, then persists that
+directory and its parent. These evidence copies require disk space and an operator
+retention policy; recovery does not delete them or clear sticky error flags.
+The replacement is flushed, its handle is prepared and its path published before the marker
 is removed. Startup has no such live-state witness and does not remove the marker or infer a safe
 boundary. Recovery after that refusal needs an independently established retained-state account; it
 is not an automatic repair or a reason to delete the marker manually.

@@ -22,6 +22,25 @@
         s.chunks.lock().unwrap().table.values().filter(|c| c.class.kind == 2).map(|c| (c.id, c.bytes)).collect()
     }
     fn inject_after(s: &Store, n: usize) { s.chunks.lock().unwrap().cat.as_mut().unwrap().fail_after_once = Some(n); }
+    #[test]
+    fn public_writer_blocks_destructive_store_replay_until_owner_release() {
+        let (s, _) = store("replay-exclusion", 1);
+        s.maint.retire(None).unwrap();
+        let protected: Vec<_> = s.chunks.lock().unwrap().table.values()
+            .filter(|c| c.state == chunks::ChunkState::Retiring)
+            .map(|c| (c.path.clone(), fs::read(&c.path).unwrap())).collect();
+        assert_eq!(protected.len(), 2);
+        let path = s.path.clone();
+        drop(s);
+        let writer = chunks::Catalogue::open(&path.join("chunks/catalogue.log")).unwrap();
+        let error = Store::open(&path, Config::default()).err().unwrap();
+        assert!(error.to_string().contains("writer ownership refused"));
+        for (file, bytes) in &protected { assert_eq!(fs::read(file).unwrap(), *bytes); }
+        drop(writer);
+        let reopened = Store::open(&path, Config::default()).unwrap();
+        assert_eq!(reopened.replay_report().retirements_finished.len(), 2);
+        for (file, _) in protected { assert!(!file.exists()); }
+    }
     fn assert_readable_index_agrees(s: &Store) {
         let state = s.state.lock().unwrap();
         let committed = s.committed.read().unwrap();

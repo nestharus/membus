@@ -244,9 +244,17 @@ pub enum Rec {
     Horizons(Vec<(String, String, u64)>),
     Summary { retired_ms: u64, keys: Vec<Key> },
     Next(u64),
-    /// An operator's `membus expiry resume` after a clock pause.
+    /// Historical resume with no retained initiating basis.
     Resume,
+    ResumeWithBasis(ResumeBasis),
     Import(Import),
+}
+/// Initiating evidence, not authentication of the operator or a portable monotonic epoch.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ResumeBasis {
+    Operator,
+    StableClock { since_utc_ms: u64, since_mono_ms: u64, observed_mono_ms: u64,
+        required_ms: u64, tolerance_ms: u64 },
 }
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct Import {
@@ -287,6 +295,7 @@ pub fn encode(r: &CatRecord) -> Vec<u8> {
         Rec::Resume => 8,
         Rec::Import(_) => 9,
         Rec::RetiringPart { .. } => 10,
+        Rec::ResumeWithBasis(_) => 11,
     };
     b.push(kind);
     b.extend(r.at_ms.to_le_bytes());
@@ -339,6 +348,15 @@ pub fn encode(r: &CatRecord) -> Vec<u8> {
         }
         Rec::Next(n) => b.extend(n.to_le_bytes()),
         Rec::Resume => {}
+        Rec::ResumeWithBasis(basis) => match basis {
+            ResumeBasis::Operator => b.push(1),
+            ResumeBasis::StableClock { since_utc_ms, since_mono_ms, observed_mono_ms, required_ms, tolerance_ms } => {
+                b.push(2);
+                for n in [since_utc_ms, since_mono_ms, observed_mono_ms, required_ms, tolerance_ms] {
+                    b.extend(n.to_le_bytes());
+                }
+            }
+        },
         Rec::Import(i) => {
             b.extend((i.files.len() as u32).to_le_bytes());
             for (name, size, sha) in &i.files {
@@ -429,6 +447,12 @@ fn decode_payload(b: &[u8]) -> Result<CatRecord, u16> {
         }
         7 => Rec::Next(c.u64()?),
         8 => Rec::Resume,
+        11 => Rec::ResumeWithBasis(match c.u8()? {
+            1 => ResumeBasis::Operator,
+            2 => ResumeBasis::StableClock { since_utc_ms: c.u64()?, since_mono_ms: c.u64()?,
+                observed_mono_ms: c.u64()?, required_ms: c.u64()?, tolerance_ms: c.u64()? },
+            _ => return Err(3),
+        }),
         9 => {
             let n = c.u32()? as usize;
             let mut files = Vec::new();
@@ -746,8 +770,10 @@ fn begin_append(path: &Path, boundary: u64) -> io::Result<()> {
     crate::sync_file(&marker)
 }
 
+/// One cooperative writer per catalogue directory, retained across log replacement.
 pub struct Catalogue {
-    pub path: PathBuf,
+    path: PathBuf,
+    _owner: File,
     file: File,
     pub bytes: u64,
     pub last_ms: u64,
@@ -757,6 +783,7 @@ pub struct Catalogue {
     pub(crate) rewrites: u64,
     pub fail_writes: bool,
     fenced: bool,
+    recovery_evidence: Option<PathBuf>,
     #[cfg(test)]
     pub(crate) fail_after_once: Option<usize>,
     #[cfg(test)]
@@ -772,11 +799,38 @@ pub struct Catalogue {
 }
 impl Catalogue {
     pub fn open(path: &Path) -> io::Result<Self> {
+        let owner = Self::acquire_owner(path)?;
+        Self::open_owned(path, owner)
+    }
+    /// The sibling lock stays at a stable name when legacy import replaces the directory.
+    pub(crate) fn acquire_owner(path: &Path) -> io::Result<File> {
+        let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."))
+            .canonicalize()?;
+        let mut name = parent.file_name().ok_or_else(|| io::Error::other("catalogue directory name required"))?.to_os_string();
+        name.push(".catalogue-owner");
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.share_mode(0);
+        }
+        let owner = options.open(parent.with_file_name(name))
+            .map_err(|e| io::Error::other(format!("catalogue writer ownership refused: {e}")))?;
+        #[cfg(not(windows))]
+        owner.try_lock().map_err(|e| io::Error::other(format!("catalogue writer ownership refused: {e}")))?;
+        Ok(owner)
+    }
+    pub(crate) fn open_owned(path: &Path, owner: File) -> io::Result<Self> {
+        let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        let path = parent.canonicalize()?.join(path.file_name().ok_or_else(|| io::Error::other("catalogue file name required"))?);
+        let path = path.as_path();
         require_resolved_append(path)?;
-        let file = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(path)?;
+        let file = Self::writer_file(path, true)?;
         let bytes = file.metadata()?.len();
         Ok(Self {
-            path: path.to_owned(), file, bytes, last_ms: 0, rewrite_base_bytes: 0, fail_writes: false, fenced: false,
+            path: path.to_owned(), _owner: owner, file, bytes, last_ms: 0, rewrite_base_bytes: 0, fail_writes: false, fenced: false,
+            recovery_evidence: None,
             #[cfg(test)]
             rewrites: 0,
             #[cfg(test)]
@@ -792,6 +846,52 @@ impl Catalogue {
             #[cfg(test)]
             directory_sync: None,
         })
+    }
+    pub(crate) fn writer_file(path: &Path, create: bool) -> io::Result<File> {
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(create).truncate(false);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // Permit snapshots and our atomic rename; deny a second writable alias, including hardlinks.
+            options.share_mode(1 | 4);
+        }
+        let file = options.open(path)?;
+        #[cfg(not(windows))]
+        file.try_lock().map_err(|e| io::Error::other(format!("catalogue file ownership refused: {e}")))?;
+        Ok(file)
+    }
+    pub fn path(&self) -> &Path { &self.path }
+    pub fn recovery_required(&self) -> io::Result<bool> {
+        Ok(self.fenced || append_pending_path(&self.path).try_exists()?)
+    }
+    pub fn recovery_evidence(&self) -> Option<&Path> { self.recovery_evidence.as_deref() }
+    fn preserve_uncertain(&self) -> io::Result<PathBuf> {
+        for n in 0..32 {
+            let dir = self.path.parent().unwrap().join(format!("catalogue-recovery-{}-{n}", crate::now_ms()));
+            match fs::create_dir(&dir) {
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+                Ok(()) => {}
+            }
+            for (source, name) in [(self.path.clone(), "catalogue.log"), (append_pending_path(&self.path), "append-pending")] {
+                if source.try_exists()? {
+                    let mut input = File::open(source)?;
+                    let mut output = OpenOptions::new().write(true).create_new(true).open(dir.join(name))?;
+                    io::copy(&mut input, &mut output)?;
+                    crate::sync_file(&output)?;
+                }
+            }
+            crate::log_io::sync_dir(&dir)?;
+            crate::log_io::sync_dir(self.path.parent().unwrap())?;
+            return Ok(dir);
+        }
+        Err(io::Error::other("cannot reserve catalogue recovery evidence directory"))
+    }
+    pub(crate) fn truncate(&mut self, bytes: u64) -> io::Result<()> {
+        self.file.set_len(bytes)?;
+        self.bytes = bytes;
+        Ok(())
     }
     fn sync_parent(&self) -> io::Result<()> {
         let parent = self.path.parent().filter(|p| !p.as_os_str().is_empty())
@@ -887,6 +987,7 @@ impl Catalogue {
     }
     /// Rewrite atomically to the live list (tmp, flush, rename). Metadata only; no record is copied.
     pub fn rewrite(&mut self, live: &[CatRecord]) -> io::Result<()> {
+        let evidence = if self.recovery_required()? { Some(self.preserve_uncertain()?) } else { None };
         let tmp = self.path.with_extension("log.tmp");
         {
             let mut f = File::create(&tmp)?;
@@ -903,11 +1004,12 @@ impl Catalogue {
         }
         // Prepare every fallible handle operation before publishing the replacement. On error the
         // current handle still names the current path, so a later append cannot go to an unlinked log.
-        let replacement = OpenOptions::new().read(true).write(true).open(&tmp)?;
+        let replacement = Self::writer_file(&tmp, false)?;
         let bytes = replacement.metadata()?.len();
         fs::rename(&tmp, &self.path)?;
         self.file = replacement;
         self.bytes = bytes;
+        if evidence.is_some() { self.recovery_evidence = evidence; }
         // A post-rename failure must keep the handle on the published image,
         // fence appends and retain any unresolved marker until a rewrite retries.
         self.fenced = true;
@@ -1256,6 +1358,8 @@ pub struct ChunkStore {
     pub degraded: Option<String>,
     pub stable_since: Option<(u64, u64)>,
     pub last_tick: Option<(u64, u64)>,
+    /// Latest resume evidence retained through replay and compaction.
+    pub last_resume: Option<CatRecord>,
     /// Last failed rewrite's cause, cleared by a successful rewrite.
     pub rewrite_error: Option<String>,
     /// A partial retirement prefix needs discharge by a known-live rewrite before retry.
@@ -1279,6 +1383,7 @@ impl ChunkStore {
             degraded: None,
             stable_since: None,
             last_tick: None,
+            last_resume: None,
             rewrite_error: None,
             incomplete_retiring: false,
         }
@@ -1347,6 +1452,7 @@ impl ChunkStore {
     /// The live list a rewrite keeps: every unretired chunk's records, horizons, summaries and the import.
     pub fn live_list(&self, now: u64, next: u64) -> Vec<CatRecord> {
         let mut out = vec![CatRecord { at_ms: now, rec: Rec::Next(next) }];
+        if let Some(resume) = &self.last_resume { out.push(resume.clone()); }
         if let Some(i) = &self.import {
             out.push(CatRecord { at_ms: self.import_at, rec: Rec::Import(i.clone()) });
         }
@@ -1588,6 +1694,52 @@ mod catalogue_failure_tests {
         Catalogue::open(&p.join("catalogue.log")).unwrap()
     }
     fn record(n: u64) -> CatRecord { CatRecord { at_ms: n, rec: Rec::Next(n) } }
+    #[test]
+    fn second_writer_is_refused_before_stale_rollback_and_after_replacement() {
+        let mut b = catalogue("writer-exclusion");
+        b.append(&record(1)).unwrap();
+        let path = b.path.clone();
+        assert!(Catalogue::open(&path).is_err(), "A must not capture a rollback boundary while B owns publication");
+        b.append(&record(2)).unwrap();
+        let acknowledged = fs::read(&path).unwrap();
+        b.fail_sync_once = true;
+        b.fail_recovery_once = true;
+        assert!(b.append(&record(3)).is_err());
+        assert!(fs::read(&path).unwrap().starts_with(&acknowledged));
+        let uncertain = fs::read(&path).unwrap();
+        let marker = fs::read(append_pending_path(&path)).unwrap();
+        b.rewrite(&[record(1), record(2)]).unwrap();
+        let evidence = b.recovery_evidence().unwrap();
+        assert_eq!(fs::read(evidence.join("catalogue.log")).unwrap(), uncertain);
+        assert_eq!(fs::read(evidence.join("append-pending")).unwrap(), marker);
+        assert!(Catalogue::open(&path).is_err(), "replacement must retain lifetime exclusion");
+        drop(b);
+        let mut a = Catalogue::open(&path).unwrap();
+        a.append(&record(4)).unwrap();
+        assert_eq!(read_catalogue(&path).unwrap(), (vec![record(1), record(2), record(4)], None));
+    }
+    #[test]
+    fn resume_encoding_evolution_and_malformed_controls() {
+        let mut legacy = vec![8];
+        legacy.extend(42u64.to_le_bytes());
+        assert_eq!(decode_payload(&legacy).unwrap(), CatRecord { at_ms: 42, rec: Rec::Resume });
+        for basis in [ResumeBasis::Operator, ResumeBasis::StableClock { since_utc_ms: 9,
+            since_mono_ms: 10, observed_mono_ms: 20, required_ms: 10, tolerance_ms: 2000 }] {
+            let record = CatRecord { at_ms: 42, rec: Rec::ResumeWithBasis(basis) };
+            let bytes = encode(&record);
+            assert_eq!(decode_payload(&bytes[16..]).unwrap(), record);
+            assert!(decode_payload(&bytes[16..bytes.len()-1]).is_err());
+            let mut extra = bytes[16..].to_vec();
+            extra.push(0);
+            assert!(decode_payload(&extra).is_err(), "unknown extension must refuse rather than invent basis");
+        }
+        let mut unknown = vec![11];
+        unknown.extend(42u64.to_le_bytes());
+        unknown.push(3);
+        assert!(decode_payload(&unknown).is_err());
+        legacy.push(1);
+        assert!(decode_payload(&legacy).is_err());
+    }
     fn check_append_failure(n: usize) {
         let mut c = catalogue(&format!("partial-{n}"));
         c.append(&record(1)).unwrap();
@@ -1655,7 +1807,7 @@ mod catalogue_failure_tests {
         assert!(failed_bytes.ends_with(&encode(&record(2))), "witness must leave the complete failed frame");
         drop(c);
         assert!(read_catalogue(&path).unwrap_err().to_string().contains("append unresolved"));
-        assert!(Catalogue::open(&path).err().unwrap().to_string().contains("append unresolved"));
+        assert!(Catalogue::open(&path).err().unwrap().to_string().contains("ownership refused"));
         assert_eq!(fs::read(&path).unwrap(), failed_bytes, "refusal preserves recovery evidence");
     }
     #[test]
@@ -1747,7 +1899,7 @@ mod catalogue_failure_tests {
         assert!(error.to_string().contains("replacement directory sync failure"));
         assert!(append_pending_path(&c.path).exists());
         assert!(read_catalogue(&c.path).unwrap_err().to_string().contains("append unresolved"));
-        assert!(Catalogue::open(&c.path).err().unwrap().to_string().contains("append unresolved"));
+        assert!(Catalogue::open(&c.path).err().unwrap().to_string().contains("ownership refused"));
         assert!(c.append(&record(3)).unwrap_err().to_string().contains("fenced"));
         assert_eq!(fs::read(&c.path).unwrap(), encode(&record(1)));
         assert_eq!(c.rewrites, 0, "a failed barrier must not count as a successful rewrite");
@@ -1829,7 +1981,7 @@ mod catalogue_failure_tests {
         assert!(append_pending_path(&c.path).exists());
         assert!(c.append(&record(3)).unwrap_err().to_string().contains("fenced"));
         assert_eq!(calls.load(Ordering::SeqCst), 1, "the fence must stop later writes before another marker attempt");
-        assert!(Catalogue::open(&c.path).err().unwrap().to_string().contains("append unresolved"));
+        assert!(Catalogue::open(&c.path).err().unwrap().to_string().contains("ownership refused"));
         assert!(read_catalogue(&c.path).unwrap_err().to_string().contains("append unresolved"));
         c.directory_sync = None;
         c.rewrite(&[record(1)]).unwrap();
@@ -1873,7 +2025,7 @@ mod catalogue_failure_tests {
     fn assert_refused(c: &mut Catalogue) {
         assert!(c.append(&record(9)).unwrap_err().to_string().contains("fenced"));
         assert!(read_catalogue(&c.path).unwrap_err().to_string().contains("append unresolved"));
-        assert!(Catalogue::open(&c.path).err().unwrap().to_string().contains("append unresolved"));
+        assert!(Catalogue::open(&c.path).err().unwrap().to_string().contains("ownership refused"));
     }
 
     fn fail_resolution(c: &mut Catalogue) -> Arc<Mutex<Vec<bool>>> {

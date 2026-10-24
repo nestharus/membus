@@ -190,7 +190,7 @@ reconstructed outcomes. Automatic retirement and latest-class pinned pressure
 wait strictly past that inclusive cutoff. A backward UTC correction between
 admission and chunk close can otherwise make close-time age pass while the
 record's recovered outcome remains retryable. The extra cutoff is in memory;
-recorded close timestamps and catalogue formats are unchanged. Forced retirement
+recorded close timestamps are unchanged. Forced retirement
 keeps its explicit override, and already Retiring cleanup is unchanged.
 
 A failed Resume publication keeps the pause and any explicit `expiry.resume`
@@ -357,3 +357,13 @@ epoch for correction. Atomic live-list rewrites retain each Open before its
 lifecycle and preserve retirement/summary ages. Normal recovery deletes an empty
 Open file before completing retirement; a leftover zero-length retired file
 retains the existing storage-error diagnostic.
+
+
+New expiry resumes use catalogue kind 11, `ResumeWithBasis`: an explicit request
+records `Operator`; automatic recovery records its observed stable-clock start UTC,
+local start/observed monotonic readings, required duration and drift tolerance.
+The latest resume survives replay and compaction and is available through
+`Store::expiry_resume_record()`. Historical kind 8 remains basis unknown; kind 10
+continues to encode multipart retirement. Older readers refuse kind 11. Resume
+basis describes the initiating route, not operator authentication or a portable
+monotonic epoch. Failed publication retains the pause and explicit request.

@@ -58,6 +58,7 @@ use flush_owner::{FlushHandle, FlushOwner};
 pub use heartbeat::heartbeat_json;
 use log_io::sync_file;
 use maintenance::Maint;
+pub use maintenance::CatalogueMaintenance;
 #[cfg(test)]
 use routing::{stripe, FixedRoute};
 use routing::{ChunkRouter, Route};

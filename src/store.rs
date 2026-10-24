@@ -250,6 +250,15 @@ impl Store {
     pub fn retry_retiring(&self) -> io::Result<usize> {
         self.maint.retry_retiring()
     }
+    /// Recover a fenced catalogue from this owner's retained chunk state, or compact when due.
+    /// This is unavailable after refused startup; it accepts no caller-supplied cold reconstruction.
+    pub fn maintain_catalogue(&self) -> io::Result<CatalogueMaintenance> {
+        self.maint.maintain_catalogue()
+    }
+    /// Latest retained resume evidence, including historical basis-free records.
+    pub fn expiry_resume_record(&self) -> Option<chunks::CatRecord> {
+        self.chunks.lock().unwrap().last_resume.clone()
+    }
     /// (index entries with summaries, live keys in `ns`).
     pub fn slots(&self, ns: &str) -> (usize, usize) {
         let state = self.state.lock().unwrap();

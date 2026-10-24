@@ -401,6 +401,8 @@ fn t10_clock_jumps() {
     s.tick();
     assert!(!s.expiry_degraded());
     assert!(!p.join("expiry.resume").exists());
+    assert_eq!(s.expiry_resume_record().unwrap().rec,
+        membus::chunks::Rec::ResumeWithBasis(membus::chunks::ResumeBasis::Operator));
     s.retirement_pass();
     assert_eq!(row(&s, chunk).3, "Retired");
     drop(s);
@@ -420,6 +422,25 @@ fn t10_clock_jumps() {
         s.tick();
     }
     assert!(!s.expiry_degraded());
+    let resumed = s.expiry_resume_record().unwrap();
+    match &resumed.rec {
+        membus::chunks::Rec::ResumeWithBasis(membus::chunks::ResumeBasis::StableClock {
+            since_utc_ms, since_mono_ms, observed_mono_ms, required_ms, tolerance_ms }) => {
+            assert_eq!(*required_ms, MIN);
+            assert_eq!(*tolerance_ms, 2000);
+            assert!(observed_mono_ms - since_mono_ms >= *required_ms);
+            assert_eq!(resumed.at_ms - since_utc_ms, observed_mono_ms - since_mono_ms);
+        }
+        other => panic!("automatic recovery must preserve available stability basis: {other:?}"),
+    }
+    drop(s);
+    let mut c = config(&clock);
+    c.catalogue_rewrite_bytes = 1;
+    let s = reopen(&p, c);
+    assert_eq!(s.expiry_resume_record(), Some(resumed.clone()));
+    assert_eq!(s.maintain_catalogue().unwrap(), membus::CatalogueMaintenance::Compacted);
+    drop(s);
+    assert_eq!(reopen(&p, config(&clock)).expiry_resume_record(), Some(resumed));
     println!("T10: forward jump retired nothing early; backward jump paused until expiry.resume; heartbeat gap paused until stable ticks");
 }
 

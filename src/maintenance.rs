@@ -338,12 +338,19 @@ impl Maint {
             .stable_since
             .is_some_and(|(_, m)| mono.saturating_sub(m) >= self.config.rotation_ms);
         if cs.degraded.is_some() && (resume || stable) {
-            if cs.log(utc, chunks::Rec::Resume).is_err() {
+            let basis = if resume { chunks::ResumeBasis::Operator } else {
+                let (since_utc_ms, since_mono_ms) = cs.stable_since.unwrap();
+                chunks::ResumeBasis::StableClock { since_utc_ms, since_mono_ms,
+                    observed_mono_ms: mono, required_ms: self.config.rotation_ms, tolerance_ms: 2000 }
+            };
+            let rec = chunks::Rec::ResumeWithBasis(basis);
+            if cs.log(utc, rec.clone()).is_err() {
                 self.flags.storage_error.store(true, Ordering::SeqCst);
                 // Preserve an explicit request until Resume is published. A
                 // later tick can retry after the catalogue becomes writable.
                 return;
             }
+            cs.last_resume = Some(chunks::CatRecord { at_ms: utc, rec });
             cs.degraded = None;
             self.flags.expiry_degraded.store(false, Ordering::SeqCst);
         }
@@ -387,17 +394,25 @@ impl Maint {
         cs.horizons.retain(|key, _| held.contains(key));
         cs.recount_index_bytes();
     }
-    /// A catalogue past its size is rewritten to the live list (5.2).
+    /// Repair from the owned live list independently of ordinary growth compaction.
     pub(super) fn rewrite_catalogue(&self) {
+        let _ = self.maintain_catalogue();
+    }
+    pub(super) fn maintain_catalogue(&self) -> io::Result<CatalogueMaintenance> {
         let mut cs = self.chunks.lock().unwrap();
-        let at = self.config.catalogue_rewrite_bytes;
-        if (cs.incomplete_retiring || cs.cat.as_ref().is_some_and(|cat| cat.needs_rewrite(at)))
-            && cs
-                .rewrite_live(self.clock.utc_ms(), self.next_issued.load(Ordering::SeqCst))
-                .is_err()
-        {
-            self.flags.storage_error.store(true, Ordering::SeqCst);
-        }
+        let result = (|| {
+            let cat = cs.cat.as_ref().ok_or_else(|| io::Error::other("catalogue not open"))?;
+            let recovering = cat.recovery_required()?;
+            if !recovering && !cs.incomplete_retiring && !cat.needs_rewrite(self.config.catalogue_rewrite_bytes) {
+                return Ok(CatalogueMaintenance::Unchanged);
+            }
+            cs.rewrite_live(self.clock.utc_ms(), self.next_issued.load(Ordering::SeqCst))?;
+            Ok(if recovering {
+                CatalogueMaintenance::Recovered { evidence: cs.cat.as_ref().unwrap().recovery_evidence().unwrap().to_owned() }
+            } else { CatalogueMaintenance::Compacted })
+        })();
+        if result.is_err() { self.flags.storage_error.store(true, Ordering::SeqCst); }
+        result
     }
 }
 
@@ -426,4 +441,12 @@ impl Maint {
         });
         (tick_stop, ticker)
     }
+}
+
+/// Outcome of owned live-list maintenance; recovery does not clear sticky health flags.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CatalogueMaintenance {
+    Unchanged,
+    Compacted,
+    Recovered { evidence: PathBuf },
 }

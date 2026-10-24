@@ -22,7 +22,7 @@ fn paused_with_threshold(f: &Fixture, threshold: u64) -> (Store, Arc<chunks::Man
 
 fn resume_count(f: &Fixture) -> usize {
     chunks::read_catalogue(&f.0.join("chunks/catalogue.log")).unwrap().0.iter()
-        .filter(|r| matches!(r.rec, chunks::Rec::Resume)).count()
+        .filter(|r| matches!(r.rec, chunks::Rec::Resume | chunks::Rec::ResumeWithBasis(_))).count()
 }
 
 #[derive(Clone, Copy)]
@@ -153,7 +153,11 @@ fn repair_with_disabled_threshold(block_replacement: bool) {
         assert!(path.exists());
         fs::remove_dir(temporary).unwrap();
     }
-    store.maint.rewrite_catalogue();
+    let crate::CatalogueMaintenance::Recovered { evidence } = store.maintain_catalogue().unwrap() else {
+        panic!("a fenced catalogue must report recovery");
+    };
+    assert_eq!(fs::read(evidence.join("catalogue.log")).unwrap(), bytes);
+    assert_eq!(fs::read(evidence.join("append-pending")).unwrap(), pending);
     assert_eq!(store.chunks.lock().unwrap().cat.as_ref().unwrap().rewrites, rewrites + 1,
         "the maintenance owner must repair the fence independently of the size threshold");
     assert!(store.health2().catalogue_rewrite_error.is_none());
