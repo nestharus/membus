@@ -1069,6 +1069,7 @@ fn replay_into(
 
 pub(super) struct Recovered {
     pub(super) clock: chunks::Clock,
+    pub(super) start_mono_ms: u64,
     pub(super) flags: Arc<Flags>,
     pub(super) chunks: chunks::ChunkStore,
     pub(super) next: u64,
@@ -1081,10 +1082,12 @@ pub(super) struct Recovered {
 }
 pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
     let clock = chunks::Clock::new(config.clock.clone());
+    let start_mono_ms = clock.mono_ms();
     let start_ms = clock.utc_ms();
     let refuse = |e: io::Error, mut report: chunks::ReplayReport| -> io::Error {
         report.start_ms = start_ms;
         report.ready_ms = 0;
+        report.elapsed_ms = Some(clock.mono_ms().saturating_sub(start_mono_ms));
         report.stage = "refused".into();
         report.refusal = Some(e.to_string());
         // The replay record is written before exit; its own failure does not hide the refusal.
@@ -1156,6 +1159,7 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
     if !rp.truncate.is_empty() || rp.report.catalogue_truncation.is_some() {
         rp.report.start_ms = start_ms;
         rp.report.ready_ms = 0;
+        rp.report.elapsed_ms = Some(clock.mono_ms().saturating_sub(start_mono_ms));
         rp.report.stage = "truncation_pending".into();
         // Preserve what replay found before its source bytes disappear. A later successful
         // start can replace replay.json; the bounded replay.log retains this non-ready stage.
@@ -1444,6 +1448,7 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
         .collect();
     Ok(Recovered {
         clock,
+        start_mono_ms,
         flags,
         chunks: cs,
         next,

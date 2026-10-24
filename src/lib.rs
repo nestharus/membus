@@ -374,6 +374,7 @@ impl Store {
     fn open_owned(path: &Path, config: Config, owner: File) -> io::Result<Self> {
         let replay::Recovered {
             clock,
+            start_mono_ms,
             flags,
             chunks: cs,
             next,
@@ -431,6 +432,7 @@ impl Store {
         }));
         let (stop, reaper) = snapshots::start_reaper(scans.clone(), &config, clock.clone());
         report.ready_ms = clock.utc_ms();
+        report.elapsed_ms = Some(clock.mono_ms().saturating_sub(start_mono_ms));
         report.stage = "ready".into();
         // Own every worker before the last fallible publication. On error,
         // Store::drop stops and joins them before releasing the directory owner.

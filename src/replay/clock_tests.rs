@@ -507,3 +507,126 @@ fn injected_clock_final_mutation_admission_rechecks_utc() {
     );
     assert!(s.get("clock", "key").is_none());
 }
+
+fn elapsed_json_number(text: &str, key: &str) -> u64 {
+    text.split(&format!("\"{key}\":")).nth(1).unwrap()
+        .split(|c: char| !c.is_ascii_digit()).next().unwrap().parse().unwrap()
+}
+
+fn elapsed_config(f: &Fixture, manual: &Arc<ManualClock>, advance: u64, jump: i64, refuse: bool) -> Config {
+    let mut config = f.config(manual);
+    let root = f.0.clone();
+    let clock = manual.clone();
+    let changed = std::sync::atomic::AtomicBool::new(false);
+    config.recovery_dir_sync = Some(Arc::new(move |dir| {
+        if dir == root && !changed.swap(true, Ordering::SeqCst) {
+            clock.advance(advance);
+            clock.jump_utc(jump);
+            if refuse { return Err(io::Error::other("injected elapsed-report recovery refusal")); }
+        }
+        Ok(())
+    }));
+    config
+}
+
+fn check_elapsed_report(f: &Fixture, s: &Store, start: u64, ready: u64, elapsed: u64) {
+    let report = s.replay_report();
+    assert_eq!((report.start_ms, report.ready_ms), (start, ready), "wall timestamps still use UTC");
+    assert_eq!(elapsed_json_number(&report.json(), "duration_ms"), elapsed, "JSON must use local elapsed time");
+    let summary = report.summary();
+    assert!(summary.ends_with(&format!("duration_ms={elapsed}")), "{summary}");
+    let published = fs::read_to_string(f.0.join("replay.json")).unwrap();
+    assert_eq!(elapsed_json_number(&published, "duration_ms"), elapsed);
+    assert_eq!(elapsed_json_number(&published, "start_ms"), start);
+    assert_eq!(elapsed_json_number(&published, "ready_ms"), ready);
+    let history = fs::read_to_string(f.0.join("replay.log")).unwrap();
+    assert_eq!(history.lines().last().unwrap(), report.json());
+}
+
+#[test]
+fn injected_clock_report_elapsed_ignores_utc_corrections() {
+    for (advance, jump, ready) in [
+        (0, 50_000, UTC + 50_000),
+        (25, -500, UTC + 25 - 500),
+        (25, -25, UTC),
+        (25, 50_000, UTC + 50_025),
+    ] {
+        let f = Fixture::new();
+        let manual = ManualClock::new(UTC);
+        let s = Store::open(&f.0, elapsed_config(&f, &manual, advance, jump, false)).unwrap();
+        check_elapsed_report(&f, &s, UTC, ready, advance);
+    }
+}
+
+#[test]
+fn injected_clock_report_elapsed_restarts_from_each_recovery() {
+    let f = Fixture::new();
+    let manual = ManualClock::new(UTC);
+    manual.advance(5000);
+    let start = manual.utc_ms();
+    let s = Store::open(&f.0, elapsed_config(&f, &manual, 25, 0, false)).unwrap();
+    check_elapsed_report(&f, &s, start, start + 25, 25);
+    drop(s);
+    f.unlock();
+    manual.advance(9000);
+    let start = manual.utc_ms();
+    let s = Store::open(&f.0, elapsed_config(&f, &manual, 17, -17, false)).unwrap();
+    assert_eq!(s.epoch, 2);
+    check_elapsed_report(&f, &s, start, start, 17);
+}
+
+#[test]
+fn injected_clock_report_elapsed_refusal_keeps_elapsed_and_zero_ready() {
+    let f = Fixture::new();
+    let manual = ManualClock::new(UTC);
+    let error = Store::open(&f.0, elapsed_config(&f, &manual, 25, -500, true)).err().unwrap();
+    assert!(error.to_string().contains("elapsed-report recovery refusal"));
+    let published = fs::read_to_string(f.0.join("replay.json")).unwrap();
+    assert!(published.contains("\"stage\":\"refused\""));
+    assert_eq!(elapsed_json_number(&published, "start_ms"), UTC);
+    assert_eq!(elapsed_json_number(&published, "ready_ms"), 0);
+    assert_eq!(elapsed_json_number(&published, "duration_ms"), 25, "refusal time is still local elapsed time");
+    let history = fs::read_to_string(f.0.join("replay.log")).unwrap();
+    assert_eq!(history.lines().last().unwrap(), published.trim_end());
+}
+
+#[test]
+fn injected_clock_report_elapsed_manual_report_constructor_keeps_utc_fallback() {
+    for (start, ready, elapsed) in [(10, 30, 20), (30, 10, 0), (30, 0, 0)] {
+        let report = chunks::ReplayReport { start_ms: start, ready_ms: ready, ..Default::default() };
+        assert_eq!(elapsed_json_number(&report.json(), "duration_ms"), elapsed);
+        assert!(report.summary().ends_with(&format!("duration_ms={elapsed}")));
+    }
+}
+
+#[test]
+fn injected_clock_report_elapsed_pending_snapshot_uses_monotonic_time() {
+    let f = Fixture::new();
+    let manual = ManualClock::new(UTC);
+    f.legacy(&[(mutation("elapsed-import", u64::MAX), 7, UTC)]);
+    let root = f.0.clone();
+    let clock = manual.clone();
+    let changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let injected = changed.clone();
+    let mut config = f.config(&manual);
+    config.recovery_dir_sync = Some(Arc::new(move |dir| {
+        let catalogue = root.join("chunks/catalogue.log");
+        if dir == root && catalogue.exists() && !injected.swap(true, Ordering::SeqCst) {
+            // The imported tree is published, before the ordinary replay observes this torn tail.
+            let mut file = OpenOptions::new().append(true).open(catalogue)?;
+            file.write_all(b"MBC")?;
+            file.sync_all()?;
+            clock.advance(25);
+            clock.jump_utc(50_000);
+        }
+        Ok(())
+    }));
+    let s = Store::open(&f.0, config).unwrap();
+    assert!(changed.load(Ordering::SeqCst));
+    let history = fs::read_to_string(f.0.join("replay.log")).unwrap();
+    let pending = history.lines().find(|line| line.contains("\"stage\":\"truncation_pending\"")).unwrap();
+    assert_eq!(elapsed_json_number(pending, "start_ms"), UTC);
+    assert_eq!(elapsed_json_number(pending, "ready_ms"), 0);
+    assert_eq!(elapsed_json_number(pending, "duration_ms"), 25, "pending evidence uses a captured elapsed snapshot");
+    check_elapsed_report(&f, &s, UTC, UTC + 50_025, 25);
+}

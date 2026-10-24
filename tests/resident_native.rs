@@ -3,6 +3,9 @@
 //! MEMBUS_RESIDENT_TEST_ROOT selects retained fixture output; MEMBUS_RESIDENT_BINARY
 //! optionally selects an explicitly identified resident instead of this package's binary.
 //! No physical-device byte or power-loss claim follows from these process-kill tests.
+//! Idle/reclamation witnesses use 200 ms. The physical-kill phase uses a separate
+//! generation with 60 s idle, confirms a live peer before kill, and bounds kill
+//! plus Job settling to 5 s so idle reclamation cannot explain the closure.
 #![cfg(windows)]
 #[path = "support/child.rs"]
 mod child;
@@ -33,18 +36,27 @@ struct Resident {
 }
 impl Resident {
     fn start(root: &Path, state: &Path, pipe: &str, label: &str, cap: bool) -> Self {
+        Self::start_with_idle(root, state, pipe, label, cap, 200)
+    }
+    fn start_kill_witness(root: &Path, state: &Path, pipe: &str, label: &str) -> Self {
+        // Keep idle reclamation separate from physical death and Job settling.
+        Self::start_with_idle(root, state, pipe, label, false, 60_000)
+    }
+    fn start_with_idle(
+        root: &Path,
+        state: &Path,
+        pipe: &str,
+        label: &str,
+        cap: bool,
+        idle_ms: u32,
+    ) -> Self {
         let mut cmd = Command::new(binary());
         cmd.arg(state)
             .arg("pipe")
             .arg(pipe)
-            .args([
-                "--idle-ms",
-                "200",
-                "--heartbeat-ms",
-                "250",
-                "--flush-ms",
-                "0",
-            ])
+            .arg("--idle-ms")
+            .arg(idle_ms.to_string())
+            .args(["--heartbeat-ms", "250", "--flush-ms", "0"])
             .stdin(Stdio::null())
             .stdout(fs::File::create(root.join(format!("{label}.stdout"))).unwrap())
             .stderr(fs::File::create(root.join(format!("{label}.stderr"))).unwrap());
@@ -153,10 +165,17 @@ impl Heartbeat {
     }
 }
 fn heartbeat_ready(state: &Path) -> Heartbeat {
+    heartbeat_until(state, |_| true)
+}
+fn heartbeat_until(state: &Path, ready: impl Fn(&Heartbeat) -> bool) -> Heartbeat {
     let until = deadline(2000).local;
     loop {
         match Heartbeat::read(state) {
-            Ok(h) => return h,
+            Ok(h) if ready(&h) => return h,
+            Ok(h) => {
+                assert!(Instant::now() < until, "heartbeat condition not published: {}", h.text);
+                std::thread::sleep(Duration::from_millis(10));
+            }
             Err(e) if Instant::now() < until => {
                 let _ = e;
                 std::thread::sleep(Duration::from_millis(10));
@@ -228,6 +247,62 @@ fn newest_nonempty_log(state: &Path) -> PathBuf {
         }
     }
     logs.into_iter().max_by_key(|(seq, _)| *seq).unwrap().1
+}
+fn silent_peer_health(
+    root: &Path,
+    state: &Path,
+    pipe: &str,
+    pid: u32,
+    epoch: u64,
+    setup_pause: Duration,
+) {
+    let setup_start = Instant::now();
+    let mut peers: Vec<_> = (0..64)
+        .map(|i| {
+            let peer = raw(pipe);
+            if i == 0 && !setup_pause.is_zero() {
+                std::thread::sleep(setup_pause);
+            }
+            peer
+        })
+        .collect();
+    let setup_elapsed = setup_start.elapsed();
+    let busy = health(root, state, pipe, "health-busy");
+    assert!(busy.0 && busy.3 < Duration::from_millis(2500), "{busy:?}");
+    assert_eq!(busy.1.trim(), format!("healthy pid={pid} epoch={epoch}"));
+    // Setup may exceed an idle window on a shared host. Witness actual server
+    // reclamation of every opened peer instead of assuming simultaneous occupancy.
+    for (index, peer) in peers.iter_mut().enumerate() {
+        assert_closed(peer, &format!("silent peer {index} reclaimed"));
+    }
+    println!(
+        "health after 64 silent opens: setup={}s health={}s; all 64 server-closed",
+        setup_elapsed.as_secs_f64(),
+        busy.3.as_secs_f64()
+    );
+    drop(peers);
+}
+fn kill_with_stale_peer(
+    server: &mut Resident,
+    pipe: &str,
+    observer_delay: Duration,
+) -> (Pipe, Duration) {
+    let mut stale = raw(pipe);
+    stale.write_all(&[13]).unwrap();
+    if !observer_delay.is_zero() {
+        std::thread::sleep(observer_delay);
+    }
+    stale
+        .write_all(&[0])
+        .expect("stale peer must still be live immediately before physical termination");
+    let started = Instant::now();
+    server.kill_wait();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "physical termination and Job settling exceeded the witness bound: {elapsed:?}"
+    );
+    (stale, elapsed)
 }
 fn run(state_cap: bool) {
     let stamp = SystemTime::now()
@@ -362,34 +437,32 @@ fn run(state_cap: bool) {
     assert!(recovered.n("heartbeat_attempts") > recovered.n("heartbeat_writes"));
     assert!(recovered.n("heartbeat_bytes_attempted") > recovered.n("heartbeat_bytes"));
     println!("heartbeat failure/recovery {}", recovered.text.trim());
-    let occupied_start = Instant::now();
-    let peers: Vec<_> = (0..64).map(|_| raw(&pipe)).collect();
-    assert!(
-        occupied_start.elapsed() < Duration::from_millis(200),
-        "connections idled before occupied health encounter"
+    // Exercise delayed setup and observation in the existing cap-mode witness.
+    let delay = Duration::from_millis(if state_cap { 300 } else { 0 });
+    silent_peer_health(
+        &root,
+        &state,
+        &pipe,
+        server.owner.child.id(),
+        epoch,
+        delay,
     );
-    let busy = health(&root, &state, &pipe, "health-busy");
-    assert!(busy.0 && busy.3 < Duration::from_millis(2500), "{busy:?}");
-    assert_eq!(
-        busy.1.trim(),
-        format!("healthy pid={} epoch={epoch}", server.owner.child.id())
-    );
-    // Silent peers may idle out while health is admitted. This witnesses bounded
-    // health through that reclamation, not admission with 64 continuously live peers.
-    println!(
-        "health after 64 opened silent connections (idle reclamation permitted): {}s",
-        busy.3.as_secs_f64()
-    );
-    drop(peers);
-    let mut stale = raw(&pipe);
-    stale.write_all(&[13]).unwrap();
-    let kill_start = Instant::now();
     server.kill_wait();
-    let kill_elapsed = kill_start.elapsed();
-    assert!(
-        kill_elapsed < Duration::from_millis(200),
-        "stale IO could expire before kill: {kill_elapsed:?}"
-    );
+    let mut server = Resident::start_kill_witness(&root, &state, &pipe, "kill-witness");
+    let mut current = connect(&pipe);
+    let killed_epoch = current.negotiated().epoch;
+    assert_ne!(killed_epoch, epoch);
+    // The new generation must have a nonempty active chunk for its torn-tail
+    // probe; previous-generation chunks are closed and must stay immutable.
+    let kill_probe = put(
+        &mut current,
+        "kill/probe",
+        b"active-kill-generation",
+        Ack::Os,
+    )
+    .unwrap();
+    drop(current);
+    let (mut stale, kill_elapsed) = kill_with_stale_peer(&mut server, &pipe, delay);
     let stripe = newest_nonempty_log(&state);
     let before_tail = fs::metadata(&stripe).unwrap().len();
     OpenOptions::new()
@@ -406,7 +479,7 @@ fn run(state_cap: bool) {
         "stale pipe after physical death and endpoint reuse",
     );
     drop(stale);
-    assert_ne!(c.negotiated().epoch, epoch);
+    assert_ne!(c.negotiated().epoch, killed_epoch);
     assert_eq!(fs::metadata(&stripe).unwrap().len(), before_tail);
     for (i, (key, bytes, ack)) in expected.iter().enumerate() {
         let value = c
@@ -417,7 +490,19 @@ fn run(state_cap: bool) {
         assert_eq!(value.version, versions[i]);
         assert_eq!(value.ack, *ack);
     }
-    println!("same state/endpoint replay: epoch {epoch} -> {}, authored 3-byte tail removed, exact OS/Flush bytes/version/ack; kill={kill_elapsed:?}", c.negotiated().epoch);
+    let probe = c
+        .get(
+            "resident",
+            "kill/probe",
+            "replay-kill-probe",
+            deadline(2000),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(probe.bytes, b"active-kill-generation");
+    assert_eq!(probe.version, kill_probe.version);
+    assert_eq!(probe.ack, Ack::Os);
+    println!("same state/endpoint replay: epoch {killed_epoch} -> {}, authored 3-byte tail removed, exact OS/Flush bytes/version/ack; kill={kill_elapsed:?}", c.negotiated().epoch);
     drop(c);
     restarted.kill_wait();
     if state_cap {
@@ -443,8 +528,7 @@ fn run(state_cap: bool) {
         assert_eq!(value.version, prior.version);
         assert_eq!(value.ack, Ack::Os);
         drop(c);
-        std::thread::sleep(Duration::from_millis(300));
-        let pressure = heartbeat_ready(&cap_state);
+        let pressure = heartbeat_until(&cap_state, |h| h.field("state_high_water") == "true");
         assert_eq!(pressure.field("state_high_water"), "true");
         assert!((187..=250).contains(&pressure.n("state_bytes")));
         assert_eq!(pressure.n("state_limit_bytes"), 250);

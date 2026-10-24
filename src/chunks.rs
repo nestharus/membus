@@ -955,6 +955,8 @@ pub struct ReplayReport {
     pub epoch: u64,
     pub start_ms: u64,
     pub ready_ms: u64,
+    /// Captured local elapsed time for startup reports. None preserves standalone UTC-only reports.
+    pub elapsed_ms: Option<u64>,
     /// Empty historically; current stages are ready, refused and truncation_pending.
     /// Pending records describe a plan, not proof that truncation completed.
     pub stage: String,
@@ -996,6 +998,9 @@ fn esc(s: &str) -> String {
     o
 }
 impl ReplayReport {
+    fn duration_ms(&self) -> u64 {
+        self.elapsed_ms.unwrap_or_else(|| self.ready_ms.saturating_sub(self.start_ms))
+    }
     pub fn json(&self) -> String {
         let stripes: Vec<String> = self
             .stripes
@@ -1025,7 +1030,7 @@ impl ReplayReport {
             self.start_ms,
             self.ready_ms,
             esc(&self.stage),
-            self.ready_ms.saturating_sub(self.start_ms),
+            self.duration_ms(),
             stripes.join(","),
             self.catalogue_truncation
                 .as_ref()
@@ -1101,7 +1106,7 @@ impl ReplayReport {
             self.dedup_entries,
             self.horizons,
             self.storage_errors.len(),
-            self.ready_ms.saturating_sub(self.start_ms)
+            self.duration_ms()
         )
     }
 }
