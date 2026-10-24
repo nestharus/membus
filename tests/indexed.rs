@@ -368,6 +368,58 @@ fn actual_declared_queries_preserve_identity_history_and_pinned_boundary() {
     .is_err());
 }
 #[test]
+fn cached_schema_still_checks_each_snapshot_and_namespace() {
+    let f = Fixture::new();
+    let mut c = f.client("schema-cache");
+    let col = Collection::new("rows", schema()).unwrap();
+    col.declare(&mut c, "fixture", "declare", Ack::Os, d())
+        .unwrap();
+    let old = c.snapshot_open("fixture", "old", d()).unwrap();
+    col.query(
+        &mut c, "fixture", &old, &Query::All, limits(), "prime", d(),
+    )
+    .unwrap();
+    let copy = col.clone();
+    assert_eq!(copy.schema(), col.schema());
+    assert_eq!(format!("{copy:?}"), format!("{col:?}"));
+    drop(col);
+
+    // A raw replacement affects new snapshots, while the pinned view keeps
+    // its original declaration. Reusing the collection must check both views.
+    write(
+        &mut c,
+        "x/rows/schema",
+        b"different declaration".to_vec(),
+        "replace",
+    );
+    let new = c.snapshot_open("fixture", "new", d()).unwrap();
+    let other = Collection::new(
+        "rows",
+        Schema { fields: vec!["different".into()] },
+    )
+    .unwrap();
+    other.declare(&mut c, "other", "other-declare", Ack::Os, d())
+        .unwrap();
+    let other_view = c.snapshot_open("other", "other-open", d()).unwrap();
+
+    for (ns, token, valid) in [
+        ("fixture", old, true),
+        ("fixture", new, false),
+        ("other", other_view, false),
+    ] {
+        let result = copy.query(&mut c, ns, &token, &Query::All, limits(), "read", d());
+        if valid {
+            assert!(result.unwrap().records.is_empty());
+        } else {
+            assert!(matches!(
+                result,
+                Err(IndexError::Conflict("schema differs"))
+            ));
+        }
+        c.snapshot_release(ns, &token, "release", d()).unwrap();
+    }
+}
+#[test]
 fn interrupted_publication_never_exposes_staged_row_and_wrong_writer_cannot_post() {
     let f = Fixture::new();
     let mut c = f.client("interrupted");

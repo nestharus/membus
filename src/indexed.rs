@@ -62,10 +62,19 @@ impl std::fmt::Display for Error {
 }
 impl std::error::Error for Error {}
 pub type Result<T> = std::result::Result<T, Error>;
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Collection {
     name: String,
     schema: Schema,
+    declaration: Box<[u8]>,
+}
+impl std::fmt::Debug for Collection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Collection")
+            .field("name", &self.name)
+            .field("schema", &self.schema)
+            .finish()
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AppendReceipt {
@@ -132,8 +141,12 @@ impl Collection {
         {
             return Err(Error::Invalid("collection name"));
         }
-        schema.encode()?;
-        Ok(Self { name, schema })
+        let declaration = schema.encode()?.into_boxed_slice();
+        Ok(Self {
+            name,
+            schema,
+            declaration,
+        })
     }
     pub fn schema(&self) -> &Schema {
         &self.schema
@@ -230,7 +243,7 @@ impl Collection {
             c,
             ns,
             &self.key("schema"),
-            self.schema.encode()?,
+            self.declaration.to_vec(),
             &format!("{op}:schema"),
             ack,
             d,
@@ -377,7 +390,7 @@ impl Collection {
             &format!("{op}:schema"),
             d,
         )?;
-        if declaration != self.schema.encode()? {
+        if declaration.as_slice() != self.declaration.as_ref() {
             return Err(Error::Conflict("schema differs"));
         }
         let through = count(&exact(

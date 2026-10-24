@@ -66,6 +66,15 @@ validated length to reserve its encoded output once. This leaves the wire bytes,
 refusal precedence and append/reconciliation protocol unchanged. Complete
 publication also allocates other protocol data.
 
+Each `Collection` keeps the canonical encoded bytes of its own immutable schema.
+Construction validates and encodes once; declaration reuses those bytes and query
+compares them with the declaration read from the caller's resident snapshot.
+Every query still reads and checks that resident declaration, including when the
+same collection is used in another namespace. This caches expected local bytes,
+not acceptance of a remote declaration. A cloned collection owns its own copy;
+the bytes leave with the collection. The exact boxed encoding is at most
+`8 + 64 * (4 + MAX_ID)` bytes per collection, separate from resident cache usage.
+
 For `All` and `Ordinals`, row pages also carry an acquisition budget: remaining
 encoded-row bytes plus conservative protocol overhead, capped by the negotiated
 frame. The overhead allows the fixed page fields, a maximum query-bound cursor,
