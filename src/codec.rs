@@ -169,7 +169,7 @@ pub fn frame(op: u8, id: u64, payload: &[u8]) -> Vec<u8> {
     out.extend_from_slice(payload);
     out
 }
-fn frame_header(op: u8, id: u64, payload_len: usize) -> Vec<u8> {
+pub(super) fn frame_header(op: u8, id: u64, payload_len: usize) -> Vec<u8> {
     let body_len = 13 + payload_len;
     let mut out = Vec::with_capacity(4 + body_len);
     out.extend_from_slice(&(body_len as u32).to_le_bytes());

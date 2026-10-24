@@ -777,7 +777,10 @@ fn scan_query_continuations_are_encoded_in_the_final_output() {
 
 // A prepared byte stream excludes resident encoding and fixture allocation from
 // the SDK measurement. Reads fragment the independently framed replies.
-struct PayloadScript(Cursor<Vec<u8>>);
+struct PayloadScript(
+    Cursor<Vec<u8>>,
+    Option<std::sync::Arc<std::sync::Mutex<Vec<u8>>>>,
+);
 impl std::io::Read for PayloadScript {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         let len = out.len().min(4096);
@@ -786,7 +789,11 @@ impl std::io::Read for PayloadScript {
 }
 impl std::io::Write for PayloadScript {
     fn write(&mut self, input: &[u8]) -> std::io::Result<usize> {
-        Ok(input.len())
+        let len = input.len().min(7);
+        if let Some(output) = &self.1 {
+            output.lock().unwrap().extend_from_slice(&input[..len]);
+        }
+        Ok(len)
     }
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
@@ -811,6 +818,13 @@ fn sdk_deadline() -> membus::client::Deadline {
     }
 }
 fn payload_client(op: u8, payload: &[u8]) -> membus::client::Client<PayloadScript> {
+    payload_client_output(op, payload, None)
+}
+fn payload_client_output(
+    op: u8,
+    payload: &[u8],
+    output: Option<std::sync::Arc<std::sync::Mutex<Vec<u8>>>>,
+) -> membus::client::Client<PayloadScript> {
     let mut hello = 7u64.to_le_bytes().to_vec();
     hello.extend((MAX_FRAME as u32).to_le_bytes());
     hello.extend((membus::MAX_VALUE as u32).to_le_bytes());
@@ -828,7 +842,7 @@ fn payload_client(op: u8, payload: &[u8]) -> membus::client::Client<PayloadScrip
     let mut options = membus::client::Options::new("payload-allocation-control", MAX_FRAME);
     options.scans = true;
     membus::client::Client::handshake(
-        PayloadScript(Cursor::new(stream)),
+        PayloadScript(Cursor::new(stream), output),
         options,
         sdk_deadline().local,
     )
@@ -940,6 +954,130 @@ fn sdk_payload_cost(scans: bool) {
 fn sdk_payloads_decode_without_complete_reply_copies() {
     sdk_payload_cost(false);
     sdk_payload_cost(true);
+}
+
+#[test]
+fn sdk_requests_use_final_frames_with_frozen_bytes_and_partial_writes() {
+    use membus::{GET_MANY, SCAN_PREFIX, SCAN_RANGE, SNAPSHOT_OPEN, SNAPSHOT_RELEASE};
+    for op in [GET, GET_MANY, SCAN_PREFIX, SCAN_RANGE, SNAPSHOT_OPEN, SNAPSHOT_RELEASE] {
+        let token = [0x31; 16];
+        let deadline = sdk_deadline();
+        let mut payload = deadline.unix_ms.to_le_bytes().to_vec();
+        membus::lp(&mut payload, b"read");
+        membus::lp(&mut payload, b"owned");
+        let mut body = Vec::new();
+        match op {
+            GET | GET_MANY => {
+                if op == GET_MANY {
+                    payload.extend(1u16.to_le_bytes());
+                    body.extend(1u16.to_le_bytes());
+                }
+                membus::lp(&mut payload, b"row/a");
+                body.push(0);
+            }
+            SCAN_PREFIX | SCAN_RANGE => {
+                membus::lp(&mut payload, &token);
+                membus::lp(&mut payload, &[]);
+                payload.extend(1u16.to_le_bytes());
+                payload.extend((MAX_FRAME as u32).to_le_bytes());
+                membus::lp(&mut payload, b"row/");
+                if op == SCAN_RANGE {
+                    membus::lp(&mut payload, b"row/z");
+                }
+                membus::lp(&mut body, &token);
+                membus::lp(&mut body, &[]);
+                body.push(1);
+                body.extend(0u16.to_le_bytes());
+            }
+            SNAPSHOT_OPEN => membus::lp(&mut body, &token),
+            SNAPSHOT_RELEASE => membus::lp(&mut payload, &token),
+            _ => unreachable!(),
+        }
+        let expected = original(op, 2, None, &payload);
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::with_capacity(4096)));
+        let mut client = payload_client_output(op, &body, Some(output.clone()));
+        output.lock().unwrap().clear();
+        let (_, calls, bytes) = observed_above(0, || match op {
+            GET => { assert!(client.get("owned", "row/a", "read", deadline).unwrap().is_none()); }
+            GET_MANY => { assert!(client.get_many("owned", &["row/a"], "read", deadline).unwrap()[0].is_none()); }
+            SCAN_PREFIX => { client.scan_prefix("owned", "row/", &token, &[], 1, MAX_FRAME, "read", deadline).unwrap(); }
+            SCAN_RANGE => { client.scan_range("owned", "row/", "row/z", &token, &[], 1, MAX_FRAME, "read", deadline).unwrap(); }
+            SNAPSHOT_OPEN => { assert_eq!(client.snapshot_open("owned", "read", deadline).unwrap(), token); }
+            SNAPSHOT_RELEASE => { client.snapshot_release("owned", &token, "read", deadline).unwrap(); }
+            _ => unreachable!(),
+        });
+        let slots = if op == GET_MANY { std::mem::size_of::<Option<membus::client::CommittedValue>>() } else { 0 };
+        assert_eq!(calls, 2 + usize::from(op == GET_MANY), "op={op}");
+        assert_eq!(bytes, expected.len() + 15 + body.len() + slots, "op={op}");
+        assert_eq!(*output.lock().unwrap(), expected);
+        assert!(client.is_usable());
+    }
+}
+
+#[test]
+fn sdk_final_values_reuse_receive_storage_without_retaining_large_prefixes() {
+    for op in [GET, membus::GET_MANY, membus::SCAN_PREFIX, membus::SCAN_RANGE] {
+        for (first_len, tail_len) in [(1, 65_536), (65_536, 1), (65_536, 0)] {
+            let token = [0x31; 16];
+            let first = vec![0x51; first_len];
+            let tail = vec![0x72; tail_len];
+            let scans = matches!(op, membus::SCAN_PREFIX | membus::SCAN_RANGE);
+            let mut body = Vec::new();
+            if scans {
+                membus::lp(&mut body, &token);
+                membus::lp(&mut body, &[]);
+                body.push(1);
+                body.extend(2u16.to_le_bytes());
+            } else if op == membus::GET_MANY {
+                body.extend(2u16.to_le_bytes());
+            }
+            if op != GET {
+                if scans { membus::lp(&mut body, b"row/a"); }
+                sdk_value(&mut body, 41, 1, &first);
+            }
+            if scans { membus::lp(&mut body, b"row/b"); }
+            sdk_value(&mut body, 42, 2, &tail);
+            let mut client = payload_client(op, &body);
+            let (values, calls, _) = observed_above(65_536, || {
+                if op == GET {
+                    vec![client.get("owned", "row/b", "read", sdk_deadline()).unwrap().unwrap()]
+                } else if op == membus::GET_MANY {
+                    client.get_many("owned", &["row/a", "row/b"], "read", sdk_deadline())
+                        .unwrap().into_iter().map(Option::unwrap).collect()
+                } else {
+                    let page = if op == membus::SCAN_PREFIX {
+                        client.scan_prefix("owned", "row/", &token, &[], 2, MAX_FRAME, "read", sdk_deadline())
+                    } else {
+                        client.scan_range("owned", "row/", "row/z", &token, &[], 2, MAX_FRAME, "read", sdk_deadline())
+                    }.unwrap();
+                    page.items.into_iter().map(|(_, value)| value).collect()
+                }
+            });
+            assert!(client.is_usable());
+            drop(client);
+            assert_eq!(values.last().unwrap().bytes, tail);
+            assert!(values.last().unwrap().bytes.capacity() <= 2 * tail_len);
+            assert_eq!(values.last().unwrap().version, 42);
+            assert_eq!(values.last().unwrap().ack, membus::client::Ack::Flush);
+            let expected = if tail_len == 65_536 { 1 } else if op == GET { 0 } else { 2 };
+            assert_eq!(calls, expected, "op={op} first={first_len} tail={tail_len}");
+            if op != GET { assert_eq!(values[0].bytes, first); }
+        }
+    }
+}
+
+#[test]
+fn mutation_preflight_sizes_validated_values_without_allocating() {
+    let client = payload_client(GET, &[0]);
+    for expected in [None, Some(7)] {
+        let request = membus::client::MutationRequest {
+            operation_id: "write".into(), namespace: "owned".into(), key: "row/a".into(),
+            value: vec![0x71; 65_536], ack: membus::client::Ack::Os, expected,
+        };
+        let (size, calls, bytes) = observed_above(0, || client.validate_mutation(&request).unwrap());
+        assert_eq!((calls, bytes), (0, 0));
+        assert_eq!(size, 13 + 8 + 3 * 4 + 5 + 5 + 5 + 1 + if expected.is_some() { 8 } else { 0 } + 4 + 65_536);
+    }
 }
 
 fn indexed_size_record() -> (membus::indexed::Collection, membus::indexed::Record) {

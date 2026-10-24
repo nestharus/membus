@@ -170,6 +170,22 @@ OS security and separation of admitted actors remain deployment concerns.
 
 ## Available checks
 
+HELLO, GET, batched GET, mutation, scan and snapshot-control requests encode into
+one final frame after validating their inputs. Mutation preflight computes that
+same validated size without encoding the value. HELLO writes borrowed feature
+suffixes in timers/subscriptions/scans order and checks the expected refusal set
+without a temporary integer list. A refused bootstrap HELLO materializes only
+the returned legacy refusal; later operations use the negotiated vocabulary.
+Connection, deadline, frame admission and request-ID behavior are preserved.
+
+GET, batched GET and value scans validate their entire reply before transferring
+the receive buffer to a present final value. Transfer requires capacity at most
+twice that value's length; small tails copy only their bytes, and earlier values
+and cursors retain independent ownership. Scan slot reservations are bounded by
+both the validated count and received bytes, while decoding retains malformed
+reply diagnostics and connection poisoning. These are call-owned buffers, not
+cached results or changes to freshness or snapshot lifetime.
+
 `cargo test --offline --locked` runs Rust controls; some are Windows-only and
 launch isolated residents. `tests/client.rs` supplies independent expected frames
 for negotiation, reads, mutation encoding, preflight, refusals and uncertainty.

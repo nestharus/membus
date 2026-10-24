@@ -166,6 +166,12 @@ application frame loads, including failures, rather than physical-device reads.
 
 ## Reproduce the measurements
 
+Policy selection borrows configured labels and the static `forever`/`latest`
+labels through admission. Resident entries own or share their labels independently
+of configuration. Statistics aggregate shared labels across shards and create
+one owned string per returned class, preserving sorted, independently owned
+results without per-shard string copies.
+
 `cargo test --offline --locked --test value_cache` exercises budgets, leases,
 expiry-wheel rotations, class selection, never-cache, concurrent eviction,
 retirement, failed writes, replay and disk errors. Tests use authored values and

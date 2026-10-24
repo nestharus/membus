@@ -2,7 +2,7 @@
 use membus::{
     client::{Ack, Client, Deadline, Error as ClientError, Options, Transport},
     indexed::{Collection, Error, Limits, Query, Record, Schema},
-    CachePolicy, Config, Cursor, Store, MAX_FRAME, SCAN_RANGE,
+    CachePolicy, Config, Cursor, Store, MAX_FRAME, SCAN_PREFIX, SCAN_RANGE,
 };
 use std::{
     io::{self, Read, Write},
@@ -30,7 +30,7 @@ impl Write for Local {
             if self.input.len() == n + 4 {
                 let body = &self.input[4..];
                 let reply = self.store.dispatch(body);
-                if body[4] == SCAN_RANGE {
+                if matches!(body[4], SCAN_PREFIX | SCAN_RANGE) {
                     let mut c = Cursor::new(&body[13..]);
                     c.u64().unwrap();
                     c.text().unwrap();
@@ -38,11 +38,14 @@ impl Write for Local {
                     c.bytes(16).unwrap();
                     c.bytes(2 * membus::MAX_ID + 48).unwrap();
                     c.u16().unwrap();
-                    self.pages.lock().unwrap().push(Page {
-                        budget: c.u32().unwrap() as usize,
-                        code: u16::from_le_bytes(reply[17..19].try_into().unwrap()),
-                        reply_bytes: reply.len(),
-                    });
+                    let budget = c.u32().unwrap() as usize;
+                    if c.text().unwrap().starts_with("x/rows/r/") {
+                        self.pages.lock().unwrap().push(Page {
+                            budget,
+                            code: u16::from_le_bytes(reply[17..19].try_into().unwrap()),
+                            reply_bytes: reply.len(),
+                        });
+                    }
                 }
                 self.output = io::Cursor::new(reply);
                 self.input.clear();
@@ -159,15 +162,16 @@ fn put(s: &Store, ns: &str, key: &str, op: &str, bytes: Vec<u8>) {
         0
     );
 }
-fn rejected_range(query: Query) {
+fn rejected_query(query: Query, allowance: usize) {
     let (_fixture, store, pages) = fixture(if matches!(query, Query::All) {
         "all"
     } else {
         "ordinals"
     });
     let mut c = client(store.clone(), pages.clone(), MAX_FRAME);
-    let collection = Collection::new("rows", Schema { fields: vec![] }).unwrap();
-    let original = row();
+    let collection = Collection::new("rows", Schema { fields: vec!["source".into()] }).unwrap();
+    let mut original = row();
+    original.fields = vec![vec![b"plumless".to_vec()]];
     collection
         .append(&mut c, "ledger", &original, "append", Ack::Os, deadline())
         .unwrap();
@@ -190,6 +194,12 @@ fn rejected_range(query: Query) {
         .unwrap()
         .records
         .is_empty());
+    if let Query::Equal { value, .. } = &query {
+        let prefix = format!("x/rows/i/00/{:08x}/", membus::crc32(value));
+        c.scan_prefix("ledger", &prefix, &token, &[], 1, MAX_FRAME, "prime-postings", deadline())
+            .unwrap();
+    }
+    pages.lock().unwrap().clear();
     put(
         &store,
         "working",
@@ -209,7 +219,7 @@ fn rejected_range(query: Query) {
         &query,
         Limits {
             max_rows: 1,
-            max_bytes: 1024,
+            max_bytes: allowance,
         },
         "bounded",
         deadline(),
@@ -244,7 +254,8 @@ fn rejected_range(query: Query) {
         )
         .unwrap();
     assert_eq!(recovered.through, 1);
-    assert_eq!(recovered.records, vec![original]);
+    let matches = !matches!(&query, Query::Equal { value, .. } if value.as_slice() != b"plumless");
+    assert_eq!(recovered.records, if matches { vec![original] } else { vec![] });
     assert_eq!(recovered.encoded_bytes_read, exact);
     assert!(matches!(
         collection.query(
@@ -283,7 +294,16 @@ fn rejected_range(query: Query) {
 #[test]
 fn range_admission_refuses_before_loading_an_oversized_row() {
     for query in [Query::All, Query::Ordinals { first: 1, last: 1 }] {
-        rejected_range(query);
+        rejected_query(query, 1024);
+    }
+}
+#[test]
+fn equality_admission_bounds_matching_and_collision_candidates() {
+    assert_eq!(membus::crc32(b"plumless"), membus::crc32(b"buckeroo"));
+    for value in [b"plumless", b"buckeroo"] {
+        for allowance in [0, 1024] {
+            rejected_query(Query::Equal { field: "source".into(), value: value.to_vec() }, allowance);
+        }
     }
 }
 #[test]
@@ -348,4 +368,53 @@ fn range_admission_keeps_transport_refusals_and_unbounded_arithmetic() {
         .unwrap();
     c.snapshot_release("ledger", &token, "release", deadline())
         .unwrap();
+}
+
+#[test]
+fn minimum_range_bounds_acquisition_before_initial_and_continuation_pages() {
+    let (_fixture, store, pages) = fixture("minimum-range");
+    let mut c = client(store.clone(), pages.clone(), MAX_FRAME);
+    let collection = Collection::new("rows", Schema {
+        fields: (0..4).map(|index| format!("field{index}")).collect(),
+    }).unwrap();
+    let rows: Vec<_> = (1..=32).map(|ordinal| Record {
+        ordinal, fields: vec![vec![]; 4],
+        payload: if ordinal == 1 { vec![0x61; 600] } else { vec![] },
+    }).collect();
+    for row in &rows {
+        collection.append(&mut c, "ledger", row, &format!("seed-{}", row.ordinal), Ack::Os, deadline()).unwrap();
+    }
+    let token = c.snapshot_open("ledger", "open", deadline()).unwrap();
+    let mut small = client(store.clone(), pages.clone(), 1024);
+    let exact: usize = rows.iter().map(|row| collection.encoded_len(row).unwrap()).sum();
+    for query in [Query::All, Query::Ordinals { first: 1, last: u64::MAX }] {
+        for (max_bytes, expected_pages) in [(32 * 28 - 1, 0), (exact - 1, 1)] {
+            pages.lock().unwrap().clear();
+            assert!(matches!(collection.query(
+                &mut small, "ledger", &token, &query,
+                Limits { max_rows: usize::MAX, max_bytes }, "bounded", deadline(),
+            ), Err(Error::Limit)));
+            assert_eq!(pages.lock().unwrap().len(), expected_pages);
+            assert!(small.is_usable());
+        }
+        let read = collection.query(
+            &mut small, "ledger", &token, &query,
+            Limits { max_rows: usize::MAX, max_bytes: exact }, "retry", deadline(),
+        ).unwrap();
+        assert_eq!(read.records, rows);
+        assert_eq!(read.encoded_bytes_read, exact);
+    }
+    c.snapshot_release("ledger", &token, "release", deadline()).unwrap();
+    let mut head = b"MBIX1H".to_vec();
+    head.extend((u64::MAX - 1).to_le_bytes());
+    put(&store, "ledger", "x/rows/head", "extreme", head);
+    let token = c.snapshot_open("ledger", "extreme", deadline()).unwrap();
+    pages.lock().unwrap().clear();
+    assert!(matches!(collection.query(
+        &mut c, "ledger", &token, &Query::All,
+        Limits { max_rows: usize::MAX, max_bytes: usize::MAX }, "extreme-read", deadline(),
+    ), Err(Error::Limit)));
+    assert!(pages.lock().unwrap().is_empty());
+    c.snapshot_release("ledger", &token, "extreme-release", deadline()).unwrap();
+    assert!(!store.storage_error());
 }

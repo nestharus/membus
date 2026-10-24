@@ -106,6 +106,7 @@ impl Store {
         self.capture_waiters.fetch_sub(1, Ordering::SeqCst);
         let lock_acquired = self.clock.mono_ns();
         let mut charge = 256usize.checked_add(ns.len()).ok_or(22u16)?;
+        let mut row_count = 0usize;
         for ((_, key), value) in committed
             .range((ns.to_owned(), String::new())..)
             .inspect(|_| {
@@ -122,6 +123,7 @@ impl Store {
                     .and_then(|n| n.checked_add(128))
                     .and_then(|n| n.checked_add(value.len))
                     .ok_or(22u16)?;
+                row_count += 1;
             }
         }
         let charge_end = self.clock.mono_ns();
@@ -161,27 +163,30 @@ impl Store {
         // Seek the same namespace interval again under the same read lock.
         // Pin immutable locations and their shared file handles. Opening a view
         // or reading keys must not load unrelated values and churn the cache.
-        let rows: Vec<_> = committed
-            .range((ns.to_owned(), String::new())..)
-            .inspect(|_| {
-                #[cfg(test)]
-                self.capture_visits.fetch_add(1, Ordering::Relaxed);
-            })
-            .take_while(|((namespace, _), _)| namespace == ns)
-            .filter(|(_, value)| !value.tombstone)
-            .map(|((_, key), entry)| {
-                (
-                    key.clone(),
-                    SnapshotValue {
-                        entry: entry.clone(),
-                        loaded: OnceLock::new(),
-                        load_gate: Mutex::new(()),
-                        #[cfg(test)]
-                        load_attempts: AtomicUsize::new(0),
-                    },
-                )
-            })
-            .collect();
+        // Admission precedes the exact live-row reservation under the same read lock.
+        let mut rows = Vec::with_capacity(row_count);
+        rows.extend(
+            committed
+                .range((ns.to_owned(), String::new())..)
+                .inspect(|_| {
+                    #[cfg(test)]
+                    self.capture_visits.fetch_add(1, Ordering::Relaxed);
+                })
+                .take_while(|((namespace, _), _)| namespace == ns)
+                .filter(|(_, value)| !value.tombstone)
+                .map(|((_, key), entry)| {
+                    (
+                        key.clone(),
+                        SnapshotValue {
+                            entry: entry.clone(),
+                            loaded: OnceLock::new(),
+                            load_gate: Mutex::new(()),
+                            #[cfg(test)]
+                            load_attempts: AtomicUsize::new(0),
+                        },
+                    )
+                }),
+        );
         let selection_end = self.clock.mono_ns();
         let copy_end = self.clock.mono_ns();
         drop(committed);

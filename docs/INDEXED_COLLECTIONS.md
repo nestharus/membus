@@ -126,3 +126,26 @@ improvement. A consumer must still demonstrate its actual query and semantics.
 evicting a useful cached value, retry with the same view, exact byte allowances,
 transport refusals, saturated arithmetic, and unexpected continuation rows.
 Cold-load counts describe the application cache, not physical-drive I/O.
+
+## Bounded allocation and acquisition
+
+Equality queries bound each posting page by the remaining candidate count plus
+one overflow witness. Required candidate rows use the remaining encoded-byte
+allowance, including CRC collisions; staged postings above the captured boundary
+do not load rows. A query-derived `too_large` becomes `Limit`, while a binding
+transport-frame refusal retains its client error. Range queries reject an
+impossible remaining interval before acquiring a page, using the minimum record
+encoding size after validating the captured declaration and boundary.
+
+Collections retain their immutable schema encoding and control keys. Publication
+borrows the schema until a missing key needs an owned mutation, skips temporary
+bucket sets for empty or singleton fields, and formats row and posting keys into
+their final buffers. Returned identities are checked without formatted copies.
+Schema validation uses at most 64 borrowed name slots and preserves field order.
+
+Decoded field lists reserve their validated counts; record slots are reserved
+from a received page after its first row validates, never from the captured head.
+A fully validated row can transfer its received encoding to a dominating payload
+when capacity is at most twice the payload length. Smaller payloads copy only
+their own bytes. Snapshot capture reserves its exact live-row count after
+admission, under the same committed-index read lock as its counting pass.

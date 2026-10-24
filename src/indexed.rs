@@ -8,7 +8,9 @@ use crate::{
     client::{self, Ack, Client, Deadline, MutationRequest, Transport},
     crc32, lp, Cursor, MAX_ID, MAX_VALUE,
 };
+use std::borrow::Cow;
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Schema {
@@ -67,6 +69,8 @@ pub struct Collection {
     name: String,
     schema: Schema,
     declaration: Box<[u8]>,
+    schema_key: Box<str>,
+    head_key: Box<str>,
 }
 impl std::fmt::Debug for Collection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -103,6 +107,12 @@ fn count(b: &[u8]) -> Result<u64> {
     }
     Ok(n)
 }
+// Twenty ASCII digits identify exactly one zero-padded u64 decimal spelling.
+fn ordinal_suffix_matches(text: &str, ordinal: u64) -> bool {
+    text.len() == 20
+        && text.bytes().all(|byte| byte.is_ascii_digit())
+        && text.parse::<u64>() == Ok(ordinal)
+}
 fn range_page_budget(max_frame: usize, remaining: usize, limit: u16) -> usize {
     // Body header/token/count, a maximum cursor, and each bounded key plus
     // value envelope. Encoded row bytes are charged separately by the caller.
@@ -116,15 +126,30 @@ impl Schema {
         if self.fields.len() > 64 {
             return Err(Error::Invalid("at most 64 indexed fields"));
         }
-        let mut names = BTreeSet::new();
-        let mut b = b"MBIX1S".to_vec();
-        b.extend((self.fields.len() as u16).to_le_bytes());
-        for name in &self.fields {
-            if name.is_empty() || name.len() > MAX_ID || !names.insert(name) {
+        // The field bound permits borrowed scratch slots instead of heap nodes.
+        let mut names = [""; 64];
+        let mut encoded_len = 8usize;
+        for (index, name) in self.fields.iter().enumerate() {
+            if name.is_empty() || name.len() > MAX_ID {
                 return Err(Error::Invalid(
                     "field names must be nonempty, distinct and bounded",
                 ));
             }
+            names[index] = name.as_str();
+            // At most 64 bounded names keep the complete declaration bounded.
+            encoded_len += 4 + name.len();
+        }
+        let names = &mut names[..self.fields.len()];
+        names.sort_unstable();
+        if names.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(Error::Invalid(
+                "field names must be nonempty, distinct and bounded",
+            ));
+        }
+        let mut b = Vec::with_capacity(encoded_len);
+        b.extend_from_slice(b"MBIX1S");
+        b.extend((self.fields.len() as u16).to_le_bytes());
+        for name in &self.fields {
             lp(&mut b, name.as_bytes());
         }
         Ok(b)
@@ -142,10 +167,24 @@ impl Collection {
             return Err(Error::Invalid("collection name"));
         }
         let declaration = schema.encode()?.into_boxed_slice();
+        // Name and schema are immutable. Each control key has one exact owned
+        // allocation, independent of caller strings, namespaces and snapshots.
+        let key = |tail: &str| {
+            let mut key = String::with_capacity(3 + name.len() + tail.len());
+            key.push_str("x/");
+            key.push_str(&name);
+            key.push('/');
+            key.push_str(tail);
+            key.into_boxed_str()
+        };
+        let schema_key = key("schema");
+        let head_key = key("head");
         Ok(Self {
             name,
             schema,
             declaration,
+            schema_key,
+            head_key,
         })
     }
     pub fn schema(&self) -> &Schema {
@@ -184,8 +223,18 @@ impl Collection {
     fn key(&self, tail: &str) -> String {
         format!("x/{}/{tail}", self.name)
     }
+    fn row_key_matches(&self, key: &str, ordinal: u64) -> bool {
+        key.strip_prefix("x/")
+            .and_then(|tail| tail.strip_prefix(self.name.as_str()))
+            .and_then(|tail| tail.strip_prefix("/r/"))
+            .is_some_and(|suffix| ordinal_suffix_matches(suffix, ordinal))
+    }
     fn row_key(&self, n: u64) -> String {
-        self.key(&format!("r/{n:020}"))
+        // x/ + the validated collection name + /r/ + twenty decimal digits.
+        let mut key = String::with_capacity(self.name.len() + 25);
+        write!(&mut key, "x/{}/r/{n:020}", self.name)
+            .expect("writing strings and integers into a String is infallible");
+        key
     }
     fn encode(&self, row: &Record) -> Result<Vec<u8>> {
         let mut b = Vec::with_capacity(self.encoded_len(row)?);
@@ -201,7 +250,7 @@ impl Collection {
         lp(&mut b, &row.payload);
         Ok(b)
     }
-    fn decode(&self, b: &[u8]) -> Result<Record> {
+    fn decode(&self, mut b: Vec<u8>) -> Result<Record> {
         if b.len() < 16 || &b[..6] != b"MBIX1R" {
             return Err(Error::Corrupt("row header"));
         }
@@ -210,20 +259,31 @@ impl Collection {
         if ordinal == 0 || malformed(c.u16())? as usize != self.schema.fields.len() {
             return Err(Error::Corrupt("row schema/ordinal"));
         }
-        let mut fields = Vec::new();
+        let mut fields = Vec::with_capacity(self.schema.fields.len());
         for _ in &self.schema.fields {
             let n = malformed(c.u16())? as usize;
             if n > 1024 {
                 return Err(Error::Corrupt("field count"));
             }
-            let mut values = Vec::new();
+            let mut values = Vec::with_capacity(n);
             for _ in 0..n {
                 values.push(malformed(c.bytes(MAX_VALUE))?.to_vec());
             }
             fields.push(values);
         }
-        let payload = malformed(c.bytes(MAX_VALUE))?.to_vec();
+        let payload = malformed(c.bytes(MAX_VALUE))?;
         malformed(c.end())?;
+        let payload = if b.capacity() <= payload.len().saturating_mul(2) {
+            // Keep the received allocation when payload bytes dominate. Do not
+            // retain a large field encoding behind an empty or small payload.
+            let len = payload.len();
+            let start = b.len() - len;
+            b.copy_within(start.., 0);
+            b.truncate(len);
+            b
+        } else {
+            payload.to_vec()
+        };
         Ok(Record {
             ordinal,
             fields,
@@ -242,14 +302,14 @@ impl Collection {
         immutable(
             c,
             ns,
-            &self.key("schema"),
-            self.declaration.to_vec(),
+            &self.schema_key,
+            Cow::Borrowed(&self.declaration),
             &format!("{op}:schema"),
             ack,
             d,
         )?;
-        let key = self.key("head");
-        match c.get(ns, &key, &format!("{op}:head-read"), d)? {
+        let key = self.head_key.as_ref();
+        match c.get(ns, key, &format!("{op}:head-read"), d)? {
             Some(v) => {
                 count(&v.bytes)?;
             }
@@ -257,7 +317,7 @@ impl Collection {
                 let mut a = c.prepare(MutationRequest {
                     operation_id: format!("{op}:head-init"),
                     namespace: ns.into(),
-                    key: key.clone(),
+                    key: key.into(),
                     value: head(0),
                     ack,
                     expected: Some(0),
@@ -266,7 +326,7 @@ impl Collection {
                     Ok(_) => (),
                     Err(client::Error::Refused(r)) if r.code == 12 => {
                         count(
-                            &c.get(ns, &key, &format!("{op}:head-reconcile"), d)?
+                            &c.get(ns, key, &format!("{op}:head-reconcile"), d)?
                                 .ok_or(Error::Corrupt("lost head"))?
                                 .bytes,
                         )?;
@@ -292,9 +352,9 @@ impl Collection {
     ) -> Result<AppendReceipt> {
         let body = self.encode(row)?;
         self.declare(c, ns, &format!("{op}:declare"), ack, d)?;
-        let key = self.key("head");
+        let key = self.head_key.as_ref();
         let h = c
-            .get(ns, &key, &format!("{op}:boundary"), d)?
+            .get(ns, key, &format!("{op}:boundary"), d)?
             .ok_or(Error::Corrupt("missing head"))?;
         let through = count(&h.bytes)?;
         if row.ordinal <= through {
@@ -318,29 +378,46 @@ impl Collection {
             c,
             ns,
             &self.row_key(row.ordinal),
-            body,
+            Cow::Owned(body),
             &format!("{op}:row"),
             ack,
             d,
         )?;
         for (i, values) in row.fields.iter().enumerate() {
-            let buckets: BTreeSet<u32> = values.iter().map(|v| crc32(v)).collect();
-            for bucket in buckets {
+            let mut publish = |bucket| {
+                // Validated schemas have at most 64 fields: two hex digits.
+                let mut key = String::with_capacity(self.name.len() + 37);
+                write!(
+                    &mut key,
+                    "x/{}/i/{i:02x}/{bucket:08x}/{:020}",
+                    self.name, row.ordinal
+                )
+                .expect("writing strings and integers into a String is infallible");
                 immutable(
                     c,
                     ns,
-                    &self.key(&format!("i/{i:02x}/{bucket:08x}/{:020}", row.ordinal)),
-                    row.ordinal.to_le_bytes().to_vec(),
+                    &key,
+                    Cow::Owned(row.ordinal.to_le_bytes().to_vec()),
                     &format!("{op}:i{i}-{bucket:08x}"),
                     ack,
                     d,
-                )?;
+                )
+            };
+            match values.as_slice() {
+                [] => (),
+                [value] => publish(crc32(value))?,
+                _ => {
+                    let buckets: BTreeSet<u32> = values.iter().map(|v| crc32(v)).collect();
+                    for bucket in buckets {
+                        publish(bucket)?;
+                    }
+                }
             }
         }
         let mut a = c.prepare(MutationRequest {
             operation_id: format!("{op}:commit"),
             namespace: ns.into(),
-            key: key.clone(),
+            key: key.into(),
             value: head(row.ordinal),
             ack,
             expected: Some(h.version),
@@ -352,7 +429,7 @@ impl Collection {
             }),
             Err(client::Error::Refused(r)) if r.code == 12 => {
                 let current = c
-                    .get(ns, &key, &format!("{op}:commit-reconcile"), d)?
+                    .get(ns, key, &format!("{op}:commit-reconcile"), d)?
                     .ok_or(Error::Corrupt("head missing after conflict"))?;
                 let n = count(&current.bytes)?;
                 if n < row.ordinal {
@@ -386,7 +463,7 @@ impl Collection {
             c,
             ns,
             snapshot,
-            &self.key("schema"),
+            &self.schema_key,
             &format!("{op}:schema"),
             d,
         )?;
@@ -397,7 +474,7 @@ impl Collection {
             c,
             ns,
             snapshot,
-            &self.key("head"),
+            &self.head_key,
             &format!("{op}:head"),
             d,
         )?)?;
@@ -426,21 +503,35 @@ impl Collection {
                     let mut expected = first;
                     let max_frame = c.negotiated().max_frame;
                     let page_limit = (last - first + 1).min(c.negotiated().max_batch as u64) as u16;
+                    // Header, ordinal, field count, empty field lists and the
+                    // payload length are required even when every value is empty.
+                    let minimum_record = 20 + 2 * self.schema.fields.len();
+                    let mut request = None;
                     loop {
+                        if expected <= last
+                            && last - expected + 1
+                                > (limits.max_bytes.saturating_sub(bytes) / minimum_record) as u64
+                        {
+                            return Err(Error::Limit);
+                        }
                         let budget = range_page_budget(
                             max_frame,
                             limits.max_bytes.saturating_sub(bytes),
                             page_limit,
                         );
+                        // Reuse these immutable identifiers across pages, but
+                        // create them only after the byte-budget preflight.
+                        let (lower, operation) = request
+                            .get_or_insert_with(|| (self.row_key(first), format!("{op}:rows")));
                         let p = match c.scan_range(
                             ns,
-                            &self.row_key(first),
+                            lower,
                             &upper,
                             snapshot,
                             &cursor,
                             page_limit,
                             budget,
-                            &format!("{op}:rows"),
+                            operation,
                             d,
                         ) {
                             Ok(page) => page,
@@ -449,14 +540,22 @@ impl Collection {
                             }
                             Err(e) => return Err(e.into()),
                         };
+                        let received = p.items.len();
                         for (key, value) in p.items {
                             bytes = bytes.checked_add(value.bytes.len()).ok_or(Error::Limit)?;
                             if bytes > limits.max_bytes {
                                 return Err(Error::Limit);
                             }
-                            let row = self.decode(&value.bytes)?;
-                            if row.ordinal != expected || key != self.row_key(expected) {
+                            let row = self.decode(value.bytes)?;
+                            if row.ordinal != expected || !self.row_key_matches(&key, expected) {
                                 return Err(Error::Corrupt("ordered row gap/identity"));
+                            }
+                            if records.is_empty() {
+                                // Reserve only a received page after its first
+                                // row passes decoding and identity checks. The
+                                // negotiated page count bounds these slots;
+                                // the committed boundary never sizes them.
+                                records.reserve(received);
                             }
                             records.push(row);
                             expected = expected
@@ -480,19 +579,36 @@ impl Collection {
                     .iter()
                     .position(|v| v == field)
                     .ok_or(Error::Invalid("field is not declared indexed"))?;
-                let prefix = self.key(&format!("i/{index:02x}/{:08x}/", crc32(value)));
+                // Validated field index and CRC32 widths add 17 fixed bytes.
+                let mut prefix = String::with_capacity(self.name.len() + 17);
+                write!(
+                    &mut prefix,
+                    "x/{}/i/{index:02x}/{:08x}/",
+                    self.name,
+                    crc32(value)
+                )
+                .expect("writing strings and integers into a String is infallible");
+                let posting_operation = format!("{op}:postings");
+                let mut value_operation = None;
                 let mut cursor = Vec::new();
                 let mut examined = 0usize;
                 let mut previous = 0;
                 loop {
+                    // One extra posting witnesses overflow without prefetching
+                    // an entire negotiated page past the query-work allowance.
+                    let page_limit = limits
+                        .max_rows
+                        .saturating_sub(examined)
+                        .saturating_add(1)
+                        .min(c.negotiated().max_batch) as u16;
                     let page = c.scan_prefix(
                         ns,
                         &prefix,
                         snapshot,
                         &cursor,
-                        c.negotiated().max_batch as u16,
+                        page_limit,
                         c.negotiated().max_frame,
-                        &format!("{op}:postings"),
+                        &posting_operation,
                         d,
                     )?;
                     for (key, v) in page.items {
@@ -500,7 +616,12 @@ impl Collection {
                             return Err(Error::Corrupt("posting"));
                         }
                         let n = u64::from_le_bytes(v.bytes.try_into().unwrap());
-                        if n == 0 || n <= previous || key != format!("{prefix}{n:020}") {
+                        if n == 0
+                            || n <= previous
+                            || !key
+                                .strip_prefix(prefix.as_str())
+                                .is_some_and(|suffix| ordinal_suffix_matches(suffix, n))
+                        {
                             return Err(Error::Corrupt("posting order/identity"));
                         }
                         previous = n;
@@ -511,13 +632,20 @@ impl Collection {
                         if n > through {
                             continue;
                         } // staged row, not committed in this snapshot
-                        let b =
-                            exact(c, ns, snapshot, &self.row_key(n), &format!("{op}:value"), d)?;
+                        let b = exact_bounded(
+                            c,
+                            ns,
+                            snapshot,
+                            &self.row_key(n),
+                            limits.max_bytes.saturating_sub(bytes),
+                            value_operation.get_or_insert_with(|| format!("{op}:value")),
+                            d,
+                        )?;
                         bytes = bytes.checked_add(b.len()).ok_or(Error::Limit)?;
                         if bytes > limits.max_bytes {
                             return Err(Error::Limit);
                         }
-                        let row = self.decode(&b)?;
+                        let row = self.decode(b)?;
                         if row.ordinal != n {
                             return Err(Error::Corrupt("posting row identity"));
                         }
@@ -546,13 +674,13 @@ fn immutable<T: Transport>(
     c: &mut Client<T>,
     ns: &str,
     key: &str,
-    bytes: Vec<u8>,
+    bytes: Cow<'_, [u8]>,
     op: &str,
     ack: Ack,
     d: Deadline,
 ) -> Result<()> {
     if let Some(v) = c.get(ns, key, &format!("{op}:read"), d)? {
-        return if v.bytes == bytes && v.ack == ack {
+        return if v.bytes == bytes.as_ref() && v.ack == ack {
             Ok(())
         } else {
             Err(Error::Conflict("immutable bytes/ack differ"))
@@ -562,7 +690,8 @@ fn immutable<T: Transport>(
         operation_id: op.into(),
         namespace: ns.into(),
         key: key.into(),
-        value: bytes,
+        // A prepared attempt owns its bytes only after an absent read.
+        value: bytes.into_owned(),
         ack,
         expected: Some(0),
     })?;
@@ -589,7 +718,26 @@ fn exact<T: Transport>(
     op: &str,
     d: Deadline,
 ) -> Result<Vec<u8>> {
-    let p = c.scan_prefix(ns, key, snapshot, &[], 1, c.negotiated().max_frame, op, d)?;
+    exact_bounded(c, ns, snapshot, key, usize::MAX, op, d)
+}
+fn exact_bounded<T: Transport>(
+    c: &mut Client<T>,
+    ns: &str,
+    snapshot: &[u8; 16],
+    key: &str,
+    remaining: usize,
+    op: &str,
+    d: Deadline,
+) -> Result<Vec<u8>> {
+    let max_frame = c.negotiated().max_frame;
+    let budget = range_page_budget(max_frame, remaining, 1);
+    let p = match c.scan_prefix(ns, key, snapshot, &[], 1, budget, op, d) {
+        Ok(page) => page,
+        Err(client::Error::Refused(r)) if r.code == 4 && budget < max_frame => {
+            return Err(Error::Limit);
+        }
+        Err(e) => return Err(e.into()),
+    };
     if !p.done || p.items.len() != 1 || p.items[0].0 != key {
         return Err(Error::Corrupt("required snapshot key absent/ambiguous"));
     }

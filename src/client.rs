@@ -202,6 +202,20 @@ pub struct Client<T: Transport> {
 // Own the bounded reply body through typed decoding. Constructed only after
 // header association and status validation; decoders borrow past that header.
 struct ReplyPayload(Vec<u8>);
+impl ReplyPayload {
+    // Call only after validating that this value ends at the reply boundary.
+    fn into_tail(mut self, len: usize) -> Vec<u8> {
+        let start = self.0.len() - len;
+        if self.0.capacity() <= len.saturating_mul(2) {
+            self.0.copy_within(start.., 0);
+            self.0.truncate(len);
+            self.0
+        } else {
+            // Tiny tails must not retain the rest of a large reply.
+            self.0[start..].to_vec()
+        }
+    }
+}
 impl std::ops::Deref for ReplyPayload {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
@@ -239,37 +253,36 @@ impl<T: Transport> Client<T> {
                 retry_window_ms: 0,
                 scans: false,
                 subscriptions: false,
-                refusals: CODES[..19]
-                    .iter()
-                    .map(|&(code, name, transient)| {
-                        (
-                            code,
-                            Refusal {
-                                code,
-                                name: name.into(),
-                                transient,
-                            },
-                        )
-                    })
-                    .collect(),
+                // No negotiated vocabulary exists before a successful HELLO.
+                refusals: BTreeMap::new(),
             },
         };
-        let mut identity = options.identity;
-        if additional.timers {
-            identity.push_str(";timers=1");
-        }
-        if options.subscriptions {
-            identity.push_str(";subscribe=1");
-        }
+        // Borrow static suffixes in wire order instead of growing the identity.
         // The current server recognizes scans only as the final feature.
-        if options.scans {
-            identity.push_str(";scans=1");
+        let features = [
+            if additional.timers { ";timers=1" } else { "" },
+            if options.subscriptions { ";subscribe=1" } else { "" },
+            if options.scans { ";scans=1" } else { "" },
+        ];
+        let identity_len = options.identity.len()
+            + features.iter().map(|feature| feature.len()).sum::<usize>();
+        if identity_len > MAX_ID {
+            return Err(Error::Invalid("identifier length"));
         }
-        identifier(&identity)?;
-        let mut p = (options.max_frame as u32).to_le_bytes().to_vec();
+        // The complete identity is bounded before reserving the final frame.
+        let payload_len = 4 + 1 + 4 + identity_len;
+        let mut p = crate::codec::frame_header(HELLO, 0, payload_len);
+        p.extend((options.max_frame as u32).to_le_bytes());
         p.push(0);
-        lp(&mut p, identity.as_bytes());
-        let b = this.exchange(HELLO, &p, until)?;
+        p.extend((identity_len as u32).to_le_bytes());
+        p.extend_from_slice(options.identity.as_bytes());
+        for feature in features {
+            p.extend_from_slice(feature.as_bytes());
+        }
+        // Preserve admission after encoding; local refusals perform no I/O.
+        let id = this.begin_exchange(payload_len, until)?;
+        p[9..17].copy_from_slice(&id.to_le_bytes());
+        let b = this.exchange_bytes(HELLO, id, &p, until)?;
         let mut c = Cursor::new(&b);
         let epoch = parse(c.u64())?;
         let max_frame = parse(c.u32())? as usize;
@@ -287,14 +300,16 @@ impl<T: Transport> Client<T> {
             return Err(Error::Protocol("HELLO limits"));
         }
         let count = parse(c.u16())? as usize;
-        let codes: Vec<u16> = match count {
-            19 => (1..=19).collect(),
-            22 if options.scans => (1..=22).collect(),
-            24 if options.subscriptions => (1..=24).collect(),
-            23 if additional.timers && !options.subscriptions => (1..=22).chain([25]).collect(),
-            25 if additional.timers && options.subscriptions => (1..=25).collect(),
+        // Expected codes are bounded protocol metadata, not owned reply data.
+        let codes = match count {
+            19 => 1..=19,
+            22 if options.scans => 1..=22,
+            24 if options.subscriptions => 1..=24,
+            23 if additional.timers && !options.subscriptions => 1..=22,
+            25 if additional.timers && options.subscriptions => 1..=25,
             _ => return Err(Error::Protocol("HELLO refusal count")),
         };
+        let mut codes = codes.chain((count == 23).then_some(25));
         let mut refusals = BTreeMap::new();
         for _ in 0..count {
             let code = parse(c.u16())?;
@@ -317,7 +332,7 @@ impl<T: Transport> Client<T> {
                 return Err(Error::Protocol("HELLO refusal vocabulary"));
             }
         }
-        if codes.iter().any(|code| !refusals.contains_key(code)) {
+        if codes.any(|code| !refusals.contains_key(&code)) {
             return Err(Error::Protocol("HELLO missing code"));
         }
         if refusals.contains_key(&24) {
@@ -380,13 +395,18 @@ impl<T: Transport> Client<T> {
         self.usable
     }
     fn exchange(&mut self, op: u8, p: &[u8], until: Instant) -> Result<ReplyPayload> {
+        let id = self.begin_exchange(p.len(), until)?;
+        let bytes = frame(op, id, p);
+        self.exchange_bytes(op, id, &bytes, until)
+    }
+    fn begin_exchange(&mut self, payload_len: usize, until: Instant) -> Result<u64> {
         if !self.usable {
             return Err(Error::Invalid("connection requires reconnect"));
         }
         if Instant::now() >= until {
             return Err(Error::Invalid("local deadline elapsed before send"));
         }
-        if p.len()
+        if payload_len
             .checked_add(13)
             .filter(|n| *n <= self.negotiated.max_frame)
             .is_none()
@@ -397,11 +417,18 @@ impl<T: Transport> Client<T> {
             .request_id
             .checked_add(1)
             .ok_or(Error::Invalid("request id exhausted"))?;
-        let id = self.request_id;
-        let bytes = frame(op, id, p);
+        Ok(self.request_id)
+    }
+    fn exchange_bytes(
+        &mut self,
+        op: u8,
+        id: u64,
+        bytes: &[u8],
+        until: Instant,
+    ) -> Result<ReplyPayload> {
         self.usable = false;
         let b = (|| -> Result<Vec<u8>> {
-            let mut rest = bytes.as_slice();
+            let mut rest = bytes;
             while !rest.is_empty() {
                 self.io.deadline(until).map_err(Error::Transport)?;
                 let n = self.io.write(rest).map_err(Error::Transport)?;
@@ -441,6 +468,19 @@ impl<T: Transport> Client<T> {
                 .refusals
                 .get(&code)
                 .cloned()
+                .or_else(|| {
+                    // HELLO may refuse before negotiation. Materialize only
+                    // that actual legacy refusal, preserving its vocabulary.
+                    if op != HELLO {
+                        return None;
+                    }
+                    CODES[..19].iter().find(|entry| entry.0 == code)
+                        .map(|&(code, name, transient)| Refusal {
+                            code,
+                            name: name.into(),
+                            transient,
+                        })
+                })
                 .ok_or(Error::Protocol("unknown refusal"))?;
             self.usable = true;
             return Err(Error::Refused(refusal));
@@ -470,7 +510,7 @@ impl<T: Transport> Client<T> {
         lp(&mut p, namespace.as_bytes());
         Ok(p)
     }
-    fn value(&self, c: &mut Cursor<'_>) -> Result<Option<CommittedValue>> {
+    fn borrowed_value<'a>(&self, c: &mut Cursor<'a>) -> Result<Option<(u64, Ack, &'a [u8])>> {
         match parse(c.u8())? {
             0 => Ok(None),
             1 => {
@@ -483,14 +523,23 @@ impl<T: Transport> Client<T> {
                 if version == 0 {
                     return Err(Error::Protocol("zero version"));
                 }
-                Ok(Some(CommittedValue {
+                Ok(Some((
                     version,
                     ack,
-                    bytes: parse(c.bytes(self.negotiated.max_value))?.to_vec(),
-                }))
+                    parse(c.bytes(self.negotiated.max_value))?,
+                )))
             }
             _ => Err(Error::Protocol("presence flag")),
         }
+    }
+    fn value(&self, c: &mut Cursor<'_>) -> Result<Option<CommittedValue>> {
+        self.borrowed_value(c).map(|value| {
+            value.map(|(version, ack, bytes)| CommittedValue {
+                version,
+                ack,
+                bytes: bytes.to_vec(),
+            })
+        })
     }
     pub fn get(
         &mut self,
@@ -500,19 +549,38 @@ impl<T: Transport> Client<T> {
         d: Deadline,
     ) -> Result<Option<CommittedValue>> {
         identifier(key)?;
-        let mut p = self.prefix(operation_id, namespace, d)?;
+        identifier(operation_id)?;
+        identifier(namespace)?;
+        // All three identifiers are bounded before reserving the final frame.
+        let payload_len = 8 + 3 * 4 + operation_id.len() + namespace.len() + key.len();
+        let mut p = crate::codec::frame_header(GET, 0, payload_len);
+        p.extend(d.unix_ms.to_le_bytes());
+        lp(&mut p, operation_id.as_bytes());
+        lp(&mut p, namespace.as_bytes());
         lp(&mut p, key.as_bytes());
-        let b = self.exchange(GET, &p, d.local)?;
+        // Keep admission after encoding; rejected reads consume no request ID.
+        let id = self.begin_exchange(payload_len, d.local)?;
+        p[9..17].copy_from_slice(&id.to_le_bytes());
+        let b = self.exchange_bytes(GET, id, &p, d.local)?;
         let mut c = Cursor::new(&b);
         let result = (|| {
-            let v = self.value(&mut c)?;
+            let value = self.borrowed_value(&mut c)?;
             parse(c.end())?;
-            Ok(v)
+            // Only a fully validated GET has one value at the end of its body.
+            Ok(value.map(|(version, ack, bytes)| (version, ack, bytes.len())))
         })();
         if result.is_err() {
             self.usable = false;
         }
-        result
+        result.map(|value| {
+            value.map(|(version, ack, len)| {
+                CommittedValue {
+                    version,
+                    ack,
+                    bytes: b.into_tail(len),
+                }
+            })
+        })
     }
     pub fn get_many(
         &mut self,
@@ -524,29 +592,57 @@ impl<T: Transport> Client<T> {
         if keys.is_empty() || keys.len() > self.negotiated.max_batch {
             return Err(Error::Invalid("get_many count"));
         }
-        let mut p = self.prefix(operation_id, namespace, d)?;
-        p.extend((keys.len() as u16).to_le_bytes());
+        identifier(operation_id)?;
+        identifier(namespace)?;
         for key in keys {
             identifier(key)?;
+        }
+        // Negotiated count and identifier bounds cap every input before reserve.
+        let payload_len = 8 + 2 * 4 + operation_id.len() + namespace.len() + 2
+            + keys.iter().map(|key| 4 + key.len()).sum::<usize>();
+        let mut p = crate::codec::frame_header(GET_MANY, 0, payload_len);
+        p.extend(d.unix_ms.to_le_bytes());
+        lp(&mut p, operation_id.as_bytes());
+        lp(&mut p, namespace.as_bytes());
+        p.extend((keys.len() as u16).to_le_bytes());
+        for key in keys {
             lp(&mut p, key.as_bytes());
         }
-        let b = self.exchange(GET_MANY, &p, d.local)?;
+        // Retain connection/deadline/frame admission and request-ID continuity.
+        let id = self.begin_exchange(payload_len, d.local)?;
+        p[9..17].copy_from_slice(&id.to_le_bytes());
+        let b = self.exchange_bytes(GET_MANY, id, &p, d.local)?;
         let mut c = Cursor::new(&b);
         let result = (|| {
             if parse(c.u16())? as usize != keys.len() {
                 return Err(Error::Protocol("get_many count association"));
             }
             let mut out = Vec::with_capacity(keys.len());
-            for _ in keys {
-                out.push(self.value(&mut c)?);
+            let mut tail = None;
+            for (index, _) in keys.iter().enumerate() {
+                if index + 1 == keys.len() {
+                    // Only a present final value can end at the reply boundary.
+                    out.push(self.borrowed_value(&mut c)?.map(|(version, ack, bytes)| {
+                        tail = Some(bytes.len());
+                        CommittedValue { version, ack, bytes: Vec::new() }
+                    }));
+                } else {
+                    out.push(self.value(&mut c)?);
+                }
             }
             parse(c.end())?;
-            Ok(out)
+            Ok((out, tail))
         })();
         if result.is_err() {
             self.usable = false;
         }
-        result
+        result.map(|(mut out, tail)| {
+            if let Some(len) = tail {
+                out.last_mut().expect("validated nonempty batch")
+                    .as_mut().expect("validated present final value").bytes = b.into_tail(len);
+            }
+            out
+        })
     }
     /// Prepare a NEW intended operation. Do not prepare again to reset an uncertain
     /// Attempt's epoch/horizon. After loss of the token, reconcile the deterministic
@@ -565,12 +661,31 @@ impl<T: Transport> Client<T> {
             retry_window_ms: self.negotiated.retry_window_ms,
         })
     }
-    fn mutation_payload(&self, m: &MutationRequest, d: Deadline) -> Result<Vec<u8>> {
+    fn mutation_payload_len(&self, m: &MutationRequest) -> Result<usize> {
         identifier(&m.key)?;
         if m.value.len() > self.negotiated.max_value {
             return Err(Error::Invalid("value limit"));
         }
-        let mut p = self.prefix(&m.operation_id, &m.namespace, d)?;
+        identifier(&m.operation_id)?;
+        identifier(&m.namespace)?;
+        // All variable lengths are validated above. The payload contains the
+        // deadline, three identifiers, acknowledgment, optional CAS comparator
+        // and the length-prefixed value; the frame header is separate.
+        Ok(8 + 3 * 4
+            + m.operation_id.len()
+            + m.namespace.len()
+            + m.key.len()
+            + 1
+            + if m.expected.is_some() { 8 } else { 0 }
+            + 4
+            + m.value.len())
+    }
+    fn mutation_frame(&self, op: u8, m: &MutationRequest, d: Deadline) -> Result<Vec<u8>> {
+        // Fill the request ID only after admission; refused sends consume none.
+        let mut p = crate::codec::frame_header(op, 0, self.mutation_payload_len(m)?);
+        p.extend(d.unix_ms.to_le_bytes());
+        lp(&mut p, m.operation_id.as_bytes());
+        lp(&mut p, m.namespace.as_bytes());
         lp(&mut p, m.key.as_bytes());
         p.push(m.ack as u8);
         if let Some(expected) = m.expected {
@@ -579,16 +694,9 @@ impl<T: Transport> Client<T> {
         lp(&mut p, &m.value);
         Ok(p)
     }
-    /// Pure preflight using the actual mutation encoder. No send or readiness claim.
+    /// Pure preflight sharing the encoder's validated size. No send or readiness claim.
     pub fn validate_mutation(&self, request: &MutationRequest) -> Result<usize> {
-        let p = self.mutation_payload(
-            request,
-            Deadline {
-                unix_ms: 0,
-                local: Instant::now(),
-            },
-        )?;
-        let size = p.len() + 13;
+        let size = self.mutation_payload_len(request)? + 13;
         if size > self.negotiated.max_frame {
             return Err(Error::Invalid("frame limit"));
         }
@@ -610,36 +718,43 @@ impl<T: Transport> Client<T> {
             return Err(Error::RetryWindowExpired);
         }
         let m = &attempt.request;
-        let p = self.mutation_payload(m, d)?;
         let op = if m.expected.is_some() {
             CONDITIONAL_PUT
         } else {
             PUT
         };
+        let mut bytes = self.mutation_frame(op, m, d)?;
         if !self.usable {
             return Err(Error::Invalid("connection requires reconnect"));
         }
         if Instant::now() >= d.local {
             return Err(Error::Invalid("local deadline elapsed before send"));
         }
-        if p.len() + 13 > self.negotiated.max_frame {
+        if bytes.len() - 4 > self.negotiated.max_frame {
             return Err(Error::Invalid("frame limit"));
         }
         attempt.first_send.get_or_insert_with(Instant::now);
-        let result = self.exchange(op, &p, d.local).and_then(|b| {
-            let mut c = Cursor::new(&b);
-            let version = parse(c.u64())?;
-            let ack = parse(c.u8())?;
-            parse(c.end())?;
-            if version == 0 || ack != m.ack as u8 {
-                return Err(Error::Protocol("mutation achieved acknowledgement"));
-            }
-            Ok(MutationReply {
-                epoch: self.negotiated.epoch,
-                version,
-                achieved: m.ack,
+        let result = self
+            .begin_exchange(bytes.len() - 17, d.local)
+            .and_then(|id| {
+                // The complete frame starts with length/version/opcode, then ID.
+                bytes[9..17].copy_from_slice(&id.to_le_bytes());
+                self.exchange_bytes(op, id, &bytes, d.local)
             })
-        });
+            .and_then(|b| {
+                let mut c = Cursor::new(&b);
+                let version = parse(c.u64())?;
+                let ack = parse(c.u8())?;
+                parse(c.end())?;
+                if version == 0 || ack != m.ack as u8 {
+                    return Err(Error::Protocol("mutation achieved acknowledgement"));
+                }
+                Ok(MutationReply {
+                    epoch: self.negotiated.epoch,
+                    version,
+                    achieved: m.ack,
+                })
+            });
         match result {
             Ok(v) => Ok(v),
             Err(e @ Error::Invalid(_)) => Err(e),

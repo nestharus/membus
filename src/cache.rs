@@ -1,5 +1,6 @@
 //! Sharded weighted LRU. The wheel owns one expiry link per resident version.
 use crate::{chunks::Clock, Class, Config, Value};
+use std::borrow::Cow;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::{
@@ -285,7 +286,7 @@ impl Cache {
             coalesced_reads: AtomicU64::new(0),
         }
     }
-    pub fn policy(config: &Config, ns: &str, key: &str, class: Class) -> (String, CachePolicy) {
+    pub fn policy<'a>(config: &'a Config, ns: &str, key: &str, class: Class) -> (Cow<'a, str>, CachePolicy) {
         config
             .cache_rules
             .iter()
@@ -296,8 +297,8 @@ impl Cache {
                     && r.class.is_none_or(|c| c == class)
             })
             .map_or_else(
-                || (class.label(), config.cache_policy),
-                |r| (r.label.clone(), r.policy),
+                || (class.label_text(), config.cache_policy),
+                |r| (Cow::Borrowed(r.label.as_str()), r.policy),
             )
     }
     pub(super) fn value_charge(capacity: usize, label: &str) -> usize {
@@ -352,7 +353,7 @@ impl Cache {
     pub fn insert(
         &self,
         value: Arc<Value>,
-        label: String,
+        label: Cow<'_, str>,
         policy: CachePolicy,
         initial: bool,
         limit: usize,
@@ -406,9 +407,11 @@ impl Cache {
         if !eligible.load(Ordering::Acquire) {
             return;
         }
-        let label = s.residency.get_key_value(label.as_str())
+        // Configuration labels stay borrowed through admission. A resident
+        // owns or shares its label independently of that configuration.
+        let label = s.residency.get_key_value(label.as_ref())
             .map(|(existing, _)| existing.clone())
-            .unwrap_or_else(|| Arc::<str>::from(label.as_str()));
+            .unwrap_or_else(|| Arc::<str>::from(label.as_ref()));
         let class = s.residency.entry(label.clone()).or_default();
         class.0 += charge;
         class.1 += 1;
@@ -479,7 +482,7 @@ impl Cache {
             coalesced_reads: self.coalesced_reads.load(Ordering::Relaxed),
             ..CacheStats::default()
         };
-        let mut classes = std::collections::BTreeMap::<String, (usize, usize)>::new();
+        let mut classes = std::collections::BTreeMap::<Arc<str>, (usize, usize)>::new();
         for shard in &self.shards {
             let mut s = shard.lock().unwrap();
             s.expire(self.clock.mono_ms());
@@ -490,12 +493,12 @@ impl Cache {
             stats.evicted_replaced += s.evictions[2];
             stats.evicted_retired += s.evictions[3];
             for (label, (bytes, count)) in &s.residency {
-                let c = classes.entry(label.as_ref().to_owned()).or_default();
+                let c = classes.entry(label.clone()).or_default();
                 c.0 += bytes;
                 c.1 += count;
             }
         }
-        stats.residency = classes.into_iter().map(|(k, (b, n))| (k, b, n)).collect();
+        stats.residency = classes.into_iter().map(|(k, (b, n))| (k.as_ref().to_owned(), b, n)).collect();
         stats
     }
 }

@@ -1,5 +1,7 @@
 //! Bounded committed views and change hints using the existing KV1 operations.
 use super::*;
+// Nonempty key, presence, version, ack and an empty length-prefixed value.
+const MIN_SCAN_ITEM_BYTES: usize = 4 + 1 + 1 + 8 + 1 + 4;
 
 #[derive(Clone, Debug)]
 pub struct ScanPage {
@@ -85,6 +87,17 @@ impl Change {
         })
     }
 }
+// Only a completely decoded page may transfer its final value's receive storage.
+// Earlier values and cursors own independent bytes. Tiny tails shed page metadata.
+fn retain_scan_tail(
+    body: ReplyPayload,
+    items: &mut [(String, CommittedValue)],
+    tail: Option<usize>,
+) {
+    if let Some(len) = tail {
+        items.last_mut().expect("decoded final scan item").1.bytes = body.into_tail(len);
+    }
+}
 impl<T: Transport> Client<T> {
     fn m3_response<R>(
         &mut self,
@@ -94,19 +107,98 @@ impl<T: Transport> Client<T> {
         decode: impl FnOnce(&Self, &[u8]) -> Result<R>,
     ) -> Result<R> {
         let b = self.exchange(op, p, until)?;
-        let result = decode(self, &b);
+        self.m3_decode_response(b, |this, b| decode(this, &b))
+    }
+    fn m3_decode_response<R>(
+        &mut self,
+        b: ReplyPayload,
+        decode: impl FnOnce(&Self, ReplyPayload) -> Result<R>,
+    ) -> Result<R> {
+        let result = decode(self, b);
         if result.is_err() {
             self.usable = false;
         }
         result
     }
+    fn snapshot_frame(
+        &self,
+        ns: &str,
+        snapshot: Option<&[u8; 16]>,
+        op: &str,
+        d: Deadline,
+    ) -> Result<Vec<u8>> {
+        // Retain prefix's validation order before reserving the final frame.
+        identifier(op)?;
+        identifier(ns)?;
+        let opcode = if snapshot.is_some() {
+            crate::SNAPSHOT_RELEASE
+        } else {
+            crate::SNAPSHOT_OPEN
+        };
+        let payload_len = 8 + 2 * 4 + op.len() + ns.len()
+            + if snapshot.is_some() { 4 + 16 } else { 0 };
+        let mut bytes = crate::codec::frame_header(opcode, 0, payload_len);
+        bytes.extend(d.unix_ms.to_le_bytes());
+        lp(&mut bytes, op.as_bytes());
+        lp(&mut bytes, ns.as_bytes());
+        if let Some(snapshot) = snapshot {
+            lp(&mut bytes, snapshot);
+        }
+        Ok(bytes)
+    }
+    // Callers validate scan bounds first; identifiers retain prefix's order.
+    #[allow(clippy::too_many_arguments)]
+    fn scan_frame(
+        &self,
+        opcode: u8,
+        ns: &str,
+        snapshot: &[u8; 16],
+        cursor: &[u8],
+        limit: u16,
+        max_bytes: usize,
+        bounds: &[&str],
+        op: &str,
+        d: Deadline,
+    ) -> Result<Vec<u8>> {
+        identifier(op)?;
+        identifier(ns)?;
+        // Every variable input is bounded before this exact reservation.
+        let payload_len = 8 + 4 + op.len() + 4 + ns.len() + 20 + 4 + cursor.len() + 2 + 4
+            + bounds.iter().map(|bound| 4 + bound.len()).sum::<usize>();
+        let mut bytes = crate::codec::frame_header(opcode, 0, payload_len);
+        bytes.extend(d.unix_ms.to_le_bytes());
+        lp(&mut bytes, op.as_bytes());
+        lp(&mut bytes, ns.as_bytes());
+        lp(&mut bytes, snapshot);
+        lp(&mut bytes, cursor);
+        bytes.extend(limit.to_le_bytes());
+        bytes.extend((max_bytes as u32).to_le_bytes());
+        for bound in bounds {
+            lp(&mut bytes, bound.as_bytes());
+        }
+        Ok(bytes)
+    }
+    fn m3_frame_response<R>(
+        &mut self,
+        op: u8,
+        mut bytes: Vec<u8>,
+        until: Instant,
+        decode: impl FnOnce(&Self, ReplyPayload) -> Result<R>,
+    ) -> Result<R> {
+        // Keep readiness/deadline/frame admission after complete encoding.
+        // Refused sends consume no request ID and perform no transport I/O.
+        let id = self.begin_exchange(bytes.len() - 17, until)?;
+        bytes[9..17].copy_from_slice(&id.to_le_bytes());
+        let b = self.exchange_bytes(op, id, &bytes, until)?;
+        self.m3_decode_response(b, decode)
+    }
     pub fn snapshot_open(&mut self, ns: &str, op: &str, d: Deadline) -> Result<[u8; 16]> {
         if !self.negotiated.scans {
             return Err(Error::Invalid("scans unavailable"));
         }
-        let p = self.prefix(op, ns, d)?;
-        self.m3_response(crate::SNAPSHOT_OPEN, &p, d.local, |_, b| {
-            let mut c = Cursor::new(b);
+        let p = self.snapshot_frame(ns, None, op, d)?;
+        self.m3_frame_response(crate::SNAPSHOT_OPEN, p, d.local, |_, b| {
+            let mut c = Cursor::new(&b);
             let t = token(&mut c)?;
             parse(c.end())?;
             Ok(t)
@@ -122,9 +214,8 @@ impl<T: Transport> Client<T> {
         if !self.negotiated.scans {
             return Err(Error::Invalid("scans unavailable"));
         }
-        let mut p = self.prefix(op, ns, d)?;
-        lp(&mut p, snapshot);
-        self.m3_response(crate::SNAPSHOT_RELEASE, &p, d.local, |_, b| {
+        let p = self.snapshot_frame(ns, Some(snapshot), op, d)?;
+        self.m3_frame_response(crate::SNAPSHOT_RELEASE, p, d.local, |_, b| {
             if !b.is_empty() {
                 return Err(Error::Protocol("release payload"));
             }
@@ -154,17 +245,12 @@ impl<T: Transport> Client<T> {
         {
             return Err(Error::Invalid("scan bounds"));
         }
-        let mut p = self.prefix(op, ns, d)?;
-        lp(&mut p, snapshot);
-        lp(&mut p, cursor);
-        p.extend(limit.to_le_bytes());
-        p.extend((max_bytes as u32).to_le_bytes());
-        lp(&mut p, prefix.as_bytes());
-        self.m3_response(crate::SCAN_PREFIX, &p, d.local, |this, b| {
+        let p = self.scan_frame(crate::SCAN_PREFIX, ns, snapshot, cursor, limit, max_bytes, &[prefix], op, d)?;
+        self.m3_frame_response(crate::SCAN_PREFIX, p, d.local, |this, b| {
             if b.len() > max_bytes {
                 return Err(Error::Protocol("scan page bytes"));
             }
-            let mut c = Cursor::new(b);
+            let mut c = Cursor::new(&b);
             let returned = token(&mut c)?;
             let next = parse(c.bytes(2 * MAX_ID + 48))?.to_vec();
             let done = parse(c.u8())?;
@@ -177,12 +263,27 @@ impl<T: Transport> Client<T> {
             {
                 return Err(Error::Protocol("scan progress"));
             }
-            let mut items = Vec::new();
-            for _ in 0..count {
+            // Received bytes bound reservations even when the advertised count lies.
+            // Keep decoding so malformed-item diagnostics retain their precedence.
+            let capacity = usize::from(count).min(c.remainder().len() / MIN_SCAN_ITEM_BYTES);
+            let mut items = Vec::with_capacity(capacity);
+            let mut tail = None;
+            for index in 0..count {
                 let key = parse(c.text())?;
-                let value = this
-                    .value(&mut c)?
+                let (version, ack, bytes) = this
+                    .borrowed_value(&mut c)?
                     .ok_or(Error::Protocol("scan tombstone"))?;
+                let bytes = if index + 1 == count {
+                    tail = Some(bytes.len());
+                    Vec::new()
+                } else {
+                    bytes.to_vec()
+                };
+                let value = CommittedValue {
+                    version,
+                    ack,
+                    bytes,
+                };
                 if !key.starts_with(prefix)
                     || items
                         .last()
@@ -193,6 +294,7 @@ impl<T: Transport> Client<T> {
                 items.push((key, value));
             }
             parse(c.end())?;
+            retain_scan_tail(b, &mut items, tail);
             Ok(ScanPage {
                 snapshot: returned,
                 cursor: next,
@@ -288,18 +390,12 @@ impl<T: Transport> Client<T> {
         {
             return Err(Error::Invalid("scan bounds"));
         }
-        let mut p = self.prefix(op, ns, d)?;
-        lp(&mut p, snapshot);
-        lp(&mut p, cursor);
-        p.extend(limit.to_le_bytes());
-        p.extend((max_bytes as u32).to_le_bytes());
-        lp(&mut p, lower.as_bytes());
-        lp(&mut p, upper.as_bytes());
-        self.m3_response(crate::SCAN_RANGE, &p, d.local, |this, b| {
+        let p = self.scan_frame(crate::SCAN_RANGE, ns, snapshot, cursor, limit, max_bytes, &[lower, upper], op, d)?;
+        self.m3_frame_response(crate::SCAN_RANGE, p, d.local, |this, b| {
             if b.len() > max_bytes {
                 return Err(Error::Protocol("scan page bytes"));
             }
-            let mut c = Cursor::new(b);
+            let mut c = Cursor::new(&b);
             let returned = token(&mut c)?;
             let next = parse(c.bytes(2 * MAX_ID + 48))?.to_vec();
             let done = parse(c.u8())?;
@@ -312,12 +408,27 @@ impl<T: Transport> Client<T> {
             {
                 return Err(Error::Protocol("scan progress"));
             }
-            let mut items: Vec<(String, CommittedValue)> = Vec::new();
-            for _ in 0..count {
+            // Received bytes bound reservations even when the advertised count lies.
+            // Keep decoding so malformed-item diagnostics retain their precedence.
+            let capacity = usize::from(count).min(c.remainder().len() / MIN_SCAN_ITEM_BYTES);
+            let mut items: Vec<(String, CommittedValue)> = Vec::with_capacity(capacity);
+            let mut tail = None;
+            for index in 0..count {
                 let key = parse(c.text())?;
-                let value = this
-                    .value(&mut c)?
+                let (version, ack, bytes) = this
+                    .borrowed_value(&mut c)?
                     .ok_or(Error::Protocol("scan tombstone"))?;
+                let bytes = if index + 1 == count {
+                    tail = Some(bytes.len());
+                    Vec::new()
+                } else {
+                    bytes.to_vec()
+                };
+                let value = CommittedValue {
+                    version,
+                    ack,
+                    bytes,
+                };
                 if key.as_str() < lower
                     || key.as_str() >= upper
                     || items.last().is_some_and(|(last, _)| last >= &key)
@@ -327,6 +438,7 @@ impl<T: Transport> Client<T> {
                 items.push((key, value));
             }
             parse(c.end())?;
+            retain_scan_tail(b, &mut items, tail);
             Ok(ScanPage {
                 snapshot: returned,
                 cursor: next,

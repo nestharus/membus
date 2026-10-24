@@ -5,6 +5,7 @@
 //! append-only log of `open`, `close`, `retiring` and `retired` records, each flushed before it takes effect.
 //! A split retirement waits for every part.
 use crate::{crc32, lp, Cursor, MAX_FRAME, MAX_ID};
+use std::borrow::Cow;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs::{self, File, OpenOptions},
@@ -52,10 +53,14 @@ impl Class {
         }
     }
     pub fn label(&self) -> String {
+        self.label_text().into_owned()
+    }
+    // Policy selection can borrow common names; public callers still own label().
+    pub(crate) fn label_text(&self) -> Cow<'static, str> {
         match self.kind {
-            0 => "forever".into(),
-            1 => "latest".into(),
-            _ => format!("expire({}ms)", self.retention_ms),
+            0 => Cow::Borrowed("forever"),
+            1 => Cow::Borrowed("latest"),
+            _ => Cow::Owned(format!("expire({}ms)", self.retention_ms)),
         }
     }
     /// Finite classes rotate by age as well as size; forever rotates by size only.
