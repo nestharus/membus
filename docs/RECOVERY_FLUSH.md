@@ -85,3 +85,28 @@ The publication controls block the temporary file with a directory and, on
 Windows, deny replacement through a real file handle. They check refusal,
 preserved replay observations and successful retry without skipping an epoch;
 they do not simulate a physical write or sync failure.
+
+## Owned recovery refusals
+
+Owned startup attempts a refused snapshot/history report for failed catalogue
+write-open or recovered Close/Retired appends, empty-Open deletion, tail repair,
+pending-report publication, and late timer/policy projection. The report retains
+the original error and observed replay evidence, identifies the validated
+attempted epoch, and sets `stage=refused` and `ready_ms=0`. A secondary reporting
+error cannot replace the underlying failure; earlier diagnostics may remain.
+
+Pending tail evidence still precedes destructive repair. Completed repairs or
+deletions are not undone when a later step fails, and no failed append is treated
+as committed. Pre-publication failures retain the prior epoch. Control projection
+and final serving-budget checks follow durable epoch publication, so their
+refusals consume an epoch and corrected-input retry starts a later one.
+
+If final ready-report publication fails, startup joins every worker while holding
+directory ownership before attempting refusal. A blocked history append can
+leave a refused snapshot with older history; snapshot replacement failure can
+leave older diagnostics too. A report alone never proves a resident is serving.
+Pre-ownership directory failures retain the separate startup-directory contract.
+
+The focused refusal modules cover catalogue and tail I/O denials, cold control
+reads, pending/ready publication failures, preserved evidence and retry. They use
+authored fixtures and keep the original OS error when reporting also fails.

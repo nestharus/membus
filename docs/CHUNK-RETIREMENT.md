@@ -21,6 +21,28 @@ otherwise policy admission refuses malformed (3). The internal timer namespace
 uses latest; internal policy records use forever. Public operations cannot
 access either internal namespace directly.
 
+Automatic retirement waits until both the UTC age since close and, for chunks
+closed in this process, the monotonic age satisfy retention and strictly exceed
+the retry horizon. Retry outcomes remain valid at the exact retry boundary,
+including a zero-length window at the close instant. Longer expire retention
+keeps its existing inclusive retention boundary. Recovered chunks use the UTC
+age without adding to a timestamp, so a close time near the integer limit cannot
+shorten either window. Explicit forced retirement retains its clock override.
+
+HEALTH2 counts latest-class bytes as pinned only after the same UTC and local
+retry bounds have passed. An exact-boundary chunk or a UTC correction alone
+does not raise the pinned-byte high-water signal. Recovered chunks use their
+actual UTC age, including when close timestamps approach the integer limit.
+
+The blocked-retirement count reflects observed delete failures. Its oldest age
+uses local monotonic time; a UTC correction does not age or clear the one-hour
+high-water signal. A restart starts a new observation when recovery again finds
+the delete blocked. `ChunkInfo::blocked_since` is this in-memory monotonic start,
+not a persisted UTC timestamp. Successful retirement clears the observation.
+If a pass stops after a durable retiring intent but before attempting deletion,
+the retry path records its own first denied delete. Repeated denials preserve
+that start; the existing sticky storage-error observation remains unchanged.
+
 The class cap is 64 distinct classes, including built-in forever/latest,
 selected policies, nonretired instantiated classes, in-flight routing choices
 and prospective policy admissions. A setter exceeding it refuses capacity (7).
@@ -68,6 +90,14 @@ published before creating the chunk file. Close syncs data and records the close
 boundary. Catalogue rewrites retain the live metadata account, without copying
 data records; growth beyond the 1 MiB default threshold triggers rewriting,
 measured relative to the last compact image.
+
+The library's `catalogue_rewrite_bytes = 0` disables growth-triggered compaction.
+It does not disable repair of a fenced catalogue or discharge of incomplete
+retirement records. Background maintenance still attempts the known-live
+rewrite required before another catalogue append can succeed. A failed repair
+retains the fence and pending requests and exposes its cause in HEALTH2; a
+successful repair permits the ordinary operation to retry. It does not apply
+the operation whose publication failed.
 
 Replay chooses each key's greatest retained revision across files, including
 policy moves between classes. Catalogue high-water prevents revision reuse when
@@ -145,6 +175,22 @@ must allow retirement. Startup pauses new automatic retirement with
 record. Already Retiring deletions are retried separately. Clock checks and
 maintenance scheduling do not provide a precise expiry deadline.
 
+Recovery also retains each chunk's latest local retry cutoff among its
+reconstructed outcomes. Automatic retirement and latest-class pinned pressure
+wait strictly past that inclusive cutoff. A backward UTC correction between
+admission and chunk close can otherwise make close-time age pass while the
+record's recovered outcome remains retryable. The extra cutoff is in memory;
+recorded close timestamps and catalogue formats are unchanged. Forced retirement
+keeps its explicit override, and already Retiring cleanup is unchanged.
+
+A failed Resume publication keeps the pause and any explicit `expiry.resume`
+request in place for a later tick. HEALTH2 sets the sticky `storage_error`
+observation for either an explicit or automatic resume failure. A fenced
+catalogue still requires a successful live-list rewrite before appending Resume;
+the request does not bypass that fence. The request file is consumed after
+successful publication, or when the clock is already unpaused. The CLI reports
+that it requested a resume; it does not wait for the server to publish it.
+
 Replay skips retired data and resumes published retirement. An Open record with
 no file can represent a crash before creation and is closed as empty. A missing
 closed file without Retiring, or an unaccounted chunk file, sets storage_error
@@ -209,7 +255,12 @@ policy-input entry remain readable with that provenance unknown. Arbitrary state
 writers and non-Windows input locking are outside this ownership guarantee.
 
 Within the configured retry window after import (default 24 hours), legacy
-records supplement dedup only, never values. Later starts stop that dedup replay
+records supplement dedup only, never values. The window includes its exact
+boundary, including the import instant when the configured window is zero.
+Each record must also satisfy its own UTC age limit; recovery gives it only the
+remaining local monotonic window. A superseded put or remove retried at the
+boundary returns its original outcome without changing the latest value.
+Later starts stop that dedup replay
 but still verify the retained inputs. These already imported read-only backups
 receive no new data-file sync witness; on Windows a read-only handle cannot flush
 them. Their existing bytes, permissions and retry grafting rules remain unchanged,
@@ -263,3 +314,36 @@ repository, refer to numbered rationale in the
 [earlier retirement document](https://github.com/nestharus/membus/blob/d7ec2b79bb48cc1f5edfa5e6cab8549c8e5d57d5/docs/CHUNK-RETIREMENT.md).
 That immutable version preserves the historical comparisons; the behavior and
 limits described above correspond to the current implementation.
+
+Chunk IDs retain a representable successor: the last assignable ID is
+`u64::MAX - 1`. Exhaustion refuses before publishing an Open, creating a file or
+exposing a route, including during import. Runtime allocation failure uses the
+existing I/O refusal (16) and write fence; prior Flush values and retry outcomes
+remain available across restart. An Open at `u64::MAX` refuses replay before
+cleanup or epoch publication. ID zero remains reserved for the legacy aggregate.
+
+Replay validates catalogue identities and lifecycle records before repairing
+tails, deleting files, applying retirement suppression or publishing an epoch:
+
+- Every Open has a nonzero, unique ID and a stripe from 0 through 3. A second
+  Open is invalid even when identical or separated by Close or Retired records.
+- Every Close, committed Retiring and Retired references an earlier Open in the
+  retained image. A later Open cannot authorize an earlier transition.
+- Close cannot revive a Retiring or Retired chunk or change an established byte
+  boundary. An identical repeated boundary retains its next-version high water.
+- Committed Retiring requires Closed or Retiring state. A repeated transition
+  preserves its original timestamp, effective per-key horizon maxima and expiry
+  key set. Reordering and redundant members are allowed; next-version high water
+  may advance. Complete multipart sets are compared after folding; incomplete
+  prefixes remain unapplied.
+- Retired for a Closed chunk requires committed Retiring intent, including for
+  zero-byte chunks. An incomplete multipart prefix does not authorize completion.
+- Direct Open-to-Retired cleanup requires an absent path or a zero-length regular
+  file. Populated files, torn bytes and non-file paths refuse; metadata errors
+  other than NotFound propagate. Repeated completions remain valid.
+
+Invalid metadata returns InvalidData and preserves source bytes and the prior
+epoch for correction. Atomic live-list rewrites retain each Open before its
+lifecycle and preserve retirement/summary ages. Normal recovery deletes an empty
+Open file before completing retirement; a leftover zero-length retired file
+retains the existing storage-error diagnostic.

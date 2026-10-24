@@ -115,6 +115,7 @@ pub struct Config {
     pub snapshot_ttl_ms: u64,
     pub state_limit_bytes: u64,
     pub quota: usize,
+    /// Global slots for live entries, retained tombstones and expiry summaries.
     pub index_cap: usize,
     pub capacity: usize,
     pub queue_bytes: usize,
@@ -137,6 +138,7 @@ pub struct Config {
     pub tick_ms: u64,
     /// The retirement pass (5.4).
     pub retire_ms: u64,
+    /// Catalogue growth trigger; zero disables size compaction, while necessary fence repair still runs.
     pub catalogue_rewrite_bytes: u64,
     /// Retain expiry summaries for this many milliseconds; the default is 30 days.
     pub summary_ms: u64,
@@ -167,6 +169,9 @@ pub struct Config {
     /// Test seam: observe or refuse each runtime chunk-directory barrier.
     #[cfg(test)]
     pub chunk_dir_sync: Option<Arc<dyn Fn(&Path) -> io::Result<()> + Send + Sync>>,
+    /// Test seam: observe or refuse state-directory name barriers before ownership.
+    #[cfg(test)]
+    pub state_dir_sync: Option<Arc<dyn Fn(&Path) -> io::Result<()> + Send + Sync>>,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -219,6 +224,8 @@ impl Default for Config {
             replay_report_dir_sync: None,
             #[cfg(test)]
             chunk_dir_sync: None,
+            #[cfg(test)]
+            state_dir_sync: None,
         }
     }
 }
@@ -270,6 +277,11 @@ pub struct Store {
 }
 impl Drop for Store {
     fn drop(&mut self) {
+        self.stop_workers();
+    }
+}
+impl Store {
+    fn stop_workers(&mut self) {
         if let Some((stop, worker)) = self.scan_reaper.take() {
             let _ = stop.send(());
             let _ = worker.join();
@@ -356,7 +368,7 @@ impl Store {
         if config.snapshot_ttl_ms == 0 {
             return Err(io::Error::other("snapshot lifetime must be positive"));
         }
-        fs::create_dir_all(path)?;
+        log_io::prepare_state_directory(path, &config)?;
         let mut options = OpenOptions::new();
         options.write(true).create(true).truncate(false);
         #[cfg(windows)]
@@ -436,7 +448,7 @@ impl Store {
         report.stage = "ready".into();
         // Own every worker before the last fallible publication. On error,
         // Store::drop stops and joins them before releasing the directory owner.
-        let store = Self {
+        let mut store = Self {
             clock: clock.clone(),
             timers,
             signals: signals::Hub::new(epoch, &config, clock.clone()),
@@ -475,7 +487,19 @@ impl Store {
             epoch,
             _owner: owner,
         };
-        store.report.lock().unwrap().write_startup(path, &store.config)?;
+        let publication = store.report.lock().unwrap().write_startup(path, &store.config);
+        if let Err(error) = publication {
+            // Keep ownership until workers have joined and the best-effort
+            // refusal replaces any ready snapshot visible from the failed write.
+            store.stop_workers();
+            let mut report = store.report.lock().unwrap();
+            report.ready_ms = 0;
+            report.elapsed_ms = Some(store.clock.mono_ms().saturating_sub(start_mono_ms));
+            report.stage = "refused".into();
+            report.refusal = Some(error.to_string());
+            let _ = report.write_startup(path, &store.config);
+            return Err(error);
+        }
         Ok(store)
     }
 }

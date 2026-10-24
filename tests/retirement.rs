@@ -189,6 +189,9 @@ fn t3_latest_class() {
     assert_eq!(row(&s, a_chunk).3, "Closed");
     clock.advance(1);
     s.retirement_pass();
+    assert_eq!(row(&s, a_chunk).3, "Closed", "retry is still valid at close + 24 h");
+    clock.advance(1);
+    s.retirement_pass();
     assert_eq!(row(&s, a_chunk).3, "Retired");
     assert_eq!(s.get("ledger", "l/a").unwrap().bytes, b"2");
     // A chunk holding one latest version stays until that key is rewritten.
@@ -204,7 +207,7 @@ fn t3_latest_class() {
     let s = reopen(&p, config(&clock));
     assert_eq!(s.get("ledger", "l/a").unwrap().bytes, b"2");
     assert_eq!(s.get("ledger", &b_key).unwrap().bytes, b"2");
-    println!("T3: superseded latest chunk kept at close+24h-1ms and retired at close+24h; one holding a latest version kept until rewritten");
+    println!("T3: superseded latest chunk kept through close+24h and retired at close+24h+1ms; one holding a latest version kept until rewritten");
 }
 
 #[test]
@@ -249,6 +252,9 @@ fn t4_removes_tombstones_versions_and_anti_resurrection() {
     assert_eq!(s.slots("ledger"), held, "the older record is still retained");
     clock.advance(DAY);
     s.retirement_pass();
+    assert_eq!(s.slots("ledger"), held, "the inclusive retry boundary still retains the older record");
+    clock.advance(1);
+    s.retirement_pass();
     assert_eq!(s.slots("ledger"), (held.0 - 1, held.1));
     drop(s);
 
@@ -270,6 +276,9 @@ fn t4_removes_tombstones_versions_and_anti_resurrection() {
     assert!(top > issued);
     close_finite(&s, &clock);
     clock.advance(DAY);
+    s.retirement_pass();
+    assert!(s.get("ledger", "r/top").is_some(), "the equal retention/retry boundary stays retained");
+    clock.advance(1);
     s.retirement_pass();
     assert!(s.get("ledger", "r/top").is_none());
     drop(s);
@@ -362,6 +371,9 @@ fn t10_clock_jumps() {
     assert_eq!(row(&s, chunk).3, "Closed");
     assert!(!s.expiry_degraded());
     clock.advance(DAY);
+    s.retirement_pass();
+    assert_eq!(row(&s, chunk).3, "Closed", "the local retry boundary stays inclusive after a UTC jump");
+    clock.advance(1);
     s.retirement_pass();
     assert_eq!(row(&s, chunk).3, "Retired");
     drop(s);

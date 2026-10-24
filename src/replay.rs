@@ -2,6 +2,9 @@
 #[cfg(test)]
 #[path = "replay/clock_tests.rs"]
 mod clock_tests;
+#[cfg(test)]
+#[path = "replay/heartbeat_tests.rs"]
+mod heartbeat_tests;
 use crate::chunks;
 use crate::codec::crc32;
 use crate::codec::mutation_bytes;
@@ -59,6 +62,16 @@ fn recovery_sync(path: &Path, config: &Config) -> io::Result<()> {
 fn corrupt(text: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, text)
 }
+fn record_successor(version: u64, name: &str, offset: u64) -> io::Result<u64> {
+    if version == 0 {
+        return Err(corrupt(format!(
+            "interior-corrupt {name} offset {offset}: reserved zero record version"
+        )));
+    }
+    version.checked_add(1).ok_or_else(|| corrupt(format!(
+        "interior-corrupt {name} offset {offset}: record version has no successor"
+    )))
+}
 fn recovery_sync_dir(path: &Path, config: &Config) -> io::Result<()> {
     #[cfg(test)]
     if let Some(hook) = &config.recovery_dir_sync { hook(path)?; }
@@ -88,8 +101,22 @@ struct Replayed {
     cat_last_ms: u64,
 }
 impl Replayed {
+    /// Snapshot the population observed so far, including on partial replay failure.
+    fn observe_populations(&mut self) {
+        self.report.keys = self.committed.len() + self.chunks.summaries.charged;
+        self.report.dedup_entries = self.dedup.len();
+        self.report.namespace_counts.clear();
+        for ((ns, _), value) in &self.committed {
+            if !value.tombstone {
+                if let Some(count) = self.report.namespace_counts.get_mut(ns) {
+                    *count += 1;
+                } else {
+                    self.report.namespace_counts.insert(ns.clone(), 1);
+                }
+            }
+        }
+    }
     fn apply(&mut self, m: Mutation, v: u64, at: u64, chunk: u64, now: u64, config: &Config, location: crate::value_disk::Location) {
-        self.next = self.next.max(v + 1);
         let k = (m.ns.clone(), m.key.clone());
         if self.committed.get(&k).is_none_or(|old| old.version < v) {
             self.committed.insert(
@@ -105,6 +132,7 @@ impl Replayed {
                     fingerprint: fingerprint(&m),
                     at,
                     until_mono: 0, // Anchored to the instance clock after replay/import validation.
+                    replayed_chunk: chunk,
                     outcome: Some(Outcome {
                         code: 0,
                         version: v,
@@ -160,14 +188,15 @@ impl Replayed {
                             "interior-corrupt {name} offset {offset}: wrong stripe"
                         )));
                     }
+                    let next = record_successor(v, &name, offset)?;
                     let k = (m.ns.clone(), m.key.clone());
                     self.chunks.register(chunk, &k, v);
                     self.report.stripes[si].records += 1;
                     self.report.stripes[si].bytes += n;
+                    self.next = self.next.max(next);
                     if horizons.get(&k).is_some_and(|h| v <= *h) {
                         // Anti-resurrection: a retired newer version's horizon hides this older one.
                         self.report.stripes[si].horizons_applied += 1;
-                        self.next = self.next.max(v + 1);
                     } else {
                         self.apply(m, v, at, chunk, now, config, crate::value_disk::Location {
                             class: self.chunks.table.get(&chunk).map_or(Class::FOREVER, |c| c.class),
@@ -253,7 +282,7 @@ fn read_legacy(files: &[(usize, PathBuf)], config: &Config, now: u64) -> io::Res
                             "interior-corrupt {name} offset {offset}: wrong stripe"
                         )));
                     }
-                    l.next = l.next.max(v + 1);
+                    l.next = l.next.max(record_successor(v, &name, offset)?);
                     let k = (m.ns.clone(), m.key.clone());
                     if l.committed.get(&k).is_none_or(|old| old.version < v) {
                         let location = crate::value_disk::Location {
@@ -274,6 +303,7 @@ fn read_legacy(files: &[(usize, PathBuf)], config: &Config, now: u64) -> io::Res
                                 fingerprint: fingerprint(&m),
                                 at,
                                 until_mono: 0,
+                                replayed_chunk: chunks::LEGACY_CHUNK,
                                 outcome: Some(Outcome {
                                     code: 0,
                                     version: v,
@@ -362,7 +392,8 @@ impl ImportWriter {
         }
         if !self.open.contains_key(&(stripe, class)) {
             let id = self.cs.next_id;
-            self.cs.next_id += 1;
+            self.cs.next_id = id.checked_add(1)
+                .ok_or_else(|| io::Error::other("chunk identifier exhausted"))?;
             let path = chunks::chunk_path(&self.cs.dir, class, stripe, id);
             self.cs.log(
                 self.utc,
@@ -593,13 +624,15 @@ fn import_legacy(
                 remove: false,
             };
             let version = w.next;
-            w.next += 1;
+            w.next = version.checked_add(1)
+                .ok_or_else(|| corrupt("import version exhausted".into()))?;
             synthetic.insert(
                 dedup_identity(&m),
                 Dedup {
                     fingerprint: fingerprint(&m),
                     at: utc,
                     until_mono: 0,
+                    replayed_chunk: chunks::LEGACY_CHUNK,
                     outcome: Some(Outcome {
                         code: 0,
                         version,
@@ -803,6 +836,7 @@ fn replay(
     let dir = path.join("chunks");
     let mut rp = Replayed::empty(dir.clone());
     let result = replay_into(&mut rp, path, &dir, true, config, clock);
+    rp.observe_populations();
     // Keep observations already collected by replay in both successful and
     // refused startup reports, even when a later file prevents replay finishing.
     rp.report.storage_errors = rp.storage_errors.clone();
@@ -833,6 +867,17 @@ fn replay_into(
     let mut horizons: Vec<(String, String, u64)> = Vec::new();
     for r in &records {
         rp.cat_last_ms = rp.cat_last_ms.max(r.at_ms);
+        let reference = match &r.rec {
+            Rec::Close { seq, .. } => Some(("Close", seq)),
+            Rec::Retiring { seq, .. } => Some(("Retiring", seq)),
+            Rec::Retired { seq } => Some(("Retired", seq)),
+            _ => None,
+        };
+        if let Some((kind, seq)) = reference {
+            if !rp.chunks.table.contains_key(seq) {
+                return Err(corrupt(format!("catalogue {kind} without prior Open for chunk {seq}")));
+            }
+        }
         match &r.rec {
             Rec::Open {
                 seq,
@@ -841,8 +886,19 @@ fn replay_into(
                 policy,
                 next,
             } => {
+                if *seq == chunks::LEGACY_CHUNK {
+                    return Err(corrupt("catalogue Open uses reserved legacy chunk identifier zero".into()));
+                }
+                if usize::from(*stripe) >= rp.report.stripes.len() {
+                    return Err(corrupt(format!("catalogue Open stripe out of range: {stripe}")));
+                }
+                if rp.chunks.table.contains_key(seq) {
+                    return Err(corrupt(format!("duplicate catalogue Open for chunk {seq}")));
+                }
                 next_hw = next_hw.max(*next);
-                rp.chunks.next_id = rp.chunks.next_id.max(seq + 1);
+                let next_id = seq.checked_add(1)
+                    .ok_or_else(|| corrupt(format!("chunk identifier has no successor: {seq}")))?;
+                rp.chunks.next_id = rp.chunks.next_id.max(next_id);
                 rp.chunks.table.insert(
                     *seq,
                     chunks::ChunkInfo {
@@ -853,6 +909,7 @@ fn replay_into(
                         open_ms: r.at_ms,
                         close_ms: None,
                         close_mono: None,
+                        recovered_retry_until_mono: None,
                         bytes: 0,
                         path: chunks::chunk_path(&dir, *class, *stripe as usize, *seq),
                         state: ChunkState::Open,
@@ -867,6 +924,12 @@ fn replay_into(
             Rec::Close { seq, bytes, next } => {
                 next_hw = next_hw.max(*next);
                 if let Some(c) = rp.chunks.table.get_mut(seq) {
+                    if matches!(c.state, ChunkState::Retiring | ChunkState::Retired) {
+                        return Err(corrupt(format!("catalogue Close after retirement for chunk {seq}")));
+                    }
+                    if c.state == ChunkState::Closed && c.bytes != *bytes {
+                        return Err(corrupt(format!("catalogue Close changes closed byte boundary for chunk {seq}")));
+                    }
                     c.state = ChunkState::Closed;
                     c.close_ms = Some(r.at_ms);
                     c.bytes = *bytes;
@@ -878,6 +941,19 @@ fn replay_into(
                 horizons: h,
                 expired,
             } => {
+                if let Some(c) = rp.chunks.table.get(seq) {
+                    if !matches!(c.state, ChunkState::Closed | ChunkState::Retiring) {
+                        return Err(corrupt(format!("catalogue Retiring requires Closed or Retiring chunk {seq}")));
+                    }
+                    if c.state == ChunkState::Retiring
+                        && (c.retired_ms != Some(r.at_ms)
+                            || chunks::horizon_set(&c.horizons) != chunks::horizon_set(h)
+                            || c.expired.iter().collect::<std::collections::HashSet<_>>()
+                                != expired.iter().collect::<std::collections::HashSet<_>>())
+                    {
+                        return Err(corrupt(format!("catalogue Retiring changes committed transition for chunk {seq}")));
+                    }
+                }
                 next_hw = next_hw.max(*next);
                 horizons.extend(h.iter().cloned());
                 if let Some(c) = rp.chunks.table.get_mut(seq) {
@@ -892,6 +968,17 @@ fn replay_into(
             }
             Rec::Retired { seq } => {
                 if let Some(c) = rp.chunks.table.get_mut(seq) {
+                    if c.state == ChunkState::Closed {
+                        return Err(corrupt(format!("catalogue Retired without committed Retiring for closed chunk {seq}")));
+                    }
+                    if c.state == ChunkState::Open {
+                        match fs::metadata(&c.path) {
+                            Ok(metadata) if metadata.is_file() && metadata.len() == 0 => {}
+                            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                            Ok(_) => return Err(corrupt(format!("catalogue Retired for nonempty or non-file Open chunk {seq}"))),
+                            Err(error) => return Err(error),
+                        }
+                    }
                     c.state = ChunkState::Retired;
                 }
             }
@@ -938,6 +1025,7 @@ fn replay_into(
                 open_ms: 0,
                 close_ms: Some(0),
                 close_mono: None,
+                recovered_retry_until_mono: None,
                 bytes: 0,
                 path: path.to_owned(),
                 state: ChunkState::Closed,
@@ -1038,7 +1126,9 @@ fn replay_into(
                 ));
             }
         }
-        let window = clock.utc_ms().saturating_sub(rp.chunks.import_at) < config.retry_ms;
+        // Backup-only outcomes must survive the same inclusive bound as the
+        // imported records; equality still grants a retry, with no elapsed time left.
+        let window = clock.utc_ms().saturating_sub(rp.chunks.import_at) <= config.retry_ms;
         if !changed.is_empty() {
             rp.storage_errors.extend(changed);
         } else if window {
@@ -1119,6 +1209,12 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
             chunks::ReplayReport::default(),
         )
     })?;
+    // Non-ready reports identify the validated attempt. This does not imply
+    // that the epoch file has been published or that startup reached readiness.
+    let refuse = |error, mut report: chunks::ReplayReport| {
+        report.epoch = epoch;
+        refuse(error, report)
+    };
     let imported = match import_legacy(path, config, &clock, epoch) {
         Ok(x) => x,
         Err(e) => {
@@ -1133,6 +1229,7 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
         Ok(rp) => rp,
         Err((e, report)) => return Err(refuse(e, report)),
     };
+    rp.report.epoch = epoch;
     if let Some((_, line)) = imported {
         rp.report.import = Some(format!(
             "{line}; {}",
@@ -1140,13 +1237,16 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
         ));
     }
     rp.chunks.recount_index_bytes();
+    // Summary lifetimes are resolved after publication. Their temporary replay
+    // charge must not refuse a serving projection that will discard them.
+    let summary_bytes: usize = rp.chunks.summaries.keys.keys().map(crate::store::index_charge).sum();
     if rp.committed.len() > config.index_cap
         || rp.committed.keys().map(crate::store::index_charge).sum::<usize>()
             + rp.dedup
                 .iter()
                 .map(|(k, _)| crate::store::dedup_charge(k))
                 .sum::<usize>()
-            + rp.chunks.index_bytes + config.memory_margin()
+            + rp.chunks.index_bytes.saturating_sub(summary_bytes) + config.memory_margin()
             > config.capacity
         || rp.dedup.len() > config.dedup_cap
     {
@@ -1163,17 +1263,21 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
         rp.report.stage = "truncation_pending".into();
         // Preserve what replay found before its source bytes disappear. A later successful
         // start can replace replay.json; the bounded replay.log retains this non-ready stage.
-        rp.report.write_startup(path, config)?;
+        rp.report.write_startup(path, config)
+            .map_err(|e| refuse(e, rp.report.clone()))?;
     }
     for (p, offset) in &rp.truncate {
-        OpenOptions::new().write(true).open(p)?.set_len(*offset)?;
+        OpenOptions::new().write(true).open(p)
+            .and_then(|file| file.set_len(*offset))
+            .map_err(|e| refuse(e, rp.report.clone()))?;
     }
     let cat_path = path.join("chunks").join("catalogue.log");
     if let Some((offset, _, _)) = &rp.report.catalogue_truncation {
         OpenOptions::new()
             .write(true)
-            .open(&cat_path)?
-            .set_len(*offset)?;
+            .open(&cat_path)
+            .and_then(|file| file.set_len(*offset))
+            .map_err(|e| refuse(e, rp.report.clone()))?;
     }
     TestSeam::checkpoint("MEMBUS_TEST_PAUSE_REPLAY_TRUNCATED");
     #[cfg(test)]
@@ -1216,7 +1320,8 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
         recovery_sync_dir(&dir, config).map_err(|e| refuse(e, rp.report.clone()))?;
     }
     let mut cs = std::mem::replace(&mut rp.chunks, chunks::ChunkStore::new(path.join("chunks")));
-    let mut catalogue = chunks::Catalogue::open(&cat_path)?;
+    let mut catalogue = chunks::Catalogue::open(&cat_path)
+        .map_err(|e| refuse(e, rp.report.clone()))?;
     catalogue.last_ms = rp.cat_last_ms;
     cs.cat = Some(catalogue);
     // Catalogue::open may create the file. Persist its name before recovery
@@ -1239,13 +1344,14 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(_) => {
-                cs.table.get_mut(&id).unwrap().blocked_since = Some(utc);
+                cs.table.get_mut(&id).unwrap().blocked_since = Some(clock.mono_ms());
                 continue;
             }
         }
         recovery_sync_deleted_chunk(&p, &cs.dir, config)
             .map_err(|e| refuse(e, rp.report.clone()))?;
-        cs.log(utc, chunks::Rec::Retired { seq: id })?;
+        cs.log(utc, chunks::Rec::Retired { seq: id })
+            .map_err(|e| refuse(e, rp.report.clone()))?;
         let c = cs.table.get_mut(&id).unwrap();
         c.state = chunks::ChunkState::Retired;
         c.keys.clear();
@@ -1260,7 +1366,8 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
             recovery_sync_deleted_chunk(&c.path, &cs.dir, config)
                 .map_err(|e| refuse(e, rp.report.clone()))?;
         }
-        cs.log(utc, chunks::Rec::Retired { seq: id })?;
+        cs.log(utc, chunks::Rec::Retired { seq: id })
+            .map_err(|e| refuse(e, rp.report.clone()))?;
         if let Some(c) = cs.table.get_mut(&id) {
             c.state = chunks::ChunkState::Retired;
         }
@@ -1283,10 +1390,12 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
                 } else {
                     Err(e)
                 }
-            })?;
+            })
+            .map_err(|e| refuse(e, rp.report.clone()))?;
             recovery_sync_deleted_chunk(&p, &cs.dir, config)
                 .map_err(|e| refuse(e, rp.report.clone()))?;
-            cs.log(utc, chunks::Rec::Retired { seq: id })?;
+            cs.log(utc, chunks::Rec::Retired { seq: id })
+                .map_err(|e| refuse(e, rp.report.clone()))?;
             cs.table.get_mut(&id).unwrap().state = chunks::ChunkState::Retired;
             rp.report.empty_closed.push(id);
             continue;
@@ -1298,7 +1407,8 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
                 bytes,
                 next,
             },
-        )?;
+        )
+        .map_err(|e| refuse(e, rp.report.clone()))?;
         let c = cs.table.get_mut(&id).unwrap();
         c.state = chunks::ChunkState::Closed;
         c.close_ms = Some(utc);
@@ -1308,25 +1418,22 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
     // Retirement pauses when the clock is in doubt (5.4).
     let beat = fs::read_to_string(path.join("heartbeat.json"))
         .ok()
-        .and_then(|t| {
-            t.split_once("\"unix_ms\":").map(|(_, r)| {
-                r.chars()
-                    .take_while(char::is_ascii_digit)
-                    .collect::<String>()
-            })
-        })
-        .and_then(|d| d.parse::<u64>().ok());
-    if utc < rp.cat_last_ms {
-        cs.degraded = Some(format!(
-            "UTC {utc} is earlier than the catalogue's last record {}",
-            rp.cat_last_ms
-        ));
-    } else if beat.is_some_and(|b| utc > b + 86_400_000) {
-        cs.degraded = Some(format!(
-            "UTC {utc} is more than 24 h past the heartbeat's last beat {}",
-            beat.unwrap()
-        ));
-    }
+        .and_then(|text| {
+            let tail = text.split_once("\"unix_ms\"")?.1;
+            let value = tail.trim_start().strip_prefix(':')?.trim_start();
+            let end = value.find(|c: char| !c.is_ascii_digit()).unwrap_or(value.len());
+            value[..end].parse::<u64>().ok()
+        });
+    let clock_degradation = |utc: u64, last_record: u64| {
+        if utc < last_record {
+            Some(format!("UTC {utc} is earlier than the catalogue's last record {last_record}"))
+        } else if beat.is_some_and(|b| utc.saturating_sub(b) > 86_400_000) {
+            Some(format!("UTC {utc} is more than 24 h past the heartbeat's last beat {}", beat.unwrap()))
+        } else {
+            None
+        }
+    };
+    cs.degraded = clock_degradation(utc, rp.cat_last_ms);
     rp.report.expiry_degraded = cs.degraded.clone();
     let flags = Arc::new(Flags::default());
     flags
@@ -1347,7 +1454,19 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
     publication.map_err(|e| refuse(e, rp.report.clone()))?;
     recovery_sync_dir(path, config).map_err(|e| refuse(e, rp.report.clone()))?;
     let mut committed = rp.committed;
-    cs.summaries.expire(utc, config.summary_ms);
+    // Epoch publication can block or observe a UTC correction. Summary ages
+    // use persisted UTC, sampled when cleanup actually runs.
+    let cleanup_utc = clock.utc_ms();
+    // Publication can outlast the clock check. Preserve an earlier pause and
+    // include Close records recovery itself has just published in the high water.
+    if cs.degraded.is_none() {
+        let last_record = cs.cat.as_ref().map_or(rp.cat_last_ms, |cat| cat.last_ms);
+        cs.degraded = clock_degradation(cleanup_utc, last_record);
+    }
+    rp.report.expiry_degraded = cs.degraded.clone();
+    flags.expiry_degraded.store(cs.degraded.is_some(), Ordering::SeqCst);
+    cs.summaries.expire(cleanup_utc, config.summary_ms);
+    cs.recount_index_bytes();
     // A tombstone no other retained chunk holds a record of leaves the index at start (5.3).
     let mut tomb_candidates = HashSet::new();
     let tombs: Vec<Key> = committed
@@ -1388,7 +1507,7 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
         }
     }
     let keys = metadata.len() + cs.summaries.charged;
-    let committed_bytes = metadata.values().map(|m| m.bytes).sum();
+    let committed_bytes: usize = metadata.values().map(|m| m.bytes).sum();
     let mut dedup = rp.dedup;
     // Persisted timestamps are UTC. Once recovered, retry bounds use only local elapsed time.
     let retry_utc = clock.utc_ms();
@@ -1397,19 +1516,39 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
     for d in dedup.values_mut() {
         let remaining = config.retry_ms.saturating_sub(retry_utc.saturating_sub(d.at));
         d.until_mono = retry_mono.saturating_add(remaining);
+        if let Some(chunk) = cs.table.get_mut(&d.replayed_chunk) {
+            chunk.recovered_retry_until_mono = Some(chunk.recovered_retry_until_mono
+                .map_or(d.until_mono, |until| until.max(d.until_mono)));
+        }
     }
     let dedup_entries = dedup.len();
-    let dedup_bytes = dedup.keys().map(crate::store::dedup_charge).sum();
+    let dedup_bytes: usize = dedup.keys().map(crate::store::dedup_charge).sum();
     let mut expiry: Vec<_> = dedup.iter().map(|(k, d)| (k.clone(), d.until_mono)).collect();
     expiry.sort_by_key(|(_, at)| *at);
+    // Later failures describe the final projection, after tombstone/summary and
+    // retry cleanup, rather than the earlier replay snapshot.
+    rp.report.keys = keys;
+    rp.report.dedup_entries = dedup_entries;
+    rp.report.namespace_counts = namespace_counts.iter().map(|(k, v)| (k.clone(), *v)).collect();
+    // Expiry summaries own global slots too. Their current population is only
+    // known after cleanup observes UTC following publication.
+    if keys > config.index_cap
+        || committed_bytes + dedup_bytes + cs.index_bytes + config.memory_margin() > config.capacity
+    {
+        return Err(refuse(io::Error::other("replayed state exceeds configured limits"), rp.report.clone()));
+    }
     // Only control records need decoding into runtime state. Ordinary values stay on disk.
     let control: HashMap<_,_> = committed.iter().filter(|(k,_)| k.0 == timers::NS)
-        .map(|(k,v)| Ok((k.clone(), v.read(&k.0, &k.1)?))).collect::<io::Result<_>>()?;
-    let timers = timers::State::restore(&control)?;
+        .map(|(k,v)| Ok((k.clone(), v.read(&k.0, &k.1)?))).collect::<io::Result<_>>()
+        .map_err(|e| refuse(e, rp.report.clone()))?;
+    let timers = timers::State::restore(&control).map_err(|e| refuse(e, rp.report.clone()))?;
     let mut policies = chunks::Policies::default();
     for ((ns, key), v) in committed.iter() {
         if ns == chunks::POLICY_NS && !v.tombstone {
-            if let Some((pns, prefix, class)) = chunks::parse_policy(key, &v.read(ns, key)?.bytes) {
+            if let Some((pns, prefix, class)) = chunks::parse_policy(
+                key,
+                &v.read(ns, key).map_err(|e| refuse(e, rp.report.clone()))?.bytes,
+            ) {
                 policies.set(&pns, &prefix, Some(class));
             }
         }
@@ -1440,12 +1579,6 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
     let mut report = rp.report;
     report.epoch = epoch;
     report.start_ms = start_ms;
-    report.dedup_entries = dedup_entries;
-    report.keys = keys;
-    report.namespace_counts = namespace_counts
-        .iter()
-        .map(|(k, v)| (k.clone(), *v))
-        .collect();
     Ok(Recovered {
         clock,
         start_mono_ms,

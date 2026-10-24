@@ -1,4 +1,11 @@
 //! Recovery rename barriers and the import's caller-scoped synthetic identity.
+#[path = "refusal_tests.rs"]
+mod refusal_tests;
+#[path = "control_refusal_tests.rs"]
+mod control_refusal_tests;
+#[cfg(windows)]
+#[path = "repair_refusal_tests.rs"]
+mod repair_refusal_tests;
 use super::*;
 use crate::{now_ms, Store};
 use std::sync::{atomic::AtomicU64, Mutex};
@@ -718,6 +725,10 @@ fn pending_report_directory_failure_preserves_both_torn_inputs_and_epoch() {
             replay_report_dir_sync: Some(Arc::new(move |dir| {
                 assert_eq!(dir, root);
                 let json = fs::read_to_string(root.join("replay.json"))?;
+                if json.contains("\"stage\":\"refused\"") {
+                    assert!(json.contains("\"ready_ms\":0"));
+                    return Ok(());
+                }
                 assert!(json.contains("\"stage\":\"truncation_pending\""));
                 assert!(json.contains("\"ready_ms\":0"));
                 let mut calls = observed.lock().unwrap();
@@ -751,7 +762,12 @@ fn ready_report_failure_releases_all_worker_config_owners_before_returning() {
             tick_ms: 3_600_000,
             replay_report_dir_sync: Some(Arc::new(move |dir| {
                 assert_eq!(dir, root);
-                assert!(fs::read_to_string(root.join("replay.json"))?.contains("\"stage\":\"ready\""));
+                let json = fs::read_to_string(root.join("replay.json"))?;
+                if json.contains("\"stage\":\"refused\"") {
+                    assert!(json.contains("\"ready_ms\":0"));
+                    return Ok(());
+                }
+                assert!(json.contains("\"stage\":\"ready\""));
                 if observed.fetch_add(1, Ordering::SeqCst) + 1 == stop {
                     Err(io::Error::from_raw_os_error(5))
                 } else {

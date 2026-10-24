@@ -116,6 +116,8 @@ impl ChunkRouter {
     ) -> io::Result<OpenChunk> {
         let mut cs = self.chunks.lock().unwrap();
         let id = cs.next_id;
+        let next_id = id.checked_add(1)
+            .ok_or_else(|| io::Error::other("chunk identifier exhausted"))?;
         let path = chunks::chunk_path(&cs.dir, class, stripe, id);
         let now = self.clock.utc_ms();
         // The open record is flushed before the file exists, so a crash leaves at most a record with no file.
@@ -129,7 +131,7 @@ impl ChunkRouter {
                 next: self.next.load(Ordering::SeqCst),
             },
         )?;
-        cs.next_id += 1;
+        cs.next_id = next_id;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -150,6 +152,7 @@ impl ChunkRouter {
                 open_ms: now,
                 close_ms: None,
                 close_mono: None,
+                recovered_retry_until_mono: None,
                 bytes: 0,
                 path,
                 state: chunks::ChunkState::Open,

@@ -1,6 +1,8 @@
 //! CR3 (docs/CHUNK-RETIREMENT.md section 10): HEALTH2 and the heartbeat fields. Test T9 of section 7.
 use membus::*;
 use std::{collections::HashMap, path::PathBuf};
+#[path = "support/writer_progress.rs"]
+mod writer_progress;
 fn path(label: &str) -> PathBuf {
     let p = std::env::var("MEMBUS_TEST_OUTPUT").unwrap_or_else(|_| ".test-output".into());
     PathBuf::from(p).join(format!("{label}-{}-{}", std::process::id(), now_ms()))
@@ -144,19 +146,34 @@ fn t9_health2_alongside_writers_that_open_chunks() {
         })
     };
     let (done, finished) = mpsc::channel();
+    let started = std::time::Instant::now();
     let writers: Vec<_> = (0..4)
         .map(|w| {
             let (s, done) = (s.clone(), done.clone());
             std::thread::spawn(move || {
                 for i in 0..300 {
                     assert_eq!(s.mutate(put(&format!("w{w}/{i}"), &format!("w{w}-{i}"))).code, 0);
+                    done.send((w, i + 1, started.elapsed())).unwrap();
                 }
-                done.send(()).unwrap();
             })
         })
         .collect();
-    for _ in 0..4 {
-        finished.recv_timeout(std::time::Duration::from_secs(60)).expect("writers stalled beside HEALTH2");
+    drop(done);
+    let mut progress = writer_progress::WriterProgress::new(4, 300, std::time::Duration::from_secs(60));
+    loop {
+        // Use actual completion timestamps, draining queued observations before evaluating staleness.
+        while let Ok((writer, completed, at)) = finished.try_recv() {
+            progress.record(writer, completed, at);
+        }
+        let wait = match progress.remaining(started.elapsed()) {
+            Ok(None) => break,
+            Ok(Some(wait)) => wait,
+            Err(writer) => panic!("writer {writer} stalled beside HEALTH2: {progress:?}"),
+        };
+        match finished.recv_timeout(wait) {
+            Ok((writer, completed, at)) => progress.record(writer, completed, at),
+            Err(error) => panic!("writers stalled beside HEALTH2: {error:?}; {progress:?}"),
+        }
     }
     stop.store(true, Ordering::SeqCst);
     let reads = reader.join().unwrap();

@@ -55,10 +55,19 @@ impl Server {
             .stderr(stderr)
             .creation_flags(0x08000000);
         let owner = child::Owned::spawn(&mut command).unwrap();
-        Self {
-            owner,
-            stopped: false,
+        let mut server = Self { owner, stopped: false };
+        let startup_until = Instant::now() + Duration::from_secs(60);
+        loop {
+            let log = fs::read_to_string(root.join(format!("server-{generation}.stderr")))
+                .unwrap_or_default();
+            if owns_ready_line(&log, server.owner.child.id()) { break; }
+            if let Some(status) = server.owner.child.try_wait().unwrap() {
+                panic!("resident exited before fixture readiness: {status}: {log}");
+            }
+            assert!(Instant::now() < startup_until, "fixture startup readiness deadline: {log}");
+            std::thread::sleep(Duration::from_millis(20));
         }
+        server
     }
     fn stop(&mut self) {
         if self.stopped {
@@ -72,6 +81,12 @@ impl Server {
         );
     }
 }
+fn owns_ready_line(log: &str, pid: u32) -> bool {
+    let identity = format!("pid={pid}");
+    log.lines().any(|line| line.starts_with("ready epoch=")
+        && line.split_whitespace().any(|field| field == identity))
+}
+
 impl Drop for Server {
     fn drop(&mut self) {
         self.stop();
@@ -309,7 +324,7 @@ fn actual_resident_legacy_reads_os_flush_put_cas_pending_timeout_and_restart() {
         r"\\.\pipe\membus-client-owned-{}-{stamp}",
         std::process::id()
     );
-    let mut server = Server::start(&root, &pipe, 200, 1);
+    let mut server = Server::start(&root, &pipe, 600, 1);
     let mut c = connect(&pipe);
     let epoch = c.negotiated().epoch;
     assert_eq!(c.negotiated().refusals.len(), 19);
@@ -390,7 +405,7 @@ fn actual_resident_legacy_reads_os_flush_put_cas_pending_timeout_and_restart() {
             .count(),
         1
     );
-    // Timeout after the physical write is uncertain; only an explicit same-token retry follows.
+    // A timed-out attempt is uncertain; only an explicit same-token retry follows.
     let mut a = c
         .prepare(mutation(
             "physical-uncertain",
@@ -404,9 +419,11 @@ fn actual_resident_legacy_reads_os_flush_put_cas_pending_timeout_and_restart() {
         Err(Error::Uncertain { .. })
     ));
     assert!(!c.is_usable());
-    std::thread::sleep(Duration::from_millis(300));
     drop(c);
     let mut c = connect(&pipe);
+    // Waiting for the retained retry result handles both a pending original
+    // admission and an attempt that never reached admission. A fixed sleep cannot.
+    let completed = c.mutate(&mut a, d(2000)).unwrap();
     let reconciled = c
         .get(
             "rust-client-owned",
@@ -417,10 +434,7 @@ fn actual_resident_legacy_reads_os_flush_put_cas_pending_timeout_and_restart() {
         .unwrap()
         .unwrap();
     assert_eq!(reconciled.bytes, b"physical-uncertain");
-    assert_eq!(
-        c.mutate(&mut a, d(2000)).unwrap().version,
-        reconciled.version
-    );
+    assert_eq!(completed.version, reconciled.version);
     drop(c);
     server.stop();
     let mut restarted = Server::start(&root, &pipe, 0, 2);

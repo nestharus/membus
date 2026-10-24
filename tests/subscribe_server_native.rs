@@ -718,7 +718,10 @@ fn complete_private_subscription_server_encounters() {
         deadline(),
     )
     .unwrap();
-    let payload = vec![b'z'; 262144];
+    let seed_bytes = usize::try_from(limits.subscription_bytes / 31)
+        .unwrap().checked_sub(512).unwrap();
+    assert!(seed_bytes > 262144 && seed_bytes <= membus::MAX_VALUE);
+    let payload = vec![b'z'; seed_bytes];
     // A successful, bounded retained catch-up seeds nearly the entire admitted
     // queue before the live write. This exposes byte-budget overflow without
     // pretending that a timed-out delivery alone proves that limit was reached.
@@ -741,8 +744,14 @@ fn complete_private_subscription_server_encounters() {
     );
     overflow_pipe.connect_until(deadline().local).unwrap();
     let seeded = status(&mut c, &overflow, |x| x.active && x.queued >= 30);
-    assert!(seeded.charged_bytes >= 30 * 262144);
+    assert!(seeded.charged_bytes >= 30 * seed_bytes as u64);
     assert!(seeded.charged_bytes <= limits.subscription_bytes);
+    // Cross the remaining byte allowance with a small live mutation. Encoding
+    // and hashing another large value can consume the unread endpoint's write
+    // deadline before overflow, testing endpoint failure instead of this limit.
+    let headroom = limits.subscription_bytes - seeded.charged_bytes;
+    assert!(headroom < 16384, "catch-up did not fill the byte allowance");
+    let spill = vec![b'z'; usize::try_from(headroom).unwrap() + 1];
     let mut max_queued = seeded.queued;
     let mut max_charge = seeded.charged_bytes;
     let mut last_overflow = 0;
@@ -751,7 +760,7 @@ fn complete_private_subscription_server_encounters() {
             &mut c,
             "quota",
             "overflow/k",
-            &payload,
+            &spill,
             &format!("overflow-{i:02}"),
         )
         .version;
@@ -832,7 +841,7 @@ fn complete_private_subscription_server_encounters() {
         CommittedValue {
             version: last_overflow,
             ack: Ack::Os,
-            bytes: payload.clone(),
+            bytes: spill.clone(),
         }
     );
     assert_eq!(

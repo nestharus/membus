@@ -141,7 +141,10 @@
         clock.advance(2);s.tick();
         let file=s.chunks.lock().unwrap().table.values().find(|c|c.class==Class::expire(DAY)).unwrap().path.clone();
         let held=OpenOptions::new().read(true).share_mode(3).open(&file).unwrap();
-        clock.advance(DAY);let original=clock.utc_ms();s.retirement_pass();
+        clock.advance(DAY);s.retirement_pass();
+        assert_eq!(s.retire_blocked(),0);assert_eq!(s.get_status("summary","k").0,0);
+        // Retry remains inclusive at the boundary; the blocked-retirement witness starts after it.
+        clock.advance(1);let original=clock.utc_ms();s.retirement_pass();
         assert_eq!(s.retire_blocked(),1);assert_eq!(s.get_status("summary","k"),(1,0));
         clock.advance(3_600_000);s.maint.rewrite_catalogue();
         let records=chunks::read_catalogue(&path.join("chunks/catalogue.log")).unwrap().0;

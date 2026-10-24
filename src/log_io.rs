@@ -11,6 +11,50 @@ use std::io;
 use std::io::Write;
 use std::path::Path;
 
+#[cfg(test)]
+mod state_directory_tests;
+
+/// Cover state-directory names before ownership and replay. Repeat the nearest
+/// existing name's parent barrier: it may be left by an earlier failed mkdir sync.
+pub(super) fn prepare_state_directory(path: &Path, config: &Config) -> io::Result<()> {
+    let absolute = std::path::absolute(path)?;
+    let mut missing = Vec::new();
+    let mut existing = absolute.as_path();
+    loop {
+        match std::fs::metadata(existing) {
+            Ok(meta) if meta.is_dir() => break,
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "state directory is a file",
+                ));
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                missing.push(existing);
+                existing = existing.parent().ok_or(e)?;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    let sync_parent = |directory: &Path| -> io::Result<()> {
+        if let Some(parent) = directory.parent() {
+            #[cfg(test)]
+            if let Some(hook) = &config.state_dir_sync {
+                hook(parent)?;
+            }
+            sync_dir(parent)?;
+        }
+        Ok(())
+    };
+    let _ = config;
+    sync_parent(existing)?;
+    for directory in missing.into_iter().rev() {
+        std::fs::create_dir_all(directory)?;
+        sync_parent(directory)?;
+    }
+    Ok(())
+}
+
 pub(super) fn sync_chunk_directory(path: &Path, _config: &Config) -> io::Result<()> {
     #[cfg(test)]
     if let Some(hook) = &_config.chunk_dir_sync { hook(path)?; }

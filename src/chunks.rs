@@ -91,14 +91,23 @@ impl ManualClock {
     pub fn new(utc_ms: u64) -> Arc<Self> {
         Arc::new(Self { utc: AtomicU64::new(utc_ms), mono: AtomicU64::new(0) })
     }
+    fn update(field: &AtomicU64, f: impl Fn(u64) -> u64) {
+        let mut current = field.load(Ordering::SeqCst);
+        loop {
+            match field.compare_exchange_weak(current, f(current), Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+    /// Advance both counters, saturating each at the representable limit.
     pub fn advance(&self, ms: u64) {
-        self.utc.fetch_add(ms, Ordering::SeqCst);
-        self.mono.fetch_add(ms, Ordering::SeqCst);
+        Self::update(&self.utc, |now| now.saturating_add(ms));
+        Self::update(&self.mono, |now| now.saturating_add(ms));
     }
     /// A wall-clock correction with no elapsed time.
     pub fn jump_utc(&self, delta_ms: i64) {
-        let now = self.utc.load(Ordering::SeqCst);
-        self.utc.store(now.saturating_add_signed(delta_ms), Ordering::SeqCst);
+        Self::update(&self.utc, |now| now.saturating_add_signed(delta_ms));
     }
     pub fn utc_ms(&self) -> u64 {
         self.utc.load(Ordering::SeqCst)
@@ -910,8 +919,9 @@ impl Catalogue {
         { self.rewrites += 1; }
         Ok(())
     }
+    /// Repair a fence regardless of the size trigger; zero disables ordinary compaction only.
     pub fn needs_rewrite(&self, threshold: u64) -> bool {
-        threshold > 0 && (self.fenced || self.bytes.saturating_sub(self.rewrite_base_bytes) > threshold)
+        self.fenced || (threshold > 0 && self.bytes.saturating_sub(self.rewrite_base_bytes) > threshold)
     }
 }
 
@@ -934,11 +944,14 @@ pub struct ChunkInfo {
     pub close_ms: Option<u64>,
     /// Monotonic close time when the chunk closed in this run.
     pub close_mono: Option<u64>,
+    /// Latest inclusive local cutoff of outcomes recovered from this chunk; not persisted.
+    pub recovered_retry_until_mono: Option<u64>,
     pub bytes: u64,
     pub path: PathBuf,
     pub state: ChunkState,
     /// Each key with records here: (lowest, highest) version held.
     pub keys: HashMap<Key, (u64, u64)>,
+    /// Monotonic start of this process's observed delete blockage; not persisted.
     pub blocked_since: Option<u64>,
     pub horizons: Vec<(String, String, u64)>,
     pub expired: Vec<Key>,
@@ -952,6 +965,7 @@ pub fn chunk_path(dir: &Path, class: Class, stripe: usize, seq: u64) -> PathBuf 
 /// What a start found and did, written as state/replay.json and a line of state/replay.log.
 #[derive(Default, Debug, Clone)]
 pub struct ReplayReport {
+    /// Validated attempted epoch; zero when validation failed. Non-ready stages do not prove publication.
     pub epoch: u64,
     pub start_ms: u64,
     pub ready_ms: u64,
@@ -1654,6 +1668,29 @@ mod catalogue_failure_tests {
         let mut reopened = Catalogue::open(&path).unwrap();
         reopened.append(&record(3)).unwrap();
         assert_eq!(read_catalogue(&path).unwrap(), (vec![record(1), record(3)], None));
+    }
+    #[test]
+    fn zero_threshold_still_requests_repair_of_an_unresolved_append() {
+        let mut c = catalogue("zero-threshold-fence");
+        c.append(&record(1)).unwrap();
+        c.fail_sync_once = true;
+        c.fail_recovery_once = true;
+        assert!(c.append(&record(2)).is_err());
+        assert!(c.needs_rewrite(0), "disabling size compaction cannot disable fence repair");
+        c.rewrite(&[record(1)]).unwrap();
+        assert!(!c.needs_rewrite(0));
+        c.append(&record(3)).unwrap();
+        assert!(!c.needs_rewrite(0));
+        assert_eq!(read_catalogue(&c.path).unwrap(), (vec![record(1), record(3)], None));
+    }
+    #[test]
+    fn zero_threshold_keeps_unfenced_catalogue_growth_uncompacted() {
+        let mut c = catalogue("zero-threshold-growth");
+        c.append(&record(1)).unwrap();
+        c.append(&record(2)).unwrap();
+        assert!(!c.needs_rewrite(0));
+        assert!(!c.needs_rewrite(c.bytes));
+        assert!(c.needs_rewrite(c.bytes - 1));
     }
     #[test]
     fn incomplete_marker_never_authorizes_replay_or_overwrite() {

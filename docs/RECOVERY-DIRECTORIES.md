@@ -1,5 +1,26 @@
 # Recovery directory durability
 
+## State directory creation
+
+Before opening the owner lock or starting replay, startup finds the nearest
+existing directory in the requested state path. It synchronizes that directory's
+parent, then creates each missing descendant in order, synchronizing its parent
+before creating the next descendant. The existing-name barrier also runs when
+the state directory already exists: a previous failed attempt may have created
+that name without completing its parent barrier. A filesystem root has no parent
+entry to synchronize. Relative paths are resolved against the current directory.
+
+A failed barrier returns the original I/O error before ownership, migration,
+repair, epoch publication or worker creation. Already created directories remain;
+the next attempt repeats the last uncovered name's barrier before continuing.
+There is no refusal-report write before ownership. An existing report remains a
+historical observation, not evidence that this attempt opened a Store. Startup
+requires access to synchronize the containing directory, including for an
+already-existing state directory. This does not synchronize every ancestor of a
+preexisting caller-provided directory tree.
+
+## Recovery publication
+
 Recovery synchronizes each rename's containing directory before performing the
 next dependent step. Synchronizing a file alone is not a directory publication
 barrier.

@@ -20,6 +20,8 @@ use std::time::Duration;
 
 #[cfg(test)]
 mod directory_tests;
+#[cfg(test)]
+mod clock_tests;
 
 /// Retirement, expiry summaries, tombstone drops and the clock check (5.3, 5.4), shared with the tick thread.
 pub(super) struct Maint {
@@ -61,16 +63,25 @@ impl Maint {
                 }
                 let expire = forced.is_none() && c.class.kind == 2;
                 if forced.is_none() {
+                    // Recorded close UTC can precede an admission after a wall
+                    // correction. Preserve every still-retryable recovered outcome.
+                    if c.recovered_retry_until_mono.is_some_and(|until| mono <= until) {
+                        continue;
+                    }
                     let window = match c.class.kind {
                         1 => self.config.retry_ms,
                         2 => c.class.retention_ms,
                         _ => continue,
                     };
                     let Some(close) = c.close_ms else { continue };
-                    // Never earlier than both clocks allow: UTC close time, and monotonic time within this run.
-                    if utc < close.saturating_add(window)
-                        || c.close_mono
-                            .is_some_and(|m| mono.saturating_sub(m) < window)
+                    // Retention may be due at equality, but retry outcomes remain
+                    // valid through their inclusive horizon. Require both clocks
+                    // to pass it; subtract ages so a large UTC cannot saturate an
+                    // unelapsed window into eligibility after recovery.
+                    let allows = |now: u64, closed: u64| now.checked_sub(closed)
+                        .is_some_and(|age| age >= window && age > self.config.retry_ms);
+                    if !allows(utc, close)
+                        || c.close_mono.is_some_and(|m| !allows(mono, m))
                     {
                         continue;
                     }
@@ -165,7 +176,7 @@ impl Maint {
                             .get_mut(&id)
                             .unwrap()
                             .blocked_since
-                            .get_or_insert(utc);
+                            .get_or_insert(self.clock.mono_ms());
                         continue;
                     }
                 }
@@ -224,7 +235,11 @@ impl Maint {
             match fs::remove_file(&p) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(_) => continue,
+                Err(_) => {
+                    cs.table.get_mut(&id).unwrap().blocked_since
+                        .get_or_insert(self.clock.mono_ms());
+                    continue;
+                }
             }
             if let Err(e) = sync_chunk_directory(p.parent().unwrap(), &self.config) {
                 self.flags.storage_error.store(true, Ordering::SeqCst);
@@ -322,7 +337,13 @@ impl Maint {
         let stable = cs
             .stable_since
             .is_some_and(|(_, m)| mono.saturating_sub(m) >= self.config.rotation_ms);
-        if cs.degraded.is_some() && (resume || stable) && cs.log(utc, chunks::Rec::Resume).is_ok() {
+        if cs.degraded.is_some() && (resume || stable) {
+            if cs.log(utc, chunks::Rec::Resume).is_err() {
+                self.flags.storage_error.store(true, Ordering::SeqCst);
+                // Preserve an explicit request until Resume is published. A
+                // later tick can retry after the catalogue becomes writable.
+                return;
+            }
             cs.degraded = None;
             self.flags.expiry_degraded.store(false, Ordering::SeqCst);
         }

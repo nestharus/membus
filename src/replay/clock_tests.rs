@@ -1,4 +1,26 @@
 //! Deterministic recovery and runtime clock witnesses; fixtures use authored MBK1 records.
+#[path = "catalogue_lifecycle_tests.rs"]
+mod catalogue_lifecycle_tests;
+#[path = "counter_tests.rs"]
+mod counter_tests;
+#[path = "summary_admission_tests.rs"]
+mod summary_admission_tests;
+#[path = "ready_refusal_tests.rs"]
+mod ready_refusal_tests;
+#[path = "pending_refusal_tests.rs"]
+mod pending_refusal_tests;
+#[path = "import_retry_tests.rs"]
+mod import_retry_tests;
+#[path = "clock_arithmetic_tests.rs"]
+mod clock_arithmetic_tests;
+#[path = "report_epoch_tests.rs"]
+mod report_epoch_tests;
+#[path = "report_population_tests.rs"]
+mod report_population_tests;
+#[path = "summary_cleanup_clock_tests.rs"]
+mod summary_cleanup_clock_tests;
+#[path = "recovery_clock_safety_tests.rs"]
+mod recovery_clock_safety_tests;
 use super::*;
 use crate::*;
 use std::sync::atomic::AtomicU64;

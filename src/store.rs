@@ -37,6 +37,8 @@ pub(super) struct Dedup {
     pub(super) at: u64,
     /// Local retry cutoff. Recovery derives remaining time from the recorded UTC age once.
     pub(super) until_mono: u64,
+    /// Source chunk during replay; zero for local admission or legacy-only outcomes.
+    pub(super) replayed_chunk: u64,
     pub(super) outcome: Option<Outcome>,
 }
 pub(super) struct State {
@@ -105,7 +107,7 @@ pub(super) type Key = (String, String);
 // One latest-key index, ordered so capture can seek directly to a namespace.
 pub(super) type Committed = BTreeMap<Key, Arc<crate::value_disk::Entry>>;
 pub(super) fn index_charge(k: &Key) -> usize { 512 + 4 * (k.0.len() + k.1.len()) }
-pub(super) fn dedup_charge(k: &Key) -> usize { 256 + 3 * (k.0.len() + k.1.len()) }
+pub(super) fn dedup_charge(k: &Key) -> usize { 264 + 3 * (k.0.len() + k.1.len()) }
 struct ColdReader<'a>(&'a (std::sync::Mutex<usize>, std::sync::Condvar));
 impl Drop for ColdReader<'_> {
     fn drop(&mut self) { *self.0.0.lock().unwrap() -= 1; self.0.1.notify_one(); }
@@ -263,6 +265,7 @@ impl Store {
         let state = self.state.lock().unwrap();
         let cs = self.chunks.lock().unwrap();
         let utc = self.maint.clock.utc_ms();
+        let mono = self.maint.clock.mono_ms();
         let c = &self.config;
         let mut h = Health2 {
             cache: self.cache.stats(),
@@ -316,7 +319,11 @@ impl Store {
                 h.chunks_closed += 1;
                 let due = chunk
                     .close_ms
-                    .is_some_and(|close| utc >= close.saturating_add(c.retry_ms));
+                    .and_then(|close| utc.checked_sub(close))
+                    .is_some_and(|age| age > c.retry_ms)
+                    && chunk.close_mono.is_none_or(|close| mono.checked_sub(close)
+                        .is_some_and(|age| age > c.retry_ms))
+                    && chunk.recovered_retry_until_mono.is_none_or(|until| mono > until);
                 if chunk.class.kind == 1
                     && due
                     && chunk
@@ -334,7 +341,7 @@ impl Store {
         }
         h.retained_bytes = by_class.into_iter().collect();
         h.pinned_high_water = h.pinned_bytes >= c.pinned_high_water_bytes;
-        h.retire_blocked_oldest_ms = oldest_blocked.map_or(0, |since| utc.saturating_sub(since));
+        h.retire_blocked_oldest_ms = oldest_blocked.map_or(0, |since| mono.saturating_sub(since));
         h.retire_blocked_high_water = h.retire_blocked_oldest_ms > 3_600_000;
         h
     }
@@ -706,7 +713,9 @@ impl Store {
             return Outcome::error(5);
         }
         let version = state.next;
-        state.next += 1;
+        // Each assigned revision must leave a representable persisted successor.
+        let Some(next) = version.checked_add(1) else { return Outcome::error(7) };
+        state.next = next;
         self.next_issued.fetch_max(state.next, Ordering::SeqCst);
         let value = Value {
             version,
@@ -745,6 +754,7 @@ impl Store {
                     fingerprint: fp,
                     at,
                     until_mono,
+                    replayed_chunk: chunks::LEGACY_CHUNK,
                     outcome: None,
                 },
             );
