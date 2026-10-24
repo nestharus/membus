@@ -5,8 +5,6 @@ use crate::store::Flags;
 use crate::store::Key;
 use crate::store::State;
 use crate::Config;
-use crate::value_disk::Entry;
-use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
 use std::io;
@@ -23,7 +21,7 @@ use std::time::Duration;
 pub(super) struct Maint {
     pub(super) cache: Arc<crate::cache::Cache>,
     pub(super) state: Arc<Mutex<State>>,
-    pub(super) committed: Arc<RwLock<HashMap<Key, Arc<Entry>>>>,
+    pub(super) committed: Arc<RwLock<crate::store::Committed>>,
     pub(super) chunks: Arc<Mutex<chunks::ChunkStore>>,
     pub(super) router: Arc<ChunkRouter>,
     pub(super) flags: Arc<Flags>,

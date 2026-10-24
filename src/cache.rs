@@ -1,15 +1,16 @@
 //! Sharded weighted LRU. The wheel owns one expiry link per resident version.
 use crate::{chunks::Clock, Class, Config, Value};
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard,
     },
 };
 const SHARDS: usize = 16;
 const SLOTS: usize = 256;
 const TICK: u64 = 10;
+const LOAD_GATES: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CachePolicy {
@@ -118,6 +119,8 @@ pub struct CacheStats {
     pub hits: u64,
     pub misses: u64,
     pub cold_reads: u64,
+    /// Initial misses satisfied by another loader's admitted immutable value.
+    pub coalesced_reads: u64,
     pub evicted_budget: u64,
     pub evicted_expired: u64,
     pub evicted_replaced: u64,
@@ -126,7 +129,7 @@ pub struct CacheStats {
 }
 struct Resident {
     value: Arc<Value>,
-    label: String,
+    label: Arc<str>,
     policy: CachePolicy,
     initial: bool,
     deadline: u64,
@@ -135,22 +138,50 @@ struct Resident {
 }
 struct Shard {
     entries: HashMap<u64, Resident>,
+    // Updated with admission/removal under this shard's lock. Residents share
+    // their label allocation with this map; zero-count rows are removed.
+    residency: BTreeMap<Arc<str>, (usize, usize)>,
     lru: BTreeSet<(u64, u64)>,
     wheel: Vec<HashSet<u64>>,
+    // A conservative lower bound per bucket. Removal may leave an earlier
+    // bound until the next scan; it must never hide an earlier inserted lease.
+    earliest: [u64; SLOTS],
     tick: u64,
     sequence: u64,
     bytes: usize,
+    total_bytes: Arc<AtomicUsize>,
     evictions: [u64; 4],
+    #[cfg(test)]
+    expiry_visits: usize,
 }
 fn slot(deadline: u64) -> usize {
     (deadline / TICK % SLOTS as u64) as usize
 }
 impl Shard {
+    fn link(&mut self, id: u64, deadline: u64) {
+        let bucket = slot(deadline);
+        self.wheel[bucket].insert(id);
+        self.earliest[bucket] = self.earliest[bucket].min(deadline);
+    }
+    fn unlink(&mut self, id: u64, deadline: u64) {
+        let bucket = slot(deadline);
+        self.wheel[bucket].remove(&id);
+        if self.wheel[bucket].is_empty() {
+            self.earliest[bucket] = u64::MAX;
+        }
+    }
     fn remove(&mut self, id: u64, reason: usize) {
         if let Some(r) = self.entries.remove(&id) {
             self.bytes -= r.charge;
+            let class = self.residency.get_mut(r.label.as_ref()).unwrap();
+            class.0 -= r.charge;
+            class.1 -= 1;
+            if class.1 == 0 {
+                self.residency.remove(r.label.as_ref());
+            }
+            self.total_bytes.fetch_sub(r.charge, Ordering::AcqRel);
             self.lru.remove(&(r.touch, id));
-            self.wheel[slot(r.deadline)].remove(&id);
+            self.unlink(id, r.deadline);
             self.evictions[reason] += 1;
         }
     }
@@ -159,12 +190,26 @@ impl Shard {
         let steps = current.saturating_sub(self.tick).min(SLOTS as u64);
         for step in 0..=steps {
             let bucket = ((self.tick + step) % SLOTS as u64) as usize;
+            if self.earliest[bucket] > now {
+                continue;
+            }
+            #[cfg(test)]
+            { self.expiry_visits += self.wheel[bucket].len(); }
             // Long leases may circle the wheel; each link remains in its bucket.
+            let mut earliest = u64::MAX;
             let due: Vec<_> = self.wheel[bucket]
                 .iter()
                 .copied()
-                .filter(|id| self.entries.get(id).is_some_and(|r| r.deadline <= now))
+                .filter(|id| self.entries.get(id).is_some_and(|r| {
+                    if r.deadline <= now {
+                        true
+                    } else {
+                        earliest = earliest.min(r.deadline);
+                        false
+                    }
+                }))
                 .collect();
+            self.earliest[bucket] = earliest;
             for id in due {
                 self.remove(id, 1);
             }
@@ -191,35 +236,53 @@ impl Shard {
 }
 pub(crate) struct Cache {
     shards: Vec<Mutex<Shard>>,
+    // Fixed stripes avoid a per-key coordination map that grows with traffic.
+    // Hot hits never acquire a load gate, and no cache shard lock spans I/O.
+    load_gates: [Mutex<()>; LOAD_GATES],
     clock: Clock,
     max: usize,
+    // Only admissions, allowance changes and statistics take this lock. Hits
+    // and invalidations retain their independent shard locking.
+    admission: Mutex<()>,
+    resident_bytes: Arc<AtomicUsize>,
     limit: AtomicUsize,
     hits: AtomicU64,
     misses: AtomicU64,
     cold_reads: AtomicU64,
+    coalesced_reads: AtomicU64,
 }
 impl Cache {
     pub fn new(config: &Config, clock: Clock) -> Self {
+        let resident_bytes = Arc::new(AtomicUsize::new(0));
         Self {
             shards: (0..SHARDS)
                 .map(|_| {
                     Mutex::new(Shard {
                         entries: HashMap::new(),
+                        residency: BTreeMap::new(),
                         lru: BTreeSet::new(),
                         wheel: (0..SLOTS).map(|_| HashSet::new()).collect(),
+                        earliest: [u64::MAX; SLOTS],
                         tick: clock.mono_ms() / TICK,
                         sequence: 0,
                         bytes: 0,
+                        total_bytes: resident_bytes.clone(),
                         evictions: [0; 4],
+                        #[cfg(test)]
+                        expiry_visits: 0,
                     })
                 })
                 .collect(),
+            load_gates: std::array::from_fn(|_| Mutex::new(())),
             clock,
             max: config.cache_bytes,
+            admission: Mutex::new(()),
+            resident_bytes,
             limit: AtomicUsize::new(0),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             cold_reads: AtomicU64::new(0),
+            coalesced_reads: AtomicU64::new(0),
         }
     }
     pub fn policy(config: &Config, ns: &str, key: &str, class: Class) -> (String, CachePolicy) {
@@ -237,7 +300,20 @@ impl Cache {
                 |r| (r.label.clone(), r.policy),
             )
     }
+    pub(super) fn value_charge(capacity: usize, label: &str) -> usize {
+        capacity + label.len() + 384
+    }
     pub fn get(&self, id: u64) -> Option<Arc<Value>> {
+        self.lookup(id, false)
+    }
+    pub fn load_guard(&self, id: u64) -> MutexGuard<'_, ()> {
+        self.load_gates[id as usize % LOAD_GATES].lock().unwrap()
+    }
+    /// A recheck preserves one initial hit/miss observation per read attempt.
+    pub fn after_miss(&self, id: u64) -> Option<Arc<Value>> {
+        self.lookup(id, true)
+    }
+    fn lookup(&self, id: u64, after_miss: bool) -> Option<Arc<Value>> {
         let now = self.clock.mono_ms();
         let mut s = self.shards[id as usize % SHARDS].lock().unwrap();
         s.expire(now);
@@ -247,20 +323,26 @@ impl Cache {
         if let Some(mut r) = s.entries.remove(&id) {
             s.lru.remove(&(r.touch, id));
             if r.initial && r.policy.refresh_on_read && !r.policy.never_cache {
-                s.wheel[slot(r.deadline)].remove(&id);
+                s.unlink(id, r.deadline);
                 r.deadline = now.saturating_add(r.policy.active_ttl);
                 r.initial = false;
-                s.wheel[slot(r.deadline)].insert(id);
+                s.link(id, r.deadline);
             }
             s.sequence += 1;
             r.touch = s.sequence;
             s.lru.insert((r.touch, id));
             let value = r.value.clone();
             s.entries.insert(id, r);
-            self.hits.fetch_add(1, Ordering::Relaxed);
+            if after_miss {
+                self.coalesced_reads.fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+            }
             Some(value)
         } else {
-            self.misses.fetch_add(1, Ordering::Relaxed);
+            if !after_miss {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+            }
             None
         }
     }
@@ -284,24 +366,47 @@ impl Cache {
         if ttl == 0 || (!initial && policy.never_cache) || value.tombstone {
             return;
         }
-        let now = self.clock.mono_ms();
-        let id = value.version;
-        let mut s = self.shards[id as usize % SHARDS].lock().unwrap();
-        s.expire(now);
-        // Retirement/replacement clears eligibility before removing under this same shard lock.
-        if !eligible.load(Ordering::Acquire) {
-            return;
-        }
-        // A racing cold reader must not reset an existing lease.
-        if s.entries.contains_key(&id) {
-            return;
-        }
-        let charge = value.bytes.capacity() + label.len() + 384;
-        let limit = limit.min(self.limit.load(Ordering::Acquire)).min(self.max) / SHARDS;
+        let charge = Self::value_charge(value.bytes.capacity(), &label);
+        // These fixed ceilings cannot be raised by concurrent maintenance.
+        // A value that cannot fit need not wait for unrelated admission work.
+        let limit = limit.min(self.max);
         if charge > limit {
             return;
         }
-        s.trim(limit - charge);
+        let _admission = self.admission.lock().unwrap();
+        let limit = limit.min(self.limit.load(Ordering::Acquire));
+        if charge > limit {
+            return;
+        }
+        let now = self.clock.mono_ms();
+        let id = value.version;
+        let shard = id as usize % SHARDS;
+        {
+            let mut s = self.shards[shard].lock().unwrap();
+            s.expire(now);
+            if !eligible.load(Ordering::Acquire) || s.entries.contains_key(&id) {
+                return;
+            }
+        }
+        let available = limit - charge;
+        if self.resident_bytes.load(Ordering::Acquire) > available {
+            // Expired capacity in another shard takes precedence over live LRU
+            // eviction. No shard lock is held while another shard is acquired.
+            self.sweep();
+            self.evict_to(available, shard);
+        }
+        let mut s = self.shards[shard].lock().unwrap();
+        // Retirement/replacement can run during pressure reclamation. Recheck
+        // under the same shard lock used by invalidation before publishing.
+        if !eligible.load(Ordering::Acquire) {
+            return;
+        }
+        let label = s.residency.get_key_value(label.as_str())
+            .map(|(existing, _)| existing.clone())
+            .unwrap_or_else(|| Arc::<str>::from(label.as_str()));
+        let class = s.residency.entry(label.clone()).or_default();
+        class.0 += charge;
+        class.1 += 1;
         s.sequence += 1;
         let r = Resident {
             value,
@@ -313,7 +418,8 @@ impl Cache {
             charge,
         };
         s.bytes += charge;
-        s.wheel[slot(r.deadline)].insert(id);
+        self.resident_bytes.fetch_add(charge, Ordering::AcqRel);
+        s.link(id, r.deadline);
         s.lru.insert((r.touch, id));
         s.entries.insert(id, r);
     }
@@ -324,12 +430,32 @@ impl Cache {
             .remove(id, if retired { 3 } else { 2 });
     }
     pub fn trim(&self, limit: usize) {
-        self.limit.store(limit.min(self.max), Ordering::Release);
+        let _admission = self.admission.lock().unwrap();
+        let limit = limit.min(self.max);
+        self.limit.store(limit, Ordering::Release);
         for shard in &self.shards {
             let mut s = shard.lock().unwrap();
             s.expire(self.clock.mono_ms());
-            s.trim(limit.min(self.max) / SHARDS);
+            let bytes = s.bytes;
+            s.trim(bytes);
         }
+        self.evict_to(limit, 0);
+    }
+    /// Called with admission held; independent removals can only reduce usage.
+    fn evict_to(&self, limit: usize, first: usize) {
+        for offset in 0..SHARDS {
+            if self.resident_bytes.load(Ordering::Acquire) <= limit {
+                break;
+            }
+            let mut s = self.shards[(first + offset) % SHARDS].lock().unwrap();
+            let excess = self
+                .resident_bytes
+                .load(Ordering::Acquire)
+                .saturating_sub(limit);
+            let retained = s.bytes.saturating_sub(excess);
+            s.trim(retained);
+        }
+        debug_assert!(self.resident_bytes.load(Ordering::Acquire) <= limit);
     }
     pub fn sweep(&self) {
         for shard in &self.shards {
@@ -337,12 +463,15 @@ impl Cache {
         }
     }
     pub fn stats(&self) -> CacheStats {
+        // Keep allowance and summed shard charges coherent across admissions.
+        let _admission = self.admission.lock().unwrap();
         let mut stats = CacheStats {
             budget: self.max,
             limit: self.limit.load(Ordering::Acquire),
             hits: self.hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
             cold_reads: self.cold_reads.load(Ordering::Relaxed),
+            coalesced_reads: self.coalesced_reads.load(Ordering::Relaxed),
             ..CacheStats::default()
         };
         let mut classes = std::collections::BTreeMap::<String, (usize, usize)>::new();
@@ -355,10 +484,10 @@ impl Cache {
             stats.evicted_expired += s.evictions[1];
             stats.evicted_replaced += s.evictions[2];
             stats.evicted_retired += s.evictions[3];
-            for r in s.entries.values() {
-                let c = classes.entry(r.label.clone()).or_default();
-                c.0 += r.charge;
-                c.1 += 1;
+            for (label, (bytes, count)) in &s.residency {
+                let c = classes.entry(label.as_ref().to_owned()).or_default();
+                c.0 += bytes;
+                c.1 += count;
             }
         }
         stats.residency = classes.into_iter().map(|(k, (b, n))| (k, b, n)).collect();
@@ -367,12 +496,18 @@ impl Cache {
 }
 
 #[cfg(test)]
+mod expiry_bucket_tests;
+#[cfg(test)]
+mod residency_tests;
+#[cfg(test)]
+mod admission_tests;
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]
     fn lru_evicts_oldest_in_its_shard_and_keeps_one_wheel_link_per_entry() {
         let c = Config {
-            cache_bytes: 16 * 3 * (1024 + 384 + 1),
+            cache_bytes: 3 * (1024 + 384 + 1),
             ..Config::default()
         };
         let clock = crate::ManualClock::new(crate::now_ms());
@@ -443,5 +578,97 @@ mod tests {
         ] {
             assert!(bad.parse::<CacheRule>().is_err());
         }
+    }
+
+    #[test]
+    fn shared_allowance_shrink_and_parallel_admission_release_every_charge() {
+        let c = Config {
+            cache_bytes: 64 * 1024,
+            ..Config::default()
+        };
+        let cache = Cache::new(
+            &c,
+            Clock::new(Some(crate::ManualClock::new(crate::now_ms()))),
+        );
+        cache.trim(c.cache_bytes);
+        let add = |version| {
+            cache.insert(
+                Arc::new(Value {
+                    version,
+                    ack: 1,
+                    tombstone: false,
+                    bytes: vec![7; 8192],
+                }),
+                "x".into(),
+                CachePolicy::default(),
+                true,
+                c.cache_bytes,
+                &AtomicBool::new(true),
+            )
+        };
+        std::thread::scope(|scope| {
+            for thread in 0..4 {
+                let (cache, add) = (&cache, &add);
+                scope.spawn(move || {
+                    for n in 0..64 {
+                        add(1 + thread * 64 + n);
+                        let stats = cache.stats();
+                        assert!(stats.bytes <= stats.limit);
+                    }
+                });
+            }
+            for _ in 0..16 {
+                cache.trim(12 * 1024);
+                assert!(cache.stats().bytes <= 12 * 1024);
+                cache.trim(0);
+                assert_eq!(cache.stats().bytes, 0);
+                cache.trim(c.cache_bytes);
+            }
+        });
+        cache.trim(0);
+        assert_eq!(cache.resident_bytes.load(Ordering::Acquire), 0);
+        assert_eq!(cache.stats().entries, 0);
+        cache.trim(c.cache_bytes);
+        add(1000);
+        assert_eq!(cache.stats().entries, 1);
+        cache.remove(1000, true);
+        assert_eq!(cache.resident_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn shared_admission_does_not_block_a_hot_hit() {
+        let c = Config {
+            cache_bytes: 64 * 1024,
+            ..Config::default()
+        };
+        let cache = Cache::new(
+            &c,
+            Clock::new(Some(crate::ManualClock::new(crate::now_ms()))),
+        );
+        cache.trim(c.cache_bytes);
+        cache.insert(
+            Arc::new(Value {
+                version: 1,
+                ack: 1,
+                tombstone: false,
+                bytes: vec![7; 8192],
+            }),
+            "x".into(),
+            CachePolicy::default(),
+            true,
+            c.cache_bytes,
+            &AtomicBool::new(true),
+        );
+        let admission = cache.admission.lock().unwrap();
+        std::thread::scope(|scope| {
+            let cache = &cache;
+            let (sent, received) = std::sync::mpsc::channel();
+            scope.spawn(move || {
+                sent.send(cache.get(1).unwrap().bytes.len()).unwrap();
+            });
+            let result = received.recv_timeout(std::time::Duration::from_secs(5));
+            drop(admission);
+            assert_eq!(result.unwrap(), 8192);
+        });
     }
 }

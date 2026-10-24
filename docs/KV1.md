@@ -87,6 +87,17 @@ the original item IDs. GET_MANY reads each committed value separately and is not
 a multi-key snapshot. Oversize replies refuse rather than truncate; bound read
 sets and use snapshots for a common view.
 
+GET and GET_MANY preflight the complete reply size from committed index metadata
+before consulting the payload cache or reading chunk frames. GET_MANY still
+observes each key separately; it does not capture a multi-key snapshot. The
+observed immutable entries bind both sizing and loading, so later replacements
+cannot substitute larger values after the size check. At most 128 entry handles
+are retained through one batch; a retired file's physical allocation can remain
+until those handles close. Input order, duplicates, absence flags and wire
+encoding are unchanged. An oversized reply returns `too_large` without validating
+unread frames or warming/evicting payloads. A fitting read still validates its
+frames and returns error 16 on storage failure.
+
 `expected=0` requires absent state (including tombstones and expired keys).
 A nonzero expected value is an opaque live revision token, not a timestamp or
 publication-order sequence. REMOVE writes a tombstone. A competing conditional

@@ -231,7 +231,11 @@ pub struct Store {
     timers: timers::Shared,
     signals: signals::Hub,
     capture_metrics: [AtomicU64; 7],
-    committed: Arc<RwLock<HashMap<(String, String), Arc<value_disk::Entry>>>>,
+    #[cfg(test)]
+    capture_visits: AtomicUsize,
+    #[cfg(test)]
+    capture_waiters: AtomicUsize,
+    committed: Arc<RwLock<store::Committed>>,
     cache: Arc<cache::Cache>,
     cold_readers: (Mutex<usize>, Condvar),
     scans: Arc<Mutex<ScanState>>,
@@ -403,7 +407,7 @@ impl Store {
             fail_sync: config.fail_sync,
         });
         let (appenders, flush_owner) = start_routed_owners(router.clone(), 4, &config, clock.clone());
-        let committed = Arc::new(RwLock::new(committed));
+        let committed = Arc::new(RwLock::new(committed.into_iter().collect::<store::Committed>()));
         let cache = Arc::new(cache::Cache::new(&config, clock.clone()));
         cache.trim(config.capacity.saturating_sub(state.committed_bytes + state.dedup_bytes
             + chunks.lock().unwrap().index_bytes + config.memory_margin()));
@@ -435,6 +439,10 @@ impl Store {
             timers,
             signals: signals::Hub::new(epoch, &config, clock.clone()),
             capture_metrics: std::array::from_fn(|_| AtomicU64::new(0)),
+            #[cfg(test)]
+            capture_visits: AtomicUsize::new(0),
+            #[cfg(test)]
+            capture_waiters: AtomicUsize::new(0),
             committed,
             cache,
             cold_readers: (Mutex::new(0), Condvar::new()),
@@ -489,3 +497,11 @@ mod retirement_failure_tests;
 #[cfg(test)]
 #[path = "store/receiving_correction_tests.rs"]
 mod receiving_correction_tests;
+
+#[cfg(test)]
+#[path = "store/cold_load_tests.rs"]
+mod cold_load_tests;
+
+#[cfg(test)]
+#[path = "value_disk/tests.rs"]
+mod cold_identity_tests;

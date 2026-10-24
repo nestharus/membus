@@ -606,8 +606,39 @@ pub enum Frame {
     Torn(&'static str),
 }
 pub fn read_frame_at(f: &mut File, magic: &[u8; 4], offset: u64, len: u64, name: &str) -> io::Result<Frame> {
+    capture_frame_at(f, magic, offset, len, name)?.validate(offset, name)
+}
+
+// Captured bytes remain opaque until their checksum is validated. Separating
+// cursor work from buffer work lets independent offsets share a read handle
+// without holding its cursor mutex across the checksum calculation.
+pub(crate) struct CapturedFrame(CapturedBody);
+enum CapturedBody {
+    Whole(Vec<u8>, u32),
+    Torn(&'static str),
+}
+impl CapturedFrame {
+    pub(crate) fn validate(self, offset: u64, name: &str) -> io::Result<Frame> {
+        match self.0 {
+            CapturedBody::Torn(reason) => Ok(Frame::Torn(reason)),
+            CapturedBody::Whole(bytes, expected) => {
+                #[cfg(test)]
+                cold_validation_tests::before_validation();
+                if crc32(&bytes) != expected {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("interior-corrupt {name} offset {offset}: CRC"),
+                    ));
+                }
+                let frame_len = 16 + bytes.len() as u64;
+                Ok(Frame::Whole(bytes, frame_len))
+            }
+        }
+    }
+}
+pub(crate) fn capture_frame_at(f: &mut File, magic: &[u8; 4], offset: u64, len: u64, name: &str) -> io::Result<CapturedFrame> {
     if len - offset < 16 {
-        return Ok(Frame::Torn("short header"));
+        return Ok(CapturedFrame(CapturedBody::Torn("short header")));
     }
     let mut head = [0; 16];
     f.read_exact(&mut head)?;
@@ -631,18 +662,17 @@ pub fn read_frame_at(f: &mut File, magic: &[u8; 4], offset: u64, len: u64, name:
         ));
     }
     if len - offset - 16 < n as u64 {
-        return Ok(Frame::Torn("short body"));
+        return Ok(CapturedFrame(CapturedBody::Torn("short body")));
     }
     let mut b = vec![0; n];
     f.read_exact(&mut b)?;
-    if crc32(&b) != u32::from_le_bytes(head[12..16].try_into().unwrap()) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("interior-corrupt {name} offset {offset}: CRC"),
-        ));
-    }
-    Ok(Frame::Whole(b, 16 + n as u64))
+    Ok(CapturedFrame(CapturedBody::Whole(
+        b, u32::from_le_bytes(head[12..16].try_into().unwrap()),
+    )))
 }
+
+#[cfg(test)]
+mod cold_validation_tests;
 
 /// The catalogue as read at start: its records, and a torn tail's offset when one was found.
 pub type CatalogueRead = (Vec<CatRecord>, Option<(u64, u64, &'static str)>);

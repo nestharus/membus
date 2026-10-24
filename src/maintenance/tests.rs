@@ -33,7 +33,7 @@
     fn later_retiring_failure_cleans_up_earlier_expired_values() {
         let (s, _) = store("index", 0);
         let original: HashMap<_, _> = s.committed.read().unwrap().iter()
-            .filter(|(k, _)| k.0 == "expiry").map(|(k, v)| (k.clone(), (*v.read().unwrap()).clone())).collect();
+            .filter(|(k, _)| k.0 == "expiry").map(|(k, v)| (k.clone(), (*v.read(&k.0, &k.1).unwrap()).clone())).collect();
         assert_eq!(original.len(), 2);
         inject_after(&s, 1);
         assert!(s.maint.retire(None).is_err());
@@ -61,7 +61,7 @@
     fn unresolved_retiring_append_refuses_restart_without_deleting_chunks() {
         let (s, _) = store("restart-unresolved", 0);
         let original: Vec<_> = s.committed.read().unwrap().iter()
-            .filter(|(k, _)| k.0 == "expiry").map(|(k, v)| (k.clone(), (*v.read().unwrap()).clone())).collect();
+            .filter(|(k, _)| k.0 == "expiry").map(|(k, v)| (k.clone(), (*v.read(&k.0, &k.1).unwrap()).clone())).collect();
         assert_eq!(original.len(), 2);
         let files: Vec<_> = s.chunks.lock().unwrap().table.values()
             .filter(|c| c.class.kind == 2).map(|c| (c.path.clone(), fs::read(&c.path).unwrap())).collect();

@@ -627,7 +627,7 @@ fn import_legacy(
             match rp.committed.get(k) {
                 Some(x)
                     if x.version == v.version
-                        && x.read()?.bytes == v.read()?.bytes
+                        && x.read(&k.0, &k.1)?.bytes == v.read(&k.0, &k.1)?.bytes
                         && x.tombstone == v.tombstone
                         && x.ack == v.ack => {}
                 Some(x) => {
@@ -1384,12 +1384,12 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
     expiry.sort_by_key(|(_, at)| *at);
     // Only control records need decoding into runtime state. Ordinary values stay on disk.
     let control: HashMap<_,_> = committed.iter().filter(|(k,_)| k.0 == timers::NS)
-        .map(|(k,v)| Ok((k.clone(), v.read()?))).collect::<io::Result<_>>()?;
+        .map(|(k,v)| Ok((k.clone(), v.read(&k.0, &k.1)?))).collect::<io::Result<_>>()?;
     let timers = timers::State::restore(&control)?;
     let mut policies = chunks::Policies::default();
     for ((ns, key), v) in committed.iter() {
         if ns == chunks::POLICY_NS && !v.tombstone {
-            if let Some((pns, prefix, class)) = chunks::parse_policy(key, &v.read()?.bytes) {
+            if let Some((pns, prefix, class)) = chunks::parse_policy(key, &v.read(ns, key)?.bytes) {
                 policies.set(&pns, &prefix, Some(class));
             }
         }

@@ -72,13 +72,27 @@ pub const POLICY_SET: u8 = 24;
 pub const POLICY_GET: u8 = 25;
 pub const GET_STATUS: u8 = 26;
 pub const HEALTH2: u8 = 27;
+const fn crc32_table() -> [u32; 256] {
+    let mut table = [0; 256];
+    let mut index = 0;
+    while index < table.len() {
+        let mut remainder = index as u32;
+        let mut round = 0;
+        while round < 8 {
+            remainder = (remainder >> 1) ^ if remainder & 1 != 0 { 0xedb8_8320 } else { 0 };
+            round += 1;
+        }
+        table[index] = remainder;
+        index += 1;
+    }
+    table
+}
+// One immutable table, evaluated at compile time and shared by every caller.
+static CRC32_TABLE: [u32; 256] = crc32_table();
 pub fn crc32(bytes: &[u8]) -> u32 {
     let mut c = !0u32;
     for &b in bytes {
-        c ^= b as u32;
-        for _ in 0..8 {
-            c = (c >> 1) ^ if c & 1 != 0 { 0xedb88320 } else { 0 };
-        }
+        c = (c >> 8) ^ CRC32_TABLE[((c as u8) ^ b) as usize];
     }
     !c
 }
@@ -123,7 +137,10 @@ impl<'a> Cursor<'a> {
         self.take(n)
     }
     pub fn text(&mut self) -> Result<String, u16> {
-        let s = self.bound()?;
+        Ok(self.text_ref()?.to_owned())
+    }
+    fn text_ref(&mut self) -> Result<&'a str, u16> {
+        let s = std::str::from_utf8(self.bytes(MAX_ID)?).map_err(|_| 3u16)?;
         if s.is_empty() {
             return Err(3);
         }
@@ -143,14 +160,18 @@ impl<'a> Cursor<'a> {
     }
 }
 pub fn frame(op: u8, id: u64, payload: &[u8]) -> Vec<u8> {
-    let mut b = Vec::new();
-    b.extend(1u16.to_le_bytes());
-    b.extend(0u16.to_le_bytes());
-    b.push(op);
-    b.extend(id.to_le_bytes());
-    b.extend(payload);
-    let mut out = (b.len() as u32).to_le_bytes().to_vec();
-    out.extend(b);
+    let mut out = frame_header(op, id, payload.len());
+    out.extend_from_slice(payload);
+    out
+}
+fn frame_header(op: u8, id: u64, payload_len: usize) -> Vec<u8> {
+    let body_len = 13 + payload_len;
+    let mut out = Vec::with_capacity(4 + body_len);
+    out.extend_from_slice(&(body_len as u32).to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.push(op);
+    out.extend_from_slice(&id.to_le_bytes());
     out
 }
 pub fn read_frame<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
@@ -192,38 +213,64 @@ impl Outcome {
 }
 /// One MBK1 payload as (mutation, version, record time).
 pub(super) fn parse_record(b: &[u8]) -> Result<(Mutation, u64, u64), u16> {
+    let record = parse_record_view(b)?;
+    Ok((
+        Mutation {
+            ns: record.ns.to_owned(),
+            key: record.key.to_owned(),
+            op_id: record.op_id.to_owned(),
+            deadline: 0,
+            ack: record.ack,
+            expected: record.expected,
+            bytes: record.bytes.to_vec(),
+            remove: record.remove,
+        },
+        record.version,
+        record.at,
+    ))
+}
+/// Validated borrowed fields share the exact durable decoding rules with replay.
+pub(super) struct RecordView<'a> {
+    pub(super) at: u64,
+    pub(super) version: u64,
+    pub(super) ack: u8,
+    pub(super) remove: bool,
+    pub(super) ns: &'a str,
+    pub(super) key: &'a str,
+    pub(super) op_id: &'a str,
+    pub(super) expected: Option<u64>,
+    pub(super) bytes: &'a [u8],
+}
+pub(super) fn parse_record_view(b: &[u8]) -> Result<RecordView<'_>, u16> {
     let mut c = Cursor::new(b);
     let at = c.u64()?;
     let version = c.u64()?;
     let ack = c.u8()?;
     let remove = c.u8()? != 0;
-    let ns = c.text()?;
-    let key = c.text()?;
-    let op_id = c.text()?;
+    let ns = c.text_ref()?;
+    let key = c.text_ref()?;
+    let op_id = c.text_ref()?;
     let expected = c.u64()?;
-    let bytes = c.bytes(MAX_VALUE)?.to_vec();
+    let bytes = c.bytes(MAX_VALUE)?;
     c.end()?;
     if !matches!(ack, 1 | 2) {
         return Err(3);
     }
-    Ok((
-        Mutation {
-            ns,
-            key,
-            op_id,
-            deadline: 0,
-            ack,
-            expected: if expected == u64::MAX {
-                None
-            } else {
-                Some(expected)
-            },
-            bytes,
-            remove,
+    Ok(RecordView {
+        ns,
+        key,
+        op_id,
+        ack,
+        expected: if expected == u64::MAX {
+            None
+        } else {
+            Some(expected)
         },
+        bytes,
+        remove,
         version,
         at,
-    ))
+    })
 }
 pub(super) fn mutation_bytes(m: &Mutation, version: u64, at: u64) -> Vec<u8> {
     let mut b = Vec::new();
@@ -237,6 +284,10 @@ pub(super) fn mutation_bytes(m: &Mutation, version: u64, at: u64) -> Vec<u8> {
     b.extend(m.expected.unwrap_or(u64::MAX).to_le_bytes());
     lp(&mut b, &m.bytes);
     b
+}
+enum DispatchReply {
+    Payload(Vec<u8>),
+    Framed(Vec<u8>),
 }
 impl Store {
     pub fn dispatch(&self, b: &[u8]) -> Vec<u8> {
@@ -266,7 +317,7 @@ impl Store {
         if major != 1 || minor != 0 {
             return reply(op, id, 1, &[]);
         }
-        let result = (|| -> Result<Vec<u8>, u16> {
+        let result = (|| -> Result<DispatchReply, u16> {
             if op == HELLO {
                 let max = c.u32()? as usize;
                 let mem = c.u8()?;
@@ -319,17 +370,19 @@ impl Store {
                 if timers {
                     p.extend(timers::hello_limits());
                 }
-                return Ok(p);
+                return Ok(DispatchReply::Payload(p));
             }
             let deadline = c.u64()?;
-            let _op_id = c.text()?;
-            let ns = c.text()?;
+            // These identifiers belong to the request for this dispatch only.
+            // Operations that retain work take their own copies below.
+            let _op_id = c.text_ref()?;
+            let ns = c.text_ref()?;
             // Internal schedule/progress records are not a public KV namespace.
             if ns == timers::NS || ns == chunks::POLICY_NS {
                 return Err(3);
             }
             if op == PUT || op == CONDITIONAL_PUT || op == REMOVE {
-                let m = parse_mutation(&mut c, op, deadline, _op_id, ns)?;
+                let m = parse_mutation(&mut c, op, deadline, _op_id.to_owned(), ns.to_owned())?;
                 c.end()?;
                 if m.ack == 0 && !allow_mem {
                     return Err(15);
@@ -338,14 +391,22 @@ impl Store {
                 if o.code != 0 {
                     return Err(o.code);
                 }
-                return Ok(o.bytes());
+                return Ok(DispatchReply::Payload(o.bytes()));
             }
             if self.clock.utc_ms() >= deadline && op != POLICY_SET {
                 return Err(5);
             }
+            if matches!(
+                op,
+                SCAN_PREFIX | SCAN_RANGE | SCAN_KEYS_PREFIX | SCAN_KEYS_RANGE
+            ) {
+                return self
+                    .scan_reply(ns, &mut c, op, id, max_frame)
+                    .map(DispatchReply::Framed);
+            }
             match op {
                 TIMER_SET | TIMER_CANCEL | TIMER_STATUS => {
-                    self.timer_call(op, ns, _op_id, deadline, &mut c)
+                    self.timer_call(op, ns.to_owned(), _op_id.to_owned(), deadline, &mut c)
                 }
                 POLICY_SET => {
                     let prefix = c.bound()?;
@@ -357,7 +418,7 @@ impl Store {
                     } else {
                         Some(Class::from_wire(kind, retention)?)
                     };
-                    let o = self.set_policy_with_id(&ns, &prefix, class, &_op_id, deadline);
+                    let o = self.set_policy_with_id(ns, &prefix, class, _op_id, deadline);
                     if o.code != 0 {
                         return Err(o.code);
                     }
@@ -386,7 +447,7 @@ impl Store {
                 GET_STATUS => {
                     let key = c.text()?;
                     c.end()?;
-                    let (status, version) = self.get_status(&ns, &key);
+                    let (status, version) = self.get_status(ns, &key);
                     let mut p = vec![status];
                     p.extend(version.to_le_bytes());
                     Ok(p)
@@ -403,7 +464,7 @@ impl Store {
                     let frame_max = c.u32()? as usize;
                     c.end()?;
                     self.signals.subscribe(
-                        &ns,
+                        ns,
                         prefix,
                         endpoint,
                         values != 0,
@@ -416,10 +477,10 @@ impl Store {
                     let token = c.bytes(16)?;
                     c.end()?;
                     if op == UNSUBSCRIBE {
-                        self.signals.unsubscribe(&ns, token)?;
+                        self.signals.unsubscribe(ns, token)?;
                         Ok(Vec::new())
                     } else {
-                        self.signals.status(&ns, token)
+                        self.signals.status(ns, token)
                     }
                 }
                 SIGNAL_USAGE => {
@@ -436,7 +497,7 @@ impl Store {
                 }
                 SNAPSHOT_OPEN => {
                     c.end()?;
-                    let (token, _) = self.snapshot_open(&ns)?;
+                    let (token, _) = self.snapshot_open(ns)?;
                     let mut p = Vec::new();
                     lp(&mut p, &token);
                     Ok(p)
@@ -444,18 +505,15 @@ impl Store {
                 SNAPSHOT_RELEASE => {
                     let token = c.bytes(16)?;
                     c.end()?;
-                    self.snapshot_release(&ns, token)?;
+                    self.snapshot_release(ns, token)?;
                     Ok(Vec::new())
                 }
-                SCAN_PREFIX | SCAN_RANGE | SCAN_KEYS_PREFIX | SCAN_KEYS_RANGE => {
-                    self.scan_page(&ns, &mut c, op, max_frame)
-                }
                 GET => {
-                    let key = c.text()?;
+                    let key = c.text_ref()?;
                     c.end()?;
-                    let mut p = Vec::new();
-                    encode_value(&mut p, self.get_handle_result(&ns, &key).map_err(|_|16u16)?.as_deref());
-                    Ok(p)
+                    return self
+                        .committed_read_reply(ns, std::slice::from_ref(&key), op, id, max_frame)
+                        .map(DispatchReply::Framed);
                 }
                 GET_MANY => {
                     let n = c.u16()? as usize;
@@ -464,20 +522,12 @@ impl Store {
                     }
                     let mut keys = Vec::with_capacity(n);
                     for _ in 0..n {
-                        keys.push(c.text()?)
+                        keys.push(c.text_ref()?)
                     }
                     c.end()?;
-                    let mut p = (n as u16).to_le_bytes().to_vec();
-                    for key in keys {
-                        let value = self.get_handle_result(&ns, &key).map_err(|_|16u16)?;
-                        if p.len() + value.as_ref().map_or(1, |v| 14 + v.bytes.len()) + 15
-                            > max_frame
-                        {
-                            return Err(4);
-                        }
-                        encode_value(&mut p, value.as_deref());
-                    }
-                    Ok(p)
+                    return self
+                        .committed_read_reply(ns, &keys, op, id, max_frame)
+                        .map(DispatchReply::Framed);
                 }
                 BATCH => {
                     let n = c.u16()? as usize;
@@ -491,7 +541,7 @@ impl Store {
                             return Err(2);
                         }
                         let id = c.text()?;
-                        let item = parse_mutation(&mut c, op, deadline, id, ns.clone())?;
+                        let item = parse_mutation(&mut c, op, deadline, id, ns.to_owned())?;
                         if item.ack == 0 && !allow_mem {
                             return Err(15);
                         }
@@ -560,7 +610,7 @@ impl Store {
                         .lock()
                         .unwrap()
                         .namespace_counts
-                        .get(&ns)
+                        .get(ns)
                         .copied()
                         .unwrap_or(0);
                     p.extend((namespace_keys as u64).to_le_bytes());
@@ -572,12 +622,64 @@ impl Store {
                 }
                 _ => Err(2),
             }
+            .map(DispatchReply::Payload)
         })();
         match result {
-            Ok(p) if p.len() + 15 <= max_frame => reply(op, id, 0, &p),
+            Ok(DispatchReply::Payload(p)) if p.len() + 15 <= max_frame => reply(op, id, 0, &p),
+            Ok(DispatchReply::Framed(p)) if p.len() <= max_frame + 4 => p,
             Ok(_) => reply(op, id, 4, &[]),
             Err(code) => reply(op, id, code, &[]),
         }
+    }
+    fn committed_read_reply(
+        &self,
+        ns: &str,
+        keys: &[&str],
+        op: u8,
+        id: u64,
+        max_frame: usize,
+    ) -> Result<Vec<u8>, u16> {
+        let available = max_frame.checked_sub(15).ok_or(4u16)?;
+        let counted = op == GET_MANY;
+        let mut payload_len = if counted { 2 } else { 0 };
+        if payload_len > available {
+            return Err(4);
+        }
+        let mut selected = Vec::with_capacity(keys.len());
+        for &key in keys {
+            // Each key retains its own committed observation, as before. No
+            // index lock spans another key or disk I/O: this is not a snapshot.
+            let entry = self
+                .committed
+                .read()
+                .unwrap()
+                .get(&(ns.to_owned(), key.to_owned()))
+                .filter(|entry| !entry.tombstone)
+                .cloned();
+            payload_len = payload_len
+                .checked_add(entry.as_ref().map_or(1, |entry| 14 + entry.len))
+                .filter(|size| *size <= available)
+                .ok_or(4u16)?;
+            selected.push(entry);
+        }
+        // Refuse the whole response before touching the payload cache or disk.
+        // Immutable entries bind both the size check and subsequent load, so a
+        // concurrent replacement cannot substitute a larger value afterward.
+        // Write directly into the final response; a failed load drops this
+        // unfinished success buffer and dispatch returns an ordinary refusal.
+        let mut response = reply_header(op, id, 0, payload_len);
+        if counted {
+            response.extend((keys.len() as u16).to_le_bytes());
+        }
+        for (&key, entry) in keys.iter().zip(selected) {
+            let value = entry
+                .map(|entry| self.read_entry(ns, key, &entry))
+                .transpose()
+                .map_err(|_| 16u16)?;
+            encode_value(&mut response, value.as_deref());
+        }
+        debug_assert_eq!(response.len(), payload_len + 19);
+        Ok(response)
     }
 }
 fn parse_mutation(
@@ -625,7 +727,23 @@ pub(super) fn encode_value(p: &mut Vec<u8>, v: Option<&Value>) {
     }
 }
 pub fn reply(op: u8, id: u64, code: u16, p: &[u8]) -> Vec<u8> {
-    let mut b = code.to_le_bytes().to_vec();
-    b.extend(p);
-    frame(op | 0x80, id, &b)
+    let mut out = reply_header(op, id, code, p.len());
+    out.extend_from_slice(p);
+    out
 }
+pub(super) fn reply_header(op: u8, id: u64, code: u16, payload_len: usize) -> Vec<u8> {
+    let mut out = frame_header(op | 0x80, id, 2 + payload_len);
+    out.extend_from_slice(&code.to_le_bytes());
+    out
+}
+
+#[cfg(test)]
+#[path = "codec/crc_tests.rs"]
+mod crc_tests;
+
+#[cfg(test)]
+mod read_tests;
+
+#[cfg(test)]
+#[path = "codec/record_tests.rs"]
+mod record_tests;

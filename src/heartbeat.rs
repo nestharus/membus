@@ -57,7 +57,7 @@ impl Health2 {
         f.push(("memory_bytes".into(), self.memory_bytes.to_string()));
         f.push(("memory_budget".into(), self.memory_budget.to_string()));
         for (name, n) in [("budget", c.budget as u64), ("limit", c.limit as u64), ("bytes", c.bytes as u64), ("entries", c.entries as u64), ("hits", c.hits),
-            ("misses", c.misses), ("cold_reads", c.cold_reads), ("evicted_budget", c.evicted_budget),
+            ("misses", c.misses), ("cold_reads", c.cold_reads), ("coalesced_reads", c.coalesced_reads), ("evicted_budget", c.evicted_budget),
             ("evicted_expired", c.evicted_expired), ("evicted_replaced", c.evicted_replaced), ("evicted_retired", c.evicted_retired)] {
             f.push((format!("cache_{name}"), n.to_string()));
         }

@@ -1,5 +1,5 @@
 //! Immutable index entries retain a shared read handle, never a payload.
-use crate::{chunks, codec::parse_record, Mutation, Value};
+use crate::{chunks, codec::parse_record_view, Mutation, Value};
 use std::{
     fs::File,
     io::{self, Seek, SeekFrom},
@@ -15,16 +15,21 @@ pub(crate) struct Location {
 }
 impl Location {
     pub fn payload(&self) -> io::Result<Vec<u8>> {
-        let mut file = self.file.lock().unwrap();
-        file.seek(SeekFrom::Start(self.offset))?;
-        match chunks::read_frame_at(
-            &mut file,
-            b"MBK1",
-            self.offset,
-            self.offset + self.record_len,
-            "indexed chunk",
-        )? {
-            chunks::Frame::Whole(bytes, _) => Ok(bytes),
+        let captured = {
+            let mut file = self.file.lock().unwrap();
+            file.seek(SeekFrom::Start(self.offset))?;
+            chunks::capture_frame_at(
+                &mut file,
+                b"MBK1",
+                self.offset,
+                self.offset + self.record_len,
+                "indexed chunk",
+            )?
+        };
+        match captured.validate(self.offset, "indexed chunk")? {
+            // The index identifies one exact record, rather than the larger
+            // file boundary accepted by the general chunk reader.
+            chunks::Frame::Whole(bytes, n) if n == self.record_len => Ok(bytes),
             _ => Err(io::Error::other("short indexed record")),
         }
     }
@@ -51,11 +56,13 @@ impl Entry {
             location,
         }
     }
-    pub fn read(&self) -> io::Result<Arc<Value>> {
+    pub fn read(&self, namespace: &str, key: &str) -> io::Result<Arc<Value>> {
         let bytes = self.location.payload()?;
-        let (m, version, _) =
-            parse_record(&bytes).map_err(|_| io::Error::other("invalid indexed record"))?;
-        if version != self.version
+        let m =
+            parse_record_view(&bytes).map_err(|_| io::Error::other("invalid indexed record"))?;
+        if m.ns != namespace
+            || m.key != key
+            || m.version != self.version
             || m.bytes.len() != self.len
             || m.ack != self.ack
             || m.remove != self.tombstone
@@ -63,9 +70,9 @@ impl Entry {
             return Err(io::Error::other("indexed record changed"));
         }
         Ok(Arc::new(Value {
-            version,
+            version: m.version,
             ack: self.ack,
-            bytes: m.bytes,
+            bytes: m.bytes.to_vec(),
             tombstone: self.tombstone,
         }))
     }

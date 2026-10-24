@@ -1,29 +1,33 @@
 //! Snapshot registry, retained-resource charges, query-bound cursors, paging and TTL reaping.
 use crate::codec::encode_value;
 use crate::codec::lp;
+use crate::codec::reply_header;
 use crate::codec::Cursor;
 use crate::codec::MAX_BATCH;
 use crate::codec::MAX_ID;
 use crate::codec::SCAN_KEYS_PREFIX;
 use crate::codec::SCAN_KEYS_RANGE;
 use crate::codec::SCAN_RANGE;
+use crate::value_disk::Entry;
 use crate::Config;
 use crate::Store;
 use crate::Value;
 use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
 use std::hash::BuildHasher;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 #[derive(Default)]
 pub(super) struct ScanUsage {
     pub(super) bytes: AtomicUsize,
     pub(super) count: AtomicUsize,
+    pub(super) released: AtomicBool,
 }
 pub(super) struct ScanCharge {
     pub(super) usage: Arc<ScanUsage>,
@@ -33,15 +37,48 @@ impl Drop for ScanCharge {
     fn drop(&mut self) {
         self.usage.bytes.fetch_sub(self.bytes, Ordering::AcqRel);
         self.usage.count.fetch_sub(1, Ordering::AcqRel);
+        // Registry removal alone does not free a view held by a dispatcher.
+        // Notify cold admission only when the last owner returns its charge.
+        self.usage.released.store(true, Ordering::Release);
     }
 }
 pub(super) struct Snapshot {
     pub(super) ns: String,
     pub(super) created: u64,
-    pub(super) rows: Vec<(String, Arc<Value>)>,
+    pub(super) rows: Vec<(String, SnapshotValue)>,
     pub(super) cursor_hash: RandomState,
     // Charges survive release/expiry while a dispatcher still holds this Arc.
     pub(super) _charge: ScanCharge,
+}
+pub(super) struct SnapshotValue {
+    entry: Arc<Entry>,
+    // The snapshot's full-payload reservation covers values pinned on first use.
+    // Never resolve through the current key: replacement and retirement may have
+    // removed this exact revision from the live index and resident cache.
+    loaded: OnceLock<Arc<Value>>,
+    // A captured revision may be ineligible for the live cache. Coordinate
+    // its first load within this view without retaining failures.
+    load_gate: Mutex<()>,
+    #[cfg(test)]
+    load_attempts: AtomicUsize,
+}
+impl SnapshotValue {
+    pub(super) fn load(&self, store: &Store, ns: &str, key: &str) -> Result<Arc<Value>, u16> {
+        if let Some(value) = self.loaded.get() {
+            return Ok(value.clone());
+        }
+        #[cfg(test)]
+        self.load_attempts.fetch_add(1, Ordering::SeqCst);
+        let _load = self.load_gate.lock().unwrap();
+        if let Some(value) = self.loaded.get() {
+            return Ok(value.clone());
+        }
+        let value = store.read_entry(ns, key, &self.entry).map_err(|_| 16u16)?;
+        // Publish only a successful immutable payload. Errors leave the slot
+        // empty and release the gate so a later request can retry storage.
+        let _ = self.loaded.set(value);
+        Ok(self.loaded.get().unwrap().clone())
+    }
 }
 pub(super) struct ScanState {
     pub(super) next: u64,
@@ -54,18 +91,30 @@ impl Store {
     }
     pub(super) fn snapshot_open(&self, ns: &str) -> Result<(Vec<u8>, Arc<Snapshot>), u16> {
         let created = self.clock.mono_ms();
-        let mut scans = self.scans.lock().unwrap();
-        self.purge_scans(&mut scans);
-        if self.scan_usage.count.load(Ordering::Acquire) >= self.config.snapshot_max {
-            return Err(22);
+        {
+            let mut scans = self.scans.lock().unwrap();
+            self.purge_scans(&mut scans);
+            if self.scan_usage.count.load(Ordering::Acquire) >= self.config.snapshot_max {
+                return Err(22);
+            }
         }
         let lock_start = self.clock.mono_ns();
+        #[cfg(test)]
+        self.capture_waiters.fetch_add(1, Ordering::SeqCst);
         let committed = self.committed.read().unwrap();
+        #[cfg(test)]
+        self.capture_waiters.fetch_sub(1, Ordering::SeqCst);
         let lock_acquired = self.clock.mono_ns();
         let mut charge = 256usize.checked_add(ns.len()).ok_or(22u16)?;
-        let mut count = 0;
-        for ((namespace, key), value) in committed.iter() {
-            if namespace == ns && !value.tombstone {
+        for ((_, key), value) in committed
+            .range((ns.to_owned(), String::new())..)
+            .inspect(|_| {
+                #[cfg(test)]
+                self.capture_visits.fetch_add(1, Ordering::Relaxed);
+            })
+            .take_while(|((namespace, _), _)| namespace == ns)
+        {
+            if !value.tombstone {
                 // Full payload capacity is charged even when shared with the live
                 // index or another snapshot; 128 covers per-row handles/metadata.
                 charge = charge
@@ -73,10 +122,16 @@ impl Store {
                     .and_then(|n| n.checked_add(128))
                     .and_then(|n| n.checked_add(value.len))
                     .ok_or(22u16)?;
-                count += 1;
             }
         }
         let charge_end = self.clock.mono_ns();
+        // Index waits and namespace enumeration must not stall admitted views.
+        // Another capture may have reserved while this one read the index.
+        let mut scans = self.scans.lock().unwrap();
+        self.purge_scans(&mut scans);
+        if self.scan_usage.count.load(Ordering::Acquire) >= self.config.snapshot_max {
+            return Err(22);
+        }
         let total = self
             .scan_usage
             .bytes
@@ -87,39 +142,50 @@ impl Store {
             return Err(22);
         }
         let state = self.state.lock().unwrap();
-        if charge > self.cache_limit(&state) { return Err(22); }
+        if charge > self.cache_limit(&state) {
+            return Err(22);
+        }
         let id = scans.next;
         scans.next = id.checked_add(1).ok_or(22u16)?;
         // Reservation is serialized before any snapshot key/handle allocation.
         self.scan_usage.bytes.fetch_add(charge, Ordering::AcqRel);
         self.scan_usage.count.fetch_add(1, Ordering::AcqRel);
-        self.trim_cache(&state);
-        drop(state);
         let reservation = ScanCharge {
             usage: self.scan_usage.clone(),
             bytes: charge,
         };
+        drop(scans);
+        self.trim_cache(&state);
+        drop(state);
         let selection_start = self.clock.mono_ns();
-        // Separate the second global index walk from namespace-owned copying.
-        // Copy immutable locations under the committed read lock, then release it
-        // before loading any missing payload. The row charge covers both vectors.
-        let selected: Vec<_> = committed
-            .iter()
-            .filter(|((namespace, _), value)| namespace == ns && !value.tombstone)
-            .map(|((_, key), value)| (key.clone(), value.clone()))
+        // Seek the same namespace interval again under the same read lock.
+        // Pin immutable locations and their shared file handles. Opening a view
+        // or reading keys must not load unrelated values and churn the cache.
+        let rows: Vec<_> = committed
+            .range((ns.to_owned(), String::new())..)
+            .inspect(|_| {
+                #[cfg(test)]
+                self.capture_visits.fetch_add(1, Ordering::Relaxed);
+            })
+            .take_while(|((namespace, _), _)| namespace == ns)
+            .filter(|(_, value)| !value.tombstone)
+            .map(|((_, key), entry)| {
+                (
+                    key.clone(),
+                    SnapshotValue {
+                        entry: entry.clone(),
+                        loaded: OnceLock::new(),
+                        load_gate: Mutex::new(()),
+                        #[cfg(test)]
+                        load_attempts: AtomicUsize::new(0),
+                    },
+                )
+            })
             .collect();
         let selection_end = self.clock.mono_ns();
         let copy_end = self.clock.mono_ns();
         drop(committed);
-        drop(scans);
-        let mut rows = Vec::with_capacity(count);
-        for (key, value) in selected {
-            let payload = self.read_entry(ns, &key, &value).map_err(|_| 16u16)?;
-            rows.push((key, payload));
-        }
-        let sort_start = self.clock.mono_ns();
-        rows.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        let sort_end = self.clock.mono_ns();
+        // The committed index already yields keys in namespace/key order.
         let times = [
             1,
             lock_acquired.saturating_sub(lock_start),
@@ -127,7 +193,7 @@ impl Store {
             selection_end.saturating_sub(selection_start),
             copy_end.saturating_sub(selection_end),
             copy_end.saturating_sub(lock_acquired),
-            sort_end.saturating_sub(sort_start),
+            0, // Ordered capture needs no separate sorting pass.
         ];
         for (metric, n) in self.capture_metrics.iter().zip(times) {
             metric.fetch_add(n, Ordering::Relaxed);
@@ -174,12 +240,33 @@ impl Store {
         drop(snapshot);
         Ok(())
     }
+    #[cfg(test)]
     pub(super) fn scan_page(
         &self,
         ns: &str,
         c: &mut Cursor<'_>,
         op: u8,
         max_frame: usize,
+    ) -> Result<Vec<u8>, u16> {
+        self.scan_output(ns, c, op, max_frame, None)
+    }
+    pub(super) fn scan_reply(
+        &self,
+        ns: &str,
+        c: &mut Cursor<'_>,
+        op: u8,
+        id: u64,
+        max_frame: usize,
+    ) -> Result<Vec<u8>, u16> {
+        self.scan_output(ns, c, op, max_frame, Some(id))
+    }
+    fn scan_output(
+        &self,
+        ns: &str,
+        c: &mut Cursor<'_>,
+        op: u8,
+        max_frame: usize,
+        response_id: Option<u64>,
     ) -> Result<Vec<u8>, u16> {
         let keys_only = matches!(op, SCAN_KEYS_PREFIX | SCAN_KEYS_RANGE);
         let is_range = matches!(op, SCAN_RANGE | SCAN_KEYS_RANGE);
@@ -251,7 +338,7 @@ impl Store {
             let mut item_bytes = 0;
             while next < end && next - at < limit {
                 let (key, value) = &rows[next];
-                let bytes = 4 + key.len() + if keys_only { 0 } else { 14 + value.bytes.len() };
+                let bytes = 4 + key.len() + if keys_only { 0 } else { 14 + value.entry.len };
                 let continuation = if next + 1 < end { 32 + query.len() } else { 0 };
                 if 42 + item_bytes + bytes + continuation > budget {
                     if next == at {
@@ -270,7 +357,11 @@ impl Store {
                 let tag = snapshot.cursor_hash.hash_one(&continuation[..]);
                 continuation.extend(tag.to_le_bytes());
             }
-            let mut p = Vec::with_capacity(27 + item_bytes + continuation.len());
+            let payload_len = 27 + item_bytes + continuation.len();
+            let mut p = match response_id {
+                Some(id) => reply_header(op, id, 0, payload_len),
+                None => Vec::with_capacity(payload_len),
+            };
             lp(&mut p, &token);
             lp(&mut p, &continuation);
             p.push((next == end) as u8);
@@ -278,7 +369,8 @@ impl Store {
             for (key, value) in &rows[at..next] {
                 lp(&mut p, key.as_bytes());
                 if !keys_only {
-                    encode_value(&mut p, Some(value));
+                    let loaded = value.load(self, ns, key)?;
+                    encode_value(&mut p, Some(&loaded));
                 }
             }
             if self.clock.mono_ms().saturating_sub(snapshot.created) >= self.config.snapshot_ttl_ms {
@@ -318,3 +410,10 @@ pub(super) fn start_reaper(
     });
     (stop, reaper)
 }
+
+#[cfg(test)]
+#[path = "snapshots/load_tests.rs"]
+mod load_tests;
+
+#[cfg(test)]
+mod allowance_tests;

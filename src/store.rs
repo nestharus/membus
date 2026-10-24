@@ -16,6 +16,7 @@ use crate::Store;
 use crate::Value;
 use crate::POLICY_NS;
 use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::io;
@@ -98,6 +99,8 @@ pub(super) struct Flags {
     pub(super) expiry_degraded: AtomicBool,
 }
 pub(super) type Key = (String, String);
+// One latest-key index, ordered so capture can seek directly to a namespace.
+pub(super) type Committed = BTreeMap<Key, Arc<crate::value_disk::Entry>>;
 pub(super) fn index_charge(k: &Key) -> usize { 512 + 4 * (k.0.len() + k.1.len()) }
 pub(super) fn dedup_charge(k: &Key) -> usize { 256 + 3 * (k.0.len() + k.1.len()) }
 struct ColdReader<'a>(&'a (std::sync::Mutex<usize>, std::sync::Condvar));
@@ -144,14 +147,31 @@ impl Store {
     }
     pub(super) fn read_entry(&self, ns: &str, key: &str, entry: &crate::value_disk::Entry) -> io::Result<Arc<Value>> {
         if let Some(v) = self.cache.get(entry.version) { return Ok(v); }
+        let (label, policy) = crate::cache::Cache::policy(&self.config, ns,key,entry.class);
+        // Coordinate only cache-eligible cold loads. Recheck after the preceding
+        // loader has published, before taking either of the global decode slots.
+        // The gate retains no payload or error and is independent of key writers.
+        // Indexed length is a lower bound on payload capacity. If even that
+        // charge exceeds the configured maximum, no loader can admit it.
+        let can_fit = crate::cache::Cache::value_charge(entry.len, &label) <= self.config.cache_bytes;
+        let _load = (can_fit && self.config.cache_bytes != 0 && !policy.never_cache && policy.active_ttl != 0
+            && entry.cacheable.load(Ordering::Acquire)).then(|| self.cache.load_guard(entry.version));
+        if _load.is_some() {
+            if let Some(v) = self.cache.after_miss(entry.version) { return Ok(v); }
+        }
         let mut readers = self.cold_readers.0.lock().unwrap();
         while *readers >= 2 { readers = self.cold_readers.1.wait(readers).unwrap(); }
         *readers += 1;
         let _reader = ColdReader(&self.cold_readers);
         drop(readers);
         self.cache.cold();
-        let value = entry.read().inspect_err(|_| { self.flags.storage_error.store(true, Ordering::SeqCst); })?;
-        let (label, policy) = crate::cache::Cache::policy(&self.config, ns,key,entry.class);
+        let value = entry.read(ns, key).inspect_err(|_| { self.flags.storage_error.store(true, Ordering::SeqCst); })?;
+        if self.scan_usage.released.swap(false, Ordering::AcqRel) {
+            // Recompute from current charges, rather than adding released bytes
+            // to a stale limit. New captures and writes serialize on state.
+            // Hot hits never take this path or the state lock.
+            self.trim_cache(&self.state.lock().unwrap());
+        }
         self.cache.insert(value.clone(), label, policy, false, self.config.cache_bytes, &entry.cacheable);
         Ok(value)
     }
