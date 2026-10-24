@@ -65,7 +65,7 @@ impl Drop for Stop {
 fn observed(call: impl FnOnce() -> Vec<u8>) -> (Vec<u8>, usize, usize) {
     observed_above(0, call)
 }
-fn observed_above(minimum: usize, call: impl FnOnce() -> Vec<u8>) -> (Vec<u8>, usize, usize) {
+fn observed_above<T>(minimum: usize, call: impl FnOnce() -> T) -> (T, usize, usize) {
     CALLS.with(|n| n.set(0));
     BYTES.with(|n| n.set(0));
     MINIMUM.with(|n| n.set(minimum));
@@ -773,4 +773,171 @@ fn scan_query_final_pages_borrow_bounds_without_temporary_copies() {
 #[test]
 fn scan_query_continuations_are_encoded_in_the_final_output() {
     scan_query_cost(true);
+}
+
+// A prepared byte stream excludes resident encoding and fixture allocation from
+// the SDK measurement. Reads fragment the independently framed replies.
+struct PayloadScript(Cursor<Vec<u8>>);
+impl std::io::Read for PayloadScript {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        let len = out.len().min(4096);
+        std::io::Read::read(&mut self.0, &mut out[..len])
+    }
+}
+impl std::io::Write for PayloadScript {
+    fn write(&mut self, input: &[u8]) -> std::io::Result<usize> {
+        Ok(input.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+impl membus::client::Transport for PayloadScript {
+    fn deadline(&mut self, until: std::time::Instant) -> std::io::Result<()> {
+        if std::time::Instant::now() >= until {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "prepared reply deadline",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+fn sdk_deadline() -> membus::client::Deadline {
+    membus::client::Deadline {
+        unix_ms: membus::now_ms() + 30_000,
+        local: std::time::Instant::now() + std::time::Duration::from_secs(30),
+    }
+}
+fn payload_client(op: u8, payload: &[u8]) -> membus::client::Client<PayloadScript> {
+    let mut hello = 7u64.to_le_bytes().to_vec();
+    hello.extend((MAX_FRAME as u32).to_le_bytes());
+    hello.extend((membus::MAX_VALUE as u32).to_le_bytes());
+    hello.extend((membus::MAX_BATCH as u16).to_le_bytes());
+    hello.push(0);
+    hello.extend(86_400_000u64.to_le_bytes());
+    hello.extend(22u16.to_le_bytes());
+    for (code, name, transient) in &membus::CODES[..22] {
+        hello.extend(code.to_le_bytes());
+        hello.push(*transient as u8);
+        membus::lp(&mut hello, name.as_bytes());
+    }
+    let mut stream = original(membus::HELLO | 0x80, 1, Some(0), &hello);
+    stream.extend(original(op | 0x80, 2, Some(0), payload));
+    let mut options = membus::client::Options::new("payload-allocation-control", MAX_FRAME);
+    options.scans = true;
+    membus::client::Client::handshake(
+        PayloadScript(Cursor::new(stream)),
+        options,
+        sdk_deadline().local,
+    )
+    .unwrap()
+}
+fn sdk_value(payload: &mut Vec<u8>, version: u64, ack: u8, bytes: &[u8]) {
+    payload.push(1);
+    payload.extend(version.to_le_bytes());
+    payload.push(ack);
+    membus::lp(payload, bytes);
+}
+fn sdk_payload_cost(scans: bool) {
+    let ops = if scans {
+        [membus::SCAN_PREFIX, membus::SCAN_RANGE]
+    } else {
+        [GET, membus::GET_MANY]
+    };
+    for op in ops {
+        for continuing in [false, true] {
+            if !scans && continuing {
+                continue;
+            }
+            let a = vec![0x64; 65_536];
+            let b = vec![0x97; 65_536];
+            let mut payload = Vec::new();
+            let snapshot = [0x31; 16];
+            let next = if continuing {
+                vec![0x81; 48]
+            } else {
+                Vec::new()
+            };
+            if scans {
+                membus::lp(&mut payload, &snapshot);
+                membus::lp(&mut payload, &next);
+                payload.push((!continuing) as u8);
+                payload.extend(2u16.to_le_bytes());
+                membus::lp(&mut payload, b"row/a");
+                sdk_value(&mut payload, 41, 1, &a);
+                membus::lp(&mut payload, b"row/b");
+                sdk_value(&mut payload, 42, 2, &b);
+            } else {
+                if op == membus::GET_MANY {
+                    payload.extend(3u16.to_le_bytes());
+                }
+                sdk_value(&mut payload, 41, 1, &a);
+                if op == membus::GET_MANY {
+                    payload.push(0);
+                    sdk_value(&mut payload, 42, 2, &b);
+                }
+            }
+            let mut client = payload_client(op, &payload);
+            let deadline = sdk_deadline();
+            let (values, calls, requested) = observed_above(65_536, || {
+                if op == GET {
+                    vec![client.get("owned", "row/a", "read", deadline).unwrap()]
+                } else if op == membus::GET_MANY {
+                    client
+                        .get_many("owned", &["row/a", "missing", "row/b"], "read", deadline)
+                        .unwrap()
+                } else {
+                    let page = if op == membus::SCAN_PREFIX {
+                        client
+                            .scan_prefix(
+                                "owned",
+                                "row/",
+                                &snapshot,
+                                &[],
+                                128,
+                                MAX_FRAME,
+                                "read",
+                                deadline,
+                            )
+                            .unwrap()
+                    } else {
+                        client
+                            .scan_range(
+                                "owned",
+                                "row/a",
+                                "row/c",
+                                &snapshot,
+                                &[],
+                                128,
+                                MAX_FRAME,
+                                "read",
+                                deadline,
+                            )
+                            .unwrap()
+                    };
+                    page.items.into_iter().map(|(_, v)| Some(v)).collect()
+                }
+            });
+            assert!(client.is_usable());
+            drop(client); // Decoded data outlives the wire buffer and transport.
+            assert_eq!(values[0].as_ref().unwrap().bytes, a);
+            let count = if op == GET { 1 } else { 2 };
+            if count == 2 {
+                if op == membus::GET_MANY {
+                    assert!(values[1].is_none());
+                }
+                assert_eq!(values.last().unwrap().as_ref().unwrap().bytes, b);
+            }
+            let expected = 15 + payload.len() + count * 65_536;
+            assert!(calls <= count + 1, "complete SDK payload copy: op={op}");
+            assert!(requested <= expected, "excess SDK payload bytes: op={op}");
+        }
+    }
+}
+#[test]
+fn sdk_payloads_decode_without_complete_reply_copies() {
+    sdk_payload_cost(false);
+    sdk_payload_cost(true);
 }

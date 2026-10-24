@@ -199,6 +199,15 @@ pub struct Client<T: Transport> {
     usable: bool,
     feature_limits: FeatureLimits,
 }
+// Own the bounded reply body through typed decoding. Constructed only after
+// header association and status validation; decoders borrow past that header.
+struct ReplyPayload(Vec<u8>);
+impl std::ops::Deref for ReplyPayload {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.0[15..]
+    }
+}
 impl<T: Transport> Client<T> {
     pub fn handshake(io: T, options: Options, until: Instant) -> Result<Self> {
         Self::handshake_with_features(io, options, AdditionalFeatures::default(), until)
@@ -370,7 +379,7 @@ impl<T: Transport> Client<T> {
     pub fn is_usable(&self) -> bool {
         self.usable
     }
-    fn exchange(&mut self, op: u8, p: &[u8], until: Instant) -> Result<Vec<u8>> {
+    fn exchange(&mut self, op: u8, p: &[u8], until: Instant) -> Result<ReplyPayload> {
         if !self.usable {
             return Err(Error::Invalid("connection requires reconnect"));
         }
@@ -437,7 +446,7 @@ impl<T: Transport> Client<T> {
             return Err(Error::Refused(refusal));
         }
         self.usable = true;
-        Ok(b[15..].to_vec())
+        Ok(ReplyPayload(b))
     }
     fn read_exact_before(&mut self, mut b: &mut [u8], until: Instant) -> Result<()> {
         while !b.is_empty() {

@@ -54,6 +54,14 @@ multiplex, reconnect or retry automatically. Transport, malformed payload or
 association failure makes the connection unusable (`is_usable()` becomes false).
 Reconnect constructs a new Client and negotiates its actual epoch.
 
+The client retains each bounded, header-validated reply body while its typed
+decoder borrows the payload. It does not allocate and copy the complete payload
+into a second temporary buffer. The received allocation includes its 15-byte
+version/opcode/request-ID/status header until decoding finishes. Returned values,
+keys and cursors still own their data independently of that buffer and transport;
+no reply buffer is cached or retained by a returned value. Payload validation and
+connection invalidation on malformed input follow the same typed decode path.
+
 ## Stable attempts and uncertainty
 
 A `Deadline` contains two caller-supplied clocks: absolute Unix milliseconds for
