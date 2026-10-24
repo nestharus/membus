@@ -6,6 +6,10 @@ not open backing files, implement another wire client, parse caller documents,
 or introduce a daemon. The caller explicitly supplies the namespace, collection,
 operation identity, acknowledgment, deadline and query limits.
 
+Keep schema, rows, postings and head on one authoritative owner when introducing
+shards. Existing publication and snapshots do not span owners; see
+[routing and cutover contracts](SHARD_ROUTING.md).
+
 `Schema { fields }` declares up to 64 distinct exact UTF-8 field names. A `Record`
 has an original ordinal, opaque payload bytes, and one list of byte values per
 field. The owning codec extracts these values. Missing fields have empty lists;
@@ -110,6 +114,10 @@ commit), so leave room within the resident identifier limit. Revisit an interrup
 append with its original operation base, bytes, ordinal and acknowledgment. A
 staged ordinal cannot be skipped by publishing a later row. The API does not clean
 abandoned staging automatically.
+
+A collection can be a recoverable event source only under its owning application's
+immutable fact/intent and retention contract. It does not transact an independent
+domain-state key or supply a delivery pump; see [durable forwarding](DURABLE_DELIVERY.md).
 
 ## Available checks
 

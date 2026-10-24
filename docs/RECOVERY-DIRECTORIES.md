@@ -1,5 +1,9 @@
 # Recovery directory durability
 
+These are filesystem publication prerequisites. The proposed
+[storage capability contract](STORAGE_CAPABILITIES.md) distinguishes them from
+object-manifest publication; arbitrary remote storage is not an existing adapter.
+
 ## State directory creation
 
 Before opening the owner lock or starting replay, startup finds the nearest

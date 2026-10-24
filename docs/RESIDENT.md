@@ -15,6 +15,10 @@ logon/session access; changing the service account changes the current-user SID.
 HELLO identity is correlation, not application authentication. Admitted clients
 share the resident's local-principal powers.
 
+Shared hosting needs a separate [tenant admission boundary](TENANCY_BOUNDARY.md)
+covering every operation and shared resource. The guide describes a proposed
+service contract; namespace naming and feature negotiation are not authorization.
+
 Choose persistent storage independently of source checkouts and build output.
 `owner.lock` fences concurrent owners: Windows holds a share-denied handle for
 the resident lifetime, released on exit. On non-Windows the create-new lock
@@ -38,7 +42,8 @@ Byte options use bytes; time options use milliseconds.
 | `--retry-ms` | 86400000 | Bounded mutation outcome retention horizon |
 | `--quota` | 500000 | Live keys per namespace, including admission reservations |
 | `--index-cap` | 917000 | Global index slots, including tombstones and expiry summaries |
-| `--capacity` | 268435456 | Logical byte admission setting; see reservation behavior below |
+| `--capacity` | 536870912 | Managed memory admission budget; not a measured RSS ceiling |
+| `--cache-bytes` | 134217728 | Bounded committed-value cache allowance |
 | `--queue-bytes` | 67108864 | Charged queued representations, divided across four stripes |
 | `--dedup-cap` | 262144 | Active outcomes and bounded retired-ID ring capacity |
 | `--snapshot-bytes` | 268435456 | Aggregate conservative retained snapshot charge |
@@ -68,19 +73,23 @@ request association. A partial trickling frame can retain a connection and its
 reservation: the server idle option is not a whole-frame or request deadline.
 Windows overlapped I/O cancellation drains completion before releasing buffers.
 
-Memory budgets are independent logical charges, not a calibrated process RSS
-limit. Values, retained 32-byte retry comparators, snapshots, history, queues, response
-encoding, worker metadata and OS pipe buffers all contribute. Large scan pages
-and concurrent responses add transient memory beyond snapshot accounting. All
-committed values remain in memory; there is no cache/tiering controller.
-Comparator compaction does not compact complete queued mutation representations,
-disk records, identifiers or bookkeeping. The capacity check includes existing
-value, retained-comparator and reservation charges plus the incoming value and
-comparator. After that check, admission adds the larger full queue charge to
-in-flight reservations. Combined pending charges can therefore exceed
-`--capacity`; it is not an instantaneous ceiling on that sum. Independent queue
-limits still apply. See [KV1.md](KV1.md) for the accounting distinction and
-[RETRY_RETENTION.md](RETRY_RETENTION.md) for encoding/collision and resource limits.
+Committed payloads remain in chunk files, with a bounded memory cache. Hot reads
+use the committed index and a cache shard; misses synchronously read and validate
+the indexed record through a separate file handle. Replay rebuilds the index with
+an empty cache. Configure cache leases with repeatable `--cache-policy` rules;
+[VALUE_CACHE.md](VALUE_CACHE.md) describes their syntax and admission behavior.
+
+Managed memory charges cover indexes, retained retry metadata, pending mutation
+buffers, chunk references, signals and pinned snapshots, plus a fixed margin.
+The cache yields space before new work is admitted. Queue, snapshot and signal
+bounds remain independently enforced. These are conservative resource estimates,
+not a calibrated process RSS limit: response encoding, allocator retention, thread
+stacks, caller allocations and OS pipe buffers also matter. Snapshot value pages
+can load and pin cold payloads beyond the cache allowance under the view's
+full-payload reservation; opening a view does not load them.
+Comparator compaction does not shrink complete queued mutation representations,
+disk records or identifiers. See [RETRY_RETENTION.md](RETRY_RETENTION.md) for
+encoding/collision limits and [VALUE_CACHE.md](VALUE_CACHE.md) for memory charges.
 
 ## Health and bounded reports
 
@@ -112,6 +121,10 @@ flags use 70%. Other flags include `read_only`, `storage_error`,
 [Chunk retirement](CHUNK-RETIREMENT.md) describes their meaning and HEALTH2.
 The heartbeat does not aggregate timer errors; reconcile individual timer status.
 
+For hosted routing, separate process/endpoint health, write eligibility, pressure
+and workflow settlement. See [service readiness](SERVICE_HEALTH.md); the native
+health command does not implement that proposed supervisor policy.
+
 Startup writes `replay.json` and `replay.log`, including refusal/truncation
 stages. The log is compacted to its last 256 lines when it exceeds 1 MiB.
 Startup/fatal diagnostics go to stderr; there is no per-request access log.
@@ -124,6 +137,10 @@ inspecting stopped state. Verify the replacement's identity and qualify it
 against a retained state copy. Preserve backups independently of the checkout.
 A changed epoch invalidates snapshots, subscriptions and resume history; reconcile
 uncertain writes and application state after reconnecting.
+
+Restoring or cloning older state can reuse an epoch from an abandoned history.
+See [backup and isolated recovery](BACKUP_RECOVERY.md) for complete-state capture,
+caller reconciliation, restore generations and cutover boundaries.
 
 Replay reconstructs committed state before service. Before exposing recovered
 values or retry outcomes, startup synchronizes present, nonempty active chunks

@@ -58,6 +58,10 @@ additive calls, with unsupported (2) on older implementations. See
 [subscriptions](SUBSCRIPTIONS.md) and [timers](TIMERS.md) for extensions.
 Identity and tokens do not authenticate application actors.
 
+See [tenant admission](TENANCY_BOUNDARY.md) for the proposed hosted boundary:
+namespace selection, all opcodes/handles, shared diagnostics and resource budgets
+require authorization outside this local protocol. No tenant gateway is supplied.
+
 Every non-HELLO request begins with `u64 deadline_unix_ms; text op_id; text
 namespace`. Read IDs have no retained deduplication or snapshot-creation lookup.
 `__membus_timers_v1` and `__membus_policy_v1` are reserved and refused through
@@ -119,10 +123,13 @@ offers only OS and Flush and requires an explicit Ack.
 
 A successful durable acknowledgment follows publication: a later current GET
 sees that revision, a later published value, or subsequent removal/expiry.
-An already open snapshot retains its older view. Committed GET reads take the
-memory index's read lock, without append/flush/admission locks or backing-file
-I/O. Publication and snapshot capture can contend on that memory lock; this is
-not a lock-free or latency-bound claim. [Grouped flushing](GROUPED-FLUSH.md)
+An already open snapshot retains its older view. Committed GET reads select an
+immutable entry under the memory index's read lock, then resolve its payload
+through the bounded cache. Hot reads take a cache shard lock; misses synchronously
+read and validate the backing record without holding the index or append/flush
+locks. Publication and snapshot capture can contend on the index lock; this is
+not a lock-free or latency-bound claim. [Value caching](VALUE_CACHE.md) describes
+cold-read limits and I/O failures. [Grouped flushing](GROUPED-FLUSH.md)
 explains the distinct append and covering-sync paths.
 
 OS acknowledgment covers process-kill replay, without an OS-crash/power-loss
@@ -212,8 +219,11 @@ outcomes; never turn them into proof of absence or a new operation identity.
 ## Namespace snapshots and scans
 
 Capture retains one immutable whole-namespace committed view, excluding
-tombstones and mem mutations. It copies keys and Arc handles rather than payload
-bytes; later changes, expiry or file retirement do not alter that view. Several
+tombstones and mem mutations. It copies keys and immutable record locations under
+the committed index lock and reserves the full payload charge without loading
+values. Value pages load selected payloads outside that lock and pin their Arc
+handles once per view; keys-only pages load no payloads. Later
+changes, expiry or file retirement do not alter that view. Several
 queries/connections can share a token in the same namespace and epoch. Separate
 captures may see different revisions. There are no multi-key write transactions.
 
@@ -253,17 +263,18 @@ all related queries on a single fresh view rather than mixing pages.
 Defaults are 8 snapshots, 256 MiB aggregate conservative charge and a fixed
 30-second monotonic lifetime from capture entry (`--snapshot-max`,
 `--snapshot-bytes`, `--snapshot-ttl-ms`). Pages do not renew it. Charge per view
-is `256 + namespace bytes + sum(key bytes + 128 + value Vec capacity)` across
+is `256 + namespace bytes + sum(key bytes + 128 + value length)` across
 the whole namespace, even for narrow or keys-only queries. Active page handles
 retain charge after release/expiry until their last reference drops. The
 maintenance reaper removes expired registry entries; this is not a renewal or
 unbounded retention facility.
 
-Capture makes two traversals of the global committed hash index under a read
-lock, charging before allocating owned rows, then copies namespace keys/handles.
-It releases the committed and registry locks before sorting. Capture can delay
-publication and other snapshot registry operations; paging reads retained data
-without append/flush locks. Payload encoding and concurrent response buffers
+Capture seeks the namespace interval twice in the ordered committed index under
+one read lock, charging before allocating owned rows, then copies keys and record
+locations in key order without a sorting pass. It releases the registry mutex
+before waiting for the index, then rechecks reservations before admission. Capture
+can delay publication; value paging can load backing records without holding the
+index or append/flush locks. Payload encoding and concurrent response buffers
 add transient memory beyond the snapshot budget. With 64 connections and 16 MiB
 page budgets, returned bodies alone can approach 1 GiB, with additional temporary
 copies. Provision page size/concurrency separately from retained charges.
@@ -271,7 +282,8 @@ copies. Provision page size/concurrency separately from retained charges.
 Opcode 20 CAPTURE_METRICS returns seven cumulative u64 values: captures,
 read_lock_wait_ns, charge_walk_ns, selection_walk_ns, namespace_copy_ns,
 read_lock_held_ns, sort_and_release_ns. These instrument completed captures;
-concurrent atomic reads are not a transactional metrics snapshot.
+concurrent atomic reads are not a transactional metrics snapshot. The retained
+sort field is zero for ordered capture.
 
 ## Storage, capacity and related operations
 
@@ -281,7 +293,8 @@ operation ID, expected token and bytes. CRC detects corruption, not identity.
 Four stable key-hash stripes route records to class-specific chunks. Replay
 resolves latest versions and retained outcomes before service. Open incomplete
 tails may be truncated after recording evidence; complete corruption refuses.
-There is no replay index checkpoint or warm/cold tier. See
+There is no replay index checkpoint or compressed archival tier. The bounded
+value cache and disk-backed reads are described in [VALUE_CACHE.md](VALUE_CACHE.md). See
 [chunk retirement, import and replay](CHUNK-RETIREMENT.md) and
 [catalogue append recovery](CATALOGUE-APPEND-RECOVERY.md).
 
@@ -289,18 +302,17 @@ Default namespace quota is 500000 live keys. Default global index cap is 917000
 slots including tombstones and expiry summaries. Reservations count at admission.
 A remove frees a live namespace slot at commit but its tombstone retains an index
 slot until no other retained chunk can contradict it. Expiry summaries occupy
-index slots for 30 days. The default logical capacity setting is 256 MiB. Before
-admission, its check adds the incoming value and 32-byte comparator to existing
-committed-value, retained-comparator and reservation charges. Admission then adds
-the larger full queue charge to reservations while the old value remains visible.
-That increment can put the combined pending account above the capacity setting;
-the current check does not enforce an instantaneous ceiling on that sum.
+index slots for 30 days. The default managed memory admission budget is 512 MiB,
+including a 128 MiB cache allowance. Admission accounts for pending mutation
+buffers, index and retry metadata, chunk references, pinned snapshots, signals
+and a fixed margin; the cache yields space for those consumers. These charges
+are conservative estimates, not a measured process RSS ceiling.
 Queue admission independently charges the complete canonical mutation
 representation plus value length plus 128 bytes; durable disk admission reserves
 the complete MBK1 record.
 Identifiers, outcomes and bookkeeping still consume per-operation memory.
-Queue/snapshot/signal/timer budgets are additional,
-not a measured RSS ceiling. Retained data defaults to 8 GiB, with the executable
+Queue, snapshot, signal and timer limits are also enforced independently.
+Retained data defaults to 8 GiB, with the executable
 reserving part for maintenance; [RESIDENT.md](RESIDENT.md) lists options.
 
 Opcodes 16..19 manage [subscriptions](SUBSCRIPTIONS.md), and 21..23 manage

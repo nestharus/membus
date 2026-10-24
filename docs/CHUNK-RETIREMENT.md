@@ -159,13 +159,23 @@ retirement from the unchanged live state. Unresolved append markers still refuse
 startup as described below; ignoring resolved partial sets does not bypass that fence.
 
 Selection/catalogue work holds the state and chunk locks; deletion holds the
-chunk lock. This is not a separate retirement I/O pool. Current reads/snapshots
-use memory, so they do not hold chunk file handles. External handles can still
-block Windows deletion. A failed delete remains Retiring, keeps bytes charged,
+chunk lock. This is not a separate retirement I/O pool. Current indexed entries
+retain shared file handles. Snapshots capture record locations and file handles
+without loading payloads; value pages load and pin selected payloads once per
+view outside the committed-index lock. Views and active reads can retain those
+handles independently of current-index retirement, delaying physical reclamation.
+Deleting a name does not establish that every handle or returned copy is gone;
+platform sharing rules determine when physical allocation is released. External
+handles can also block Windows deletion. A failed delete remains Retiring,
+keeps bytes charged,
 and is retried on later passes/startup. `retire_blocked` and its age describe
 observed failed deletions; an initiation record alone does not prove failure or
 completion. A blocked chunk older than one hour sets
 `retire_blocked_high_water`. See [read-only inspection](RETIREMENT-INSPECTION.md).
+
+Logical removal and class retirement are distinct from tenant-wide copy cleanup;
+see [tenant lifecycle boundaries](TENANT_LIFECYCLE.md) before making a hosted
+deletion promise. Class/stripe chunks can contain multiple namespaces.
 
 Eligibility uses UTC close time and, within a run, monotonic elapsed time; both
 must allow retirement. Startup pauses new automatic retirement with

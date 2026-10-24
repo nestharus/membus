@@ -115,6 +115,20 @@ window. See [Rust client usage and uncertainty](docs/RUST_CLIENT.md).
 - [Indexed append-only collections](docs/INDEXED_COLLECTIONS.md)
 - [Disk-backed values, bounded cache and cache policy](docs/VALUE_CACHE.md)
 
+The following guides distinguish current local behavior from proposed hosted
+service contracts; their gateways, adapters and distributed protocols are not
+implemented:
+
+- [External read-cache freshness and fill races](docs/CLIENT_CACHE.md)
+- [Complete-state backups, isolated recovery and restore lineage](docs/BACKUP_RECOVERY.md)
+- [Tenant admission and shared-resource boundaries](docs/TENANCY_BOUNDARY.md)
+- [Tenant offboarding and retained copies](docs/TENANT_LIFECYCLE.md)
+- [Remote storage capabilities and durability](docs/STORAGE_CAPABILITIES.md)
+- [Shard routing, uncertain dispatch and cutover](docs/SHARD_ROUTING.md)
+- [Durable delivery sources and progress checkpoints](docs/DURABLE_DELIVERY.md)
+- [Remote deadlines and timeout settlement](docs/DEADLINES.md)
+- [Service health and readiness evidence](docs/SERVICE_HEALTH.md)
+
 Rust checks use `cargo test --offline --locked`; Windows listener/forwarder tests
 need the explicit fixture inputs described in [RUST_CLIENT.md](docs/RUST_CLIENT.md).
 Tests create isolated state and some launch resident processes. Build and test

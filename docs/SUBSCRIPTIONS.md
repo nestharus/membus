@@ -49,6 +49,12 @@ namespace-bound; missing, evicted or old-epoch tokens refuse subscription_missin
 filter, and do not certify complete processing by any receiver. Empty cursor
 starts at the current head without replay.
 
+Filtered subscriptions need not receive adjacent publication sequences: other
+namespaces or prefixes can advance the global cursor without matching this
+registration. A numeric jump alone is not a delivery-gap indication. Preserve
+cursors as opaque bytes and use the explicit resume/status and epoch results,
+together with receiver-owned reconciliation, to determine stream state.
+
 ## Change frames and publication order
 
 A `membus.change/1` frame is:
@@ -122,6 +128,40 @@ its server token. Restart clears every registration, status row and history.
 
 ## Native client and reconciliation
 
+Choose the consumer contract before treating a change as work:
+
+| Consumer need | Use and limits |
+|---|---|
+| Current-state invalidation | A key/revision hint can prompt a fresh GET or a pinned namespace capture. Included bytes identify that publication; a later GET can return newer state. A fresh snapshot reconstructs current state, not overwritten intermediate events. |
+| Every-event processing | Retain immutable event records and original event identities under an explicit durable acknowledgment/retention policy. The volatile ring, transport `written` count and current-value snapshot do not provide a durable consumer queue or exactly-once effects. Receiver acknowledgment and retry/deduplication remain application responsibilities. |
+| Timer wake | Decode and associate the timer envelope and reconcile timer/application state. A due identity or complete pipe write is not a lease or an effect receipt. |
+
+For durable forwarding, keep a recoverable source of committed export intent and
+checkpoint its original identities only after the selected downstream acceptance.
+Hints can accelerate the forwarder; after ring loss it must recover from that
+source. A domain mutation and a separate event-key write are not atomic together:
+KV1 supplies no multi-key transaction. Do not infer a durable outbox from two
+independently successful calls or from a current-state scan.
+
+A forwarder also needs a complete enumeration and checkpoint boundary; the
+largest native revision observed is not a contiguous durable publication cursor.
+See [durable delivery](DURABLE_DELIVERY.md) for late publication, sparse delivery,
+acceptance/settlement, source retention and bounded-backlog contracts.
+
+Delivery I/O stays outside publication locks, but hint production still takes the
+hub mutex under the committed-index write lock and checks active registrations.
+Enqueue/reference accounting and live overflow handling are therefore write-path
+work. Encoding and pipe copies recur for each delivered recipient, and the one
+delivery worker can be delayed by a slow endpoint. Bound fan-out and payloads;
+do not interpret asynchronous delivery as zero-cost publication or an unlimited
+throughput guarantee.
+
+Bound receiver-owned buffers and coalescing batches independently of the resident
+queues. A consumer that waits only for a quiet interval can postpone handling
+indefinitely under continuous input. Use explicit total-time, item and byte bounds
+where finite dispatch latency is required; the hub does not impose those limits
+on an application's own receive loop.
+
 On Windows, bind `ChangeListener` before subscribing. `subscribe` requests no
 values/resume and uses the negotiated request frame bound. `subscribe_with` takes
 `SubscribeOptions { include_values, resume, max_frame }`. Receive checks token,
@@ -139,6 +179,12 @@ register live first, then capture current state and reconcile buffered changes
 by their KV revisions. Registering after capture leaves a race. Immutable event
 consumers also need state/retention policy to retain their reconstruction data.
 Snapshot TTL, page bounds, periodic refresh and release remain caller obligations.
+
+Register-before-capture closes the registration race, but is not a freshness
+lease or atomic snapshot-and-stream checkpoint. A delayed read can refill a key
+after its hint was handled; retirement can remove data without a KV publication.
+[External client caching](CLIENT_CACHE.md) describes the required fill guards,
+bounded observation age and reconstruction limits.
 
 [Timers](TIMERS.md) share the same transport with MBT1 values. They create no
 public KV signal-key value: MBC1 revision is timer configuration generation,

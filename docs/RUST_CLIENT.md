@@ -8,6 +8,11 @@ and recovery policy. See the [README example](../README.md) for a Windows
 connection and mutation; loopback TCP uses `Client::connect_tcp` with an explicit
 `SocketAddr` for foreground tests.
 
+The Client carries the admitted local principal's powers. A hosted service must
+derive and authorize tenant scope before sending; see the proposed
+[tenant admission boundary](TENANCY_BOUNDARY.md). Connection reuse and negotiated
+features do not authenticate an application actor.
+
 ## Operations and discovery
 
 `Options::new(identity, max_frame)` requires a nonempty identity without `;` and
@@ -62,11 +67,19 @@ keys and cursors still own their data independently of that buffer and transport
 no reply buffer is cached or retained by a returned value. Payload validation and
 connection invalidation on malformed input follow the same typed decode path.
 
+Native epoch equality does not identify a logical store across independent
+endpoints. A future placement adapter must preserve source/partition identity,
+uncertainty and opaque handles; see [routing contracts](SHARD_ROUTING.md).
+
 ## Stable attempts and uncertainty
 
 A `Deadline` contains two caller-supplied clocks: absolute Unix milliseconds for
 server admission and local `Instant` expiry for transport. Convert application
 budgets explicitly; neither value substitutes for the other.
+
+Across a gateway or worker, preserve the original budget through queueing and
+reconnect, with an explicit remote clock policy. See [deadline boundaries](DEADLINES.md)
+for propagation, timeout uncertainty and cancellation/settlement distinctions.
 
 A MutationRequest retains the complete logical mutation, including caller
 operation ID, namespace, deterministic key, bytes, Ack and expectation. `prepare`
@@ -94,6 +107,11 @@ boundaries. After losing the token or crossing epoch/horizon, reconcile the
 deterministic key and embedded operation identity and make an explicit application
 decision. Fresh connection, identity or operation ID is not evidence of absence.
 These in-memory tokens are not a second journal or permanent exactly-once guarantee.
+
+Physical restore/clone can reuse an epoch from an abandoned history. Equal
+negotiated epochs alone cannot authorize reuse of an old Attempt across that
+boundary. Preserve its uncertainty for application reconciliation; see
+[backup lineage and cutover](BACKUP_RECOVERY.md).
 
 The caller's Attempt still retains its full immutable request. The resident's
 retained retry comparison instead uses a 32-byte SHA-256 comparator, subject to
@@ -143,6 +161,11 @@ The caller owns buffering hints during capture, periodic refresh, receiver
 cursor persistence, unsubscribe and application reconciliation. Included KV bytes
 belong to that publication; later GET can see newer state. Server written/status
 is not receiver receipt. See [SUBSCRIPTIONS.md](SUBSCRIPTIONS.md).
+
+Callers caching GET results also need an explicit read/freshness contract and
+protection against delayed fills crossing invalidation, absence or epoch change.
+See [external client caching](CLIENT_CACHE.md) for the proposed adapter contract;
+the Client does not implement a read-through or coherence layer.
 
 ## Timers and authority
 

@@ -55,3 +55,7 @@ precedes tail repair, import publication and epoch publication, leaving the
 inputs available for correction. Ordinary first revision one, the zero
 expected-version comparator, and an empty catalogue high-water hint retain
 their existing meanings.
+
+Retained identity/outcome state belongs to this store. Equal native epochs at
+different endpoints do not prove authority or retry continuity; see
+[routing and cutover contracts](SHARD_ROUTING.md) before forwarding Attempts.

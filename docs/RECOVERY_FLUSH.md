@@ -1,5 +1,9 @@
 # Recovered Flush prerequisite
 
+This startup barrier is one prerequisite of recovery, not a backup protocol.
+[Backup and isolated recovery](BACKUP_RECOVERY.md) describes complete-state
+capture, mutable validation and the rollback/clone limits of resident epochs.
+
 A complete MBK1 record contains the requested acknowledgement. It can survive a
 failed or interrupted live write without having received a covering data-file
 sync. Replaying its acknowledgement byte alone does not establish achieved Flush.

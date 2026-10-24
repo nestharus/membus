@@ -1,5 +1,13 @@
 # Value cache and disk reads
 
+This cache is internal to one Store. Its memory-residency leases do not provide
+freshness for a copy in another process or resident. See
+[external client-cache contracts](CLIENT_CACHE.md) before caching remote reads.
+
+Payload/location separation is not a pluggable remote-volume API. See
+[storage capabilities](STORAGE_CAPABILITIES.md) for the proposed read, append,
+durability, metadata and recovery contracts beyond the current filesystem.
+
 Committed values live in the existing immutable chunk records. The resident index
 holds each key's version, acknowledgement, length, retention class and record
 location. Entries in one chunk share a read handle. A cache miss reads and checks
@@ -185,3 +193,16 @@ remove it after retaining the numeric output. The example uses APIs available
 before cache implementation so both versions can run the same source and work
 set. It reports application-cold reads after replay, with no claim of cold OS or
 device caches.
+
+The cache example times in-process `Store::get`, including key formatting and
+the caller-owned value copy, not KV1 framing, IPC or a remote round trip. It uses
+4,096 values of 32 KiB, with 4,096 first-read samples after replay and 640 warmed
+reads for each hot phase. These percentiles do not measure sustained
+throughput, concurrent-client capacity or write acknowledgments. Compare those
+separately at the selected value size, concurrency and achieved durability.
+
+`resident_measure` also contains older hot-read controls that assert zero process
+read I/O after a write phase. A working set that has expired from or exceeds the
+bounded cache can now require reads, so that assertion is not a general Store
+guarantee. Use the cache example to distinguish warmed and first-read behavior;
+do not interpret an old memory-resident assumption as a current performance limit.

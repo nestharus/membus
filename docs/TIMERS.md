@@ -6,6 +6,10 @@ hub, without creating a public KV event key or launching payloads. A wake grants
 no lease, durable delivery guarantee or receiver receipt. Application due-ID,
 lease and result handling govern useful effects.
 
+UTC scheduling, a caller's request budget and observed cancellation/settlement
+are separate contracts. See [deadlines across processes](DEADLINES.md) before
+using timer wakes or expiry to control remote jobs.
+
 ## Discovery and control
 
 HELLO identity feature `;timers=1` advertises timer_missing (25) and a 34-byte

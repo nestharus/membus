@@ -6,6 +6,10 @@ coordinates covering extents per sink. [KV1.md](KV1.md) describes admission,
 visibility and uncertainty; [CHUNK-RETIREMENT.md](CHUNK-RETIREMENT.md) describes
 rotation and retained-byte accounting.
 
+The private route and sink coverage remain file-backed. A remote volume must
+qualify the separate [storage capabilities](STORAGE_CAPABILITIES.md), including
+metadata publication and fencing; an upload receipt is not local Flush coverage.
+
 Admission charges `canonical mutation representation length + value length + 128`
 bytes per queued mutation, at most 1024 outstanding items and `queue_bytes / 4` charged bytes per
 stripe, within `queue_bytes` globally. Saturation returns busy (6) before pending
@@ -50,8 +54,10 @@ A partial append fences its stripe so later records cannot follow a torn tail.
 Sync failure fences that stripe's flush work; late waiters receive uncertain
 I/O failure (16), and new durable admissions become read-only (10). A complete
 record left by failed I/O can still replay. Preserve uncertainty and stable
-operation identity. Committed GET reads use memory without append/flush locks
-or file I/O; HEALTH and metrics can wait for a log lock. Store teardown joins
+operation identity. Hot committed GET reads use the memory index and bounded
+cache without append/flush locks. A cache miss reads the indexed chunk record
+synchronously; [VALUE_CACHE.md](VALUE_CACHE.md) describes that separate path.
+HEALTH and metrics can wait for a log lock. Store teardown joins
 its durable workers.
 
 Startup synchronizes present active recovered data before exposing recovered
