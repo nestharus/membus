@@ -1,5 +1,6 @@
 //! Retention, retirement, expiry summaries and the periodic maintenance worker.
 use crate::chunks;
+use crate::log_io::sync_chunk_directory;
 use crate::routing::ChunkRouter;
 use crate::store::Flags;
 use crate::store::Key;
@@ -16,6 +17,9 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
 use std::time::Duration;
+
+#[cfg(test)]
+mod directory_tests;
 
 /// Retirement, expiry summaries, tombstone drops and the clock check (5.3, 5.4), shared with the tick thread.
 pub(super) struct Maint {
@@ -168,6 +172,11 @@ impl Maint {
                 if self.config.retire_stop_after == 2 {
                     continue;
                 }
+                if let Err(e) = sync_chunk_directory(p.parent().unwrap(), &self.config) {
+                    self.flags.storage_error.store(true, Ordering::SeqCst);
+                    failure = Some(e);
+                    break;
+                }
                 if let Err(e) = cs.log(utc, chunks::Rec::Retired { seq: id }) {
                     self.flags.storage_error.store(true, Ordering::SeqCst);
                     failure = Some(e);
@@ -216,6 +225,11 @@ impl Maint {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(_) => continue,
+            }
+            if let Err(e) = sync_chunk_directory(p.parent().unwrap(), &self.config) {
+                self.flags.storage_error.store(true, Ordering::SeqCst);
+                failure = Some(e);
+                break;
             }
             let now = self.clock.utc_ms();
             if let Err(e) = cs.log(now, chunks::Rec::Retired { seq: id }) {

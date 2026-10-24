@@ -67,6 +67,13 @@ fn recovery_sync_dir(path: &Path, config: &Config) -> io::Result<()> {
     crate::log_io::sync_dir(path).map_err(|e| io::Error::new(e.kind(),
         format!("recovery directory sync {}: {e}", path.display())))
 }
+fn recovery_sync_deleted_chunk(path: &Path, root: &Path, config: &Config) -> io::Result<()> {
+    let parent = path.parent().unwrap();
+    // An Open can be durable before its class directory was ever created.
+    // Persist that absence in chunks, instead of refusing on a missing parent.
+    let dir = if parent.try_exists()? { parent } else { root };
+    recovery_sync_dir(dir, config)
+}
 /// What replay rebuilt, before any file is changed.
 struct Replayed {
     committed: HashMap<(String, String), Arc<crate::value_disk::Entry>>,
@@ -1232,6 +1239,8 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
                 continue;
             }
         }
+        recovery_sync_deleted_chunk(&p, &cs.dir, config)
+            .map_err(|e| refuse(e, rp.report.clone()))?;
         cs.log(utc, chunks::Rec::Retired { seq: id })?;
         let c = cs.table.get_mut(&id).unwrap();
         c.state = chunks::ChunkState::Retired;
@@ -1243,6 +1252,10 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
     }
     // An open record whose file was never made retires at once: it holds nothing.
     for id in rp.report.empty_closed.clone() {
+        if let Some(c) = cs.table.get(&id) {
+            recovery_sync_deleted_chunk(&c.path, &cs.dir, config)
+                .map_err(|e| refuse(e, rp.report.clone()))?;
+        }
         cs.log(utc, chunks::Rec::Retired { seq: id })?;
         if let Some(c) = cs.table.get_mut(&id) {
             c.state = chunks::ChunkState::Retired;
@@ -1259,13 +1272,16 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
         let bytes = cs.table[&id].bytes;
         if bytes == 0 {
             // Nothing whole was written (or its torn tail went): the empty file retires, so no empty chunk stays.
-            fs::remove_file(&cs.table[&id].path).or_else(|e| {
+            let p = cs.table[&id].path.clone();
+            fs::remove_file(&p).or_else(|e| {
                 if e.kind() == io::ErrorKind::NotFound {
                     Ok(())
                 } else {
                     Err(e)
                 }
             })?;
+            recovery_sync_deleted_chunk(&p, &cs.dir, config)
+                .map_err(|e| refuse(e, rp.report.clone()))?;
             cs.log(utc, chunks::Rec::Retired { seq: id })?;
             cs.table.get_mut(&id).unwrap().state = chunks::ChunkState::Retired;
             rp.report.empty_closed.push(id);

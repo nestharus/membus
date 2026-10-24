@@ -4,6 +4,31 @@ Recovery synchronizes each rename's containing directory before performing the
 next dependent step. Synchronizing a file alone is not a directory publication
 barrier.
 
+Retirement completes its namespace work before publishing reclaimed bytes.
+After removing a chunk file, the live pass synchronizes the containing class
+directory before appending the Retired record or releasing that chunk's byte
+charge. Retry follows the same order even when the file is already absent:
+absence alone does not establish that an earlier delete barrier completed.
+A held or denied delete stays Retiring without reaching the directory barrier.
+
+A directory-sync failure returns the error, retains Retiring responsibility
+and sets the existing storage-error observation. It does not publish that
+chunk's Retired record or reclaim its byte charge. Successful chunks earlier
+in the pass keep their completed publication and reclamation. A later retry
+can complete the absent file's barrier, with the storage-error observation
+remaining sticky. Already durable retirement intent, horizons and expiry
+effects are not rolled back by a later deletion failure.
+
+Startup completion follows the same deletion-before-barrier-before-Retired
+order for interrupted Retiring chunks and empty Open cleanup. An already
+absent file still requires the barrier. When an interrupted Open never created
+its class directory, startup synchronizes the existing `chunks` directory to
+cover that absence; it does not try to open a nonexistent class directory as
+the barrier. Required directory failures refuse startup before the failed
+chunk's Retired record and before epoch/ready publication, retaining collected
+observations. A completed earlier retirement remains completed; a later start
+can finish the remainder. Held-delete handling retains its existing behavior.
+
 Live chunk creation has a matching namespace prerequisite. The router first
 flushes the Open catalogue record, reserves its sequence, creates the class
 directory and prepares the empty file's writer and reader handles. It then
@@ -29,8 +54,9 @@ chunks. This precedes catalogue open/name publication, recovered Close records
 and the epoch. The later `chunks` barrier covers the class-directory names.
 A failure refuses startup with collected observations and no new Close or
 epoch; a later open can retry. It does not undo earlier reported tail truncation.
-Missing, retiring and retired chunks retain their existing handling. Imported historical
-read-only backups are outside this active-chunk prerequisite.
+Missing, retiring and retired chunks are outside this active-file prerequisite;
+retirement completion has the separate deletion barriers above. Historical
+read-only import backups remain outside the active-chunk prerequisite.
 
 Before the import's directory switch, startup also synchronizes the constructed
 replacement tree. After all data files and their Close records are synced, the
@@ -104,10 +130,10 @@ and `GetLastError`. These requirements motivate an actual barrier, rather than
 assuming that NTFS journaling makes directory flushing unnecessary. Unsupported
 directory flushes and access denials propagate; they are never treated as a
 successful no-op. Storage hardware and filesystems still determine actual media
-persistence. These barriers cover live chunk creation, active class directories
-at restart, replacement-tree creation during import, the startup catalogue and
-report namespaces, and the named recovery renames. They do not cover every
-creation, removal or rename elsewhere in the store.
+persistence. These barriers cover live chunk creation and retirement, active class
+directories and retirement completion at restart, replacement-tree creation during
+import, the startup catalogue and report namespaces, and the named recovery renames.
+They do not cover every creation, removal or rename elsewhere in the store.
 
 Tests in `src/replay/durability_tests.rs` observe filesystem state at each barrier,
 inject failures, and verify both refusal and a subsequent successful retry.

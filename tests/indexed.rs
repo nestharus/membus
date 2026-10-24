@@ -24,19 +24,32 @@ struct Fixture {
     pipe: String,
     owner: child::Owned,
 }
+fn fixture_names(stamp: u128) -> (PathBuf, String) {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let identity = format!("{stamp}-{}-{}", std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    let root = PathBuf::from(
+        std::env::var_os("MEMBUS_INDEXED_TEST_ROOT")
+            .unwrap_or_else(|| "target/indexed-fixtures".into()),
+    ).join(&identity);
+    let pipe = format!(r"\\.\pipe\membus-indexed-{identity}");
+    (root, pipe)
+}
+#[test]
+fn equal_timestamp_fixtures_have_distinct_paths_and_endpoints() {
+    let first = fixture_names(7);
+    let second = fixture_names(7);
+    assert_ne!(first.0, second.0, "equal wall timestamps must not share a state directory");
+    assert_ne!(first.1, second.1, "equal wall timestamps must not share a pipe endpoint");
+}
 impl Fixture {
     fn new() -> Self {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = PathBuf::from(
-            std::env::var_os("MEMBUS_INDEXED_TEST_ROOT")
-                .unwrap_or_else(|| "target/indexed-fixtures".into()),
-        )
-        .join(stamp.to_string());
+        let (root, pipe) = fixture_names(stamp);
         fs::create_dir_all(&root).unwrap();
-        let pipe = format!(r"\\.\pipe\membus-indexed-{stamp}");
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_membus"));
         cmd.arg(root.join("state"))
             .args([

@@ -10,6 +10,12 @@ use std::fs::OpenOptions;
 use std::io;
 use std::io::Write;
 use std::path::Path;
+
+pub(super) fn sync_chunk_directory(path: &Path, _config: &Config) -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(hook) = &_config.chunk_dir_sync { hook(path)?; }
+    sync_dir(path)
+}
 #[cfg(all(windows, feature = "sync-witness"))]
 use std::sync::Mutex;
 

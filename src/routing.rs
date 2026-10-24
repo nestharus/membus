@@ -1,7 +1,7 @@
 //! Stripe and class routing, chunk rotation, sink identity and fencing.
 use crate::chunks;
 use crate::codec::crc32;
-use crate::log_io::append_to;
+use crate::log_io::{append_to, sync_chunk_directory};
 use crate::store::Flags;
 use crate::test_seam::TestSeam;
 use crate::Class;
@@ -19,12 +19,6 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
-
-fn sync_chunk_directory(path: &std::path::Path, _config: &Config) -> io::Result<()> {
-    #[cfg(test)]
-    if let Some(hook) = &_config.chunk_dir_sync { hook(path)?; }
-    crate::log_io::sync_dir(path)
-}
 
 /// A selected route or admitted policy owns its class until a chunk or the published policy owns it.
 /// Coordination order: reservations -> policies -> chunks. None is held across queued I/O;

@@ -900,3 +900,169 @@ fn recovery_data_sync_failure_never_reaches_class_directory_barriers() {
     assert!(error.to_string().contains("recovery sync failure"));
     assert!(seen.lock().unwrap().is_empty());
 }
+
+fn seed_retirement_recovery(f: &Fixture, stop: u8) -> (Config, Vec<(u64, PathBuf)>) {
+    let clock = chunks::ManualClock::new(1_000_000);
+    let mut config = Config { clock: Some(clock.clone()), retry_ms: 10, chunk_bytes: 1,
+        tick_ms: 3_600_000, retire_ms: 3_600_000, retire_stop_after: stop, ..Config::default() };
+    let store = Store::open(&f.0, config.clone()).unwrap();
+    store.policies.write().unwrap().set("caller", "", Some(Class::LATEST));
+    for n in 1..=3 {
+        let m = Mutation { ns: "caller".into(), key: "key".into(), op_id: format!("op-{n}"),
+            deadline: u64::MAX, ack: 2, expected: None, bytes: vec![n], remove: false };
+        assert_eq!(store.mutate(m).code, 0);
+    }
+    let mut old: Vec<_> = store.chunks.lock().unwrap().table.values()
+        .filter(|c| c.state == chunks::ChunkState::Closed).map(|c| (c.id, c.path.clone())).collect();
+    old.sort_by_key(|(id, _)| *id);
+    assert_eq!(old.len(), 2);
+    clock.advance(20);
+    assert!(store.maint.retire(None).unwrap().is_empty());
+    drop(store);
+    f.unlock();
+    config.retire_stop_after = 0;
+    (config, old)
+}
+
+fn retired_ids(root: &Path) -> Vec<u64> {
+    chunks::read_catalogue(&root.join("chunks/catalogue.log")).unwrap().0.iter()
+        .filter_map(|r| match r.rec { chunks::Rec::Retired { seq } => Some(seq), _ => None }).collect()
+}
+
+#[test]
+fn startup_retirement_directory_failure_refuses_and_preserves_completed_prefix() {
+    for stop in [1, 2] {
+        for fail in 1..=2 {
+            let f = Fixture::new();
+            let (mut config, old) = seed_retirement_recovery(&f, stop);
+            let live = chunks::chunk_path(&f.0.join("chunks"), Class::LATEST, stripe("caller", "key"), 3);
+            let data = fs::read(&live).unwrap();
+            let unregistered = live.with_file_name(format!("{}-1003.log", stripe("caller", "key")));
+            fs::copy(&live, &unregistered).unwrap();
+            let epoch = fs::read(f.0.join("epoch")).unwrap();
+            let root = f.0.clone();
+            let class = live.parent().unwrap().to_owned();
+            let paths = old.iter().map(|(_, path)| path.clone()).collect::<Vec<_>>();
+            let opened = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let phase = opened.clone();
+            let calls = Arc::new(AtomicU64::new(0));
+            let observed = calls.clone();
+            config.recovery_dir_sync = Some(Arc::new(move |dir| {
+                if dir == root.join("chunks") { phase.store(true, Ordering::SeqCst); }
+                if dir == class && phase.load(Ordering::SeqCst) {
+                    let call = observed.fetch_add(1, Ordering::SeqCst) + 1;
+                    assert_eq!(retired_ids(&root).len(), call as usize - 1);
+                    assert!(paths.iter().filter(|path| !path.exists()).count() >= call as usize,
+                        "delete precedes its retirement record");
+                    if call == fail { return Err(io::Error::from_raw_os_error(5)); }
+                }
+                Ok(())
+            }));
+            let error = Store::open(&f.0, config.clone()).err().expect("deletion sync failure must refuse startup");
+            assert_eq!(error.raw_os_error(), Some(5));
+            assert_eq!(calls.load(Ordering::SeqCst), fail);
+            assert_eq!(retired_ids(&f.0).len(), fail as usize - 1);
+            assert_eq!(fs::read(f.0.join("epoch")).unwrap(), epoch);
+            assert_eq!(fs::read(&live).unwrap(), data);
+            let json = fs::read_to_string(f.0.join("replay.json")).unwrap();
+            assert!(json.contains("\"stage\":\"refused\"") && json.contains("\"ready_ms\":0"));
+            let observation = format!("chunk file with no open record: {}", unregistered.display());
+            assert!(json.contains(&format!("{observation:?}")), "{json}");
+            f.unlock();
+            config.recovery_dir_sync = None;
+            let store = Store::open(&f.0, config).unwrap();
+            assert_eq!(store.epoch, 2);
+            assert_eq!(store.get("caller", "key").unwrap().bytes, vec![3]);
+            assert_eq!(store.replay_report().retirements_finished.len(), 3 - fail as usize);
+            assert!(old.iter().all(|(_, p)| !p.exists()));
+        }
+    }
+}
+
+fn seed_empty_open(f: &Fixture, file: bool, class_dir: bool) -> Config {
+    let config = Config { clock: Some(chunks::ManualClock::new(1_000_000)), ..Config::default() };
+    drop(Store::open(&f.0, config.clone()).unwrap());
+    f.unlock();
+    let mut catalogue = chunks::Catalogue::open(&f.0.join("chunks/catalogue.log")).unwrap();
+    catalogue.append(&chunks::CatRecord { at_ms: 1_000_000, rec: chunks::Rec::Open {
+        seq: 1, stripe: 0, class: Class::FOREVER, policy: String::new(), next: 2 } }).unwrap();
+    let path = chunks::chunk_path(&f.0.join("chunks"), Class::FOREVER, 0, 1);
+    if class_dir { fs::create_dir_all(path.parent().unwrap()).unwrap(); }
+    if file { fs::write(path, b"").unwrap(); }
+    config
+}
+
+#[test]
+fn empty_open_deletion_directory_failure_refuses_before_retired() {
+    for file in [true, false] {
+        let f = Fixture::new();
+        let mut config = seed_empty_open(&f, file, true);
+        let root = f.0.clone();
+        let epoch = fs::read(root.join("epoch")).unwrap();
+        let config_root = root.clone();
+        config.recovery_dir_sync = Some(Arc::new(move |dir| {
+            if dir == config_root.join("chunks/forever") {
+                assert!(!config_root.join("chunks/forever/0-1.log").exists());
+                assert!(retired_ids(&config_root).is_empty());
+                return Err(io::Error::from_raw_os_error(5));
+            }
+            Ok(())
+        }));
+        let error = Store::open(&root, config.clone()).err().expect("empty and missing files need the deletion barrier");
+        assert_eq!(error.raw_os_error(), Some(5));
+        assert!(retired_ids(&root).is_empty());
+        assert_eq!(fs::read(root.join("epoch")).unwrap(), epoch);
+        let json = fs::read_to_string(root.join("replay.json")).unwrap();
+        assert!(json.contains("\"stage\":\"refused\"") && json.contains("\"ready_ms\":0"));
+        f.unlock();
+        config.recovery_dir_sync = None;
+        let store = Store::open(&root, config).unwrap();
+        assert_eq!(store.epoch, 2);
+        assert_eq!(retired_ids(&root), vec![1]);
+    }
+}
+
+#[test]
+fn empty_open_without_a_class_directory_syncs_chunks_and_can_restart() {
+    let f = Fixture::new();
+    let mut config = seed_empty_open(&f, false, false);
+    let root = f.0.clone();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let observed = seen.clone();
+    config.recovery_dir_sync = Some(Arc::new(move |dir| {
+        if dir == root.join("chunks") {
+            observed.lock().unwrap().push(retired_ids(&root));
+        }
+        Ok(())
+    }));
+    let store = Store::open(&f.0, config).unwrap();
+    assert_eq!(*seen.lock().unwrap(), vec![Vec::<u64>::new(), Vec::new()],
+        "sync the existing parent before retiring the missing class/file");
+    assert_eq!(retired_ids(&f.0), vec![1]);
+    assert_eq!(store.epoch, 2);
+    assert!(!f.0.join("chunks/forever").exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn held_startup_retirement_delete_never_reaches_its_directory_barrier() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let f = Fixture::new();
+    let (mut config, old) = seed_retirement_recovery(&f, 1);
+    let held: Vec<_> = old.iter().map(|(_, p)| OpenOptions::new().read(true).share_mode(3).open(p).unwrap()).collect();
+    let root = f.0.clone();
+    let phase = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let opened = phase.clone();
+    config.recovery_dir_sync = Some(Arc::new(move |dir| {
+        if dir == root.join("chunks") { opened.store(true, Ordering::SeqCst); }
+        assert!(!(dir == root.join("chunks/latest") && opened.load(Ordering::SeqCst)),
+            "a held delete must not reach its directory barrier");
+        Ok(())
+    }));
+    let store = Store::open(&f.0, config).unwrap();
+    assert_eq!(store.retire_blocked(), 2);
+    assert!(retired_ids(&f.0).is_empty());
+    assert!(old.iter().all(|(_, p)| p.exists()));
+    assert_eq!(store.get("caller", "key").unwrap().bytes, vec![3]);
+    drop(held);
+}
