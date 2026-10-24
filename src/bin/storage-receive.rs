@@ -1,7 +1,12 @@
 //! Explicit fresh-state staging and native receiving of a caller-owned engineering value. Uses the
 //! public wire dispatcher in the selected library; no installed pointer, server or network is used.
 use membus::{chunks, *};
-use std::{fs, io, path::Path, process::ExitCode};
+use std::{
+    fs,
+    io::{self, Write},
+    path::{Path, PathBuf},
+    process::ExitCode,
+};
 #[path = "../../tools/catalogue_receiver.rs"]
 mod receiver;
 const HEAD: &str = match option_env!("MEMBUS_BUILD_HEAD") {
@@ -89,9 +94,16 @@ fn policy(s: &Store, ns: &str, key: &str) -> io::Result<Vec<u8>> {
     Ok(reply)
 }
 fn run() -> io::Result<()> {
-    let a: Vec<String> = std::env::args().skip(1).collect();
+    let mut a: Vec<String> = std::env::args().skip(1).collect();
+    let snapshot_path = if a.len() >= 2 && a[a.len() - 2] == "--catalogue-snapshot" {
+        let path = PathBuf::from(a.pop().unwrap());
+        a.pop();
+        Some(path)
+    } else {
+        None
+    };
     if !((a.len() == 6 && a[0] == "stage") || (a.len() == 7 && a[0] == "receive")) {
-        return Err(fail("usage: storage-receive stage FRESH_STATE NS KEY INPUT EXPECTED_HEAD | receive STATE NS KEY INPUT EXPECTED_HEAD EXPECTED_VERSION"));
+        return Err(fail("usage: storage-receive stage FRESH_STATE NS KEY INPUT EXPECTED_HEAD | receive STATE NS KEY INPUT EXPECTED_HEAD EXPECTED_VERSION [--catalogue-snapshot NEW_FILE]"));
     }
     if a[5] != HEAD {
         return Err(fail(format!(
@@ -144,6 +156,14 @@ fn run() -> io::Result<()> {
     let mut hash = chunks::Sha256::new();
     hash.update(&catalogue_snapshot);
     let catalogue_sha256 = hash.hex();
+    if let Some(path) = snapshot_path {
+        let mut output = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        output.write_all(&catalogue_snapshot)?;
+        output.sync_all()?;
+    }
     if !records.iter().any(|r| {
         matches!(&r.rec,chunks::Rec::Open { class,policy,.. }
         if *class==Class::LATEST && policy==&format!("{}/{}",a[2],a[3]))
