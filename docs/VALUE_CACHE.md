@@ -27,6 +27,13 @@ before its mutex when the allocated charge exceeds a fixed caller or configured
 ceiling. Potentially retainable values still coordinate and recheck the current
 allowance under that mutex, including during temporary pressure.
 
+Captured revisions already invalidated by replacement, deletion or retirement
+also bypass final admission coordination. Their successful payloads remain
+pinned under the snapshot's existing reservation. Eligibility is still rechecked
+under the destination shard lock before publishing, so invalidation during
+admission cannot restore an obsolete revision to the live cache. Other cold-read
+locks and pending allowance recalculation can still delay a snapshot load.
+
 GET and GET_MANY preflight complete reply sizes from immutable index entries
 before payload reads or cache changes. Fitting committed reads and snapshot pages
 encode directly into their final response buffer. Request and cold-record

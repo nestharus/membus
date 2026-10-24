@@ -161,3 +161,54 @@ fn admission_bypass_disabled_cache_during_trim() {
 fn admission_bypass_fitting_value_still_coordinates_and_admits_after_restore() {
     read_during_stalled_trim(64 * 1024, 8192, true);
 }
+
+#[test]
+fn obsolete_revision_bypasses_admission_even_when_its_charge_fits() {
+    let config = Config {
+        cache_bytes: 64 * 1024,
+        ..Config::default()
+    };
+    let cache = Cache::new(
+        &config,
+        Clock::new(Some(crate::ManualClock::new(crate::now_ms()))),
+    );
+    cache.trim(config.cache_bytes);
+    let value = Arc::new(Value {
+        version: 1,
+        ack: 1,
+        tombstone: false,
+        bytes: vec![0x71; 8192],
+    });
+    let admission = cache.admission.lock().unwrap();
+    let (done, finished) = mpsc::channel();
+    let completed = std::thread::scope(|scope| {
+        let (cache, value) = (&cache, value.clone());
+        let reader = scope.spawn(move || {
+            cache.insert(
+                value,
+                "snapshot".into(),
+                CachePolicy::default(),
+                false,
+                config.cache_bytes,
+                &AtomicBool::new(false),
+            );
+            done.send(()).unwrap();
+        });
+        let completed = finished.recv_timeout(Duration::from_secs(5)).is_ok();
+        // Release coordination and join before asserting, including on old code.
+        drop(admission);
+        reader.join().unwrap();
+        completed
+    });
+    assert!(completed, "obsolete revisions must bypass admission coordination");
+    assert_eq!(cache.stats().entries, 0);
+    cache.insert(
+        value,
+        "snapshot".into(),
+        CachePolicy::default(),
+        false,
+        config.cache_bytes,
+        &AtomicBool::new(true),
+    );
+    assert_eq!(cache.stats().entries, 1);
+}

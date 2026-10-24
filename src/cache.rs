@@ -366,6 +366,11 @@ impl Cache {
         if ttl == 0 || (!initial && policy.never_cache) || value.tombstone {
             return;
         }
+        // Entry eligibility only changes to false. A captured obsolete revision
+        // cannot be admitted; keep the locked checks for later invalidation.
+        if !eligible.load(Ordering::Acquire) {
+            return;
+        }
         let charge = Self::value_charge(value.bytes.capacity(), &label);
         // These fixed ceilings cannot be raised by concurrent maintenance.
         // A value that cannot fit need not wait for unrelated admission work.
