@@ -532,17 +532,16 @@ fn request_identifier_cost(op: u8) {
     assert_eq!(after.hits - before.hits, if op == GET { 1 } else { 2 });
     assert_eq!(after.misses, before.misses);
     assert_eq!(after.bytes, before.bytes);
-    let index_copies = 2 * keys.len();
     eprintln!("request identifiers op={op} allocations={calls} requested_bytes={requested} output_bytes={} cache_hits={} cache_bytes={}", output.len(), after.hits-before.hits, after.bytes);
-    // Allow the final output and the existing owned index-lookup pairs. Wire
-    // identifiers need no additional owned copies. Smaller future costs pass.
+    // Borrow identifiers through index lookup as well as dispatch. Only the
+    // final output may request at least 1 KiB; smaller future costs pass.
     assert!(
-        calls <= index_copies + 1,
-        "discarded request identifier allocations: {calls}"
+        calls <= 1,
+        "discarded read identifier allocations: {calls}"
     );
     assert!(
-        requested <= output.len() + index_copies * membus::MAX_ID,
-        "discarded request identifier bytes: {requested}"
+        requested <= output.len(),
+        "discarded read identifier bytes: {requested}"
     );
 }
 #[test]

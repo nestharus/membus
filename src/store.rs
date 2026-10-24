@@ -28,6 +28,9 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
 
+mod borrowed_keys;
+pub(super) use borrowed_keys::get as committed_get;
+
 #[derive(Clone)]
 pub(super) struct Dedup {
     pub(super) fingerprint: [u8; 32],
@@ -137,10 +140,7 @@ impl Store {
         self.get_handle_result(ns,key).ok().flatten()
     }
     pub(super) fn get_handle_result(&self, ns: &str, key: &str) -> io::Result<Option<Arc<Value>>> {
-        let entry = self.committed
-            .read()
-            .unwrap()
-            .get(&(ns.to_owned(), key.to_owned()))
+        let entry = committed_get(&self.committed.read().unwrap(), ns, key)
             .filter(|v| !v.tombstone)
             .cloned();
         entry.map(|entry| self.read_entry(ns, key, &entry)).transpose()
@@ -340,7 +340,7 @@ impl Store {
     }
     /// GET_STATUS (5.3): 0 live with its version, 1 expired (in a summary), 2 missing.
     pub fn get_status(&self, ns: &str, key: &str) -> (u8, u64) {
-        if let Some(v) = self.committed.read().unwrap().get(&(ns.to_owned(),key.to_owned())).filter(|v|!v.tombstone) {
+        if let Some(v) = committed_get(&self.committed.read().unwrap(), ns, key).filter(|v|!v.tombstone) {
             return (0, v.version);
         }
         let k = (ns.to_owned(), key.to_owned());

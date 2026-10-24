@@ -649,11 +649,7 @@ impl Store {
         for &key in keys {
             // Each key retains its own committed observation, as before. No
             // index lock spans another key or disk I/O: this is not a snapshot.
-            let entry = self
-                .committed
-                .read()
-                .unwrap()
-                .get(&(ns.to_owned(), key.to_owned()))
+            let entry = crate::store::committed_get(&self.committed.read().unwrap(), ns, key)
                 .filter(|entry| !entry.tombstone)
                 .cloned();
             payload_len = payload_len
