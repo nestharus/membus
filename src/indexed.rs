@@ -562,7 +562,7 @@ fn immutable<T: Transport>(
         operation_id: op.into(),
         namespace: ns.into(),
         key: key.into(),
-        value: bytes.clone(),
+        value: bytes,
         ack,
         expected: Some(0),
     })?;
@@ -572,7 +572,7 @@ fn immutable<T: Transport>(
             let v = c
                 .get(ns, key, &format!("{op}:reconcile"), d)?
                 .ok_or(Error::Corrupt("immutable conflict absent"))?;
-            if v.bytes == bytes && v.ack == ack {
+            if v.bytes == a.request().value && v.ack == ack {
                 Ok(())
             } else {
                 Err(Error::Conflict("immutable collision"))

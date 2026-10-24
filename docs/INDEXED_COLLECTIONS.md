@@ -75,6 +75,13 @@ not acceptance of a remote declaration. A cloned collection owns its own copy;
 the bytes leave with the collection. The exact boxed encoding is at most
 `8 + 64 * (4 + MAX_ID)` bytes per collection, separate from resident cache usage.
 
+Immutable publication moves the encoded value into the client's prepared
+mutation. Conflict reconciliation compares against that retained request, so no
+second full value copy is kept just for the comparison. The request remains
+owned until publication/reconciliation returns; acknowledgment matching and
+immutable collision refusal still apply. Other transport and resident copies
+remain.
+
 For `All` and `Ordinals`, row pages also carry an acquisition budget: remaining
 encoded-row bytes plus conservative protocol overhead, capped by the negotiated
 frame. The overhead allows the fixed page fields, a maximum query-bound cursor,
