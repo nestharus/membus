@@ -138,9 +138,35 @@ impl Collection {
     pub fn schema(&self) -> &Schema {
         &self.schema
     }
-    /// Validate and measure the exact encoded record before publication.
+    /// Validate and measure the exact encoded record without allocating it.
     pub fn encoded_len(&self, record: &Record) -> Result<usize> {
-        Ok(self.encode(record)?.len())
+        if record.ordinal == 0
+            || record.ordinal == u64::MAX
+            || record.fields.len() != self.schema.fields.len()
+        {
+            return Err(Error::Invalid("row ordinal/declared fields"));
+        }
+        let mut len = 16usize;
+        for values in &record.fields {
+            if values.len() > 1024 {
+                return Err(Error::Invalid("field value count"));
+            }
+            if len > MAX_VALUE - 2 {
+                return Err(Error::Invalid("encoded row bound"));
+            }
+            len += 2;
+            for value in values {
+                len = len
+                    .checked_add(4)
+                    .and_then(|n| n.checked_add(value.len()))
+                    .filter(|&n| value.len() <= MAX_VALUE && n <= MAX_VALUE)
+                    .ok_or(Error::Invalid("field bytes"))?;
+            }
+        }
+        len.checked_add(4)
+            .and_then(|n| n.checked_add(record.payload.len()))
+            .filter(|&n| record.payload.len() <= MAX_VALUE && n <= MAX_VALUE)
+            .ok_or(Error::Invalid("payload bytes"))
     }
     fn key(&self, tail: &str) -> String {
         format!("x/{}/{tail}", self.name)
@@ -149,47 +175,17 @@ impl Collection {
         self.key(&format!("r/{n:020}"))
     }
     fn encode(&self, row: &Record) -> Result<Vec<u8>> {
-        if row.ordinal == 0
-            || row.ordinal == u64::MAX
-            || row.fields.len() != self.schema.fields.len()
-        {
-            return Err(Error::Invalid("row ordinal/declared fields"));
-        }
-        let mut b = b"MBIX1R".to_vec();
+        let mut b = Vec::with_capacity(self.encoded_len(row)?);
+        b.extend(b"MBIX1R");
         b.extend(row.ordinal.to_le_bytes());
         b.extend((row.fields.len() as u16).to_le_bytes());
         for values in &row.fields {
-            if values.len() > 1024 {
-                return Err(Error::Invalid("field value count"));
-            }
-            if b.len() > MAX_VALUE - 2 {
-                return Err(Error::Invalid("encoded row bound"));
-            }
             b.extend((values.len() as u16).to_le_bytes());
             for value in values {
-                if value.len() > MAX_VALUE
-                    || b.len()
-                        .checked_add(4)
-                        .and_then(|n| n.checked_add(value.len()))
-                        .is_none_or(|n| n > MAX_VALUE)
-                {
-                    return Err(Error::Invalid("field bytes"));
-                }
                 lp(&mut b, value);
             }
         }
-        if row.payload.len() > MAX_VALUE
-            || b.len()
-                .checked_add(4)
-                .and_then(|n| n.checked_add(row.payload.len()))
-                .is_none_or(|n| n > MAX_VALUE)
-        {
-            return Err(Error::Invalid("payload bytes"));
-        }
         lp(&mut b, &row.payload);
-        if b.len() > MAX_VALUE {
-            return Err(Error::Invalid("encoded row exceeds resident value bound"));
-        }
         Ok(b)
     }
     fn decode(&self, b: &[u8]) -> Result<Record> {

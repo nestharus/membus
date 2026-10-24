@@ -941,3 +941,144 @@ fn sdk_payloads_decode_without_complete_reply_copies() {
     sdk_payload_cost(false);
     sdk_payload_cost(true);
 }
+
+fn indexed_size_record() -> (membus::indexed::Collection, membus::indexed::Record) {
+    use membus::indexed::{Collection, Record, Schema};
+    let collection = Collection::new(
+        "records",
+        Schema {
+            fields: ["id", "kind", "source", "revises"]
+                .map(str::to_string)
+                .to_vec(),
+        },
+    )
+    .unwrap();
+    let mut payload = b"{\"detail\":\"".to_vec();
+    payload.extend(vec![b'q'; 65_536]);
+    payload.extend(b"\"}");
+    (
+        collection,
+        Record {
+            ordinal: 1,
+            fields: vec![
+                vec![b"authored-id".to_vec()],
+                vec![b"observation".to_vec()],
+                vec![b"authored-source".to_vec()],
+                vec![],
+            ],
+            payload,
+        },
+    )
+}
+fn indexed_size_reference(row: &membus::indexed::Record) -> Vec<u8> {
+    let mut bytes = b"MBIX1R".to_vec();
+    bytes.extend(row.ordinal.to_le_bytes());
+    bytes.extend((row.fields.len() as u16).to_le_bytes());
+    for values in &row.fields {
+        bytes.extend((values.len() as u16).to_le_bytes());
+        for value in values {
+            membus::lp(&mut bytes, value);
+        }
+    }
+    membus::lp(&mut bytes, &row.payload);
+    bytes
+}
+#[test]
+fn indexed_size_measurement_does_not_encode_the_record() {
+    let (collection, row) = indexed_size_record();
+    let expected = indexed_size_reference(&row);
+    let unchanged = row.clone();
+    let (length, calls, bytes) = observed_above(0, || collection.encoded_len(&row));
+    assert_eq!(length.unwrap(), expected.len());
+    assert_eq!(row, unchanged);
+    assert_eq!(
+        calls, 0,
+        "record measurement must not allocate a temporary encoding"
+    );
+    assert_eq!(bytes, 0);
+}
+#[test]
+fn indexed_size_refusal_does_not_encode_preceding_fields() {
+    use membus::indexed::{Collection, Error, Record, Schema};
+    let collection = Collection::new(
+        "records",
+        Schema {
+            fields: vec!["field".into()],
+        },
+    )
+    .unwrap();
+    let row = Record {
+        ordinal: 1,
+        fields: vec![vec![vec![0x71; 262_144]]],
+        payload: vec![0x92; membus::MAX_VALUE + 1],
+    };
+    let (result, calls, bytes) = observed_above(0, || collection.encoded_len(&row));
+    assert!(matches!(result, Err(Error::Invalid("payload bytes"))));
+    assert_eq!(
+        calls, 0,
+        "refused measurement must not encode earlier valid fields"
+    );
+    assert_eq!(bytes, 0);
+}
+#[test]
+fn indexed_size_preserves_validation_order_and_exact_bounds() {
+    use membus::indexed::{Collection, Error, Record, Schema};
+    let empty = Collection::new("records", Schema { fields: vec![] }).unwrap();
+    let field = Collection::new(
+        "records",
+        Schema {
+            fields: vec!["field".into()],
+        },
+    )
+    .unwrap();
+    for ordinal in [0, u64::MAX] {
+        assert!(matches!(
+            empty.encoded_len(&Record {
+                ordinal,
+                fields: vec![],
+                payload: vec![]
+            }),
+            Err(Error::Invalid("row ordinal/declared fields"))
+        ));
+    }
+    let mut row = Record {
+        ordinal: 1,
+        fields: vec![],
+        payload: vec![],
+    };
+    assert!(matches!(
+        field.encoded_len(&row),
+        Err(Error::Invalid("row ordinal/declared fields"))
+    ));
+    row.fields = vec![vec![vec![]; 1025]];
+    assert!(matches!(
+        field.encoded_len(&row),
+        Err(Error::Invalid("field value count"))
+    ));
+    row.fields = vec![vec![vec![0x51; membus::MAX_VALUE]]];
+    assert!(matches!(
+        field.encoded_len(&row),
+        Err(Error::Invalid("field bytes"))
+    ));
+    row.fields.clear();
+    row.payload = vec![0x39; membus::MAX_VALUE - 20];
+    assert_eq!(empty.encoded_len(&row).unwrap(), membus::MAX_VALUE);
+    row.payload.push(0);
+    assert!(matches!(
+        empty.encoded_len(&row),
+        Err(Error::Invalid("payload bytes"))
+    ));
+    // The first bad field still wins even when a later field has a bad count.
+    let two = Collection::new(
+        "records",
+        Schema {
+            fields: vec!["one".into(), "two".into()],
+        },
+    )
+    .unwrap();
+    row.fields = vec![vec![vec![0; membus::MAX_VALUE]], vec![vec![]; 1025]];
+    assert!(matches!(
+        two.encoded_len(&row),
+        Err(Error::Invalid("field bytes"))
+    ));
+}

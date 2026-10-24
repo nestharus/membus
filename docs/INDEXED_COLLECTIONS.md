@@ -60,6 +60,12 @@ rather than only returned matches. These are query-work bounds, not a complete
 allocator/response-memory limit. `encoded_len` validates and
 measures an exact record before publication.
 
+Measurement checks ordinal, field counts and cumulative byte bounds in encoding
+order without allocating or copying the record. Publication uses that same
+validated length to reserve its encoded output once. This leaves the wire bytes,
+refusal precedence and append/reconciliation protocol unchanged. Complete
+publication also allocates other protocol data.
+
 For `All` and `Ordinals`, row pages also carry an acquisition budget: remaining
 encoded-row bytes plus conservative protocol overhead, capped by the negotiated
 frame. The overhead allows the fixed page fields, a maximum query-bound cursor,
