@@ -60,6 +60,22 @@ rather than only returned matches. These are query-work bounds, not a complete
 allocator/response-memory limit. `encoded_len` validates and
 measures an exact record before publication.
 
+For `All` and `Ordinals`, row pages also carry an acquisition budget: remaining
+encoded-row bytes plus conservative protocol overhead, capped by the negotiated
+frame. The overhead allows the fixed page fields, a maximum query-bound cursor,
+and each page slot's maximum key and value envelope. Page slots are capped by the
+requested committed interval and negotiated batch count. This positive slot cap
+remains fixed across continuations so extra malformed rows still reach the
+existing identity/completeness checks.
+
+When the smaller query-derived budget refuses a first item as `too_large`, the
+collection returns its ordinary `Limit`; an inherited transport-frame refusal
+keeps its typed client error. Row-byte accounting and all validation remain in
+place after reception. Conservative overhead can admit some excess encoded
+bytes before `Limit`; this is not an exact storage-read cutoff or a total memory
+bound. Declaration/boundary reads and equality row lookup keep their existing
+acquisition behavior. The caller still owns snapshot release on every error.
+
 This is an append/publication contract for participating callers in an explicitly
 selected namespace, not an access-control boundary against arbitrary raw KV
 writers. Unsupported overwrites can corrupt that namespace. Ordered query
@@ -83,3 +99,8 @@ data, and a deliberate CRC bucket collision. Fixtures own and settle their
 children through the repository's existing finite-child support. These controls
 do not install a service, select a consumer backend, or establish a performance
 improvement. A consumer must still demonstrate its actual query and semantics.
+
+`indexed_admission` covers refusal before loading an oversized required row or
+evicting a useful cached value, retry with the same view, exact byte allowances,
+transport refusals, saturated arithmetic, and unexpected continuation rows.
+Cold-load counts describe the application cache, not physical-drive I/O.

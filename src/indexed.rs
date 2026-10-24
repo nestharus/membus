@@ -94,6 +94,14 @@ fn count(b: &[u8]) -> Result<u64> {
     }
     Ok(n)
 }
+fn range_page_budget(max_frame: usize, remaining: usize, limit: u16) -> usize {
+    // Body header/token/count, a maximum cursor, and each bounded key plus
+    // value envelope. Encoded row bytes are charged separately by the caller.
+    remaining
+        .saturating_add(42 + 2 * MAX_ID + 48)
+        .saturating_add(usize::from(limit) * (4 + MAX_ID + 14))
+        .min(max_frame)
+}
 impl Schema {
     fn encode(&self) -> Result<Vec<u8>> {
         if self.fields.len() > 64 {
@@ -407,18 +415,31 @@ impl Collection {
                         .unwrap_or_else(|| self.key("r/~"));
                     let mut cursor = Vec::new();
                     let mut expected = first;
+                    let max_frame = c.negotiated().max_frame;
+                    let page_limit = (last - first + 1).min(c.negotiated().max_batch as u64) as u16;
                     loop {
-                        let p = c.scan_range(
+                        let budget = range_page_budget(
+                            max_frame,
+                            limits.max_bytes.saturating_sub(bytes),
+                            page_limit,
+                        );
+                        let p = match c.scan_range(
                             ns,
                             &self.row_key(first),
                             &upper,
                             snapshot,
                             &cursor,
-                            c.negotiated().max_batch as u16,
-                            c.negotiated().max_frame,
+                            page_limit,
+                            budget,
                             &format!("{op}:rows"),
                             d,
-                        )?;
+                        ) {
+                            Ok(page) => page,
+                            Err(client::Error::Refused(r)) if r.code == 4 && budget < max_frame => {
+                                return Err(Error::Limit);
+                            }
+                            Err(e) => return Err(e.into()),
+                        };
                         for (key, value) in p.items {
                             bytes = bytes.checked_add(value.bytes.len()).ok_or(Error::Limit)?;
                             if bytes > limits.max_bytes {
