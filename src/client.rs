@@ -2,7 +2,7 @@
 //! Operation identity, clock conversion, retry policy and reconciliation belong to the caller.
 use crate::{
     frame, lp, Cursor, CODES, CONDITIONAL_PUT, GET, GET_MANY, HELLO, MAX_BATCH, MAX_FRAME, MAX_ID,
-    MAX_VALUE, PUT,
+    MAX_VALUE, PUT, REMOVE,
 };
 use std::{
     collections::BTreeMap,
@@ -174,6 +174,31 @@ pub struct MutationRequest {
     pub value: Vec<u8>,
     pub ack: Ack,
     pub expected: Option<u64>,
+}
+/// Conditional tombstone, using the existing REMOVE opcode. Zero requires absence;
+/// a nonzero expectation is an opaque live revision, never an application ID.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoveRequest {
+    pub operation_id: String,
+    pub namespace: String,
+    pub key: String,
+    pub ack: Ack,
+    pub expected: u64,
+}
+/// Caller-owned removal identity and original retry context. Like Attempt, this
+/// is in memory, not a durable journal or authority across clone/restore.
+#[derive(Debug)]
+pub struct RemoveAttempt {
+    request: RemoveRequest,
+    inner: Attempt,
+}
+impl RemoveAttempt {
+    pub fn request(&self) -> &RemoveRequest {
+        &self.request
+    }
+    pub fn epoch(&self) -> u64 {
+        self.inner.epoch
+    }
 }
 /// Retains the exact request and a conservative retry horizon from BEFORE its first send.
 /// Keep this object after every uncertain result. It is an in-memory token, not a journal.
@@ -661,6 +686,32 @@ impl<T: Transport> Client<T> {
             retry_window_ms: self.negotiated.retry_window_ms,
         })
     }
+    /// Prepare a NEW removal. Retain this token after an uncertain send; do not
+    /// prepare again to erase its original epoch, retry window or uncertainty.
+    pub fn prepare_remove(&self, request: RemoveRequest) -> Result<RemoveAttempt> {
+        self.validate_remove(&request)?;
+        let inner = self.prepare(MutationRequest {
+            operation_id: request.operation_id.clone(),
+            namespace: request.namespace.clone(),
+            key: request.key.clone(),
+            value: Vec::new(),
+            ack: request.ack,
+            expected: Some(request.expected),
+        })?;
+        Ok(RemoveAttempt { request, inner })
+    }
+    /// Pure REMOVE frame preflight; performs no transport I/O.
+    pub fn validate_remove(&self, request: &RemoveRequest) -> Result<usize> {
+        identifier(&request.operation_id)?;
+        identifier(&request.namespace)?;
+        identifier(&request.key)?;
+        let size = 13 + 8 + 3 * 4 + request.operation_id.len()
+            + request.namespace.len() + request.key.len() + 1 + 8;
+        if size > self.negotiated.max_frame {
+            return Err(Error::Invalid("frame limit"));
+        }
+        Ok(size)
+    }
     fn mutation_payload_len(&self, m: &MutationRequest) -> Result<usize> {
         identifier(&m.key)?;
         if m.value.len() > self.negotiated.max_value {
@@ -682,7 +733,9 @@ impl<T: Transport> Client<T> {
     }
     fn mutation_frame(&self, op: u8, m: &MutationRequest, d: Deadline) -> Result<Vec<u8>> {
         // Fill the request ID only after admission; refused sends consume none.
-        let mut p = crate::codec::frame_header(op, 0, self.mutation_payload_len(m)?);
+        let payload_len = self.mutation_payload_len(m)?
+            - if op == REMOVE { 4 + m.value.len() } else { 0 };
+        let mut p = crate::codec::frame_header(op, 0, payload_len);
         p.extend(d.unix_ms.to_le_bytes());
         lp(&mut p, m.operation_id.as_bytes());
         lp(&mut p, m.namespace.as_bytes());
@@ -691,7 +744,9 @@ impl<T: Transport> Client<T> {
         if let Some(expected) = m.expected {
             p.extend(expected.to_le_bytes());
         }
-        lp(&mut p, &m.value);
+        if op != REMOVE {
+            lp(&mut p, &m.value);
+        }
         Ok(p)
     }
     /// Pure preflight sharing the encoder's validated size. No send or readiness claim.
@@ -705,6 +760,19 @@ impl<T: Transport> Client<T> {
     /// No retry, reconnect, new identity or backing-state fallback is performed.
     /// Reusing an Attempt is allowed only in its original epoch and conservative retry window.
     pub fn mutate(&mut self, attempt: &mut Attempt, d: Deadline) -> Result<MutationReply> {
+        let op = if attempt.request.expected.is_some() {
+            CONDITIONAL_PUT
+        } else {
+            PUT
+        };
+        self.send_mutation(attempt, op, d)
+    }
+    /// Publish one conditional tombstone with explicit achieved Ack. This is
+    /// not an atomic multi-key operation, archive, or cancellation of a prior send.
+    pub fn remove(&mut self, attempt: &mut RemoveAttempt, d: Deadline) -> Result<MutationReply> {
+        self.send_mutation(&mut attempt.inner, REMOVE, d)
+    }
+    fn send_mutation(&mut self, attempt: &mut Attempt, op: u8, d: Deadline) -> Result<MutationReply> {
         if attempt.epoch != self.negotiated.epoch {
             return Err(Error::EpochChanged {
                 expected: attempt.epoch,
@@ -718,11 +786,6 @@ impl<T: Transport> Client<T> {
             return Err(Error::RetryWindowExpired);
         }
         let m = &attempt.request;
-        let op = if m.expected.is_some() {
-            CONDITIONAL_PUT
-        } else {
-            PUT
-        };
         let mut bytes = self.mutation_frame(op, m, d)?;
         if !self.usable {
             return Err(Error::Invalid("connection requires reconnect"));

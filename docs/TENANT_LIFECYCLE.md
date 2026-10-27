@@ -84,9 +84,15 @@ Inventory namespaces, internal controls, handles, local/remote caches, worker
 spools, artifacts, collector/export queues, specialist backends and backups by
 tenant/generation. Clean up through each owner's supported interface using bounded
 work and stable operation IDs. Preserve necessary anti-resurrection/recovery
-state. Current native Client has no typed REMOVE or tenant-delete method; a
-future service must implement and qualify its supported cleanup surface rather
-than inventing an unchecked private wire path.
+state. The native [Rust Client](RUST_CLIENT.md) supports one-key conditional
+tombstones through `prepare_remove` and `remove`, with an explicitly requested
+OS or Flush acknowledgment. Retain the original `RemoveAttempt` and uncertainty
+within its original epoch and retry horizon; this in-memory token does not
+restore lost retry context after caller restart. This primitive does not
+implement archive eligibility, physical erasure or restore authority. There is
+no tenant-delete method or tenant-wide offboarding workflow; a future service
+must implement and qualify its supported cleanup surface rather than inventing
+an unchecked private wire path.
 
 Backup restoration must consult an authoritative exclusion/lifecycle record
 outside the restored root before enabling access, timers, exporters or workers.
