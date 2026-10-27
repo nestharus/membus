@@ -26,6 +26,22 @@ reconcile those original intentions before deciding on any later call. Repeating
 `call` with the same ID or a fresh deadline starts another call and does not
 carry custody forward. No automatic cross-call replay is provided.
 
+For PUT, conditional PUT, REMOVE, BATCH and unsubscribe, `call` validates the
+typed successful payload before releasing this custody, then returns the same
+bytes. Mutation replies require exactly a version and an Ack in 0..2. BATCH
+requires the original item count, complete ordered outcomes with known refusal
+codes (or success), valid Ack values and no trailing bytes. Unsubscribe requires
+an empty payload. Malformed typed data after a first transport loss raises
+`CallUncertain` with that first cause and the validation error as `last_error`;
+validation never triggers another send. Valid wrapper results and call signatures
+are unchanged. Direct `call` users of these opcodes now also reject malformed
+successful payloads. Previously tolerated invalid Ack, BATCH count, code or tail
+data now raises `ValueError`; short/long fixed mutation payloads keep
+`struct.error`, truncated BATCH keeps `ValueError`, and invalid unsubscribe keeps
+`ValueError` when there was no earlier loss. This validation does not upgrade an
+Ack or make BATCH atomic. Policy SET and other raw calls retain their existing
+operation-specific validation responsibility.
+
 First-attempt protocol errors and definitive refusals keep their existing types;
 codes 16 and 17 retain their protocol uncertainty meaning. `retry_transport=False`
 still sends once and leaves errors to its explicit owner. Indexed publication

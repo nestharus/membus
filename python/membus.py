@@ -299,7 +299,28 @@ class Client:
                             raise TimeoutError('original retry horizon elapsed')
                         if int(time.time()*1000) >= deadline:
                             raise TimeoutError('original request deadline elapsed')
-                return self.exchange(opcode, payload, deadline)
+                reply = self.exchange(opcode, payload, deadline)
+                # An associated success frame is not yet a typed settlement.
+                # Validate while the original request and first loss are in scope.
+                if opcode in (4, 5, 6):
+                    _, achieved = struct.unpack('<QB', reply)
+                    if achieved > 2:
+                        raise ValueError('invalid mutation acknowledgment')
+                elif opcode == 7:
+                    d = Decoder(reply)
+                    count, = d.unpack('<H')
+                    expected, = struct.unpack('<H', suffix[:2])
+                    if count != expected:
+                        raise ValueError('invalid batch reply count')
+                    for _ in range(count):
+                        code, _, achieved = d.unpack('<HQB')
+                        if (code and code not in self.codes) or achieved > 2:
+                            raise ValueError('invalid batch outcome')
+                    if d.pos != len(reply):
+                        raise ValueError('invalid batch reply length')
+                elif opcode == 17 and reply:
+                    raise ValueError('invalid unsubscribe reply')
+                return reply
             except Exception as error:
                 transport_error = isinstance(error, (OSError, ConnectionError))
                 if transport_error or lost is not None:

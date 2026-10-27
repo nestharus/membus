@@ -65,7 +65,7 @@ class RetryControls(unittest.TestCase):
 
     def setup_client(self, *, elapsed=0, reconnect_elapsed=0, retry_ms=10,
                      new_retry_ms=None, new_epoch=7, new_address='finite',
-                     second_code=0, second_tail=b'accepted', first_code=None,
+                     second_code=0, second_tail=None, first_code=None,
                      reconnect_error=None, second_loss=False):
         c = membus.Client.__new__(membus.Client)
         c.timeout, c.transport, c.address, c.request_id = 10, 'authored', 'finite', 0
@@ -82,7 +82,9 @@ class RetryControls(unittest.TestCase):
         def second(request):
             if second_loss:
                 raise ConnectionError('authored second loss')
-            return answer(request[8], 2, second_tail, second_code)
+            tail = (b'\x5b\x00\x00\x00\x00\x00\x00\x00\x02'
+                    if request[8] in (4, 5, 6) else b'accepted') if second_tail is None else second_tail
+            return answer(request[8], 2, tail, second_code)
 
         self.first, self.second = BytePeer(first), BytePeer(second)
         c.channel = self.first
@@ -143,7 +145,7 @@ class RetryControls(unittest.TestCase):
 
     def test_one_nanosecond_inside_retries_identical_payload_and_returns_bytes(self):
         c = self.setup_client(elapsed=9_999_999)
-        self.assertEqual(self.invoke(c), b'accepted')
+        self.assertEqual(self.invoke(c), b'\x5b\x00\x00\x00\x00\x00\x00\x00\x02')
         self.assert_identity(sends=2)
         self.assertEqual(self.connects, [DEADLINE])
 
