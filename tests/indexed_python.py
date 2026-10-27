@@ -22,6 +22,7 @@ def no_retry_control():
     class Lost(Client):
         def __init__(self):
             self.timeout, self.channel, self.calls, self.reconnects = 10, Channel(), 0, 0
+            self.transport, self.address, self.epoch, self.retry_ms = 'authored', 'no-retry-control', 7, 60000
 
         def exchange(self, *args):
             self.calls += 1
