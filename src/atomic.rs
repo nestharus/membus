@@ -347,6 +347,22 @@ pub(crate) fn decode_envelope(b: &[u8]) -> Result<Envelope, u16> {
 }
 /// Borrowed subrecord selection is explicit; a location never points at a synthetic singleton key.
 pub(crate) fn subrecord(b: &[u8], index: u16) -> Result<Vec<u8>, u16> {
+    let mut selected = None;
+    visit_subrecords(b, |i, record| {
+        if i == index {
+            let m = Mutation { ns: record.ns.into(), key: record.key.into(),
+                op_id: record.op_id.into(), deadline: 0, ack: record.ack,
+                expected: None, bytes: record.bytes.to_vec(), remove: record.remove };
+            selected = Some(codec::mutation_bytes(&m, record.version, record.at));
+        }
+    })?;
+    selected.ok_or(3)
+}
+/// One shared validation walk for default selection and explicitly retained frames.
+/// A visitor's provisional results must not escape unless the complete walk succeeds.
+pub(crate) fn visit_subrecords<'a>(b: &'a [u8], mut visit: impl FnMut(u16, codec::RecordView<'a>)) -> Result<(), u16> {
+    #[cfg(test)]
+    crate::read_work_tests::work(2, 1);
     // Cold reads borrow the envelope instead of allocating every peer value.
     let mut c = Cursor::new(b);
     let at = c.u64()?;
@@ -385,35 +401,24 @@ pub(crate) fn subrecord(b: &[u8], index: u16) -> Result<Vec<u8>, u16> {
         previous = Some(k);
     }
     let n = c.u16()? as usize;
-    if n == 0 || n > MAX_CHANGES || index as usize >= n || first.checked_add(n as u64).is_none() {
+    if n == 0 || n > MAX_CHANGES || first.checked_add(n as u64).is_none() {
         return Err(3);
     }
-    let mut selected = None;
     let mut keys = HashSet::new();
     for i in 0..n {
+        #[cfg(test)]
+        crate::read_work_tests::work(3, 1);
         let key = c.bound_ref()?;
         let remove = c.u8()?;
         let bytes = c.bytes(crate::MAX_VALUE)?;
         if !valid(key) || !keys.insert(key) || remove > 1 || remove == 1 && !bytes.is_empty() {
             return Err(3);
         }
-        if i == index as usize {
-            selected = Some((key, remove == 1, bytes));
-        }
+        visit(i as u16, codec::RecordView { at, version: first + i as u64, ack,
+            remove: remove == 1, ns, key, op_id: op, expected: None, bytes });
     }
     c.end()?;
-    let (key, remove, bytes) = selected.ok_or(3u16)?;
-    let m = Mutation {
-        ns: ns.into(),
-        key: key.into(),
-        op_id: op.into(),
-        deadline: 0,
-        ack,
-        expected: None,
-        bytes: bytes.to_vec(),
-        remove,
-    };
-    Ok(codec::mutation_bytes(&m, first + index as u64, at))
+    Ok(())
 }
 pub(crate) fn route_records(b: &[u8]) -> Result<Vec<(String, String, u64)>, u16> {
     if is_envelope(b) {

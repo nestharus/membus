@@ -661,6 +661,8 @@ impl CapturedFrame {
             CapturedBody::Torn(reason) => Ok(Frame::Torn(reason)),
             CapturedBody::Whole(bytes, expected) => {
                 #[cfg(test)]
+                crate::read_work_tests::work(1, bytes.len());
+                #[cfg(test)]
                 cold_validation_tests::before_validation();
                 if crc32(&bytes) != expected {
                     return Err(io::Error::new(

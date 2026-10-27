@@ -15,27 +15,41 @@ pub(crate) struct Location {
     pub subrecord: Option<u16>,
 }
 impl Location {
-    pub fn payload(&self) -> io::Result<Vec<u8>> {
+    pub(crate) fn whole_payload(&self) -> io::Result<Vec<u8>> {
+        let end = self.offset.checked_add(self.record_len)
+            .ok_or_else(|| io::Error::other("indexed extent overflow"))?;
         let captured = {
             let mut file = self.file.lock().unwrap();
             file.seek(SeekFrom::Start(self.offset))?;
+            #[cfg(test)]
+            crate::read_work_tests::work(0, self.record_len as usize);
             chunks::capture_frame_at(
                 &mut file,
                 b"MBK1",
                 self.offset,
-                self.offset + self.record_len,
+                end,
                 "indexed chunk",
             )?
         };
         match captured.validate(self.offset, "indexed chunk")? {
             // The index identifies one exact record, rather than the larger
             // file boundary accepted by the general chunk reader.
-            chunks::Frame::Whole(bytes, n) if n == self.record_len => match self.subrecord {
-                Some(index)=>crate::atomic::subrecord(&bytes,index).map_err(|_|io::Error::other("invalid envelope subrecord")),
-                None=>Ok(bytes),
-            },
+            chunks::Frame::Whole(bytes, n) if n == self.record_len => Ok(bytes),
             _ => Err(io::Error::other("short indexed record")),
         }
+    }
+    pub fn payload(&self) -> io::Result<Vec<u8>> {
+        let bytes = self.whole_payload()?;
+        match self.subrecord {
+            Some(index) => crate::atomic::subrecord(&bytes, index)
+                .map_err(|_| io::Error::other("invalid envelope subrecord")),
+            None => Ok(bytes),
+        }
+    }
+    pub(crate) fn same_frame(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.file, &other.file)
+            && self.offset == other.offset && self.record_len == other.record_len
+            && self.subrecord.is_some() == other.subrecord.is_some()
     }
 }
 #[derive(Debug)]
@@ -49,6 +63,13 @@ pub(crate) struct Entry {
     pub location: Location,
 }
 impl Entry {
+    pub(crate) fn check_identity(&self, namespace: &str, key: &str,
+        actual: (&str, &str, u64, u8, bool, usize)) -> io::Result<()> {
+        if actual != (namespace, key, self.version, self.ack, self.tombstone, self.len) {
+            return Err(io::Error::other("indexed record changed"));
+        }
+        Ok(())
+    }
     pub fn new(m: &Mutation, version: u64, location: Location) -> Self {
         Self {
             cacheable: AtomicBool::new(true),
@@ -64,15 +85,8 @@ impl Entry {
         let bytes = self.location.payload()?;
         let m =
             parse_record_view(&bytes).map_err(|_| io::Error::other("invalid indexed record"))?;
-        if m.ns != namespace
-            || m.key != key
-            || m.version != self.version
-            || m.bytes.len() != self.len
-            || m.ack != self.ack
-            || m.remove != self.tombstone
-        {
-            return Err(io::Error::other("indexed record changed"));
-        }
+        self.check_identity(namespace, key,
+            (m.ns, m.key, m.version, m.ack, m.remove, m.bytes.len()))?;
         Ok(Arc::new(Value {
             version: m.version,
             ack: self.ack,

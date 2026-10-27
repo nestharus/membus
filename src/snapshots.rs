@@ -11,7 +11,6 @@ use crate::codec::SCAN_RANGE;
 use crate::value_disk::Entry;
 use crate::Config;
 use crate::Store;
-use crate::Value;
 use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
 use std::hash::BuildHasher;
@@ -48,14 +47,15 @@ pub(super) struct Snapshot {
     pub(super) rows: Vec<(String, SnapshotValue)>,
     pub(super) cursor_hash: RandomState,
     // Charges survive release/expiry while a dispatcher still holds this Arc.
-    pub(super) _charge: ScanCharge,
+    pub(super) _charge: Arc<ScanCharge>,
 }
 pub(super) struct SnapshotValue {
     entry: Arc<Entry>,
     // The snapshot's full-payload reservation covers values pinned on first use.
     // Never resolve through the current key: replacement and retirement may have
     // removed this exact revision from the live index and resident cache.
-    loaded: OnceLock<Arc<Value>>,
+    loaded: OnceLock<crate::ReadValue>,
+    workspace: Arc<crate::read_cohort::SnapshotWorkspace>,
     // A captured revision may be ineligible for the live cache. Coordinate
     // its first load within this view without retaining failures.
     load_gate: Mutex<()>,
@@ -63,7 +63,7 @@ pub(super) struct SnapshotValue {
     load_attempts: AtomicUsize,
 }
 impl SnapshotValue {
-    pub(super) fn load(&self, store: &Store, ns: &str, key: &str) -> Result<Arc<Value>, u16> {
+    pub(super) fn load(&self, store: &Store, ns: &str, key: &str) -> Result<crate::ReadValue, u16> {
         if let Some(value) = self.loaded.get() {
             return Ok(value.clone());
         }
@@ -73,7 +73,12 @@ impl SnapshotValue {
         if let Some(value) = self.loaded.get() {
             return Ok(value.clone());
         }
-        let value = store.read_entry(ns, key, &self.entry).map_err(|_| 16u16)?;
+        let value = if self.entry.location.subrecord.is_some() {
+            self.workspace.read(store, ns, key, &self.entry)?
+        } else {
+            crate::ReadValue::snapshot(store.read_entry(ns, key, &self.entry).map_err(|_| 16u16)?,
+                self.workspace.owner.clone())
+        };
         // Publish only a successful immutable payload. Errors leave the slot
         // empty and release the gate so a later request can retry storage.
         let _ = self.loaded.set(value);
@@ -144,6 +149,14 @@ impl Store {
             return Err(22);
         }
         let state = self.state.lock().unwrap();
+        // Atomic captures reserve under State without taking scans. Prechecks
+        // cannot authorize a reservation after waiting for that owner.
+        if self.scan_usage.count.load(Ordering::Acquire) >= self.config.snapshot_max
+            || self.scan_usage.bytes.load(Ordering::Acquire).checked_add(charge)
+                .is_none_or(|total| total > self.config.snapshot_bytes)
+        {
+            return Err(22);
+        }
         if charge > self.cache_limit(&state) {
             return Err(22);
         }
@@ -152,13 +165,14 @@ impl Store {
         // Reservation is serialized before any snapshot key/handle allocation.
         self.scan_usage.bytes.fetch_add(charge, Ordering::AcqRel);
         self.scan_usage.count.fetch_add(1, Ordering::AcqRel);
-        let reservation = ScanCharge {
+        let reservation = Arc::new(ScanCharge {
             usage: self.scan_usage.clone(),
             bytes: charge,
-        };
+        });
         drop(scans);
         self.trim_cache(&state);
         drop(state);
+        let workspace = Arc::new(crate::read_cohort::SnapshotWorkspace::new(reservation.clone()));
         let selection_start = self.clock.mono_ns();
         // Seek the same namespace interval again under the same read lock.
         // Pin immutable locations and their shared file handles. Opening a view
@@ -180,6 +194,7 @@ impl Store {
                         SnapshotValue {
                             entry: entry.clone(),
                             loaded: OnceLock::new(),
+                            workspace: workspace.clone(),
                             load_gate: Mutex::new(()),
                             #[cfg(test)]
                             load_attempts: AtomicUsize::new(0),

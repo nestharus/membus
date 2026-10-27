@@ -1,5 +1,9 @@
 # Value cache and disk reads
 
+Library callers can explicitly reserve a [charged read cohort](READ-COHORT.md)
+to reuse validated frames across point calls. This additive lifetime leaves
+the default cache-bypass behavior described below unchanged.
+
 This cache is internal to one Store. Its memory-residency leases do not provide
 freshness for a copy in another process or resident. See
 [external client-cache contracts](CLIENT_CACHE.md) before caching remote reads.

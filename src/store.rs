@@ -109,7 +109,7 @@ pub(super) type Key = (String, String);
 pub(super) type Committed = BTreeMap<Key, Arc<crate::value_disk::Entry>>;
 pub(super) fn index_charge(k: &Key) -> usize { 512 + 4 * (k.0.len() + k.1.len()) }
 pub(super) fn dedup_charge(k: &Key) -> usize { 264 + 3 * (k.0.len() + k.1.len()) }
-struct ColdReader<'a>(&'a (std::sync::Mutex<usize>, std::sync::Condvar));
+pub(crate) struct ColdReader<'a>(&'a (std::sync::Mutex<usize>, std::sync::Condvar));
 impl Drop for ColdReader<'_> {
     fn drop(&mut self) { *self.0.0.lock().unwrap() -= 1; self.0.1.notify_one(); }
 }
@@ -130,6 +130,12 @@ pub(super) fn dedup_identity(m: &Mutation) -> Key {
     (ns.to_owned(), m.op_id.clone())
 }
 impl Store {
+    pub(crate) fn cold_reader(&self) -> ColdReader<'_> {
+        let mut readers = self.cold_readers.0.lock().unwrap();
+        while *readers >= 2 { readers = self.cold_readers.1.wait(readers).unwrap(); }
+        *readers += 1;
+        ColdReader(&self.cold_readers)
+    }
     /// The instance clock, shared by recovery and server runtime owners.
     pub fn clock(&self) -> &chunks::Clock { &self.clock }
     pub fn get(&self, ns: &str, key: &str) -> Option<Value> {
@@ -162,14 +168,11 @@ impl Store {
         if _load.is_some() {
             if let Some(v) = self.cache.after_miss(entry.version) { return Ok(v); }
         }
-        let mut readers = self.cold_readers.0.lock().unwrap();
-        while *readers >= 2 { readers = self.cold_readers.1.wait(readers).unwrap(); }
-        *readers += 1;
-        let _reader = ColdReader(&self.cold_readers);
-        drop(readers);
+        let _reader = self.cold_reader();
         self.cache.cold();
         let value = entry.read(ns, key).inspect_err(|_| { self.flags.storage_error.store(true, Ordering::SeqCst); })?;
-        if self.scan_usage.released.swap(false, Ordering::AcqRel) {
+        if self.scan_usage.released.swap(false, Ordering::AcqRel)
+            | self.read_usage.released.swap(false, Ordering::AcqRel) {
             // Recompute from current charges, rather than adding released bytes
             // to a stale limit. New captures and writes serialize on state.
             // Hot hits never take this path or the state lock.
@@ -181,7 +184,7 @@ impl Store {
     pub fn cache_stats(&self) -> crate::CacheStats { self.cache.stats() }
     pub(super) fn cache_limit(&self, state: &State) -> usize {
         self.config.capacity.saturating_sub(state.committed_bytes + state.dedup_bytes + state.memory_reserved
-            + self.scan_usage.bytes.load(Ordering::Acquire) + self.config.memory_margin()
+            + self.scan_usage.bytes.load(Ordering::Acquire) + self.read_cohort_bytes() + self.config.memory_margin()
             + self.chunks.lock().unwrap().index_bytes + self.signals.memory_bytes())
     }
     pub(super) fn trim_cache(&self, state: &State) {
@@ -300,7 +303,7 @@ impl Store {
             ..Health2::default()
         };
         h.memory_bytes = h.cache.bytes + state.committed_bytes + state.dedup_bytes + state.memory_reserved
-            + self.scan_usage.bytes.load(Ordering::Acquire) + c.memory_margin() + cs.index_bytes
+            + self.scan_usage.bytes.load(Ordering::Acquire) + self.read_cohort_bytes() + c.memory_margin() + cs.index_bytes
             + self.signals.memory_bytes();
         let mut namespaces: Vec<(String, usize)> = state
             .namespace_counts

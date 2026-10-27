@@ -118,7 +118,7 @@
         let live = s.get_handle("ledger", "large").unwrap();
         let (token, snapshot) = s.snapshot_open("ledger").unwrap();
         let captured = snapshot.rows[0].1.load(&s, "ledger", "large").unwrap();
-        assert!(Arc::ptr_eq(&live, &captured));
+        assert!(Arc::ptr_eq(&live, &captured.value));
         assert_eq!(live.bytes.as_ptr(), captured.bytes.as_ptr());
         let mut suffix = Vec::new();
         lp(&mut suffix, &token);
@@ -170,7 +170,7 @@
         assert_eq!(completed.expect("cold page held the write publication lock").code,0);
         assert_eq!(s.get_status("cold","k"),(1,0));
         assert_eq!(value.bytes,b"snapshot value");
-        assert!(Arc::ptr_eq(&value,&snapshot.rows[0].1.load(&s,"cold","k").unwrap()));
+        assert!(Arc::ptr_eq(&value.value,&snapshot.rows[0].1.load(&s,"cold","k").unwrap().value));
         assert!(!s.cache_stats().residency.iter().any(|(class,_,_)|class=="expire(20ms)"),
             "a cold reader finishing after retirement must not reinsert the retired version");
     }

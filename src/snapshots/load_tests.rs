@@ -44,7 +44,7 @@ fn concurrent(never:bool) {
     drop(blocked);let values:Vec<_>=workers.into_iter().map(|w|w.join().unwrap()).collect();
     let cold=s.cache_stats().cold_reads-before;
     assert_eq!(values[0].version,version);assert_eq!(values[0].bytes,vec![7;8192]);
-    assert!(Arc::ptr_eq(&values[0],&values[1]));assert_eq!(s.cache_stats().entries,0);
+    assert!(Arc::ptr_eq(&values[0].value,&values[1].value));assert_eq!(s.cache_stats().entries,0);
     s.snapshot_release("ledger",&token).unwrap();drop(view);drop(entry);drop(s);drop(f);
     assert!(both_started,"both readers must encounter the empty snapshot slot");
     assert_eq!(cold,1,"one snapshot revision must need only one successful cold load");
@@ -74,7 +74,7 @@ fn snapshot_load_errors_are_not_pinned_and_valid_retry_is_shared() {
     let cold=s.cache_stats().cold_reads;let entries=s.cache_stats().entries;let failed=s.storage_error();
     s.snapshot_release("ledger",&token).unwrap();drop(view);drop(s);drop(f);
     assert_eq!(errors,(Some(16),Some(16)));assert!(!pinned);assert!(failed);
-    assert_eq!(valid.bytes,vec![7;8192]);assert!(Arc::ptr_eq(&valid,&again));assert_eq!((cold,entries),(3,0));
+    assert_eq!(valid.bytes,vec![7;8192]);assert!(Arc::ptr_eq(&valid.value,&again.value));assert_eq!((cold,entries),(3,0));
 }
 #[test]
 fn snapshot_load_pinned_row_bypasses_another_rows_blocked_load() {
@@ -90,6 +90,6 @@ fn snapshot_load_pinned_row_bypasses_another_rows_blocked_load() {
     let result=received.recv_timeout(Duration::from_secs(1));drop(blocked);
     let other=worker.join().unwrap();reader.join().unwrap();
     s.snapshot_release("ledger",&token).unwrap();drop(view);drop(entry);drop(s);drop(f);
-    assert!(started);assert!(Arc::ptr_eq(&warm,&result.expect("pinned row waited for another row's I/O")));
+    assert!(started);assert!(Arc::ptr_eq(&warm.value,&result.expect("pinned row waited for another row's I/O").value));
     assert_eq!(other.bytes,vec![8;8192]);assert!(std::mem::size_of::<(String,SnapshotValue)>()<=128);
 }

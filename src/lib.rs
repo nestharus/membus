@@ -33,6 +33,10 @@ use std::{
 mod append_owner;
 mod cache;
 mod value_disk;
+mod read_cohort;
+pub use read_cohort::{ReadCohort, ReadValue};
+#[cfg(test)]
+use read_cohort::tests as read_work_tests;
 pub use cache::{CachePolicy, CacheRule, CacheStats};
 mod codec;
 mod flush_owner;
@@ -250,6 +254,7 @@ pub struct Store {
     committed: Arc<RwLock<store::Committed>>,
     cache: Arc<cache::Cache>,
     cold_readers: (Mutex<usize>, Condvar),
+    read_usage: Arc<read_cohort::ReadUsage>,
     scans: Arc<Mutex<ScanState>>,
     scan_usage: Arc<ScanUsage>,
     scan_reaper: Option<(mpsc::Sender<()>, std::thread::JoinHandle<()>)>,
@@ -485,6 +490,7 @@ impl Store {
             committed,
             cache,
             cold_readers: (Mutex::new(0), Condvar::new()),
+            read_usage: Arc::new(read_cohort::ReadUsage::default()),
             scans,
             scan_usage: Arc::new(ScanUsage::default()),
             scan_reaper: Some((stop, reaper)),
