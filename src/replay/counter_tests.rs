@@ -234,7 +234,7 @@ mod zero_chunks {
         replay_into(&mut rp, &f.0, &dir, true, &f.config(&manual),
                     &chunks::Clock::new(Some(manual))).unwrap();
         assert!(rp.chunks.table.contains_key(&chunks::LEGACY_CHUNK));
-        let value = rp.committed[&("clock".into(), "key".into())].read().unwrap();
+        let value = rp.committed[&("clock".into(), "key".into())].read("clock", "key").unwrap();
         assert_eq!(value.version, 7);
         assert_eq!(value.bytes, m.bytes);
         assert_eq!(rp.next, 8);

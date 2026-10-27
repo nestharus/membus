@@ -8,6 +8,7 @@ use crate::codec::MAX_VALUE;
 use crate::routing::stripe;
 use crate::routing::ClassReservation;
 use crate::timers;
+use crate::CatalogueMaintenance;
 use crate::Class;
 use crate::Health2;
 use crate::Mutation;
