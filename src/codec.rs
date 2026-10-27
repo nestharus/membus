@@ -251,7 +251,9 @@ pub(super) fn parse_record_view(b: &[u8]) -> Result<RecordView<'_>, u16> {
     let at = c.u64()?;
     let version = c.u64()?;
     let ack = c.u8()?;
-    let remove = c.u8()? != 0;
+    let remove_byte = c.u8()?;
+    if remove_byte > 1 {return Err(3)}
+    let remove = remove_byte != 0;
     let ns = c.text_ref()?;
     let key = c.text_ref()?;
     let op_id = c.text_ref()?;

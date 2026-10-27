@@ -180,6 +180,30 @@ impl Replayed {
                     break;
                 }
                 chunks::Frame::Whole(b, n) => {
+                    if crate::atomic::is_envelope(&b) {
+                        // Validate the complete envelope before projecting even one entry.
+                        let e=crate::atomic::decode_envelope(&b).map_err(|_|corrupt(format!("interior-corrupt {name} offset {offset}: atomic envelope")))?;
+                        if crate::atomic::envelope_stripe(e.request.namespace())!=si
+                            || self.chunks.table.get(&chunk).is_none_or(|c|c.class!=Class::FOREVER) {
+                            return Err(corrupt(format!("interior-corrupt {name} offset {offset}: atomic route/class")));
+                        }
+                        self.next=self.next.max(e.first.checked_add(e.mutations.len() as u64).ok_or_else(||corrupt("atomic revision overflow".into()))?);
+                        for (i,m) in e.mutations.iter().enumerate() {
+                            let v=e.first+i as u64;let k=(m.ns.clone(),m.key.clone());self.chunks.register(chunk,&k,v);
+                            if horizons.get(&k).is_some_and(|h|v<=*h) {self.report.stripes[si].horizons_applied+=1;}
+                            else {self.apply(m.clone(),v,e.at,chunk,now,config,crate::value_disk::Location {
+                                class:Class::FOREVER,file:reader.clone(),offset,record_len:n,subrecord:Some(i as u16),
+                            });}
+                        }
+                        if now.saturating_sub(e.at)<=config.retry_ms {
+                            self.dedup.insert((e.request.namespace().into(),e.request.operation_id().into()),Dedup {
+                                fingerprint:e.request.fingerprint(),at:e.at,until_mono:0,replayed_chunk:chunk,
+                                outcome:Some(Outcome {code:0,version:e.first,ack:e.mutations[0].ack}),
+                            });
+                        }
+                        self.report.stripes[si].records+=e.mutations.len() as u64;
+                        self.report.stripes[si].bytes+=n;
+                    } else {
                     let (m, v, at) = parse_record(&b).map_err(|_| {
                         corrupt(format!("interior-corrupt {name} offset {offset}: payload"))
                     })?;
@@ -200,8 +224,9 @@ impl Replayed {
                     } else {
                         self.apply(m, v, at, chunk, now, config, crate::value_disk::Location {
                             class: self.chunks.table.get(&chunk).map_or(Class::FOREVER, |c| c.class),
-                            file: reader.clone(), offset, record_len: n,
+                            file: reader.clone(), offset, record_len: n, subrecord:None,
                         });
+                    }
                     }
                     offset += n;
                 }
@@ -286,7 +311,7 @@ fn read_legacy(files: &[(usize, PathBuf)], config: &Config, now: u64) -> io::Res
                     let k = (m.ns.clone(), m.key.clone());
                     if l.committed.get(&k).is_none_or(|old| old.version < v) {
                         let location = crate::value_disk::Location {
-                            class: Class::FOREVER, file: reader.clone(), offset, record_len: n,
+                            class: Class::FOREVER, file: reader.clone(), offset, record_len: n, subrecord:None,
                         };
                         l.committed.insert(
                             k.clone(),

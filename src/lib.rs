@@ -8,6 +8,8 @@ mod timers;
 pub use chunks::{Class, ManualClock, POLICY_NS};
 pub mod client;
 pub mod indexed;
+pub mod atomic;
+pub mod recovery_image;
 #[cfg(windows)]
 pub mod pipe_io;
 use std::{
@@ -267,6 +269,7 @@ pub struct Store {
     appenders: Vec<AppendHandle>,
     flush_owner: Option<FlushHandle>,
     batch_gate: Mutex<()>,
+    admission_gate: Arc<RwLock<()>>,
     // Administrative ordering never holds the routing map lock across append/flush work.
     policy_updates: Mutex<()>,
     class_reservations: Arc<Mutex<HashMap<Class, usize>>>,
@@ -360,7 +363,20 @@ fn start_owners(logs: &[Arc<Mutex<Log>>], config: &Config) -> (Vec<AppendHandle>
     start_routed_owners(Arc::new(FixedRoute(logs.to_vec())), logs.len(), config, chunks::Clock::new(config.clock.clone()))
 }
 impl Store {
-    pub fn open(path: &Path, mut config: Config) -> io::Result<Self> {
+    pub fn open(path: &Path, config: Config) -> io::Result<Self> {
+        if path.join(".membus-quarantine").try_exists()? {
+            return Err(io::Error::other("quarantined recovery has no serving authority"));
+        }
+        if path.join("capture.started").try_exists()? || path.parent().is_some_and(|p|p.join("capture.started").exists()) {
+            return Err(io::Error::other("retained capture image cannot be opened for serving"));
+        }
+        Self::open_impl(path, config, false)
+    }
+    pub(crate) fn open_quarantined(path: &Path, config: Config) -> io::Result<Self> {
+        if !path.join(".membus-quarantine").is_file() {return Err(io::Error::other("missing quarantine fence"));}
+        Self::open_impl(path, config, true)
+    }
+    fn open_impl(path: &Path, mut config: Config, quarantine: bool) -> io::Result<Self> {
         // Change history is optional bounded retention, so it yields to a smaller process budget.
         config.signal_bytes = config.signal_bytes.min(config.capacity / 8);
         if config.cache_rules.len() > 64 || config.cache_rules.iter().any(|r| r.label.is_empty()
@@ -373,7 +389,7 @@ impl Store {
         }
         log_io::prepare_state_directory(path, &config)?;
         let mut options = OpenOptions::new();
-        options.write(true).create(true).truncate(false);
+        options.read(true).write(true).create(true).truncate(false);
         #[cfg(windows)]
         {
             use std::os::windows::fs::OpenOptionsExt;
@@ -384,9 +400,13 @@ impl Store {
             options.create_new(true);
         }
         let owner = options.open(path.join("owner.lock"))?;
-        Self::open_owned(path, config, owner)
+        Self::open_owned_mode(path, config, owner, quarantine)
     }
+    #[cfg(test)]
     fn open_owned(path: &Path, config: Config, owner: File) -> io::Result<Self> {
+        Self::open_owned_mode(path, config, owner, false)
+    }
+    fn open_owned_mode(path: &Path, config: Config, owner: File, quarantine: bool) -> io::Result<Self> {
         let replay::Recovered {
             clock,
             start_mono_ms,
@@ -428,7 +448,9 @@ impl Store {
         cache.trim(config.capacity.saturating_sub(state.committed_bytes + state.dedup_bytes
             + chunks.lock().unwrap().index_bytes + config.memory_margin()));
         let state = Arc::new(Mutex::new(state));
+        let admission_gate = Arc::new(RwLock::new(()));
         let maint = Arc::new(Maint {
+            admission_gate: admission_gate.clone(),
             cache: cache.clone(),
             state: state.clone(),
             committed: committed.clone(),
@@ -440,7 +462,7 @@ impl Store {
             config: config.clone(),
             path: path.to_owned(),
         });
-        let (tick_stop, ticker) = maint.start();
+        let ticker = if quarantine {None} else {let (stop, worker)=maint.start();Some((stop,worker))};
         let scans = Arc::new(Mutex::new(ScanState {
             next: 1,
             snapshots: HashMap::new(),
@@ -466,7 +488,7 @@ impl Store {
             scans,
             scan_usage: Arc::new(ScanUsage::default()),
             scan_reaper: Some((stop, reaper)),
-            ticker: Some((tick_stop, ticker)),
+            ticker,
             state,
             maint,
             done: Condvar::new(),
@@ -480,6 +502,7 @@ impl Store {
             appenders,
             flush_owner: Some(flush_owner),
             batch_gate: Mutex::new(()),
+            admission_gate,
             policy_updates: Mutex::new(()),
             class_reservations,
             #[cfg(test)]
