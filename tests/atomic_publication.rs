@@ -537,7 +537,9 @@ fn atomic_retry_admission_reclaims_expired_capacity_without_rerunning_old_origin
 fn atomic_envelope_survives_complete_capture_and_only_quarantined_recovery() {
     use membus::{
         client::Ack,
-        recovery_image::{recover_quarantined, validate_image, CaptureRequest},
+        recovery_image::{
+            recover_quarantined_with_completion, validate_image_with_completion, CaptureRequest,
+        },
     };
     let root = root("capture-envelope");
     let original = root.join("original");
@@ -564,7 +566,13 @@ fn atomic_envelope_survives_complete_capture_and_only_quarantined_recovery() {
             },
         )
         .unwrap();
-    let copy = recover_quarantined(&image, &working, config()).unwrap();
+    let copy = recover_quarantined_with_completion(
+        &image,
+        &working,
+        config(),
+        manifest.completion().unwrap(),
+    )
+    .unwrap();
     assert_eq!(
         copy.try_get("authored", "a").unwrap().unwrap().bytes,
         b"one"
@@ -576,7 +584,10 @@ fn atomic_envelope_survives_complete_capture_and_only_quarantined_recovery() {
     assert!(copy.health2().read_only);
     drop(copy);
     assert!(Store::open(&working, config()).is_err());
-    assert_eq!(validate_image(&image).unwrap(), manifest);
+    assert_eq!(
+        validate_image_with_completion(&image, manifest.completion().unwrap()).unwrap(),
+        manifest
+    );
 }
 #[test]
 fn nonexpiring_latest_class_is_explicitly_outside_the_initial_compatible_scope() {

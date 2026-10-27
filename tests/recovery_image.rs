@@ -61,18 +61,23 @@ fn request(ack: Ack) -> CaptureRequest {
         ack,
     }
 }
-fn hashes(root: &Path) -> BTreeMap<PathBuf, (u64, String)> {
-    fn walk(root: &Path, p: &Path, out: &mut BTreeMap<PathBuf, (u64, String)>) {
+fn hashes(root: &Path) -> BTreeMap<PathBuf, (bool, u64, String)> {
+    fn walk(root: &Path, p: &Path, out: &mut BTreeMap<PathBuf, (bool, u64, String)>) {
         for e in fs::read_dir(p).unwrap() {
             let e = e.unwrap();
             let path = e.path();
-            let meta = e.metadata().unwrap();
+            let meta = fs::symlink_metadata(&path).unwrap();
+            assert!(!meta.file_type().is_symlink());
             if meta.is_dir() {
+                out.insert(
+                    path.strip_prefix(root).unwrap().into(),
+                    (true, 0, String::new()),
+                );
                 walk(root, &path, out);
             } else {
                 out.insert(
                     path.strip_prefix(root).unwrap().into(),
-                    (meta.len(), sha256_file(&path).unwrap()),
+                    (false, meta.len(), sha256_file(&path).unwrap()),
                 );
             }
         }
@@ -131,10 +136,13 @@ fn complete_unknown_population_and_private_recovery_keep_original_immutable_and_
         .iter()
         .any(|e| e.path == "unrecognized-config"));
     let retained = hashes(&image);
-    assert_eq!(validate_image(&image).unwrap(), manifest);
+    assert_eq!(
+        validate_image_with_completion(&image, manifest.completion().unwrap()).unwrap(),
+        manifest
+    );
     let canonical_image = image.canonicalize().unwrap();
     assert_eq!(
-        validate_image(&canonical_image).unwrap(),
+        validate_image_with_completion(&canonical_image, manifest.completion().unwrap()).unwrap(),
         manifest,
         "canonicalized absolute selectors must retain prefix/root semantics"
     );
@@ -147,7 +155,13 @@ fn complete_unknown_population_and_private_recovery_keep_original_immutable_and_
         retained,
         "refusing direct image open must preserve the retained image"
     );
-    let recovered = recover_quarantined(&canonical_image, &working, config()).unwrap();
+    let recovered = recover_quarantined_with_completion(
+        &canonical_image,
+        &working,
+        config(),
+        manifest.completion().unwrap(),
+    )
+    .unwrap();
     assert_eq!(
         recovered
             .try_get("authored", "item")
@@ -204,15 +218,16 @@ fn changed_configuration_and_incomplete_capture_refuse_without_mutating_original
     let original = root.join("original");
     let store = Store::open(&original, config()).unwrap();
     put(&store, "first", b"value");
-    store.capture_stopped(&image, request(Ack::Flush)).unwrap();
+    let manifest = store.capture_stopped(&image, request(Ack::Flush)).unwrap();
     let retained = hashes(&image);
-    assert!(recover_quarantined(
+    assert!(recover_quarantined_with_completion(
         &image,
         &root.join("changed-config"),
         Config {
             quota: 1,
             ..config()
-        }
+        },
+        manifest.completion().unwrap()
     )
     .is_err());
     assert!(!root.join("changed-config").exists());
@@ -438,4 +453,335 @@ fn internally_valid_image_with_missing_closed_chunk_is_refused_by_recovered_heal
     assert_eq!(hashes(&authored), authored_before);
     assert_eq!(hashes(&image), retained);
     assert!(Store::open(&root.join("health-refused-working"), config()).is_err());
+}
+
+#[test]
+fn refusal_oracle_rejects_empty_directory_then_refusal_neighbor() {
+    let p = root("oracle-neighbor");
+    fs::write(p.join("file"), b"unchanged").unwrap();
+    let before = hashes(&p);
+    let harmful_neighbor = || -> std::io::Result<()> {
+        fs::create_dir(p.join("added-empty-directory"))?;
+        Err(std::io::Error::other("expected refusal"))
+    };
+    assert!(harmful_neighbor().is_err());
+    assert_ne!(
+        hashes(&p),
+        before,
+        "refusal oracle must reject this exact mutation"
+    );
+}
+
+#[test]
+fn embedded_import_escape_is_refused_before_outside_effects() {
+    let p = root("embedded-import");
+    let image = p.join("baseline-image");
+    let store = Store::open(&p.join("source"), config()).unwrap();
+    put(&store, "seed", b"protected baseline");
+    let baseline = store.capture_stopped(&image, request(Ack::Os)).unwrap();
+    let protected = hashes(&image);
+    for (label, directory, filename) in [
+        ("parent", "../escape-canary/new-empty", None),
+        ("backslash", "..\\escape-canary\\new-empty", None),
+        ("file-parent", "legacy-7", Some("../escape-canary/sentinel")),
+        (
+            "file-backslash",
+            "legacy-7",
+            Some("..\\escape-canary\\sentinel"),
+        ),
+        ("earlier-import", "../escape-canary/new-empty", None),
+        ("absolute-directory", "@absolute", None),
+        ("absolute-file", "legacy-7", Some("@absolute")),
+    ] {
+        let case = p.join(label);
+        fs::create_dir(&case).unwrap();
+        let canary = case.join("escape-canary");
+        fs::create_dir(&canary).unwrap();
+        fs::write(canary.join("sentinel"), b"outside remains exact").unwrap();
+        let before = hashes(&canary);
+        let directory = if directory == "@absolute" {
+            canary.join("new-empty").to_string_lossy().into_owned()
+        } else {
+            directory.to_owned()
+        };
+        let filename = filename.map(|name| {
+            if name == "@absolute" {
+                canary.join("sentinel").to_string_lossy().into_owned()
+            } else {
+                name.to_owned()
+            }
+        });
+        let authored = case.join("authored-image");
+        copy_tree(&image, &authored);
+        let cat = authored.join("root/chunks/catalogue.log");
+        let mut records = membus::chunks::read_catalogue(&cat).unwrap().0;
+        records.push(membus::chunks::CatRecord {
+            at_ms: membus::now_ms(),
+            rec: membus::chunks::Rec::Import(membus::chunks::Import {
+                files: filename
+                    .into_iter()
+                    .map(|name| (name.into(), 21, "invalid".into()))
+                    .collect(),
+                keys: 0,
+                bytes: 0,
+                epoch: 7,
+                legacy_dir: directory,
+            }),
+        });
+        if label == "earlier-import" {
+            records.push(membus::chunks::CatRecord {
+                at_ms: membus::now_ms(),
+                rec: membus::chunks::Rec::Import(membus::chunks::Import {
+                    files: vec![],
+                    keys: 0,
+                    bytes: 0,
+                    epoch: 8,
+                    legacy_dir: "legacy-8".into(),
+                }),
+            });
+        }
+        fs::write(
+            &cat,
+            records
+                .iter()
+                .flat_map(membus::chunks::encode)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let mut manifest = baseline.clone();
+        let entry = manifest
+            .entries
+            .iter_mut()
+            .find(|e| e.path == "chunks/catalogue.log")
+            .unwrap();
+        entry.bytes = fs::metadata(&cat).unwrap().len();
+        entry.sha256 = sha256_file(&cat).unwrap();
+        manifest.root_sha256 = manifest_population_hash(&manifest.entries);
+        let bytes = encode_manifest(&manifest);
+        let mut h = Sha256::new();
+        h.update(&bytes);
+        fs::write(authored.join("capture.manifest"), bytes).unwrap();
+        fs::write(authored.join("capture.complete"), h.hex()).unwrap();
+        assert!(
+            validate_image(&authored).is_ok(),
+            "internally consistent authored input"
+        );
+        let input_before = hashes(&authored);
+        let result = recover_quarantined(&authored, &case.join("working"), config());
+        println!(
+            "escape case={label} outside_directory={} startup_refused={}",
+            canary.join("new-empty").exists(),
+            result.is_err()
+        );
+        assert!(
+            !canary.join("new-empty").exists(),
+            "outside empty-directory escape: {label}"
+        );
+        assert!(result.is_err(), "invalid embedded Import must refuse");
+        assert_eq!(hashes(&canary), before, "outside canary: {label}");
+        assert_eq!(hashes(&authored), input_before);
+    }
+    assert_eq!(hashes(&image), protected);
+}
+
+#[test]
+fn flush_completion_custody_binds_original_success_without_later_image_barriers() {
+    let p = root("completion-custody");
+    let image = p.join("image");
+    let store = Store::open(&p.join("source"), config()).unwrap();
+    let original_outcome = store.mutate(Mutation {
+        ns: "authored".into(),
+        key: "item".into(),
+        op_id: "original-os-ack".into(),
+        deadline: u64::MAX,
+        ack: 1,
+        expected: None,
+        bytes: b"unchanged original Ack".to_vec(),
+        remove: false,
+    });
+    assert_eq!((original_outcome.code, original_outcome.ack), (0, 1));
+    let manifest = store.capture_stopped(&image, request(Ack::Flush)).unwrap();
+    let retained = hashes(&image);
+    assert!(validate_image(&image)
+        .unwrap_err()
+        .to_string()
+        .contains("settlement unknown"));
+    assert!(recover_quarantined(&image, &p.join("no-evidence-working"), config()).is_err());
+    assert!(!p.join("no-evidence-working").exists());
+    let completion = manifest.completion().unwrap();
+    completion
+        .persist_new(&p.join("original-completion.custody"))
+        .unwrap();
+    assert!(completion
+        .persist_new(&p.join("original-completion.custody"))
+        .is_err());
+    let decoded =
+        CaptureCompletion::from_bytes(&fs::read(p.join("original-completion.custody")).unwrap())
+            .unwrap();
+    assert_eq!(&decoded, completion);
+    assert_eq!(
+        validate_image_with_completion(&image, &decoded).unwrap(),
+        manifest
+    );
+    let other = Store::open(&p.join("other-source"), config())
+        .unwrap()
+        .capture_stopped(
+            &p.join("other-image"),
+            CaptureRequest {
+                source_label: "other-source".into(),
+                ack: Ack::Flush,
+            },
+        )
+        .unwrap();
+    assert!(validate_image_with_completion(&image, other.completion().unwrap()).is_err());
+    let recovered =
+        recover_quarantined_with_completion(&image, &p.join("working"), config(), &decoded)
+            .unwrap();
+    let value = recovered.try_get("authored", "item").unwrap().unwrap();
+    assert_eq!(value.ack, 1);
+    assert_eq!(value.bytes, b"unchanged original Ack");
+    drop(recovered);
+    assert_eq!(hashes(&image), retained);
+}
+
+#[test]
+fn existing_working_root_is_refused_without_touching_its_owner_or_population() {
+    let p = root("existing-owner");
+    let image = p.join("image");
+    Store::open(&p.join("source"), config())
+        .unwrap()
+        .capture_stopped(&image, request(Ack::Os))
+        .unwrap();
+    let working = p.join("existing-working");
+    fs::create_dir(&working).unwrap();
+    fs::write(working.join("owner.lock"), b"preexisting owner evidence").unwrap();
+    fs::create_dir(working.join("empty-directory")).unwrap();
+    let before = hashes(&working);
+    assert!(recover_quarantined(&image, &working, config()).is_err());
+    assert_eq!(hashes(&working), before);
+}
+
+#[test]
+fn supported_import_preserves_flat_legacy_inputs_and_backup_history() {
+    let p = root("valid-import");
+    let source = p.join("source");
+    let store = Store::open(&source, config()).unwrap();
+    let files = vec![
+        ("stripe-0.log".to_owned(), Vec::new()),
+        (
+            "import-policies.txt".to_owned(),
+            b"# authored policy history\n".to_vec(),
+        ),
+    ];
+    let imported = membus::chunks::Import {
+        files: files
+            .iter()
+            .map(|(name, bytes)| {
+                let mut h = Sha256::new();
+                h.update(bytes);
+                (name.clone(), bytes.len() as u64, h.hex())
+            })
+            .collect(),
+        keys: 0,
+        bytes: 0,
+        epoch: 7,
+        legacy_dir: "legacy-7".into(),
+    };
+    drop(store);
+    // Only this stopped private authored fixture is changed. No retained capture
+    // or original source image is opened or rewritten by this control.
+    for (name, bytes) in &files {
+        fs::write(source.join(name), bytes).unwrap();
+    }
+    use std::io::Write;
+    let mut cat = fs::OpenOptions::new()
+        .append(true)
+        .open(source.join("chunks/catalogue.log"))
+        .unwrap();
+    cat.write_all(&membus::chunks::encode(&membus::chunks::CatRecord {
+        at_ms: membus::now_ms(),
+        rec: membus::chunks::Rec::Import(imported),
+    }))
+    .unwrap();
+    cat.sync_all().unwrap();
+    drop(cat);
+    // The following recovery is on a copied authored image, not this root.
+    // Build the image from a read-only byte account of the stopped fixture.
+    let image = p.join("image");
+    let template = Store::open(&p.join("template"), config())
+        .unwrap()
+        .capture_stopped(&p.join("template-image"), request(Ack::Os))
+        .unwrap();
+    fs::create_dir(&image).unwrap();
+    copy_tree(&source, &image.join("root"));
+    fn population(base: &Path, path: &Path, out: &mut Vec<ImageEntry>) {
+        for entry in fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            let meta = fs::metadata(&path).unwrap();
+            out.push(ImageEntry {
+                path: path
+                    .strip_prefix(base)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+                directory: meta.is_dir(),
+                bytes: if meta.is_dir() { 0 } else { meta.len() },
+                sha256: if meta.is_dir() {
+                    String::new()
+                } else {
+                    sha256_file(&path).unwrap()
+                },
+            });
+            if meta.is_dir() {
+                population(base, &path, out);
+            }
+        }
+    }
+    let mut manifest = template;
+    manifest.entries.clear();
+    population(
+        &image.join("root"),
+        &image.join("root"),
+        &mut manifest.entries,
+    );
+    manifest.entries.sort_by(|a, b| a.path.cmp(&b.path));
+    manifest.root_sha256 = manifest_population_hash(&manifest.entries);
+    let bytes = encode_manifest(&manifest);
+    let mut h = Sha256::new();
+    h.update(&bytes);
+    fs::write(
+        image.join("capture.started"),
+        b"MBCAP1 incomplete unless capture.complete validates\n",
+    )
+    .unwrap();
+    fs::write(image.join("capture.manifest"), bytes).unwrap();
+    fs::write(image.join("capture.complete"), h.hex()).unwrap();
+    let before = hashes(&image);
+    let result = recover_quarantined(&image, &p.join("working"), config()).unwrap();
+    for (name, bytes) in files {
+        assert_eq!(
+            fs::read(p.join("working/legacy-7").join(name)).unwrap(),
+            bytes
+        );
+    }
+    assert_eq!(hashes(&image), before);
+    drop(result);
+}
+
+#[cfg(not(windows))]
+#[test]
+fn copied_nonwindows_owner_lock_is_prepared_only_in_new_private_root() {
+    let p = root("nonwindows-owner");
+    let image = p.join("image");
+    Store::open(&p.join("source"), config())
+        .unwrap()
+        .capture_stopped(&image, request(Ack::Os))
+        .unwrap();
+    let before = hashes(&image);
+    assert!(image.join("root/owner.lock").is_file());
+    let recovered = recover_quarantined(&image, &p.join("working"), config()).unwrap();
+    assert_eq!(hashes(&image), before);
+    assert!(recovered.health2().read_only);
+    drop(recovered);
+    assert!(Store::open(&p.join("working"), config()).is_err());
 }

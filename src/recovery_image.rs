@@ -20,6 +20,13 @@ const COMPLETE: &str = "capture.complete";
 const PAYLOAD: &str = "root";
 const MAX_MANIFEST: u64 = 64 * 1024 * 1024;
 const MAX_ENTRIES: usize = 1_000_000;
+#[cfg(test)]
+#[path = "recovery_image_correction_tests.rs"]
+mod correction_tests;
+#[cfg(test)]
+fn barrier_test(path: &Path, directory: bool) -> io::Result<()> {
+    correction_tests::barrier(path, directory)
+}
 
 /// The label identifies the source to its caller without embedding a host path.
 #[derive(Clone, Debug)]
@@ -55,6 +62,54 @@ pub struct CaptureManifest {
     pub file_barriers: u64,
     pub directory_barriers: u64,
     pub readback: bool,
+    completion: Option<CaptureCompletion>,
+}
+
+/// Successful post-barrier return evidence. Retain outside the image; never
+/// derive it from capture.complete. This is caller custody, not authentication.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaptureCompletion {
+    manifest_sha256: String,
+}
+impl CaptureCompletion {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = b"MBCDONE1".to_vec();
+        bytes.extend(self.manifest_sha256.as_bytes());
+        bytes
+    }
+    /// Decode previously retained successful return evidence, not image bytes.
+    pub fn from_bytes(bytes: &[u8]) -> io::Result<Self> {
+        if bytes.len() != 72
+            || &bytes[..8] != b"MBCDONE1"
+            || !bytes[8..]
+                .iter()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+        {
+            return Err(invalid("invalid capture completion custody"));
+        }
+        Ok(Self {
+            manifest_sha256: String::from_utf8(bytes[8..].to_vec()).unwrap(),
+        })
+    }
+    /// New-only custody writer. A caller must observe this result and retain the
+    /// original bytes; a partial custody write is not a successful handoff.
+    pub fn persist_new(&self, path: &Path) -> io::Result<()> {
+        let parent = root_directory(
+            path.parent()
+                .ok_or_else(|| invalid("completion custody parent required"))?,
+        )?;
+        if !path.is_absolute() {
+            return Err(invalid("absolute completion custody selector required"));
+        }
+        write_new(path, &self.to_bytes(), Ack::Flush)?;
+        sync_output(&parent, true, Ack::Flush)
+    }
+}
+impl CaptureManifest {
+    /// Present only on a successful Flush capture or evidence-backed validation.
+    pub fn completion(&self) -> Option<&CaptureCompletion> {
+        self.completion.as_ref()
+    }
 }
 
 fn invalid(message: impl Into<String>) -> io::Error {
@@ -473,6 +528,8 @@ fn entries_bytes(entries: &[ImageEntry]) -> Vec<u8> {
 }
 fn sync_output(path: &Path, directory: bool, requested: Ack) -> io::Result<()> {
     if requested == Ack::Flush {
+        #[cfg(test)]
+        barrier_test(path, directory)?;
         if directory {
             crate::log_io::sync_dir(path).map_err(|e| context("capture directory barrier", path, e))
         } else {
@@ -496,6 +553,8 @@ fn write_new(path: &Path, bytes: &[u8], ack: Ack) -> io::Result<()> {
     file.write_all(bytes)
         .map_err(|e| context("capture write file", path, e))?;
     if ack == Ack::Flush {
+        #[cfg(test)]
+        barrier_test(path, false)?;
         file.sync_all()
             .map_err(|e| context("capture file barrier", path, e))?;
     }
@@ -683,6 +742,7 @@ impl CaptureManifest {
             file_barriers,
             directory_barriers,
             readback,
+            completion: None,
         })
     }
 }
@@ -774,7 +834,7 @@ impl Store {
                 "capture source/config changed or destination readback differs",
             ));
         }
-        let manifest = CaptureManifest {
+        let mut manifest = CaptureManifest {
             version: 1,
             source_label: request.source_label,
             source_epoch: self.epoch,
@@ -790,6 +850,7 @@ impl Store {
             file_barriers,
             directory_barriers: directory_barriers + if request.ack == Ack::Flush { 3 } else { 0 },
             readback: true,
+            completion: None,
         };
         let encoded = manifest.encode();
         if encoded.len() as u64 > MAX_MANIFEST {
@@ -809,9 +870,17 @@ impl Store {
             request.ack,
         )?;
         sync_output(&output, true, request.ack)?;
-        let validated = validate_image(&output)?;
+        let validated = validate_contents(&output)?;
         if validated != manifest {
             return Err(invalid("completed image readback differs"));
+        }
+        // This evidence is issued only AFTER successful completion-file and
+        // final directory sync, plus complete readback. It is not stored inside
+        // the image: no readable in-image marker can prove its own failed sync.
+        if request.ack == Ack::Flush {
+            manifest.completion = Some(CaptureCompletion {
+                manifest_sha256: hash(&encoded),
+            });
         }
         Ok(manifest)
     }
@@ -819,6 +888,33 @@ impl Store {
 
 /// Validate every retained file and directory before any mutable recovery.
 pub fn validate_image(image: &Path) -> io::Result<CaptureManifest> {
+    validate_selected(image, None)
+}
+/// Validate a Flush image using original successful post-barrier return evidence.
+/// This performs no new image barriers and never backdates later persistence.
+pub fn validate_image_with_completion(
+    image: &Path,
+    completion: &CaptureCompletion,
+) -> io::Result<CaptureManifest> {
+    validate_selected(image, Some(completion))
+}
+fn validate_selected(
+    image: &Path,
+    completion: Option<&CaptureCompletion>,
+) -> io::Result<CaptureManifest> {
+    let mut manifest = validate_contents(image)?;
+    if manifest.requested_ack == Ack::Flush {
+        let evidence = completion.ok_or_else(|| invalid("Flush capture settlement unknown: original post-barrier completion evidence required"))?;
+        if evidence.manifest_sha256 != hash(&manifest.encode()) {
+            return Err(invalid(
+                "capture completion evidence does not bind this manifest",
+            ));
+        }
+        manifest.completion = Some(evidence.clone());
+    }
+    Ok(manifest)
+}
+fn validate_contents(image: &Path) -> io::Result<CaptureManifest> {
     let image = root_directory(image)?;
     directory_streams(&image)?;
     let names: std::collections::BTreeSet<_> = fs::read_dir(&image)?
@@ -899,9 +995,25 @@ impl QuarantinedRecovery {
 pub fn recover_quarantined(
     image: &Path,
     working: &Path,
-    mut config: Config,
+    config: Config,
 ) -> io::Result<QuarantinedRecovery> {
-    let manifest = validate_image(image)?;
+    recover_selected(image, working, config, None)
+}
+pub fn recover_quarantined_with_completion(
+    image: &Path,
+    working: &Path,
+    config: Config,
+    completion: &CaptureCompletion,
+) -> io::Result<QuarantinedRecovery> {
+    recover_selected(image, working, config, Some(completion))
+}
+fn recover_selected(
+    image: &Path,
+    working: &Path,
+    mut config: Config,
+    completion: Option<&CaptureCompletion>,
+) -> io::Result<QuarantinedRecovery> {
+    let manifest = validate_selected(image, completion)?;
     config.signal_bytes = config.signal_bytes.min(config.capacity / 8);
     if config_bytes(&config)? != manifest.config {
         return Err(invalid("recovery configuration differs from capture"));
@@ -942,8 +1054,30 @@ pub fn recover_quarantined(
             "private working-copy readback differs before recovery",
         ));
     }
-    if validate_image(&source)? != manifest {
+    if validate_selected(&source, completion)? != manifest {
         return Err(invalid("retained image changed during copy"));
+    }
+    // Validate ALL historical embedded effects before ordinary startup. Inventory
+    // already refused links; this fresh private copy has no outward path aliases.
+    let catalogue = target.join("chunks/catalogue.log");
+    if catalogue.try_exists()? {
+        for record in crate::chunks::read_catalogue(&catalogue)?.0 {
+            if let crate::chunks::Rec::Import(import) = record.rec {
+                crate::replay::validate_import_paths(&import)?;
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        // new_directory exclusively created this fenced private root; its copied
+        // ownership bytes cannot name a live owner. Never apply to the image or
+        // an existing/reused root. Keep the original lock bytes in the image.
+        let lock = target.join("owner.lock");
+        match fs::remove_file(&lock) {
+            Ok(()) => sync_output(&target, true, Ack::Flush)?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(context("private stopped ownership preparation", &lock, e)),
+        }
     }
     let mut store = Store::open_quarantined(&target, config)?;
     let health = store.health2();
@@ -959,7 +1093,7 @@ pub fn recover_quarantined(
     store.stop_workers();
     store.signals.stop_for_capture()?;
     store.set_read_only(true);
-    if validate_image(&source)? != manifest {
+    if validate_selected(&source, completion)? != manifest {
         return Err(invalid("retained image changed during recovery"));
     }
     Ok(QuarantinedRecovery {

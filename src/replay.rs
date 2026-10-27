@@ -465,9 +465,26 @@ impl ImportWriter {
         Ok(())
     }
 }
+/// Import provenance names the exact legacy backup and flat original inputs.
+/// Refuse invalid history rather than rewriting names or ignoring an old Import.
+pub(crate) fn validate_import_paths(import: &chunks::Import) -> io::Result<()> {
+    if import.legacy_dir != format!("legacy-{}", import.epoch) {
+        return Err(corrupt("Import backup path is outside the supported legacy layout".into()));
+    }
+    let mut names = HashSet::new();
+    for (name, _, _) in &import.files {
+        if !matches!(name.as_str(), "stripe-0.log" | "stripe-1.log" | "stripe-2.log" | "stripe-3.log" | "import-policies.txt")
+            || !names.insert(name)
+        {
+            return Err(corrupt("Import input path is outside the supported legacy layout or repeated".into()));
+        }
+    }
+    Ok(())
+}
 /// Move the legacy logs into legacy-<epoch>/, unmodified, and set them read-only (5.6, step 1). Run again after a
 /// stop between the switch and the move.
 fn move_legacy(path: &Path, import: &chunks::Import, config: &Config) -> io::Result<()> {
+    validate_import_paths(import)?;
     let to = path.join(&import.legacy_dir);
     fs::create_dir_all(&to)?;
     for (name, size, sha) in &import.files {
@@ -885,6 +902,9 @@ fn replay_into(
     let dir = dir.to_owned();
     fs::create_dir_all(&dir)?;
     let (records, torn) = chunks::read_catalogue(&dir.join("catalogue.log"))?;
+    for record in &records {
+        if let Rec::Import(import) = &record.rec { validate_import_paths(import)?; }
+    }
     let (records, incomplete_retiring) = chunks::committed_records(records);
     rp.chunks.incomplete_retiring = incomplete_retiring;
     rp.report.catalogue_truncation = torn.map(|(o, b, r)| (o, b, r.to_string()));
