@@ -42,6 +42,7 @@ pub(super) struct Dedup {
     pub(super) replayed_chunk: u64,
     pub(super) outcome: Option<Outcome>,
 }
+#[cfg_attr(test, derive(Default))]
 pub(super) struct State {
     pub(super) pending: HashMap<(String, String), Meta>,
     pub(super) metadata: HashMap<(String, String), Meta>,
@@ -69,6 +70,15 @@ pub(super) struct State {
     pub(super) tomb_candidates: HashSet<(String, String)>,
 }
 impl State {
+    /// Current non-cache ownership, including prospective legacy signal growth.
+    /// The Store captures external owners under its existing admission guard.
+    pub(super) fn available_memory(&self, capacity: usize, snapshots: usize,
+        margin: usize, chunk_index: usize, signals: usize) -> usize {
+        [self.committed_bytes, self.dedup_bytes, self.memory_reserved,
+            snapshots, margin, chunk_index, signals].into_iter()
+            .try_fold(0usize, |n, v| n.checked_add(v))
+            .map_or(0, |owned| capacity.saturating_sub(owned))
+    }
     pub(super) fn release_namespace(&mut self, ns: &str) {
         if let Some(count) = self.namespace_counts.get_mut(ns) {
             *count -= 1;
@@ -169,7 +179,8 @@ impl Store {
         drop(readers);
         self.cache.cold();
         let value = entry.read(ns, key).inspect_err(|_| { self.flags.storage_error.store(true, Ordering::SeqCst); })?;
-        if self.scan_usage.released.swap(false, Ordering::AcqRel) {
+        if self.scan_usage.released.swap(false, Ordering::AcqRel)
+            | self.subscription_released.swap(false, Ordering::AcqRel) {
             // Recompute from current charges, rather than adding released bytes
             // to a stale limit. New captures and writes serialize on state.
             // Hot hits never take this path or the state lock.
@@ -180,9 +191,9 @@ impl Store {
     }
     pub fn cache_stats(&self) -> crate::CacheStats { self.cache.stats() }
     pub(super) fn cache_limit(&self, state: &State) -> usize {
-        self.config.capacity.saturating_sub(state.committed_bytes + state.dedup_bytes + state.memory_reserved
-            + self.scan_usage.bytes.load(Ordering::Acquire) + self.config.memory_margin()
-            + self.chunks.lock().unwrap().index_bytes + self.signals.memory_bytes())
+        state.available_memory(self.config.capacity,
+            self.scan_usage.bytes.load(Ordering::Acquire), self.config.memory_margin(),
+            self.chunks.lock().unwrap().index_bytes, self.signals.memory_reservation_bytes())
     }
     pub(super) fn trim_cache(&self, state: &State) {
         self.cache.trim(self.cache_limit(state));
@@ -697,19 +708,11 @@ impl Store {
             state.retired_set.remove(&k);
             state.dedup_bytes -= dedup_charge(&k);
         }
-        if state.committed_bytes
-            + state.dedup_bytes
-            + state.memory_reserved
-            + memory_charge
-            + if new { index_charge(&k) } else { 0 }
-            + index_charge(&k) * 2
-            + if deduplicate { dedup_charge(&id) } else { 0 }
-            + self.scan_usage.bytes.load(Ordering::Acquire)
-            + self.config.memory_margin()
-            + self.chunks.lock().unwrap().index_bytes
-            + self.signals.memory_bytes()
-            > self.config.capacity
-        {
+        let required_memory = memory_charge
+            .checked_add(if new { index_charge(&k) } else { 0 })
+            .and_then(|n| n.checked_add(index_charge(&k) * 2))
+            .and_then(|n| n.checked_add(if deduplicate { dedup_charge(&id) } else { 0 }));
+        if required_memory.is_none_or(|needed| needed > self.cache_limit(&state)) {
             return Outcome::error(7);
         }
         // Ordinary admissions stop at the limit less the maintenance reserve (5.5).

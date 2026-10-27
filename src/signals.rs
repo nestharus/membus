@@ -59,6 +59,36 @@ pub struct Hub {
     state: Arc<(Mutex<State>, Condvar)>,
     worker: Option<thread::JoinHandle<()>>,
 }
+/// Existing concrete layouts, shared with prospective resource demand builders.
+pub(crate) fn registration_allocation_bytes() -> usize {
+    std::mem::size_of::<Subscription>() + 4 * std::mem::size_of::<(u64, Option<Connection>)>()
+}
+pub(crate) fn change_allocation_bytes() -> usize {
+    // Arc strong/weak counters for Change and Value, plus a retained Arc link.
+    std::mem::size_of::<Change>() + std::mem::size_of::<Value>()
+        + 4 * std::mem::size_of::<usize>() + std::mem::size_of::<Arc<Change>>()
+}
+/// Prospective managed representation charge for the unchanged legacy Hub.
+/// This is reserved even while quiet. Kernel buffers/handles and allocator RSS
+/// are not measured; the Store margin remains separate. No policy is enlarged.
+pub(crate) fn legacy_memory_reservation(history_items: usize, history_bytes: usize) -> usize {
+    use std::mem::size_of;
+    // A retained Change charges at least 256. Include the append-before-evict
+    // slot and replay collection, with backing growth for both VecDeques.
+    let history_slots = history_items.min(history_bytes / 256).saturating_add(1);
+    let links = history_slots.saturating_mul(4).saturating_add(8)
+        .saturating_mul(size_of::<Arc<Change>>());
+    // Actual row, owned identifier strings, queue backing and connection-map
+    // bookkeeping. The existing legacy queue/registration bounds still govern.
+    let row = size_of::<Subscription>().saturating_add(3 * MAX_ID)
+        .saturating_add(2 * (SUB_ITEMS + 1) * size_of::<Arc<Change>>())
+        .saturating_add(4 * size_of::<(u64, Option<Connection>)>());
+    let transient_change = 256usize.saturating_add(2 * MAX_ID).saturating_add(crate::MAX_VALUE);
+    // encode holds body and framed buffers at once, each with growth slack.
+    history_bytes.saturating_add(QUEUE_BYTES).saturating_add(links)
+        .saturating_add(SUB_MAX.saturating_mul(row)).saturating_add(transient_change)
+        .saturating_add(4 * (crate::MAX_FRAME + 4))
+}
 fn token(epoch: u64, seq: u64) -> Vec<u8> {
     let mut b = epoch.to_le_bytes().to_vec();
     b.extend(seq.to_le_bytes());
@@ -255,6 +285,9 @@ impl Hub {
             s.queue_bytes as u64, s.subs.len() as u64, self.ring_max as u64,
             self.ring_budget as u64, QUEUE_BYTES as u64] { p.extend(n.to_le_bytes()); }
         p
+    }
+    pub(crate) fn memory_reservation_bytes(&self) -> usize {
+        legacy_memory_reservation(self.ring_max, self.ring_budget)
     }
     pub(crate) fn memory_bytes(&self) -> usize {
         let s = self.state.0.lock().unwrap();

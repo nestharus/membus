@@ -4,6 +4,7 @@ pub mod chunks;
 #[cfg(test)]
 extern crate self as membus;
 mod signals;
+pub mod subscription_resources;
 mod timers;
 pub use chunks::{Class, ManualClock, POLICY_NS};
 pub mod client;
@@ -252,6 +253,7 @@ pub struct Store {
     cold_readers: (Mutex<usize>, Condvar),
     scans: Arc<Mutex<ScanState>>,
     scan_usage: Arc<ScanUsage>,
+    subscription_released: Arc<AtomicBool>,
     scan_reaper: Option<(mpsc::Sender<()>, std::thread::JoinHandle<()>)>,
     /// The idle tick (5.2): closes finite-class chunks past their age and rewrites a large catalogue.
     ticker: Option<(mpsc::Sender<()>, std::thread::JoinHandle<()>)>,
@@ -445,8 +447,9 @@ impl Store {
         let (appenders, flush_owner) = start_routed_owners(router.clone(), 4, &config, clock.clone());
         let committed = Arc::new(RwLock::new(committed.into_iter().collect::<store::Committed>()));
         let cache = Arc::new(cache::Cache::new(&config, clock.clone()));
-        cache.trim(config.capacity.saturating_sub(state.committed_bytes + state.dedup_bytes
-            + chunks.lock().unwrap().index_bytes + config.memory_margin()));
+        cache.trim(state.available_memory(config.capacity, 0, config.memory_margin(),
+            chunks.lock().unwrap().index_bytes,
+            signals::legacy_memory_reservation(config.signal_history, config.signal_bytes)));
         let state = Arc::new(Mutex::new(state));
         let admission_gate = Arc::new(RwLock::new(()));
         let maint = Arc::new(Maint {
@@ -487,6 +490,7 @@ impl Store {
             cold_readers: (Mutex::new(0), Condvar::new()),
             scans,
             scan_usage: Arc::new(ScanUsage::default()),
+            subscription_released: Arc::new(AtomicBool::new(false)),
             scan_reaper: Some((stop, reaper)),
             ticker,
             state,
