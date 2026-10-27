@@ -28,7 +28,14 @@ The typed surface includes:
 - `prepare(MutationRequest)` and `mutate(&mut Attempt, Deadline)` perform PUT or
   conditional PUT. `expected: None` is unconditional, `Some(0)` absent, and
   `Some(version)` a live revision check. Select `Ack::Os` or `Ack::Flush` explicitly.
-  Memory acknowledgment, REMOVE and BATCH have no typed Client methods.
+  Memory acknowledgment and BATCH have no typed Client methods.
+- `prepare_remove(RemoveRequest)` and `remove(&mut RemoveAttempt, Deadline)`
+  perform the existing conditional REMOVE. `expected: 0` requires absence;
+  other values check an exact live revision. Success writes a tombstone, with
+  the explicitly requested OS or Flush acknowledgment. `validate_remove`
+  preflights the exact body size without sending. There is no unconditional
+  typed removal: the wire always carries its expected revision. The operation
+  has no value payload, including no empty value-length field.
 - `validate_mutation` uses the same encoder to check identifiers, value and frame
   size without sending. It returns encoded body bytes, without establishing
   connection readiness or changing prepare/Attempt state.
@@ -107,6 +114,21 @@ boundaries. After losing the token or crossing epoch/horizon, reconcile the
 deterministic key and embedded operation identity and make an explicit application
 decision. Fresh connection, identity or operation ID is not evidence of absence.
 These in-memory tokens are not a second journal or permanent exactly-once guarantee.
+
+`RemoveAttempt` retains its complete immutable `RemoveRequest` and reuses the
+same mutation completion path, epoch check and original first-send retry bound.
+Retain it and the original uncertainty across an explicit reconnect. A duplicate
+returns the original retained removal outcome; it does not remove a newer value
+that replaced that tombstone. Conflict, pending conflict, deadline, capacity and
+unsupported remain distinct refusals. Lost, partial, foreign, malformed or
+wrong-Ack replies and refusals 16/17 retain uncertainty. A later refusal does not
+erase a prior uncertain removal. Neither request accessors nor a new prepare
+call restore lost retry context after caller restart.
+
+Removal is one key's conditional mutation. It does not atomically check another
+key, a snapshot or phantom additions; transact a collection of records; implement
+archive eligibility; or authorize an OS effect. Its tombstone/retry retention
+remains governed by the existing Store policy and resource contracts.
 
 Physical restore/clone can reuse an epoch from an abandoned history. Equal
 negotiated epochs alone cannot authorize reuse of an old Attempt across that
@@ -232,3 +254,13 @@ running process tests. Test presence or passing against one selected image does
 not establish installed compatibility, a kernel cancellation race or universal
 endpoint security. Listener controls distinguish complete, idle, partial,
 malformed, closed/reset and endpoint-reuse paths.
+
+`tests/client_remove.rs` independently fixes REMOVE wire bytes, exact revisions,
+acknowledgments, preflight, refusal classifications and original-token retry
+bounds with in-memory transports. `tests/store_remove.rs` connects that typed
+client to real Store dispatch on a required explicit `MEMBUS_REMOVE_TEST_ROOT`.
+It covers conflict/absence, duplicate removal after a newer replacement,
+replay, reply loss after commit and failed live/recovery sync ordering. These
+authored library controls retain their files and start no resident endpoint or
+timer owner. They do not qualify process-kill transport, physical durability,
+complete backup/restore or durable client-operation custody.
