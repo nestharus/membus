@@ -765,6 +765,28 @@ fn supported_import_preserves_flat_legacy_inputs_and_backup_history() {
         );
     }
     assert_eq!(hashes(&image), before);
+    // Backup conversion is a replay obligation, separate from byte preservation
+    // and from the image format's intentionally excluded ACL preservation.
+    for name in ["stripe-0.log", "import-policies.txt"] {
+        let source_readonly = fs::metadata(source.join(name))
+            .unwrap()
+            .permissions()
+            .readonly();
+        let image_readonly = fs::metadata(image.join("root").join(name))
+            .unwrap()
+            .permissions()
+            .readonly();
+        let backup_readonly = fs::metadata(p.join("working/legacy-7").join(name))
+            .unwrap()
+            .permissions()
+            .readonly();
+        println!("Import backup {name}: source_readonly={source_readonly} image_readonly={image_readonly} backup_readonly={backup_readonly}");
+        assert!(
+            !source_readonly && !image_readonly,
+            "authored inputs stay writable: {name}"
+        );
+        assert!(backup_readonly, "replayed backup must be read-only: {name}");
+    }
     drop(result);
 }
 
