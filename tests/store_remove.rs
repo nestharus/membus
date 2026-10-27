@@ -381,7 +381,7 @@ fn independent_cas_allows_two_claims_from_the_same_pinned_population() {
 }
 
 #[test]
-fn unchanged_batch_keeps_first_effect_when_later_admission_hits_quota() {
+fn unchanged_batch_keeps_one_effect_when_peer_admission_hits_quota() {
     let path = root("batch-partial");
     let store = Store::open(
         &path,
@@ -406,16 +406,30 @@ fn unchanged_batch_keeps_first_effect_when_later_admission_hits_quota() {
     assert_eq!(&response[17..19], &[0, 0]);
     let mut c = membus::Cursor::new(&response[19..]);
     assert_eq!(c.u16().unwrap(), 2);
-    assert_eq!(c.u16().unwrap(), 0);
-    assert_ne!(c.u64().unwrap(), 0);
-    assert_eq!(c.u8().unwrap(), 1);
-    assert_eq!(c.u16().unwrap(), 8);
-    assert_eq!(c.u64().unwrap(), 0);
-    assert_eq!(c.u8().unwrap(), 0);
+    let mut codes = Vec::new();
+    for key in ["first", "second"] {
+        let code = c.u16().unwrap();
+        let version = c.u64().unwrap();
+        let ack = c.u8().unwrap();
+        let value = store.try_get("authored", key).unwrap();
+        match code {
+            0 => {
+                let value = value.unwrap();
+                assert_eq!(value.bytes, vec![1]);
+                assert_eq!(value.version, version);
+                assert_eq!(ack, 1);
+            }
+            8 => {
+                assert!(value.is_none());
+                assert_eq!(version, 0);
+                assert_eq!(ack, 0);
+            }
+            code => panic!("unexpected batch item refusal {code}"),
+        }
+        codes.push(code);
+    }
     c.end().unwrap();
-    assert_eq!(
-        store.try_get("authored", "first").unwrap().unwrap().bytes,
-        vec![1]
-    );
-    assert!(store.try_get("authored", "second").unwrap().is_none());
+    // Different keys may execute concurrently; either input item may win.
+    codes.sort();
+    assert_eq!(codes, vec![0, 8]);
 }
