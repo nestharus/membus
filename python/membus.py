@@ -245,10 +245,14 @@ class Client:
             self.close()
             raise ValueError('reply association')
         if code:
-            raise Refusal(code, getattr(self, 'codes', CODES))
+            codes = getattr(self, 'codes', CODES)
+            if code not in codes or len(body) != 15:
+                self.close()
+                raise ValueError('invalid refusal reply')
+            raise Refusal(code, codes)
         return body[15:]
 
-    def call(self, opcode, ns, suffix=b'', op_id=None, deadline=None):
+    def call(self, opcode, ns, suffix=b'', op_id=None, deadline=None, *, retry_transport=True):
         op_id = op_id or str(uuid.uuid4())
         deadline = deadline or deadline_ms(self.timeout)
         payload = struct.pack('<Q', deadline)+lp(op_id)+lp(ns)+suffix
@@ -259,7 +263,7 @@ class Client:
                 return self.exchange(opcode, payload, deadline)
             except (OSError, ConnectionError):
                 self.close()
-                if creates_snapshot or attempt or int(time.time()*1000) >= deadline:
+                if not retry_transport or creates_snapshot or attempt or int(time.time()*1000) >= deadline:
                     raise
                 self.connect(deadline)
         raise AssertionError('unreachable')
@@ -305,13 +309,14 @@ class Client:
         count, = d.unpack('<H')
         return [d.value() for _ in range(count)]
 
-    def put(self, ns, key, value, ack=1, expected=None, op_id=None, deadline=None):
+    def put(self, ns, key, value, ack=1, expected=None, op_id=None, deadline=None, *, retry_transport=True):
         opcode = 4 if expected is None else 5
         suffix = lp(key)+struct.pack('<B',ack)
         if expected is not None:
             suffix += struct.pack('<Q',expected)
         suffix += lp(value)
-        version, achieved = struct.unpack('<QB', self.call(opcode,ns,suffix,op_id,deadline))
+        options = {} if retry_transport else {'retry_transport': False}
+        version, achieved = struct.unpack('<QB', self.call(opcode,ns,suffix,op_id,deadline,**options))
         return {'version':version,'ack':achieved}
 
     def remove(self, ns, key, expected, ack=1, **options):
@@ -442,6 +447,23 @@ class Client:
         """Release retention. A released/expired token returns cursor_expired."""
         if self.call(13, ns, lp(snapshot), **options):
             raise ValueError('invalid release reply')
+
+    def snapshot_require_complete(self, ns, snapshot, **options):
+        """Require captured complete-query eligibility on this exact token.
+
+        Unsupported providers raise NotAvailable; captured uncertainty and token
+        refusals retain their original codes. This does not inspect live health.
+        """
+        if not isinstance(snapshot, bytes) or len(snapshot) != 16:
+            raise ValueError('explicit 16-byte snapshot token required')
+        try:
+            reply = self.call(31, ns, lp(snapshot), **options)
+        except Refusal as error:
+            if error.code == 2:
+                raise NotAvailable('snapshot_require_complete') from error
+            raise
+        if reply != b'':
+            raise ValueError('invalid snapshot completeness reply')
 
     def _scan(self, opcode, ns, bounds, snapshot, cursor, limit, max_bytes, options):
         if not 1 <= limit <= MAX_BATCH or not 42 <= max_bytes <= MAX_FRAME:
