@@ -26,6 +26,12 @@ pub(crate) struct State {
 }
 pub(crate) type Shared = Arc<(Mutex<State>, Condvar)>;
 
+/// Weak Store ownership lets a timer owner outlive the last strong reference;
+/// capture must inspect the actual owner state rather than an Arc count.
+pub(crate) fn capture_owner_running(shared: &Shared) -> bool {
+    shared.0.lock().unwrap().running
+}
+
 fn identity(ns: &str, id: &str) -> Result<String, u16> {
     if ns == NS || ns.contains('\0') || id.contains('\0') || ns.is_empty() || id.is_empty() { return Err(3); }
     let key = format!("{ns}\0{id}");

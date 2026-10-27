@@ -94,6 +94,18 @@ fn encode(epoch: u64, id: u64, change: &Change, values: bool) -> Vec<u8> {
     frame
 }
 impl Hub {
+    pub(crate) fn stop_for_capture(&mut self) -> io::Result<()> {
+        {
+            let mut s=self.state.0.lock().unwrap();
+            if s.subs.iter().any(|sub|sub.active || sub.bytes!=0) || s.queue_bytes!=0 {
+                return Err(io::Error::other("signal delivery owner/subscription is not settled"));
+            }
+            s.stop=true;self.state.1.notify_all();
+        }
+        if let Some(worker)=self.worker.take() {worker.join().map_err(|_|io::Error::other("signal owner panicked"))?;}
+        Ok(())
+    }
+
     pub fn new(epoch: u64, config: &Config, clock: crate::chunks::Clock) -> Self {
         Self::with_sink(epoch, config, deliver, clock)
     }

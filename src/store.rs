@@ -395,6 +395,7 @@ impl Store {
         op_id: &str,
         deadline: u64,
     ) -> Outcome {
+        let _publication = self.admission_gate.read().unwrap();
         let key = match chunks::policy_key(ns, prefix) {
             Ok(k) => k,
             Err(code) => return Outcome::error(code),
@@ -515,7 +516,7 @@ impl Store {
             .unwrap()
             .policy_publishing
             .insert(id.clone());
-        let outcome = self.mutate(m);
+        let outcome = self.mutate_mode_ungated(m, true);
         if outcome.code == 0 {
             #[cfg(test)]
             {
@@ -576,6 +577,10 @@ impl Store {
         self.mutate_mode(m, false)
     }
     pub(super) fn mutate_mode(&self, m: Mutation, deduplicate: bool) -> Outcome {
+        let _publication = self.admission_gate.read().unwrap();
+        self.mutate_mode_ungated(m, deduplicate)
+    }
+    fn mutate_mode_ungated(&self, m: Mutation, deduplicate: bool) -> Outcome {
         if m.ns.is_empty() || m.key.is_empty() || m.op_id.is_empty() {
             return Outcome::error(3);
         }

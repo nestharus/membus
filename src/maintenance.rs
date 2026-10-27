@@ -22,9 +22,13 @@ use std::time::Duration;
 mod directory_tests;
 #[cfg(test)]
 mod clock_tests;
+#[cfg(test)]
+#[path = "maintenance_correction_tests.rs"]
+mod correction_tests;
 
 /// Retirement, expiry summaries, tombstone drops and the clock check (5.3, 5.4), shared with the tick thread.
 pub(super) struct Maint {
+    pub(super) admission_gate: Arc<RwLock<()>>,
     pub(super) cache: Arc<crate::cache::Cache>,
     pub(super) state: Arc<Mutex<State>>,
     pub(super) committed: Arc<RwLock<crate::store::Committed>>,
@@ -40,6 +44,7 @@ impl Maint {
     /// Retire closed chunks due by their class, or (forced) one chunk that holds no key's latest record.
     /// Returns the chunks retired whole; a stopped, kept or held chunk is left out.
     pub(super) fn retire(&self, forced: Option<u64>) -> io::Result<Vec<u64>> {
+        let _publication = self.admission_gate.read().unwrap();
         use chunks::ChunkState;
         let utc = self.clock.utc_ms();
         let mono = self.clock.mono_ms();
@@ -56,11 +61,21 @@ impl Maint {
                 Some(id) => vec![id],
                 None => cs.table.keys().copied().collect(),
             };
+            // One pass per invocation, including forced requests. The same locks
+            // keep this snapshot valid through all candidate decisions.
+            let retry_chunks: HashSet<u64> = state.dedup.values().filter_map(|d| {
+                #[cfg(test)] correction_tests::visit();
+                (d.replayed_chunk != chunks::LEGACY_CHUNK
+                    && (d.outcome.is_none() || mono <= d.until_mono)).then_some(d.replayed_chunk)
+            }).collect();
             for id in ids {
                 let Some(c) = cs.table.get(&id) else { continue };
                 if id == chunks::LEGACY_CHUNK || c.state != ChunkState::Closed {
                     continue;
                 }
+                // A multi-entry outcome owns the whole chunk through its retry horizon,
+                // including forced retirement. Never retain only a prefix's retry evidence.
+                if retry_chunks.contains(&id) { continue; }
                 let expire = forced.is_none() && c.class.kind == 2;
                 if forced.is_none() {
                     // Recorded close UTC can precede an admission after a wall
@@ -271,6 +286,7 @@ impl Maint {
     }
     /// Drop tombstone index entries no other retained chunk can contradict (5.3), and expired summaries.
     pub(super) fn drop_tombstones(&self) {
+        let _publication = self.admission_gate.read().unwrap();
         let utc = self.clock.utc_ms();
         let mut gone = Vec::new();
         {

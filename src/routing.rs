@@ -271,9 +271,13 @@ impl ChunkRouter {
 }
 impl Route for ChunkRouter {
     fn write(&self, stripe: usize, record: &[u8], config: &Config) -> (io::Result<()>, usize, u64) {
-        let Some((ns, key, version)) = record.get(16..).and_then(chunks::record_key) else {
-            return (Err(io::Error::other("unroutable record")), 0, 0);
+        let payload = &record[16..];
+        let records = match crate::atomic::route_records(payload) {
+            Ok(rows) if !rows.is_empty()=>rows,
+            _=>return (Err(io::Error::other("unroutable record")),0,0),
         };
+        let (ns,key,_) = &records[0];
+        let atomic=crate::atomic::is_envelope(payload);
         let (class, policy, _selection) = {
             let mut counts = self.class_reservations.lock().unwrap();
             let (class, policy) = self.policies.read().unwrap().resolve(&ns, &key);
@@ -328,11 +332,15 @@ impl Route for ChunkRouter {
         if result.is_err() {
             self.fence(stripe);
         } else {
-            self.locations.lock().unwrap().insert(version, crate::value_disk::Location {
-                class, file: c.reader.clone(), offset: end - record.len() as u64, record_len: record.len() as u64,
-            });
+            let mut locations=self.locations.lock().unwrap();
             let mut cs = self.chunks.lock().unwrap();
-            cs.register(c.id, &(ns, key), version);
+            for (index,(ns,key,version)) in records.iter().enumerate() {
+                locations.insert(*version, crate::value_disk::Location {
+                    class, file: c.reader.clone(), offset: end-record.len() as u64, record_len:record.len() as u64,
+                    subrecord:atomic.then_some(index as u16),
+                });
+                cs.register(c.id,&(ns.clone(),key.clone()),*version);
+            }
             if let Some(info) = cs.table.get_mut(&c.id) {
                 info.bytes = end;
             }

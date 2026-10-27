@@ -862,6 +862,7 @@ impl Catalogue {
         Ok(file)
     }
     pub fn path(&self) -> &Path { &self.path }
+    pub(crate) fn capture_owner(&self) -> io::Result<File> {self._owner.try_clone()}
     pub fn recovery_required(&self) -> io::Result<bool> {
         Ok(self.fenced || append_pending_path(&self.path).try_exists()?)
     }
