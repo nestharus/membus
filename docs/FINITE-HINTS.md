@@ -54,3 +54,15 @@ finite-expiry settlement of an unknown creation remains unresolved debt.
 This is opt-in source capability. Legacy callers retain quiet-retention exposure;
 Python, caller migration, read-cohort composition, operating qualification and
 installation are separate work.
+
+
+Each registration names one immutable endpoint generation. Multiple registrations
+can name the same endpoint and can produce duplicate hints. There is no global
+recipient cardinality or accepted-delivery counter; this profile declines such
+requirements. Successful cancellation prevents future selection and drops pending
+hints, but a previously selected write can finish afterward. Receiver binding
+checks isolate a replacement; cancellation is not a drain/recipient receipt.
+Shared Hub/State/list/clock metadata is included in the prospective account
+envelope in addition to per-registration grants. Version-one discovery retains
+its historical negative reason byte for compatibility; it makes no statement
+about the separate implemented version-two Store capability.

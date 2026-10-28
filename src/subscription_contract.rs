@@ -1,7 +1,8 @@
 //! Discovery of the stronger process-owned subscription contract.
 //!
-//! This version advertises a missing shared reservation capability. It cannot
-//! select lifetime, buffering, latency or receiver-acceptance guarantees.
+//! Version-one discovery retains its historical negative representation and
+//! reason code. It cannot select the version-two finite-hint profile below;
+//! its reason is not an observation of current Store resource availability.
 
 /// Exact opt-in HELLO identity feature, separate from legacy change/1.
 pub const HELLO_FEATURE: &str = ";subscription-contract=1";
@@ -11,7 +12,8 @@ pub const HELLO_FEATURE: &str = ";subscription-contract=1";
 pub enum Unavailable {
     /// The peer did not return the opt-in discovery extension.
     PeerDidNotNegotiate,
-    /// The producer has no shared subscription resource reservation capability.
+    /// Historical version-one negative discovery reason. This does not describe
+    /// availability of the separate version-two Store grant/hint capability.
     SharedResourceReservationUnavailable,
 }
 
@@ -39,7 +41,7 @@ pub const FINITE_CREATE: u8 = 28;
 pub const FINITE_RENEW: u8 = 29;
 pub const FINITE_CANCEL: u8 = 30;
 /// Exact supported semantics: volatile coalesced hints, buffered, no replay,
-/// no every-event/receipt/deadline guarantee, per-registration write counts only.
+/// no every-event/receipt/deadline guarantee or delivery-count evidence.
 pub const COALESCED_HINTS: u16 = 1;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HintOptions {

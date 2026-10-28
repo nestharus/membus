@@ -6,7 +6,7 @@ durable work acknowledgment or permission to execute an effect. Subscriptions,
 status and history are memory-only and disappear on resident restart.
 
 
-## Stronger process-owned contract: unavailable
+## Version-one discovery remains negative
 
 Legacy change/1 is **UNQUALIFIED** for guaranteed quiet owner-loss reclamation,
 resource-derived admission or stronger communication requirements. The optional
@@ -15,7 +15,7 @@ suffix, after all selected legacy signal/timer extensions:
 
 ```text
 magic MSC1; u16 discovery_version=1; u8 available=0;
-u16 reason=1 // shared resource reservation unavailable
+u16 reason=1 // historical version-one unavailable reason
 ```
 
 These nine bytes explicitly decline the stronger capability. They select no
@@ -34,25 +34,25 @@ sent. This API does not release any earlier caller-owned registration or erase
 an unresolved creation. An ordinary legacy handshake remains available only
 when the caller deliberately selects its narrower contract.
 
-The existing Store capacity calculation accounts current signal history/queue
-bytes alongside writes and snapshots. It supplies no shared subscription grant
-that reserves registration metadata, future negotiated queue/in-flight/encoding
-ownership and independently growing publication history. Sampling that number,
-using Config.capacity as a new budget or raising a slot constant cannot provide
-that grant. Integration must use the existing Store accounting owner and preserve
-all other reservations; no second allocator or fake resource provider is supplied.
+The Store now supplies real typed subscription resource reservations, and the
+existing Hub implements the separate opt-in finite coalesced-hint profile in
+[FINITE-HINTS.md](FINITE-HINTS.md). Version-one discovery retains its historical
+negative reason byte for compatibility; it is not an observation that current
+Store grants are absent. Use `Client::handshake_finite_hints` to require the new
+exact positive profile. Neither an ignored HELLO feature nor version-one negative
+discovery selects it.
 
-Once that capability exists, a stronger version must affirmatively agree process
-incarnation, epoch and exact registration identity; finite server-monotonic
-expiry and renewal ordering; quiet reclamation in the existing Hub worker;
-queued/in-flight charge return exactly once; old renewal/cancel/completion
-isolation; and lost-creation-reply custody. It must independently negotiate whether
-buffering, replay and coalescing are admissible, overload/recovery behavior,
-latency origin/clock/bound and delivery count/recipient acceptance evidence.
-No such profile is currently selected. Queued and completely written counts do
-not prove delivered or accepted events, exactly-once effects or end-to-end latency.
-Required unsupported guarantees must be refused explicitly. Lifetime implementation,
-allocated-capacity integration, legacy and Python/caller migration remain owed.
+The finite profile negotiates buffered coalesced dirty hints, finite monotonic
+renewal and receiver-checked incarnation/recipient binding. It declines replay,
+every-event/no-buffer/recipient-accepted/delivery-count and end-to-end deadline
+requirements. It reserves actual managed row/slot/in-flight storage and reclaims
+quiet expired rows in the existing worker. Existing legacy callers still have
+the quiet-retention exposure below and need migration. Python/caller/native
+receiver migration, physical capacity and operating qualification remain separate.
+
+The remainder of this document describes legacy change/1, its 46-byte limits,
+retention, counters and listener. Those limits do not govern finite-hint admission;
+their artificial policy exposure remains a separate migration obligation.
 
 ## Discovery and controls
 
@@ -253,3 +253,6 @@ retains physical Python encoding/listener and existing-client automatic
 Test code and
 historical measurements do not certify arbitrary endpoint security, complete
 receipt or a universal delivery deadline.
+
+
+Finite coalesced hints are a separate explicit opt-in profile. See [FINITE-HINTS.md](FINITE-HINTS.md). Version-one negative discovery does not select it. Legacy quiet rows still require caller migration; no current caller has been migrated by this source change.

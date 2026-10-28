@@ -768,7 +768,8 @@ mod record_tests;
 
 /// Used by the actual HELLO path; unknown feature text grants no capability.
 pub(crate) fn append_subscription_contract_discovery(client: &str, hub: &crate::signals::Hub, payload: &mut Vec<u8>) {
-    if client.split(';').skip(1).any(|feature| feature == "subscription-contract=2") {
+    if client.split(';').skip(1).any(|feature| feature == "subscription-contract=2")
+        && client.split(';').skip(1).any(|feature| feature == "subscribe=1") {
         payload.extend_from_slice(hub.finite_discovery());
     } else if client.split(';').skip(1).any(|feature| feature == "subscription-contract=1") {
         payload.extend_from_slice(hub.contract_discovery());

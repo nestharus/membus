@@ -75,7 +75,7 @@ fn serve<S: Read + Write>(
             ))?;
             continue;
         }
-        let mut response = if hello && (membus::subscription_contract::FINITE_CREATE..=membus::subscription_contract::FINITE_CANCEL).contains(&b[4]) && !finite_hints {
+        let mut response = if hello && (membus::subscription_contract::FINITE_CREATE..=membus::subscription_contract::FINITE_CANCEL).contains(&b[4]) && (!finite_hints || !subscribe) {
             membus::reply(b[4], u64::from_le_bytes(b[5..13].try_into().unwrap()), 2, &[])
         } else if hello && (membus::SUBSCRIBE..=membus::SIGNAL_USAGE).contains(&b[4]) && !subscribe {
             membus::reply(b[4], u64::from_le_bytes(b[5..13].try_into().unwrap()), 2, &[])

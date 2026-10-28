@@ -69,10 +69,10 @@ fn malformed_unknown_positive_and_trailing_never_agree() {
 #[test]
 fn ordinary_hello_has_no_new_feature_or_suffix() {
     let (peer,sent)=peer(hello(&[],false,false));
-    let client=Client::handshake(peer,Options::new("récipiendaire",4096),until()).unwrap();
+    let client=Client::handshake(peer,Options::new("rÃ©cipiendaire",4096),until()).unwrap();
     assert_eq!(client.negotiated().epoch,44);
     assert!(!client.negotiated().subscriptions);
-    assert_eq!(*sent.lock().unwrap(),request("récipiendaire"));
+    assert_eq!(*sent.lock().unwrap(),request("rÃ©cipiendaire"));
 }
 #[test]
 fn unsolicited_suffix_is_protocol_error_for_ordinary_client() {
@@ -106,4 +106,83 @@ fn lost_hello_reply_is_single_send_without_creation_or_fallback() {
     let (result,sent)=required(Vec::new(),Options::new("receiver",4096));
     assert!(matches!(result,Err(Error::Transport(_))));
     assert_eq!(sent,request("receiver;subscription-contract=1"));
+}
+
+fn finite_peer(extra:&[u8],suffix:&[u8])->(Peer,Arc<Mutex<Vec<u8>>>) {
+    let mut bytes=hello(suffix,true,false);bytes.extend_from_slice(extra);peer(bytes)
+}
+fn finite_options()->membus::subscription_contract::HintOptions {
+    membus::subscription_contract::HintOptions{profile:1,lifetime_ms:40,write_ms:10,incarnation:[7;16],recipient:[9;16]}
+}
+fn finite_receipt()->membus::subscription_contract::HintReceipt {
+    use membus::subscription_contract::*;
+    HintReceipt{binding:HintBinding{epoch:44,id:88,incarnation:[7;16],recipient:[9;16]},authority_until_ms:140,generation:1}
+}
+fn deadline()->membus::client::Deadline {membus::client::Deadline{unix_ms:999999,local:until()}}
+#[test]
+fn finite_positive_requires_exact_affirmative_complete_profile() {
+    for suffix in [b"".as_slice(),b"MSH2\x01\x00\x01",b"MSH2\x02\x00\x01\x00",b"MSH2\x01\x00\x02\x00",b"MSH2\x01\x00\x01\x00\x00",b"MSC1\x01\x00\x00\x01\x00"] {
+        let (peer,sent)=finite_peer(&[],suffix);
+        assert!(Client::handshake_finite_hints(peer,Options::new("r",4096),AdditionalFeatures::default(),until()).is_err());
+        assert_eq!(*sent.lock().unwrap(),request("r;subscribe=1;subscription-contract=2"));
+    }
+    let (peer,sent)=finite_peer(&[],b"MSH2\x01\x00\x01\x00");
+    let c=Client::handshake_finite_hints(peer,Options::new("r",4096),AdditionalFeatures::default(),until()).unwrap();
+    assert!(c.prepare_finite_hints("ns","p",r"\\.\pipe\authored",finite_options()).is_ok());
+    assert_eq!(*sent.lock().unwrap(),request("r;subscribe=1;subscription-contract=2"));
+}
+#[test]
+fn finite_creation_wire_and_known_renew_cancel_are_exact() {
+    use membus::client::HintCreationState;
+    let r=finite_receipt();let mut renewed=r;renewed.authority_until_ms=155;renewed.generation=2;
+    let mut replies=membus::reply(28,2,0,&r.bytes());replies.extend(membus::reply(29,3,0,&renewed.bytes()));replies.extend(membus::reply(30,4,0,&[]));
+    let (peer,sent)=finite_peer(&replies,b"MSH2\x01\x00\x01\x00");let mut c=Client::handshake_finite_hints(peer,Options::new("r",4096),AdditionalFeatures::default(),until()).unwrap();
+    let mut attempt=c.prepare_finite_hints("ns","p",r"\\.\pipe\authored",finite_options()).unwrap();
+    assert_eq!(attempt.state(),HintCreationState::Unsent);assert_eq!(c.create_finite_hints(&mut attempt,"create",deadline()).unwrap(),r);
+    let mut p=999999u64.to_le_bytes().to_vec();lp(&mut p,b"create");lp(&mut p,b"ns");p.extend(1u16.to_le_bytes());p.extend(40u64.to_le_bytes());p.extend(10u32.to_le_bytes());lp(&mut p,&[7;16]);lp(&mut p,&[9;16]);lp(&mut p,b"p");lp(&mut p,br"\\.\pipe\authored");
+    let mut expected=request("r;subscribe=1;subscription-contract=2");expected.extend(membus::frame(28,2,&p));assert_eq!(*sent.lock().unwrap(),expected);
+    assert_eq!(c.renew_finite_hints(&mut attempt,"renew",deadline()).unwrap(),renewed);
+    c.cancel_finite_hints(&mut attempt,"cancel",deadline()).unwrap();assert_eq!(attempt.state(),HintCreationState::Cancelled);
+}
+#[test]
+fn finite_lost_or_malformed_creation_keeps_intent_and_forbids_retry() {
+    use membus::client::HintCreationState;
+    let r=finite_receipt();let mut wrong=r;wrong.binding.recipient=[8;16];
+    for reply in [Vec::new(),membus::reply(28,2,0,b"bad"),membus::reply(28,2,0,&wrong.bytes())] {
+        let (peer,sent)=finite_peer(&reply,b"MSH2\x01\x00\x01\x00");let mut c=Client::handshake_finite_hints(peer,Options::new("r",4096),AdditionalFeatures::default(),until()).unwrap();
+        let mut attempt=c.prepare_finite_hints("ns","p",r"\\.\pipe\authored",finite_options()).unwrap();
+        assert!(c.create_finite_hints(&mut attempt,"create",deadline()).is_err());assert_eq!(attempt.state(),HintCreationState::Unknown{last_receipt:None});
+        let before=sent.lock().unwrap().clone();assert!(c.create_finite_hints(&mut attempt,"replacement",deadline()).is_err());assert_eq!(*sent.lock().unwrap(),before);
+        assert_eq!(attempt.endpoint(),r"\\.\pipe\authored");assert_eq!(attempt.options(),finite_options());
+    }
+}
+#[test]
+fn finite_lost_renew_and_malformed_cancel_retain_original_known_receipt() {
+    use membus::client::HintCreationState;
+    let r=finite_receipt();
+    for cancel in [false,true] {
+        let mut replies=membus::reply(28,2,0,&r.bytes());if cancel {replies.extend(membus::reply(30,3,0,b"not-empty"));}
+        let (peer,sent)=finite_peer(&replies,b"MSH2\x01\x00\x01\x00");let mut c=Client::handshake_finite_hints(peer,Options::new("r",4096),AdditionalFeatures::default(),until()).unwrap();
+        let mut attempt=c.prepare_finite_hints("ns","p",r"\\.\pipe\authored",finite_options()).unwrap();c.create_finite_hints(&mut attempt,"create",deadline()).unwrap();
+        let failed=if cancel {c.cancel_finite_hints(&mut attempt,"cancel",deadline()).map(|_|r)}else{c.renew_finite_hints(&mut attempt,"renew",deadline())};
+        assert!(failed.is_err());assert_eq!(attempt.state(),HintCreationState::Unknown{last_receipt:Some(r)});
+        let before=sent.lock().unwrap().clone();assert!(c.create_finite_hints(&mut attempt,"replacement",deadline()).is_err());assert_eq!(*sent.lock().unwrap(),before);
+    }
+}
+#[test]
+fn finite_unsupported_semantics_and_preflight_cannot_create() {
+    use membus::client::HintCreationState;
+    let (peer,sent)=finite_peer(&[],b"MSH2\x01\x00\x01\x00");let mut c=Client::handshake_finite_hints(peer,Options::new("r",4096),AdditionalFeatures::default(),until()).unwrap();
+    let before=sent.lock().unwrap().clone();
+    for profile in [0,2,65535] {let mut o=finite_options();o.profile=profile;assert!(c.prepare_finite_hints("ns","p",r"\\.\pipe\authored",o).is_err());}
+    let mut attempt=c.prepare_finite_hints("ns","p",r"\\.\pipe\authored",finite_options()).unwrap();
+    assert!(c.create_finite_hints(&mut attempt,"create",membus::client::Deadline{unix_ms:0,local:Instant::now()-Duration::from_millis(1)}).is_err());
+    assert_eq!(attempt.state(),HintCreationState::Unsent);assert_eq!(*sent.lock().unwrap(),before);
+}
+#[test]
+fn finite_explicit_preadmission_capacity_refusal_retains_unsent_intent() {
+    use membus::client::HintCreationState;
+    let (peer,_)=finite_peer(&membus::reply(28,2,7,&[]),b"MSH2\x01\x00\x01\x00");let mut c=Client::handshake_finite_hints(peer,Options::new("r",4096),AdditionalFeatures::default(),until()).unwrap();
+    let mut attempt=c.prepare_finite_hints("ns","p",r"\\.\pipe\authored",finite_options()).unwrap();
+    assert!(matches!(c.create_finite_hints(&mut attempt,"create",deadline()),Err(Error::Refused(r)) if r.code==7));assert_eq!(attempt.state(),HintCreationState::Unsent);
 }

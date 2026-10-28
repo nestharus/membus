@@ -92,6 +92,8 @@ pub(crate) fn legacy_memory_reservation(history_items: usize, history_bytes: usi
     let transient_change = 256usize.saturating_add(2 * MAX_ID).saturating_add(crate::MAX_VALUE);
     // encode holds body and framed buffers at once, each with growth slack.
     history_bytes.saturating_add(QUEUE_BYTES).saturating_add(links)
+        // Shared Hub/State/clock/list metadata is present even with no rows.
+        .saturating_add(size_of::<State>()).saturating_add(size_of::<Hub>())
         .saturating_add(SUB_MAX.saturating_mul(row)).saturating_add(transient_change)
         .saturating_add(4 * (crate::MAX_FRAME + 4))
 }
@@ -437,4 +439,29 @@ mod tests {
         assert_eq!(h.subscribe("quota", "".into(), r"\\.\pipe\..\GLOBALROOT\x".into(), false, &[], "membus.change/1", crate::MAX_FRAME).err(), Some(3));
         assert_eq!(h.subscribe("quota", "".into(), r"\\.\pipe\test".into(), false, &[], "other/1", crate::MAX_FRAME).err(), Some(2));
     }
+}
+
+#[cfg(test)]
+mod contract_seam_tests {
+    use super::*;
+    fn inert(_: &str, _: &[u8], _: u32, _: &mut Option<Connection>, _: &crate::chunks::Clock) -> io::Result<()> { Ok(()) }
+    #[test]
+    fn actual_64_quiet_legacy_registrations_do_not_expire() {
+        let manual = crate::chunks::ManualClock::new(900_000);
+        let hub = Hub::with_sink(91, &Config { signal_history: 0, signal_bytes: 0, ..Config::default() }, inert, crate::chunks::Clock::new(Some(manual.clone())));
+        let mut tokens = Vec::new();
+        for i in 0..64 {
+            let reply = hub.subscribe("authored", "".into(), format!(r"\\.\pipe\inert-{i}"), false, &[], "membus.change/1", 1024).unwrap();
+            tokens.push(reply[4..20].to_vec());
+        }
+        manual.advance(1_000_000);
+        manual.jump_utc(-700_000);
+        assert_eq!(hub.subscribe("authored", "".into(), r"\\.\pipe\inert-65".into(), false, &[], "membus.change/1", 1024), Err(6));
+        assert_eq!(hub.memory_bytes(), 0);
+        for token in &tokens { assert_eq!(hub.status("authored", token).unwrap()[0], 1); }
+        for token in tokens { hub.unsubscribe("authored", &token).unwrap(); }
+        let mut hub = hub;
+        hub.stop_for_capture().unwrap();
+    }
+
 }
