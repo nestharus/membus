@@ -7,6 +7,12 @@ any different prefix policy or stored class in the namespace refuses explicitly.
 It does not establish the suitability of that class for every application's data.
 Existing BATCH remains independent per-item publication.
 
+For complete populations beyond the legacy capture profile, use
+`capture_namespace_funded` with an actual finite Store reservation. Retained
+originals and clones keep their backing funded, and startup validates borrowed
+originals. See [allocation ownership](ATOMIC-RESOURCES.md) for the public budget
+and codec contracts, conservative charging, and compatibility limits.
+
 ```rust,no_run
 use membus::{Store, atomic::{AtomicAck, AtomicRequest, FinalChange, PublicationError}};
 use std::path::Path;
