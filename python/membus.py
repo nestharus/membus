@@ -331,7 +331,7 @@ class Client:
         d=Decoder(self.call(7,ns,b''.join(parts),**options))
         count,=d.unpack('<H')
         outcomes=[dict(zip(('code','version','ack'),d.unpack('<HQB'))) for _ in range(count)]
-        for outcome in outcomes: outcome['name'],outcome['transient']=CODES.get(outcome['code'],('success',False))
+        for outcome in outcomes: outcome['name'],outcome['transient']=self.codes.get(outcome['code'],('success',False))
         return outcomes
 
     def health(self, ns='ledger'):
