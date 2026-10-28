@@ -24,9 +24,15 @@ pub(super) fn demand(ns:usize,prefix:usize,endpoint:usize)->Result<SubscriptionR
 }
 pub(super) fn detach_expired(s:&mut State, now:u64)->LinkedList<FiniteSubscription> {
     let mut retired=LinkedList::new();
+    if s.finite_expiry.is_none_or(|until|now<until) {return retired;}
+    s.finite_expiry=None;
     for _ in 0..s.finite.len() {
+        #[cfg(test)] {s.worker_visits.0+=1;}
         let row=s.finite.pop_front().unwrap();
-        if now>=row.until {retired.push_back(row);}else{s.finite.push_back(row);}
+        if now>=row.until {retired.push_back(row);}else{
+            s.finite_expiry=Some(s.finite_expiry.map_or(row.until,|until|until.min(row.until)));
+            s.finite.push_back(row);
+        }
     }
     retired
 }
@@ -61,6 +67,7 @@ impl Hub {
         let result=if self.clock.mono_ms()>=until {Err(5)}else if s.stop {Err(2)}else if let Some(next)=s.next.checked_add(1) {
             row.binding.id=s.next;s.next=next;
             let receipt=HintReceipt{binding:row.binding,authority_until_ms:row.until,generation:1};
+            s.finite_expiry=Some(s.finite_expiry.map_or(row.until,|until|until.min(row.until)));
             s.finite.push_back(row);self.state.1.notify_all();drop(s);settle_rows(retired);return Ok(receipt);
         }else{Err(7)};
         drop(s);settle_rows(retired);{let mut retired=LinkedList::new();retired.push_back(row);settle_rows(retired);}result

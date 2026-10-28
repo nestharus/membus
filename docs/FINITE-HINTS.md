@@ -67,3 +67,14 @@ row/list/queue/slot and publication ownership is explicitly granted at admission
 there is no fixed prospective legacy envelope on an empty Hub. Version-one discovery retains
 its historical negative reason byte for compatibility; it makes no statement
 about the separate implemented version-two Store capability.
+
+The delivery/expiry participant has its own implementation and remains owned and
+joined by Hub. Finite selection rotates existing funded rows up to the first
+pending hint. A conservative earliest-expiry scalar avoids a full expiry scan
+before every successful write; installation lowers it, and a due sweep recomputes
+it. Renewal or removal may leave an earlier harmless wakeup. Quiescent successful
+broadcast drain therefore avoids a full registry traversal per hint. Publication,
+controls, due expiry sweeps and exact failed-generation removal remain linear
+registry operations; repeated failures or newly due expiry groups can still
+produce quadratic aggregate work. Legacy priority is unchanged. This describes
+source scheduling, without an operating throughput or delivery-latency guarantee.
