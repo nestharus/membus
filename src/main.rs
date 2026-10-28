@@ -35,6 +35,7 @@ fn serve<S: Read + Write>(
     let mut max_frame = membus::MAX_FRAME;
     let mut subscribe = false;
     let mut timers = false;
+    let mut finite_hints = false;
     loop {
         let mut head = [0u8; 4];
         stream.read_exact(&mut head)?;
@@ -74,7 +75,9 @@ fn serve<S: Read + Write>(
             ))?;
             continue;
         }
-        let mut response = if hello && (membus::SUBSCRIBE..=membus::SIGNAL_USAGE).contains(&b[4]) && !subscribe {
+        let mut response = if hello && (membus::subscription_contract::FINITE_CREATE..=membus::subscription_contract::FINITE_CANCEL).contains(&b[4]) && !finite_hints {
+            membus::reply(b[4], u64::from_le_bytes(b[5..13].try_into().unwrap()), 2, &[])
+        } else if hello && (membus::SUBSCRIBE..=membus::SIGNAL_USAGE).contains(&b[4]) && !subscribe {
             membus::reply(b[4], u64::from_le_bytes(b[5..13].try_into().unwrap()), 2, &[])
         } else if hello && (membus::TIMER_SET..=membus::TIMER_STATUS).contains(&b[4]) && !timers {
             membus::reply(b[4], u64::from_le_bytes(b[5..13].try_into().unwrap()), 2, &[])
@@ -105,6 +108,7 @@ fn serve<S: Read + Write>(
             let _ = c.u8().unwrap();
             let client = c.text().unwrap();
             subscribe = client.split(';').skip(1).any(|feature| feature == "subscribe=1");
+            finite_hints = client.split(';').skip(1).any(|feature| feature == "subscription-contract=2");
             timers = client.split(';').skip(1).any(|feature| feature == "timers=1");
         }
     }

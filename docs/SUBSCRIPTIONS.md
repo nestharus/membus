@@ -5,6 +5,55 @@ endpoints. A complete pipe write is transport progress, not receiver receipt,
 durable work acknowledgment or permission to execute an effect. Subscriptions,
 status and history are memory-only and disappear on resident restart.
 
+
+## Stronger process-owned contract: unavailable
+
+Legacy change/1 is **UNQUALIFIED** for guaranteed quiet owner-loss reclamation,
+resource-derived admission or stronger communication requirements. The optional
+HELLO identity feature `;subscription-contract=1` requests a separate discovery
+suffix, after all selected legacy signal/timer extensions:
+
+```text
+magic MSC1; u16 discovery_version=1; u8 available=0;
+u16 reason=1 // shared resource reservation unavailable
+```
+
+These nine bytes explicitly decline the stronger capability. They select no
+creation, renewal or delivery operation and change no change/1 field. A peer
+ignoring the feature returns no suffix; this is unnegotiated, never agreement.
+Unknown versions/reasons, a claimed positive availability, truncation and trailing
+bytes are protocol errors for this discovery version. Ordinary clients request
+no suffix and retain their exact original HELLO layout.
+
+Rust `Client::handshake_requiring_owned_subscriptions` sends this opt-in once and
+returns `Error::SubscriptionContractUnavailable` with typed
+`subscription_contract::Unavailable::{PeerDidNotNegotiate,
+SharedResourceReservationUnavailable}`. It never returns a legacy client as
+success. HELLO transport failure remains a transport failure; no creation was
+sent. This API does not release any earlier caller-owned registration or erase
+an unresolved creation. An ordinary legacy handshake remains available only
+when the caller deliberately selects its narrower contract.
+
+The existing Store capacity calculation accounts current signal history/queue
+bytes alongside writes and snapshots. It supplies no shared subscription grant
+that reserves registration metadata, future negotiated queue/in-flight/encoding
+ownership and independently growing publication history. Sampling that number,
+using Config.capacity as a new budget or raising a slot constant cannot provide
+that grant. Integration must use the existing Store accounting owner and preserve
+all other reservations; no second allocator or fake resource provider is supplied.
+
+Once that capability exists, a stronger version must affirmatively agree process
+incarnation, epoch and exact registration identity; finite server-monotonic
+expiry and renewal ordering; quiet reclamation in the existing Hub worker;
+queued/in-flight charge return exactly once; old renewal/cancel/completion
+isolation; and lost-creation-reply custody. It must independently negotiate whether
+buffering, replay and coalescing are admissible, overload/recovery behavior,
+latency origin/clock/bound and delivery count/recipient acceptance evidence.
+No such profile is currently selected. Queued and completely written counts do
+not prove delivered or accepted events, exactly-once effects or end-to-end latency.
+Required unsupported guarantees must be refused explicitly. Lifetime implementation,
+allocated-capacity integration, legacy and Python/caller migration remain owed.
+
 ## Discovery and controls
 
 HELLO identity feature `;subscribe=1` selects codes 1..24 and a 46-byte extension

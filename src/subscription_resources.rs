@@ -173,7 +173,7 @@ fn debit(state: &mut State, available: usize, resources: SubscriptionResources) 
     Ok(())
 }
 
-fn issue(owner: &Arc<Mutex<State>>, state: &mut State, available: usize,
+pub(crate) fn issue(owner: &Arc<Mutex<State>>, state: &mut State, available: usize,
     resources: SubscriptionResources, released: &Arc<AtomicBool>) -> Result<SubscriptionReservation, ReservationError>
 {
     debit(state, available, resources)?;

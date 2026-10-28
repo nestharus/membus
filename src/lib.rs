@@ -5,6 +5,7 @@ pub mod chunks;
 extern crate self as membus;
 mod signals;
 pub mod subscription_resources;
+pub mod subscription_contract;
 mod timers;
 pub use chunks::{Class, ManualClock, POLICY_NS};
 pub mod client;

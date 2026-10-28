@@ -377,6 +377,7 @@ impl Store {
                 if timers {
                     p.extend(timers::hello_limits());
                 }
+                append_subscription_contract_discovery(&client, &self.signals, &mut p);
                 return Ok(DispatchReply::Payload(p));
             }
             let deadline = c.u64()?;
@@ -412,6 +413,20 @@ impl Store {
                     .map(DispatchReply::Framed);
             }
             match op {
+                crate::subscription_contract::FINITE_CREATE => {
+                    use crate::subscription_contract::*;
+                    let profile=c.u16()?;let lifetime_ms=c.u64()?;let write_ms=c.u32()?;
+                    let incarnation=c.bytes(16)?.try_into().map_err(|_|3u16)?;
+                    let recipient=c.bytes(16)?.try_into().map_err(|_|3u16)?;
+                    let prefix=c.bound_ref()?;let endpoint=c.text_ref()?;c.end()?;
+                    Ok(self.subscribe_finite_hints(ns,prefix,endpoint,HintOptions{profile,lifetime_ms,write_ms,incarnation,recipient})?.bytes().to_vec())
+                }
+                crate::subscription_contract::FINITE_RENEW | crate::subscription_contract::FINITE_CANCEL => {
+                    use crate::subscription_contract::*;
+                    let receipt=HintReceipt::decode(c.bytes(64)?)?;c.end()?;
+                    if op==FINITE_CANCEL {self.cancel_finite_hints(ns,receipt)?;Ok(Vec::new())}
+                    else {Ok(self.renew_finite_hints(ns,receipt)?.bytes().to_vec())}
+                }
                 TIMER_SET | TIMER_CANCEL | TIMER_STATUS => {
                     self.timer_call(op, ns.to_owned(), _op_id.to_owned(), deadline, &mut c)
                 }
@@ -750,3 +765,12 @@ mod read_tests;
 #[cfg(test)]
 #[path = "codec/record_tests.rs"]
 mod record_tests;
+
+/// Used by the actual HELLO path; unknown feature text grants no capability.
+pub(crate) fn append_subscription_contract_discovery(client: &str, hub: &crate::signals::Hub, payload: &mut Vec<u8>) {
+    if client.split(';').skip(1).any(|feature| feature == "subscription-contract=2") {
+        payload.extend_from_slice(hub.finite_discovery());
+    } else if client.split(';').skip(1).any(|feature| feature == "subscription-contract=1") {
+        payload.extend_from_slice(hub.contract_discovery());
+    }
+}

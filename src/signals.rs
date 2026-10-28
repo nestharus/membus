@@ -2,6 +2,10 @@
 use crate::{lp, Config, Value, MAX_ID};
 use std::{collections::{HashMap, VecDeque}, io, sync::{Arc, Condvar, Mutex}, thread, time::Duration};
 
+#[path = "signals/finite.rs"]
+mod finite;
+use finite::*;
+
 const SUB_MAX: usize = 64;
 const SUB_ITEMS: usize = 256;
 const SUB_BYTES: usize = 8 * 1024 * 1024;
@@ -44,6 +48,7 @@ struct State {
     ring_bytes: usize,
     queue_bytes: usize,
     subs: Vec<Subscription>,
+    finite: std::collections::LinkedList<FiniteSubscription>,
     turn: usize,
     stop: bool,
 }
@@ -58,6 +63,7 @@ pub struct Hub {
     ring_budget: usize,
     state: Arc<(Mutex<State>, Condvar)>,
     worker: Option<thread::JoinHandle<()>>,
+    clock: crate::chunks::Clock,
 }
 /// Existing concrete layouts, shared with prospective resource demand builders.
 pub(crate) fn registration_allocation_bytes() -> usize {
@@ -123,11 +129,15 @@ fn encode(epoch: u64, id: u64, change: &Change, values: bool) -> Vec<u8> {
     frame.extend(b);
     frame
 }
+enum Job {
+    Legacy(u64,String,bool,Arc<Change>),
+    Hint(crate::subscription_contract::HintBinding,Arc<HintSlot>,u64,u32,u64,u64),
+}
 impl Hub {
     pub(crate) fn stop_for_capture(&mut self) -> io::Result<()> {
         {
             let mut s=self.state.0.lock().unwrap();
-            if s.subs.iter().any(|sub|sub.active || sub.bytes!=0) || s.queue_bytes!=0 {
+            if !s.finite.is_empty() || s.subs.iter().any(|sub|sub.active || sub.bytes!=0) || s.queue_bytes!=0 {
                 return Err(io::Error::other("signal delivery owner/subscription is not settled"));
             }
             s.stop=true;self.state.1.notify_all();
@@ -142,8 +152,9 @@ impl Hub {
     fn with_sink(epoch: u64, config: &Config, sink: Sink, clock: crate::chunks::Clock) -> Self {
         let state = Arc::new((Mutex::new(State { head: 0, floor: 0, next: 1,
             ring: VecDeque::new(), ring_bytes: 0, queue_bytes: 0,
-            subs: Vec::new(), turn: 0, stop: false }), Condvar::new()));
+            subs: Vec::new(), finite: Default::default(), turn: 0, stop: false }), Condvar::new()));
         let owner = state.clone();
+        let hub_clock=clock.clone();
         let worker = thread::spawn(move || {
             let mut connections: HashMap<u64, Option<Connection>> = HashMap::new();
             loop {
@@ -151,24 +162,64 @@ impl Hub {
                     let (lock, wake) = &*owner;
                     let mut s = lock.lock().unwrap();
                     loop {
+                        let retired=detach_expired(&mut s,clock.mono_ms());
+                        if !retired.is_empty() {drop(s);settle_rows(retired);s=lock.lock().unwrap();continue;}
                         connections.retain(|id, _| s.subs.iter().any(|sub| sub.id == *id && sub.active));
-                        if s.stop { return; }
+                        if s.stop {
+                            let retired=std::mem::take(&mut s.finite);drop(s);settle_rows(retired);return;
+                        }
                         let mut job = None;
                         let count = s.subs.len();
                         for offset in 0..count {
                             let n = (s.turn + offset) % count;
                             let sub = &mut s.subs[n];
                             if let Some(change) = sub.queue.pop_front() {
-                                job = Some((sub.id, sub.endpoint.clone(), sub.values, change));
+                                job = Some(Job::Legacy(sub.id, sub.endpoint.clone(), sub.values, change));
                                 s.turn = (n + 1) % count;
                                 break;
                             }
                         }
                         if let Some(job) = job { break job; }
-                        s = wake.wait(s).unwrap();
+                        let mut hint=None;
+                        for _ in 0..s.finite.len() {
+                            let mut row=s.finite.pop_front().unwrap();
+                            if hint.is_none() {if let Some(seq)=row.pending.take() {
+                                hint=Some(Job::Hint(row.binding,row.slot.clone(),seq,row.write_ms,row.until,row.generation));
+                            }}
+                            s.finite.push_back(row);
+                        }
+                        if let Some(job)=hint {break job;}
+                        if let Some(until)=s.finite.iter().map(|row|row.until).min() {
+                            let wait=Duration::from_millis(until.saturating_sub(clock.mono_ms()));
+                            s=wake.wait_timeout(s,wait).unwrap().0;
+                        }else{s = wake.wait(s).unwrap();}
                     }
                 };
-                let (id, endpoint, values, change) = job;
+                let (id, endpoint, values, change) = match job {
+                    Job::Legacy(id,endpoint,values,change)=>(id,endpoint,values,change),
+                    Job::Hint(binding,slot,seq,write_ms,until,generation)=>{
+                        // Local completion confers no recipient-accepted evidence. No
+                        // persistent connection survives the actual in-flight owner.
+                        let mut frame=[0u8;64];frame[..4].copy_from_slice(&60u32.to_le_bytes());frame[4..8].copy_from_slice(b"MBH2");
+                        frame[8..56].copy_from_slice(&binding.bytes());frame[56..].copy_from_slice(&seq.to_le_bytes());
+                        let now=clock.mono_ms();
+                        if now<until {
+                            let mut connection=None;
+                            let timeout=(until-now).min(write_ms as u64) as u32;
+                            let result=sink(&slot.endpoint,&frame,timeout,&mut connection,&clock);
+                            drop(connection);
+                            if result.is_err() {
+                                // Exact old identity only. Detach while locked; return
+                                // allocation ownership after releasing the Hub mutex.
+                                let mut s=owner.0.lock().unwrap();let mut retired=std::collections::LinkedList::new();
+                                for _ in 0..s.finite.len() {let row=s.finite.pop_front().unwrap();
+                                    if row.binding==binding && row.generation==generation {retired.push_back(row);}else{s.finite.push_back(row);}}
+                                drop(s);settle_rows(retired);
+                            }
+                        }
+                        settle_slot(slot);continue;
+                    }
+                };
                 // Encoding and all endpoint I/O are outside the publication/hub lock.
                 let result = sink(&endpoint, &encode(epoch, id, &change, values), WRITE_MS,
                     connections.entry(id).or_default(), &clock);
@@ -190,7 +241,7 @@ impl Hub {
                 }
             }
         });
-        Self { epoch, ring_max: config.signal_history, ring_budget: config.signal_bytes, state, worker: Some(worker) }
+        Self { epoch, ring_max: config.signal_history, ring_budget: config.signal_bytes, state, worker: Some(worker), clock:hub_clock }
     }
     /// Called while the committed write lock orders successful publication.
     pub fn publish(&self, ns: &str, key: &str, value: Arc<Value>) {
@@ -210,6 +261,8 @@ impl Hub {
             s.ring_bytes -= old.charge;
             s.floor = old.seq;
         }
+        let now=self.clock.mono_ms();
+        for row in &mut s.finite {if now<row.until && row.ns==ns && key.starts_with(&row.prefix) {row.pending=Some(seq);}}
         let mut total = s.queue_bytes;
         for sub in &mut s.subs {
             if sub.active && sub.ns == ns && key.starts_with(&sub.prefix) {
@@ -293,6 +346,7 @@ impl Hub {
         let s = self.state.0.lock().unwrap();
         s.ring_bytes + s.queue_bytes
     }
+    pub(crate) fn contract_discovery(&self) -> &'static [u8] { crate::subscription_contract::DISCOVERY }
     pub fn hello_limits(&self) -> Vec<u8> {
         let mut p = 1u16.to_le_bytes().to_vec(); // membus.change/1
         p.extend((crate::MAX_FRAME as u32).to_le_bytes());

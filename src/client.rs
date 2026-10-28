@@ -73,6 +73,8 @@ pub enum Error {
         actual: u64,
     },
     RetryWindowExpired,
+    /// No stronger contract was selected; creating a legacy registration is not a fallback.
+    SubscriptionContractUnavailable(crate::subscription_contract::Unavailable),
 }
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -257,6 +259,26 @@ impl<T: Transport> Client<T> {
         additional: AdditionalFeatures,
         until: Instant,
     ) -> Result<Self> {
+        Self::handshake_inner(io, options, additional, until, false)
+    }
+    /// Require the stronger process-owned subscription contract during HELLO.
+    /// Current producers explicitly report a missing shared reservation; older
+    /// peers are unnegotiated. Neither outcome creates a legacy subscription.
+    pub fn handshake_requiring_owned_subscriptions(
+        io: T,
+        options: Options,
+        additional: AdditionalFeatures,
+        until: Instant,
+    ) -> Result<Self> {
+        Self::handshake_inner(io, options, additional, until, true)
+    }
+    fn handshake_inner(
+        io: T,
+        options: Options,
+        additional: AdditionalFeatures,
+        until: Instant,
+        require_contract: bool,
+    ) -> Result<Self> {
         identifier(&options.identity)?;
         if options.identity.contains(';') {
             return Err(Error::Invalid("identity contains feature delimiter"));
@@ -287,6 +309,7 @@ impl<T: Transport> Client<T> {
         let features = [
             if additional.timers { ";timers=1" } else { "" },
             if options.subscriptions { ";subscribe=1" } else { "" },
+            if require_contract { crate::subscription_contract::HELLO_FEATURE } else { "" },
             if options.scans { ";scans=1" } else { "" },
         ];
         let identity_len = options.identity.len()
@@ -395,6 +418,11 @@ impl<T: Transport> Client<T> {
         }
         if refusals.contains_key(&25) {
             this.feature_limits.timers = Some(TimerLimits::parse(&mut c)?);
+        }
+        if require_contract {
+            let reason = crate::subscription_contract::decode_discovery(c.remainder())
+                .map_err(|_| Error::Protocol("subscription contract discovery"))?;
+            return Err(Error::SubscriptionContractUnavailable(reason));
         }
         parse(c.end())?;
         this.negotiated = Negotiated {
