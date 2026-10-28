@@ -20,6 +20,8 @@ pub use captured_backing::{BackingCharge, BackingLayout};
 mod custody;
 #[cfg(windows)]
 pub use custody::HeldOriginalFile;
+#[path = "atomic_original.rs"]
+pub mod original;
 #[cfg(test)]
 #[path = "atomic_funding_tests.rs"]
 mod funding_tests;
@@ -29,6 +31,18 @@ pub use result_inspection::{
     AtomicResultEvidence, AtomicResultInspection, InspectionError, OriginalRef, RetainedAtomicResult,
     RetryRetention, RESULT_INSPECTION_SCRATCH_BYTES,
 };
+
+/// Complete borrowed original, including the whole captured guard population.
+/// Inspection and successful decoding establish no domain-original provenance.
+pub struct AtomicInspection<'a> {
+    pub namespace: &'a str,
+    pub operation_id: &'a str,
+    pub epoch: u64,
+    pub expires_mono: u64,
+    pub population: &'a [(String, u64)],
+    pub requested_ack: AtomicAck,
+    pub changes: &'a [FinalChange],
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AtomicAck {
     Os,
@@ -266,6 +280,20 @@ impl OriginalEncoding<'_> {
 }
 
 impl AtomicRequest {
+    pub fn inspect(&self) -> AtomicInspection<'_> {
+        AtomicInspection {
+            namespace: &self.data.namespace,
+            operation_id: &self.data.operation_id,
+            epoch: self.data.epoch,
+            expires_mono: self.data.expires_mono,
+            population: &self.data.population.rows,
+            requested_ack: self.data.ack,
+            changes: &self.data.changes,
+        }
+    }
+    pub(crate) fn validate(&self) -> Result<(), PublicationError> {
+        BorrowedOriginal::from_canonical_bytes(&self.to_bytes()).map(|_| ())
+    }
     pub(crate) fn prepare_bounded(
         namespace: &str,
         id: &str,
@@ -999,3 +1027,7 @@ impl Store {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "atomic_original_tests.rs"]
+mod original_tests;
