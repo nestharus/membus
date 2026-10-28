@@ -1609,6 +1609,7 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
         }
     }
     let state = State {
+        subscription_usage: Default::default(),
         pending: HashMap::new(),
         metadata,
         namespace_counts: namespace_counts.clone(),

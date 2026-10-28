@@ -2,8 +2,8 @@
 //!
 //! Charges describe retained representations and prospective allocations, not
 //! measured RSS or kernel memory. Only Store admission can create new ownership.
-//! Grant, growth and return (including token destruction) acquire State. Do not
-//! hold a Hub lock across them: existing health reads acquire State then Hub.
+//! Grant and growth acquire State. Return atomically releases the live subscription
+//! portion after allocation release, without acquiring State under the Hub lock.
 use crate::{store::State, Store};
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 
@@ -31,14 +31,13 @@ impl SubscriptionResources {
     pub fn registration(namespace_capacity: usize, prefix_capacity: usize,
         endpoint_capacity: usize, queue_capacity: usize) -> Result<Self, ReservationError> {
         let metadata = crate::signals::registration_allocation_bytes()
-            .checked_add(std::mem::size_of::<SubscriptionReservation>())
-            .and_then(|n| n.checked_add(namespace_capacity))
-            .and_then(|n| n.checked_add(prefix_capacity))
-            .and_then(|n| n.checked_add(endpoint_capacity)).ok_or(ReservationError::InvalidDemand)?;
-        let retained = queue_capacity.checked_mul(std::mem::size_of::<Arc<()>>())
+            .checked_add(namespace_capacity)
+            .and_then(|n| n.checked_add(prefix_capacity)).ok_or(ReservationError::InvalidDemand)?;
+        let retained = queue_capacity.checked_mul(crate::signals::queue_link_allocation_bytes())
             .ok_or(ReservationError::InvalidDemand)?;
-        // Worker-owned endpoint copy. Native kernel storage is not measured.
-        let result = Self { metadata, retained, in_flight: endpoint_capacity, ..Self::default() };
+        // The shared slot owns endpoint, Connection and its grant through I/O.
+        let in_flight=crate::signals::connection_allocation_bytes().checked_add(endpoint_capacity).ok_or(ReservationError::InvalidDemand)?;
+        let result = Self { metadata, retained, in_flight, ..Self::default() };
         result.total()?; Ok(result)
     }
     /// One prospective retained Change/Value allocation. Shared payloads are
@@ -121,6 +120,8 @@ pub struct SubscriptionResourceProfile {
 pub struct SubscriptionReservation {
     owner: Option<Arc<Mutex<State>>>,
     released: Arc<AtomicBool>,
+    usage: Arc<SubscriptionUsage>,
+    legacy: bool,
     resources: SubscriptionResources,
 }
 impl SubscriptionReservation {
@@ -131,7 +132,7 @@ impl SubscriptionReservation {
         let owner = self.owner.as_ref().ok_or(ReservationError::Returned)?;
         if resources.total()? == 0 { return Err(ReservationError::InvalidDemand); }
         let remaining = self.resources.checked_sub(resources)?;
-        let child = Self { owner: Some(owner.clone()), released: self.released.clone(), resources };
+        let child = Self { owner: Some(owner.clone()), released: self.released.clone(), usage:self.usage.clone(),legacy:self.legacy,resources };
         self.resources = remaining;
         Ok(child)
     }
@@ -148,12 +149,15 @@ impl SubscriptionReservation {
         Ok(())
     }
     /// Idempotent exact-once return of this token's remaining ownership.
-    /// Release Hub/consumer locks first; this method acquires the Store State.
+    /// Returns only the live subscription portion; never acquires State or changes ordinary debits.
     pub fn return_to_owner(&mut self) {
         if let Some(owner) = self.owner.take() {
             let bytes = self.resources.total().expect("issued charge is representable");
-            let mut state = owner.lock().unwrap();
-            state.memory_reserved = state.memory_reserved.checked_sub(bytes).expect("owned charge retained");
+            // The original State identity stays attached, but release does not
+            // acquire it. Ordinary/atomic debits are never overwritten.
+            self.usage.bytes.try_update(Ordering::AcqRel,Ordering::Acquire,|n|n.checked_sub(bytes)).expect("owned charge retained");
+            if self.legacy {self.usage.legacy.try_update(Ordering::AcqRel,Ordering::Acquire,|n|n.checked_sub(bytes)).expect("legacy charge retained");}
+            drop(owner);
             self.resources = SubscriptionResources::default();
             self.released.store(true, Ordering::Release);
         }
@@ -169,7 +173,7 @@ fn debit(state: &mut State, available: usize, resources: SubscriptionResources) 
     let bytes = resources.total()?;
     if bytes == 0 { return Err(ReservationError::InvalidDemand); }
     if bytes > available { return Err(ReservationError::Capacity); }
-    state.memory_reserved = state.memory_reserved.checked_add(bytes).ok_or(ReservationError::Capacity)?;
+    state.subscription_usage.bytes.try_update(Ordering::AcqRel,Ordering::Acquire,|n|n.checked_add(bytes)).map_err(|_|ReservationError::Capacity)?;
     Ok(())
 }
 
@@ -177,7 +181,7 @@ pub(crate) fn issue(owner: &Arc<Mutex<State>>, state: &mut State, available: usi
     resources: SubscriptionResources, released: &Arc<AtomicBool>) -> Result<SubscriptionReservation, ReservationError>
 {
     debit(state, available, resources)?;
-    Ok(SubscriptionReservation { owner: Some(owner.clone()), released: released.clone(), resources })
+    Ok(SubscriptionReservation { owner: Some(owner.clone()), released: released.clone(),usage:state.subscription_usage.clone(),legacy:false,resources })
 }
 fn check_owner(original: &Arc<Mutex<State>>, owner: &Arc<Mutex<State>>) -> Result<(), ReservationError> {
     if !Arc::ptr_eq(original, owner) { return Err(ReservationError::ForeignOwner); }
@@ -190,6 +194,7 @@ fn extend(owner: &Arc<Mutex<State>>, state: &mut State, available: usize,
     check_owner(original, owner)?;
     let next = reservation.resources.checked_add(additional)?;
     debit(state, available, additional)?;
+    if reservation.legacy {reservation.usage.legacy.fetch_add(additional.total()?,Ordering::AcqRel);}
     reservation.resources = next;
     Ok(())
 }
@@ -204,11 +209,11 @@ impl Store {
         let chunk_index = self.chunks.lock().unwrap().index_bytes;
         let snapshots = self.scan_usage.bytes.load(Ordering::Acquire);
         let margin = self.config.memory_margin();
-        let legacy_signals = self.signals.memory_reservation_bytes();
+        let legacy_signals = state.subscription_usage.legacy.load(Ordering::Acquire);
         SubscriptionResourceProfile { capacity: self.config.capacity,
             committed_index: state.committed_bytes, retained_retries: state.dedup_bytes,
-            reserved: state.memory_reserved, snapshots, margin, chunk_index, legacy_signals,
-            available: state.available_memory(self.config.capacity, snapshots, margin, chunk_index, legacy_signals) }
+            reserved: state.total_reserved(), snapshots, margin, chunk_index, legacy_signals,
+            available: state.available_memory(self.config.capacity, snapshots, margin, chunk_index, 0) }
     }
     /// Reserve before allocating registration metadata, queue backing, retained
     /// data, encoding or future publication. No fixed subscription policy cap.
@@ -237,3 +242,65 @@ impl Store {
 #[cfg(test)]
 #[path = "subscription_resources/tests.rs"]
 mod tests;
+
+
+/// Live subscription portion of the existing State admission account. Grants
+/// serialize on State; release is atomic after the covered allocation is freed.
+#[derive(Default)]
+pub(crate) struct SubscriptionUsage {
+    pub(crate) bytes: std::sync::atomic::AtomicUsize,
+    pub(crate) legacy: std::sync::atomic::AtomicUsize,
+}
+/// No Store/Hub/worker strong reference: publisher admission cannot keep its
+/// service owner alive or cause a worker to destroy/join itself.
+#[derive(Clone)]
+pub(crate) struct SubscriptionAccount {
+    owner: std::sync::Weak<Mutex<State>>,
+    pub(crate) usage: Arc<SubscriptionUsage>,
+    capacity: usize,
+    margin: usize,
+    released: Arc<AtomicBool>,
+    context: AccountContext,
+}
+#[derive(Clone)]
+enum AccountContext {
+    Store {
+        scans: Arc<crate::snapshots::ScanUsage>,
+        chunks: std::sync::Weak<Mutex<crate::chunks::ChunkStore>>,
+        cache: std::sync::Weak<crate::cache::Cache>,
+    },
+    #[cfg(test)]
+    Capture { scans: Arc<crate::snapshots::ScanUsage>, chunk_index: usize },
+}
+impl SubscriptionAccount {
+    pub(crate) fn from_store(store:&Store)->Self {
+        Self{owner:Arc::downgrade(&store.state),usage:store.state.lock().unwrap().subscription_usage.clone(),
+            capacity:store.config.capacity,margin:store.config.memory_margin(),released:store.subscription_released.clone(),
+            context:AccountContext::Store{scans:store.scan_usage.clone(),chunks:Arc::downgrade(&store.chunks),cache:Arc::downgrade(&store.cache)}}
+    }
+    #[cfg(test)]
+    pub(crate) fn for_capture(owner:&Arc<Mutex<State>>,config:&crate::Config,scans:Arc<crate::snapshots::ScanUsage>,chunk_index:usize)->Self {
+        Self{owner:Arc::downgrade(owner),usage:owner.lock().unwrap().subscription_usage.clone(),capacity:config.capacity,
+            margin:config.memory_margin(),released:Arc::new(AtomicBool::new(false)),context:AccountContext::Capture{scans,chunk_index}}
+    }
+    pub(crate) fn reserve(&self,resources:SubscriptionResources,legacy:bool)->Result<SubscriptionReservation,ReservationError> {
+        let owner=self.owner.upgrade().ok_or(ReservationError::Returned)?;
+        let mut state=owner.lock().unwrap();
+        let (snapshots,index,cache)=match &self.context {
+            AccountContext::Store{scans,chunks,cache}=>{
+                let chunks=chunks.upgrade().ok_or(ReservationError::Returned)?;
+                let index=chunks.lock().unwrap().index_bytes;
+                (scans.bytes.load(Ordering::Acquire),index,Some(cache.upgrade().ok_or(ReservationError::Returned)?))
+            },
+            #[cfg(test)]
+            AccountContext::Capture{scans,chunk_index}=>(scans.bytes.load(Ordering::Acquire),*chunk_index,None),
+        };
+        let available=state.available_memory(self.capacity,snapshots,self.margin,index,0);
+        let mut grant=issue(&owner,&mut state,available,resources,&self.released)?;
+        if legacy {
+            self.usage.legacy.fetch_add(resources.total()?,Ordering::AcqRel);grant.legacy=true;
+        }
+        if let Some(cache)=cache {cache.trim(state.available_memory(self.capacity,snapshots,self.margin,index,0));}
+        Ok(grant)
+    }
+}

@@ -22,9 +22,9 @@ LP prefix and LP local endpoint. All integers are little-endian. Lifetime and
 write budget must be positive and representable in the authority's clock range.
 No new time policy cap is imposed. The Store's real common account grants all
 managed row/node/string/slot/encoding demand before allocation. It may refuse
-capacity; even a quiet small Store can have no allowance due to the inherited
-prospective legacy envelope. Count is resource-derived, with no 64-row limit in
-this mode. Native kernel/allocator RSS remains unmeasured.
+capacity under actual shared ownership. An empty Hub withdraws no prospective
+legacy envelope from a quiet Store. Count is resource-derived, with no 64-row
+limit in this mode. Native kernel/allocator RSS remains unmeasured.
 
 The 64-byte receipt is epoch:u64, id:u64, incarnation:16, recipient:16,
 authority_until_ms:u64, generation:u64. The endpoint is immutable for that ID.
@@ -62,7 +62,8 @@ recipient cardinality or accepted-delivery counter; this profile declines such
 requirements. Successful cancellation prevents future selection and drops pending
 hints, but a previously selected write can finish afterward. Receiver binding
 checks isolate a replacement; cancellation is not a drain/recipient receipt.
-Shared Hub/State/list/clock metadata is included in the prospective account
-envelope in addition to per-registration grants. Version-one discovery retains
+Fixed Hub/State/clock bookkeeping belongs to the existing Store margin. Live
+row/list/queue/slot and publication ownership is explicitly granted at admission;
+there is no fixed prospective legacy envelope on an empty Hub. Version-one discovery retains
 its historical negative reason byte for compatibility; it makes no statement
 about the separate implemented version-two Store capability.

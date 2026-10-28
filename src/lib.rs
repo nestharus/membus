@@ -450,7 +450,7 @@ impl Store {
         let cache = Arc::new(cache::Cache::new(&config, clock.clone()));
         cache.trim(state.available_memory(config.capacity, 0, config.memory_margin(),
             chunks.lock().unwrap().index_bytes,
-            signals::legacy_memory_reservation(config.signal_history, config.signal_bytes)));
+            0));
         let state = Arc::new(Mutex::new(state));
         let admission_gate = Arc::new(RwLock::new(()));
         let maint = Arc::new(Maint {
@@ -518,6 +518,7 @@ impl Store {
             epoch,
             _owner: owner,
         };
+        store.signals.bind_account(subscription_resources::SubscriptionAccount::from_store(&store));
         let publication = store.report.lock().unwrap().write_startup(path, &store.config);
         if let Err(error) = publication {
             // Keep ownership until workers have joined and the best-effort

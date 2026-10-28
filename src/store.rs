@@ -44,6 +44,7 @@ pub(super) struct Dedup {
 }
 #[cfg_attr(test, derive(Default))]
 pub(super) struct State {
+    pub(crate) subscription_usage: Arc<crate::subscription_resources::SubscriptionUsage>,
     pub(super) pending: HashMap<(String, String), Meta>,
     pub(super) metadata: HashMap<(String, String), Meta>,
     pub(super) namespace_counts: HashMap<String, usize>,
@@ -70,11 +71,12 @@ pub(super) struct State {
     pub(super) tomb_candidates: HashSet<(String, String)>,
 }
 impl State {
-    /// Current non-cache ownership, including prospective legacy signal growth.
+    pub(crate) fn total_reserved(&self)->usize {self.memory_reserved.saturating_add(self.subscription_usage.bytes.load(Ordering::Acquire))}
+    /// Current non-cache ownership, including actually granted subscription storage.
     /// The Store captures external owners under its existing admission guard.
     pub(super) fn available_memory(&self, capacity: usize, snapshots: usize,
         margin: usize, chunk_index: usize, signals: usize) -> usize {
-        [self.committed_bytes, self.dedup_bytes, self.memory_reserved,
+        [self.committed_bytes, self.dedup_bytes, self.total_reserved(),
             snapshots, margin, chunk_index, signals].into_iter()
             .try_fold(0usize, |n, v| n.checked_add(v))
             .map_or(0, |owned| capacity.saturating_sub(owned))
@@ -193,7 +195,7 @@ impl Store {
     pub(super) fn cache_limit(&self, state: &State) -> usize {
         state.available_memory(self.config.capacity,
             self.scan_usage.bytes.load(Ordering::Acquire), self.config.memory_margin(),
-            self.chunks.lock().unwrap().index_bytes, self.signals.memory_reservation_bytes())
+            self.chunks.lock().unwrap().index_bytes, 0)
     }
     pub(super) fn trim_cache(&self, state: &State) {
         self.cache.trim(self.cache_limit(state));
@@ -312,7 +314,7 @@ impl Store {
         };
         h.memory_bytes = h.cache.bytes + state.committed_bytes + state.dedup_bytes + state.memory_reserved
             + self.scan_usage.bytes.load(Ordering::Acquire) + c.memory_margin() + cs.index_bytes
-            + self.signals.memory_bytes();
+            + state.subscription_usage.bytes.load(Ordering::Acquire);
         let mut namespaces: Vec<(String, usize)> = state
             .namespace_counts
             .iter()

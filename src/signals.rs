@@ -1,10 +1,13 @@
 //! Epoch-scoped change retention and one bounded, independent delivery owner.
 use crate::{lp, Config, Value, MAX_ID};
-use std::{collections::{HashMap, VecDeque}, io, sync::{Arc, Condvar, Mutex}, thread, time::Duration};
+use std::{io, sync::{Arc, Condvar, Mutex}, thread, time::Duration};
 
 #[path = "signals/finite.rs"]
 mod finite;
 use finite::*;
+#[path="signals/legacy.rs"]
+mod legacy;
+use legacy::*;
 
 const SUB_MAX: usize = 64;
 const SUB_ITEMS: usize = 256;
@@ -23,33 +26,34 @@ struct Change {
     key: String,
     value: Arc<Value>,
     charge: usize,
+    allocation: Option<crate::subscription_resources::SubscriptionReservation>,
 }
 struct Subscription {
     id: u64,
     ns: String,
     prefix: String,
-    endpoint: String,
+    slot: Option<LegacySlotRef>,
     values: bool,
     frame_max: usize,
     active: bool,
     status: u8,
-    queue: VecDeque<Arc<Change>>,
+    queue: std::collections::LinkedList<ChangeRef>,
     bytes: usize, // includes delivery in flight
     written: u64,
     failed: u64,
     dropped: u64,
     last: u64,
+    allocation: Option<crate::subscription_resources::SubscriptionReservation>,
 }
 struct State {
     head: u64,
     floor: u64, // a resume at floor is valid; earlier history is gone
     next: u64,
-    ring: VecDeque<Arc<Change>>,
+    ring: std::collections::LinkedList<ChangeRef>,
     ring_bytes: usize,
     queue_bytes: usize,
-    subs: Vec<Subscription>,
+    subs: std::collections::LinkedList<Subscription>,
     finite: std::collections::LinkedList<FiniteSubscription>,
-    turn: usize,
     stop: bool,
 }
 #[cfg(windows)]
@@ -64,11 +68,15 @@ pub struct Hub {
     state: Arc<(Mutex<State>, Condvar)>,
     worker: Option<thread::JoinHandle<()>>,
     clock: crate::chunks::Clock,
+    account: std::sync::OnceLock<crate::subscription_resources::SubscriptionAccount>,
+    admission:Mutex<()>,
 }
 /// Existing concrete layouts, shared with prospective resource demand builders.
 pub(crate) fn registration_allocation_bytes() -> usize {
-    std::mem::size_of::<Subscription>() + 4 * std::mem::size_of::<(u64, Option<Connection>)>()
+    2*(std::mem::size_of::<Subscription>()+2*std::mem::size_of::<usize>())
 }
+pub(crate) fn connection_allocation_bytes()->usize {legacy::slot_allocation_bytes()}
+pub(crate) fn queue_link_allocation_bytes()->usize {2*std::mem::size_of::<usize>()+std::mem::size_of::<ChangeRef>()}
 pub(crate) fn change_allocation_bytes() -> usize {
     // Arc strong/weak counters for Change and Value, plus a retained Arc link.
     std::mem::size_of::<Change>() + std::mem::size_of::<Value>()
@@ -77,6 +85,7 @@ pub(crate) fn change_allocation_bytes() -> usize {
 /// Prospective managed representation charge for the unchanged legacy Hub.
 /// This is reserved even while quiet. Kernel buffers/handles and allocator RSS
 /// are not measured; the Store margin remains separate. No policy is enlarged.
+#[cfg(test)]
 pub(crate) fn legacy_memory_reservation(history_items: usize, history_bytes: usize) -> usize {
     use std::mem::size_of;
     // A retained Change charges at least 256. Include the append-before-evict
@@ -113,13 +122,18 @@ fn clear(sub: &mut Subscription) -> usize {
     sub.bytes -= bytes;
     sub.dropped += sub.queue.len() as u64;
     sub.queue.clear();
+    if let Some(grant)=sub.allocation.as_mut() {
+        let retained=grant.resources().retained;
+        if retained!=0 {let mut queue=grant.split(crate::subscription_resources::SubscriptionResources{retained,..Default::default()}).expect("owned queue backing");queue.return_to_owner();}
+    }
     bytes
 }
 fn encode(epoch: u64, id: u64, change: &Change, values: bool) -> Vec<u8> {
-    let mut b = b"MBC1".to_vec();
+    let mut b = Vec::with_capacity(wire_size(change,values));
+    b.extend_from_slice(b"MBC1");
     b.extend(1u16.to_le_bytes());
-    b.extend(token(epoch, id));
-    b.extend(token(epoch, change.seq));
+    b.extend(epoch.to_le_bytes());b.extend(id.to_le_bytes());
+    b.extend(epoch.to_le_bytes());b.extend(change.seq.to_le_bytes());
     lp(&mut b, change.ns.as_bytes());
     lp(&mut b, change.key.as_bytes());
     b.extend(change.value.version.to_le_bytes());
@@ -127,12 +141,13 @@ fn encode(epoch: u64, id: u64, change: &Change, values: bool) -> Vec<u8> {
     b.push(change.value.tombstone as u8);
     b.push(values as u8);
     if values { lp(&mut b, &change.value.bytes); }
-    let mut frame = (b.len() as u32).to_le_bytes().to_vec();
+    let mut frame = Vec::with_capacity(b.len()+4);
+    frame.extend((b.len() as u32).to_le_bytes());
     frame.extend(b);
     frame
 }
 enum Job {
-    Legacy(u64,String,bool,Arc<Change>),
+    Legacy(u64,LegacySlotRef,bool,ChangeRef),
     Hint(crate::subscription_contract::HintBinding,Arc<HintSlot>,u64,u32,u64,u64),
 }
 impl Hub {
@@ -145,6 +160,7 @@ impl Hub {
             s.stop=true;self.state.1.notify_all();
         }
         if let Some(worker)=self.worker.take() {worker.join().map_err(|_|io::Error::other("signal owner panicked"))?;}
+        {let mut s=self.state.0.lock().unwrap();while let Some(row)=s.subs.pop_front(){drop(row);}while let Some(change)=s.ring.pop_front(){drop(change);}s.ring_bytes=0;}
         Ok(())
     }
 
@@ -153,12 +169,12 @@ impl Hub {
     }
     fn with_sink(epoch: u64, config: &Config, sink: Sink, clock: crate::chunks::Clock) -> Self {
         let state = Arc::new((Mutex::new(State { head: 0, floor: 0, next: 1,
-            ring: VecDeque::new(), ring_bytes: 0, queue_bytes: 0,
-            subs: Vec::new(), finite: Default::default(), turn: 0, stop: false }), Condvar::new()));
+            ring: Default::default(), ring_bytes: 0, queue_bytes: 0,
+            subs: Default::default(), finite: Default::default(), stop: false }), Condvar::new()));
         let owner = state.clone();
         let hub_clock=clock.clone();
         let worker = thread::spawn(move || {
-            let mut connections: HashMap<u64, Option<Connection>> = HashMap::new();
+
             loop {
                 let job = {
                     let (lock, wake) = &*owner;
@@ -166,20 +182,19 @@ impl Hub {
                     loop {
                         let retired=detach_expired(&mut s,clock.mono_ms());
                         if !retired.is_empty() {drop(s);settle_rows(retired);s=lock.lock().unwrap();continue;}
-                        connections.retain(|id, _| s.subs.iter().any(|sub| sub.id == *id && sub.active));
+
                         if s.stop {
                             let retired=std::mem::take(&mut s.finite);drop(s);settle_rows(retired);return;
                         }
                         let mut job = None;
-                        let count = s.subs.len();
-                        for offset in 0..count {
-                            let n = (s.turn + offset) % count;
-                            let sub = &mut s.subs[n];
-                            if let Some(change) = sub.queue.pop_front() {
-                                job = Some(Job::Legacy(sub.id, sub.endpoint.clone(), sub.values, change));
-                                s.turn = (n + 1) % count;
-                                break;
+                        let count=s.subs.len();
+                        for _ in 0..count {
+                            let mut sub=s.subs.pop_front().unwrap();
+                            if let Some(change)=sub.queue.pop_front() {
+                                job=Some(Job::Legacy(sub.id,sub.slot.as_ref().unwrap().clone(),sub.values,change));
                             }
+                            s.subs.push_back(sub);
+                            if job.is_some(){break;}
                         }
                         if let Some(job) = job { break job; }
                         let mut hint=None;
@@ -197,8 +212,8 @@ impl Hub {
                         }else{s = wake.wait(s).unwrap();}
                     }
                 };
-                let (id, endpoint, values, change) = match job {
-                    Job::Legacy(id,endpoint,values,change)=>(id,endpoint,values,change),
+                let (id, slot, values, change) = match job {
+                    Job::Legacy(id,slot,values,change)=>(id,slot,values,change),
                     Job::Hint(binding,slot,seq,write_ms,until,generation)=>{
                         // Local completion confers no recipient-accepted evidence. No
                         // persistent connection survives the actual in-flight owner.
@@ -223,8 +238,7 @@ impl Hub {
                     }
                 };
                 // Encoding and all endpoint I/O are outside the publication/hub lock.
-                let result = sink(&endpoint, &encode(epoch, id, &change, values), WRITE_MS,
-                    connections.entry(id).or_default(), &clock);
+                let result = slot.send(sink,&encode(epoch,id,&change,values),&clock);
                 let mut s = owner.0.lock().unwrap();
                 s.queue_bytes -= change.charge;
                 if let Some(sub) = s.subs.iter_mut().find(|sub| sub.id == id) {
@@ -237,80 +251,14 @@ impl Hub {
                         sub.failed += 1;
                         if sub.active { sub.status = FAILED; }
                         sub.active = false;
+                        drop(sub.slot.take());
                         let freed = clear(sub);
                         s.queue_bytes -= freed;
                     }
                 }
             }
         });
-        Self { epoch, ring_max: config.signal_history, ring_budget: config.signal_bytes, state, worker: Some(worker), clock:hub_clock }
-    }
-    /// Called while the committed write lock orders successful publication.
-    pub fn publish(&self, ns: &str, key: &str, value: Arc<Value>) {
-        let mut s = self.state.0.lock().unwrap();
-        let Some(seq) = s.head.checked_add(1) else {
-            // Sequence exhaustion explicitly fences all streams, never reuses ids.
-            for sub in &mut s.subs { sub.active = false; sub.status = DROPPED; }
-            return;
-        };
-        s.head = seq;
-        let charge = 256 + ns.len() + key.len() + value.bytes.capacity();
-        let change = Arc::new(Change { seq, ns: ns.into(), key: key.into(), value, charge });
-        s.ring_bytes += charge;
-        s.ring.push_back(change.clone());
-        while s.ring.len() > self.ring_max || s.ring_bytes > self.ring_budget {
-            let old = s.ring.pop_front().unwrap();
-            s.ring_bytes -= old.charge;
-            s.floor = old.seq;
-        }
-        let now=self.clock.mono_ms();
-        for row in &mut s.finite {if now<row.until && row.ns==ns && key.starts_with(&row.prefix) {row.pending=Some(seq);}}
-        let mut total = s.queue_bytes;
-        for sub in &mut s.subs {
-            if sub.active && sub.ns == ns && key.starts_with(&sub.prefix) {
-                if wire_size(&change, sub.values) > sub.frame_max || sub.queue.len() >= SUB_ITEMS || sub.bytes + charge > SUB_BYTES || total + charge > QUEUE_BYTES {
-                    sub.active = false;
-                    sub.status = DROPPED;
-                    total -= clear(sub);
-                    sub.dropped += 1;
-                } else {
-                    sub.queue.push_back(change.clone());
-                    sub.bytes += charge;
-                    total += charge;
-                    sub.status = QUEUED;
-                }
-            }
-        }
-        s.queue_bytes = total;
-        self.state.1.notify_one();
-    }
-    pub fn subscribe(&self, ns: &str, prefix: String, endpoint: String, values: bool, cursor: &[u8], protocol: &str, frame_max: usize) -> Result<Vec<u8>, u16> {
-        if protocol != "membus.change/1" { return Err(2); }
-        if !(1024..=crate::MAX_FRAME).contains(&frame_max) { return Err(4); }
-        if !valid_endpoint(&endpoint) || prefix.len() > MAX_ID { return Err(3); }
-        let mut s = self.state.0.lock().unwrap();
-        let start = if cursor.is_empty() { s.head } else { parse_token(self.epoch, cursor, 23)? };
-        if start < s.floor || start > s.head { return Err(23); }
-        let queue: VecDeque<_> = s.ring.iter().filter(|c| c.seq > start && c.ns == ns && c.key.starts_with(&prefix)).cloned().collect();
-        let bytes: usize = queue.iter().map(|c| c.charge).sum();
-        if queue.iter().any(|c| wire_size(c, values) > frame_max) { return Err(4); }
-        // Refuse oversize catch-up instead of returning a silently partial stream.
-        if queue.len() > SUB_ITEMS || bytes > SUB_BYTES || s.queue_bytes + bytes > QUEUE_BYTES { return Err(6); }
-        if s.subs.len() == SUB_MAX {
-            if let Some(n) = s.subs.iter().position(|sub| !sub.active && sub.bytes == 0) { s.subs.remove(n); }
-            else { return Err(6); }
-        }
-        let id = s.next;
-        s.next = id.checked_add(1).ok_or(7u16)?;
-        let status = if queue.is_empty() { WRITTEN } else { QUEUED };
-        s.subs.push(Subscription { id, ns: ns.into(), prefix, endpoint, values, frame_max,
-            active: true, status, queue, bytes, written: 0, failed: 0, dropped: 0, last: start });
-        s.queue_bytes += bytes;
-        let mut reply = Vec::new();
-        lp(&mut reply, &token(self.epoch, id));
-        lp(&mut reply, &token(self.epoch, start));
-        self.state.1.notify_one();
-        Ok(reply)
+        Self { epoch, ring_max: config.signal_history, ring_budget: config.signal_bytes, state, worker: Some(worker), clock:hub_clock,account:Default::default(),admission:Mutex::new(()) }
     }
     pub fn unsubscribe(&self, ns: &str, b: &[u8]) -> Result<(), u16> {
         let id = parse_token(self.epoch, b, 24)?;
@@ -318,6 +266,7 @@ impl Hub {
         let sub = s.subs.iter_mut().find(|sub| sub.id == id && sub.ns == ns).ok_or(24u16)?;
         sub.active = false;
         sub.status = CANCELLED;
+        drop(sub.slot.take());
         let freed = clear(sub);
         s.queue_bytes -= freed;
         self.state.1.notify_one();
@@ -342,7 +291,7 @@ impl Hub {
         p
     }
     pub(crate) fn memory_reservation_bytes(&self) -> usize {
-        legacy_memory_reservation(self.ring_max, self.ring_budget)
+        self.account.get().map_or(0,|account|account.usage.bytes.load(std::sync::atomic::Ordering::Acquire))
     }
     pub(crate) fn memory_bytes(&self) -> usize {
         let s = self.state.0.lock().unwrap();
@@ -414,6 +363,7 @@ mod tests {
     #[test]
     fn retention_gap_and_filter_resume() {
         let h = Hub::with_sink(7, &Config { signal_history: 2, ..Config::default() }, ok, crate::chunks::Clock::new(None));
+        let _account=h.capture_account(&Config {signal_history:2,..Config::default()});
         h.publish("quota", "event/1", value(1));
         h.publish("other", "event/2", value(2));
         h.publish("quota", "state/3", value(3));
@@ -433,6 +383,7 @@ mod tests {
     #[test]
     fn oversized_replay_is_explicit_and_endpoints_are_local() {
         let h = Hub::with_sink(7, &Config::default(), ok, crate::chunks::Clock::new(None));
+        let _account=h.capture_account(&Config::default());
         for n in 1..=257 { h.publish("quota", "event/x", value(n)); }
         assert_eq!(h.subscribe("quota", "".into(), r"\\.\pipe\test".into(), false, &token(7, 0), "membus.change/1", crate::MAX_FRAME).err(), Some(6));
         assert_eq!(h.subscribe("quota", "".into(), r"\\remote\pipe\x".into(), false, &[], "membus.change/1", crate::MAX_FRAME).err(), Some(3));
@@ -449,6 +400,7 @@ mod contract_seam_tests {
     fn actual_64_quiet_legacy_registrations_do_not_expire() {
         let manual = crate::chunks::ManualClock::new(900_000);
         let hub = Hub::with_sink(91, &Config { signal_history: 0, signal_bytes: 0, ..Config::default() }, inert, crate::chunks::Clock::new(Some(manual.clone())));
+        let _account=hub.capture_account(&Config{signal_history:0,signal_bytes:0,..Config::default()});
         let mut tokens = Vec::new();
         for i in 0..64 {
             let reply = hub.subscribe("authored", "".into(), format!(r"\\.\pipe\inert-{i}"), false, &[], "membus.change/1", 1024).unwrap();
@@ -465,3 +417,7 @@ mod contract_seam_tests {
     }
 
 }
+
+#[cfg(test)]
+#[path="signals/quiet_compat_tests.rs"]
+mod quiet_compat_tests;

@@ -18,14 +18,14 @@ fn actual_account_all_owners_boundary_and_once_only_rollback() {
     let available=s.available_memory(200,snapshots.bytes.load(Ordering::Acquire),23,29,31);
     assert_eq!(available,57);
     assert!(matches!(issue(&owner,&mut s,available,demand(58),&released),Err(ReservationError::Capacity)));
-    assert_eq!(s.memory_reserved,11);
+    assert_eq!(s.total_reserved(),11);
     let mut grant=issue(&owner,&mut s,available,demand(57),&released).unwrap();
-    assert_eq!(s.memory_reserved,68);
+    assert_eq!(s.total_reserved(),68);
     assert_eq!(s.available_memory(200,19,23,29,31),0);
     drop(s);
     grant.return_to_owner(); grant.return_to_owner();
     let s=owner.lock().unwrap();
-    assert_eq!((s.committed_bytes,s.dedup_bytes,s.memory_reserved),(13,17,11));
+    assert_eq!((s.committed_bytes,s.dedup_bytes,s.total_reserved()),(13,17,11));
     assert_eq!(snapshots.bytes.load(Ordering::Acquire),19);
     assert!(released.load(Ordering::Acquire));
     assert_eq!(s.available_memory(200,19,23,29,31),57);
@@ -39,15 +39,15 @@ fn transfer_split_cancel_old_callback_preserve_replacement_and_pending() {
     let mut registration={let mut s=owner.lock().unwrap();issue(&owner,&mut s,193,original,&released).unwrap()};
     registration.transfer(SubscriptionResource::Retained,SubscriptionResource::InFlight,12).unwrap();
     let mut callback=registration.split(SubscriptionResources {in_flight:12,encoding:30,..Default::default()}).unwrap();
-    assert_eq!(owner.lock().unwrap().memory_reserved,107);
+    assert_eq!(owner.lock().unwrap().total_reserved(),107);
     registration.return_to_owner();
-    assert_eq!(owner.lock().unwrap().memory_reserved,49);
+    assert_eq!(owner.lock().unwrap().total_reserved(),49);
     let mut replacement={let mut s=owner.lock().unwrap();issue(&owner,&mut s,151,demand(100),&released).unwrap()};
     callback.return_to_owner();callback.return_to_owner();
-    assert_eq!(owner.lock().unwrap().memory_reserved,107);
+    assert_eq!(owner.lock().unwrap().total_reserved(),107);
     assert_eq!(replacement.resources().retained,100);
     replacement.return_to_owner();
-    assert_eq!(owner.lock().unwrap().memory_reserved,7);
+    assert_eq!(owner.lock().unwrap().total_reserved(),7);
 }
 
 #[test]
@@ -59,11 +59,11 @@ fn growth_rechecks_current_pressure_and_is_atomic_on_failure() {
     let available=s.available_memory(100,0,0,0,0);
     assert_eq!(available,10);
     assert_eq!(extend(&owner,&mut s,available,&mut grant,demand(11)),Err(ReservationError::Capacity));
-    assert_eq!((s.memory_reserved,grant.resources().retained),(90,40));
+    assert_eq!((s.total_reserved(),grant.resources().retained),(90,40));
     extend(&owner,&mut s,available,&mut grant,demand(10)).unwrap();
-    assert_eq!((s.memory_reserved,grant.resources().retained),(100,50));
+    assert_eq!((s.total_reserved(),grant.resources().retained),(100,50));
     s.memory_reserved-=50;drop(s);
-    grant.return_to_owner();assert_eq!(owner.lock().unwrap().memory_reserved,0);
+    grant.return_to_owner();assert_eq!(owner.lock().unwrap().total_reserved(),0);
 }
 
 #[test]
@@ -73,15 +73,15 @@ fn zero_overflow_foreign_and_returned_never_debit() {
     assert!(matches!(issue(&owner,&mut s,100,demand(0),&released),Err(ReservationError::InvalidDemand)));
     let overflow=SubscriptionResources {metadata:usize::MAX,encoding:1,..Default::default()};
     assert!(matches!(issue(&owner,&mut s,usize::MAX,overflow,&released),Err(ReservationError::InvalidDemand)));
-    assert_eq!(s.memory_reserved,0);
+    assert_eq!(s.total_reserved(),0);
     let mut grant=issue(&owner,&mut s,100,demand(10),&released).unwrap();drop(s);
     {let mut f=foreign.lock().unwrap();
     assert_eq!(extend(&foreign,&mut f,100,&mut grant,demand(5)),Err(ReservationError::ForeignOwner));
-    assert_eq!(f.memory_reserved,0);}
+    assert_eq!(f.total_reserved(),0);}
     grant.return_to_owner();
     {let mut s=owner.lock().unwrap();
     assert_eq!(extend(&owner,&mut s,100,&mut grant,demand(5)),Err(ReservationError::Returned));
-    assert_eq!(s.memory_reserved,0);}
+    assert_eq!(s.total_reserved(),0);}
     assert!(matches!(grant.split(demand(1)),Err(ReservationError::Returned)));
 }
 
@@ -112,9 +112,9 @@ fn simultaneous_actual_account_grants_cannot_spend_same_capacity() {
     let results:Vec<_>=jobs.into_iter().map(|j|j.join().unwrap()).collect();
     assert_eq!(results.iter().filter(|r|r.is_ok()).count(),1);
     assert_eq!(results.iter().filter(|r|matches!(r,Err(ReservationError::Capacity))).count(),1);
-    assert_eq!(owner.lock().unwrap().memory_reserved,60);
+    assert_eq!(owner.lock().unwrap().total_reserved(),60);
     for result in results {if let Ok(mut grant)=result {grant.return_to_owner();}}
-    assert_eq!(owner.lock().unwrap().memory_reserved,0);
+    assert_eq!(owner.lock().unwrap().total_reserved(),0);
 }
 
 #[test]
@@ -127,7 +127,7 @@ fn cancellation_and_exact_old_completions_race_without_neighbor_loss() {
         thread::spawn(move || {start.wait();grant.return_to_owner();grant.return_to_owner();})}).collect();
     let mut neighbor={let mut s=owner.lock().unwrap();issue(&owner,&mut s,10,demand(10),&released).unwrap()};
     start.wait();for h in handles {h.join().unwrap();}
-    assert_eq!(owner.lock().unwrap().memory_reserved,10);
+    assert_eq!(owner.lock().unwrap().total_reserved(),10);
     assert_eq!(neighbor.resources().retained,10);neighbor.return_to_owner();
 }
 
@@ -141,7 +141,7 @@ fn retained_snapshot_pressure_and_overflow_are_fail_closed() {
 }
 
 #[test]
-fn legacy_future_growth_is_reserved_while_quiet_and_tracks_configuration() {
+fn old_envelope_is_diagnostic_not_quiet_admission_ownership() {
     // Independent lower bound: 16 MiB history + 16 MiB queues + 64 MiB
     // simultaneous encoder buffers + a 4 MiB prospective publication.
     let normal=crate::signals::legacy_memory_reservation(4096,16*1024*1024);
@@ -159,7 +159,7 @@ fn legacy_future_growth_is_reserved_while_quiet_and_tracks_configuration() {
 fn debit_reserves_in_actual_shared_pending_account() {
     let mut s=State::default();s.memory_reserved=7;
     debit(&mut s,93,demand(60)).unwrap();
-    assert_eq!(s.memory_reserved,67);
+    assert_eq!(s.total_reserved(),67);
 }
 
 #[test]

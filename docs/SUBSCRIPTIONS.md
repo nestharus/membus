@@ -256,3 +256,16 @@ receipt or a universal delivery deadline.
 
 
 Finite coalesced hints are a separate explicit opt-in profile. See [FINITE-HINTS.md](FINITE-HINTS.md). Version-one negative discovery does not select it. Legacy quiet rows still require caller migration; no current caller has been migrated by this source change.
+
+
+## Actual shared resource admission
+
+Legacy metadata/linked backing and negotiated prospective encoding are reserved
+only when a registration is admitted. Each retained publication body acquires a
+real grant before allocation. Shared account pressure can therefore refuse
+creation with capacity, drop a matching legacy stream and advance a history
+resume gap. It does not change an already committed ordinary write result.
+Inactive terminal status metadata remains owned until eviction; empty queue
+authorization returns on deactivation and in-flight children retain actual charge.
+No prospective subscription envelope is charged to an empty history-disabled
+Hub. See [resource ownership](SUBSCRIPTION-RESOURCES.md) for accounting and limits.

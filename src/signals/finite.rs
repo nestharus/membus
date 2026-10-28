@@ -12,7 +12,7 @@ pub(super) struct FiniteSubscription {
     lifetime:u64, pub(super) write_ms:u32, pub(super) pending:Option<u64>, pub(super) slot:Arc<HintSlot>,
     _charge:SubscriptionReservation,
 }
-fn demand(ns:usize,prefix:usize,endpoint:usize)->Result<SubscriptionResources,u16> {
+pub(super) fn demand(ns:usize,prefix:usize,endpoint:usize)->Result<SubscriptionResources,u16> {
     // Two list nodes cover pop/reinsert and detached reclamation. The slot's Arc
     // header, native connection value and fixed 64-byte encode are charged too.
     let metadata=std::mem::size_of::<FiniteSubscription>().checked_mul(2)
@@ -45,7 +45,7 @@ impl Hub {
     pub(crate) fn finite_discovery(&self)->&'static [u8] {FINITE_DISCOVERY}
     // The caller supplies a real Store token. This internal seam neither creates
     // authority from a number nor invokes State while holding the Hub mutex.
-    fn install_hint(&self,ns:&str,prefix:&str,endpoint:&str,options:HintOptions,mut grant:SubscriptionReservation)->Result<HintReceipt,u16> {
+    pub(super) fn install_hint(&self,ns:&str,prefix:&str,endpoint:&str,options:HintOptions,mut grant:SubscriptionReservation)->Result<HintReceipt,u16> {
         let checked=(|| {options.validate()?;
             if ns.is_empty() || ns.len()>MAX_ID || prefix.len()>MAX_ID || !valid_endpoint(endpoint) {return Err(3);}
             let required=demand(ns.len(),prefix.len(),endpoint.len())?;

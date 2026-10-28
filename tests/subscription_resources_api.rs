@@ -13,7 +13,8 @@ fn real_store_methods_have_typed_grant_and_growth_signatures() {
 fn prospective_layouts_preserve_every_capacity_dimension_and_overflow() {
     let a=SubscriptionResources::registration(3,5,7,11).unwrap();
     let b=SubscriptionResources::registration(13,5,7,11).unwrap();
-    assert_eq!(b.metadata-a.metadata,10);assert_eq!(a.in_flight,7);
+    assert_eq!(b.metadata-a.metadata,10);assert!(a.in_flight>=std::mem::size_of::<SubscriptionReservation>()+7);
+    assert_eq!(SubscriptionResources::registration(3,5,17,11).unwrap().in_flight-a.in_flight,10);
     let c=SubscriptionResources::change(2,3,17).unwrap();
     let d=SubscriptionResources::change(2,3,117).unwrap();
     assert_eq!(d.retained-c.retained,100);

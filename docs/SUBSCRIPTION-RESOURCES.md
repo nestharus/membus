@@ -1,79 +1,73 @@
-# Store-owned subscription resource reservations
+# Actual allocation ownership and quiet Store compatibility
 
-The Store issues `SubscriptionReservation` through
-`reserve_subscription_resources`. This debits its existing State
-`memory_reserved` account under the same mutex used by ordinary admission.
-Snapshots and atomic publication still check the same cache allowance. A demand
-or `SubscriptionResourceProfile` is never an allocation grant. No free-RAM or
-RSS sample participates. The public source module is `subscription_resources`.
+The existing 16 MiB quiet configuration keeps its 14 MiB allowance after the
+existing 2 MiB Store margin. No future signal envelope is debited merely because
+the Hub exists. Actual admitted signal ownership is still deducted from the
+one Store State allowance; ordinary pending/atomic, retry index, snapshots,
+chunk index and separate retained-read ownership are not overwritten or stolen.
 
-`SubscriptionResources` has five checked managed-byte parts: metadata, retained,
-in_flight, encoding and publication. Demand builders describe the existing
-concrete registration and Change/Value layouts, string/queue backing capacities,
-two encoding Vec capacities and a prospective publication. They allocate nothing.
-Supply actual backing capacities, including growth slack, not just payload lengths.
-The connection-map coefficient is conservative managed bookkeeping; native kernel
-buffers, allocator overhead and RSS are not measured. Existing memory margin is
-separate. Reaudit layout charges when the receiving Hub changes its structures.
+The internal State now owns a shared subscription-usage counter. New grants and
+growth still serialize on State and check its complete current allowance.
+Exact token returns subtract only that subscription portion atomically after
+the covered allocation is freed and set the existing cold-read recalculation
+hint. They do not lock State under Hub or alter ordinary memory_reserved.
+Public reservation methods and v2 wire fields are unchanged. The advisory
+profile's reserved field includes ordinary plus live subscription ownership;
+legacy_signals reports the actual legacy subset already included in reserved,
+not a second debit or a hypothetical empty-Store envelope. Concurrent release
+can change advisory readings; a profile never grants later capacity.
 
-Only the Store creates new owned bytes. `extend_subscription_resources` verifies
-the exact original account identity and reserves additional demand at the current
-allowance. Refusal changes neither account nor token. `ReservationError` separates
-Capacity, InvalidDemand, ForeignOwner, Returned and InsufficientPart. No new slot,
-queue, byte or time hard cap is imposed by these APIs.
+The Hub binds to its actual Store State/cache/chunk/snapshot context. It holds
+weak State/cache/chunk references, with no Store/Hub/worker strong cycle.
+Capture controls instantiate actual State and account arithmetic with authored
+snapshot/chunk inputs; they do not construct an empty Store or replace grant
+issuance. The independent ReadUsage candidate remains uncomposed and needs its
+own subtraction/release hint when later received.
 
-Move the non-Clone token into the representation's owner. `split` transfers chosen
-parts without increasing the shared debit. `transfer` reclassifies already owned
-bytes, for example Retained to InFlight. `return_to_owner` is idempotent and returns
-only that token's remaining charge. A destructor is a fallback. Release covered
-allocations first; when embedding the token, arrange field destruction after those
-allocations. An old in-flight child survives registration cancellation/expiry and
-returns only after that exact callback. It cannot identify or release a replacement.
+Legacy registration reserves its real row, namespace/prefix, linked-node
+backing and endpoint/connection state. Its existing queue policy authorizes at
+most 256 linked nodes; its negotiated frame bound reserves exact prospective
+body/frame encode capacities, limited by existing representable payload fields.
+This is an existing legacy selected demand, not a new finite-profile cap. On
+deactivation empty queue authorization returns; terminal status metadata stays
+owned until actual eviction/controlled stop. A live worker retains its endpoint
+and encoding child through completion.
 
-Lock order is part of the receiving contract. Existing HEALTH2 takes State
-before the Hub observation lock. Grant, grow and return (including token Drop)
-take State. Never hold the Hub lock while invoking them or discarding a charged
-token. Reserve before acquiring Hub, then install or roll back after releasing
-Hub; detach returned/cancelled portions under Hub and settle them outside it.
-The prospective allowance calculation itself needs no Hub lock.
+Each legacy publication reserves its actual Change/Value/string/payload capacity
+and history-node ownership before allocation. Linked queues/ring avoid retained
+uncharged Vec/map capacity. Shared Change and slot wrappers consume the final Arc
+before freeing retained representations and returning exact ownership. Queue
+links belong to row backing; history links belong to their publication owner.
+Allocation pressure explicitly drops matching legacy subscriptions and clears
+history to a resume gap. An already committed ordinary operation keeps its
+original result. With history disabled and no legacy subscriber, finite dirty
+hints require no retained Change/value allocation.
 
-The profile reports configured capacity, committed index, retained retries,
-existing reservations, retained snapshots, margin, chunk index and a prospective
-legacy signal envelope. `available` is the cache-yielding managed allowance at
-that observation, not a promise for the next request. Grant admission recomputes
-it under State and trims the cache before returning. Charge return sets a cold-read
-reclaim hint; a later cold miss recomputes current allowance rather than adding a
-stale released amount. Hot-hit clocks, cache hashes and snapshot lifetimes remain.
+Legacy change/1 framing, statuses, limits and token/cursor layout remain; finite
+profile negotiation, expiry/renewal/full binding, coalescing and refusal of stronger
+delivery semantics remain unchanged. The added publication-admission mutex only
+serializes existing Hub ownership changes; it is not a queue/controller/service.
+Actual publisher order is committed -> State -> chunks/cache -> Hub, and no
+State grant is acquired under Hub. Atomic releases require no State lock.
 
-Legacy publication grows independently of State. While any new grant survives,
-its future allocations therefore cannot be covered by a current history/queue
-sample. The allowance now reserves a conservative entire prospective legacy
-envelope: configured history, existing bounded queue charges, row/string and
-queue/map backing, append-before-evict/replay links, one maximum Change and dual
-encoding buffers with growth slack. This uses existing legacy representation and
-policies; it does not enlarge them. Even a quiet or history-disabled legacy Hub
-has prospective publication/encoding ownership. The reservation reduces cache
-and other admission allowance substantially; a small configured capacity can
-have no available allowance. This is a source accounting change, not operating
-capacity or a measured physical-memory ceiling. HEALTH2 retains its current
-logical signal sample; the resource profile exposes the prospective reservation.
+No physical RSS/kernel bound, recipient acceptance, authenticated process death,
+hard native-drain deadline or unknown-creation settlement is established. Unknown
+creation remains unresolved without actual clock/incarnation witnesses and cannot
+be blindly retried or resolved from endpoint/operation names. This source change
+does not migrate SDK/Python/leases/current callers or install a default.
 
-Separate read-cohort source adds ReadUsage to the same cache allowance. Receiving
-must retain that subtraction and the last-owner release hint. This module does
-not compose or replace the read-cohort implementation. Grants in memory_reserved
-continue to reduce allowance alongside that independent account.
 
-This is a callable resource-owner source capability. It does not register or expire
-a subscription, select a wire profile, renew a lifetime or acknowledge delivery.
-The legacy and explicit unavailable-discovery contracts are unchanged. The next
-Hub implementation must reserve before allocation, transfer to actual owners,
-account new publication growth before allocating, retain in-flight children and
-return on exact completion. It must also positively negotiate lifetime, binding,
-buffering/replay/coalescing/overload and time/recipient acceptance requirements.
-No client, Python or caller migration is supplied here.
+Public methods remain reserve_subscription_resources,
+extend_subscription_resources and subscription_resource_profile. Five demand
+parts remain metadata, retained, in_flight, encoding and publication. Demand
+builders do not allocate or grant. The registration builder now describes the
+actual linked-row/queue and Arc-slot representation, including its token and
+endpoint/connection lifetime; callers must re-evaluate costs after this layout
+change. split moves existing ownership; transfer reclassifies without a debit;
+return_to_owner is idempotent. Foreign/returned/overflow/growth refusal is atomic.
 
-Pure account tests execute production State arithmetic, issuance, growth,
-transfer and explicit return with authored operands and finite contention. Public
-tests compile actual Store signatures and exercise demand layout builders. No
-Store/Hub/native endpoint/data/process/retirement/destructor fixture is used;
-public Store runtime and subsequent Hub integration remain separate qualification.
+Grant and growth acquire State and preserve ordinary State -> chunks/cache
+ordering. Atomic release acquires neither State nor Hub and leaves the existing
+cold-read recalculation hint. Prospective queue/encoding authorization is owned
+only by an admitted legacy registration; per-publication bodies are granted on
+real demand. The former fixed envelope is not a charge on an empty Hub.
