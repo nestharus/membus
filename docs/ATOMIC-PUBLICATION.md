@@ -7,6 +7,9 @@ any different prefix policy or stored class in the namespace refuses explicitly.
 It does not establish the suitability of that class for every application's data.
 Existing BATCH remains independent per-item publication.
 
+Use [read-only result inspection](ATOMIC-RESULT-INSPECTION.md) to observe retained
+same-original evidence without allowing first admission on a miss.
+
 For complete populations beyond the legacy capture profile, use
 `capture_namespace_funded` with an actual finite Store reservation. Retained
 originals and clones keep their backing funded, and startup validates borrowed

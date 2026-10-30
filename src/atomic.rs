@@ -19,6 +19,12 @@ include!("atomic_resources.rs");
 #[cfg(test)]
 #[path = "atomic_funding_tests.rs"]
 mod funding_tests;
+#[path = "atomic_result.rs"]
+mod result_inspection;
+pub use result_inspection::{
+    AtomicResultEvidence, AtomicResultInspection, InspectionError, OriginalRef, RetainedAtomicResult,
+    RetryRetention, RESULT_INSPECTION_SCRATCH_BYTES,
+};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AtomicAck {
     Os,
