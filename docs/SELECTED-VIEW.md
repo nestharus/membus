@@ -96,6 +96,9 @@ drops the whole reservation and pinned population. No partial token is returned.
 Infallible standard-library allocations still have the process's ordinary
 allocator-abort behavior; this API does not turn an allocator abort into a refusal.
 The token retains the existing epoch/id format and does not survive restart.
+Tokens belong to their originating Store/endpoint. Epochs are not globally unique
+across independent instances; callers must retain that origin association and
+must not transplant tokens to another resident. Tokens are not authentication.
 Explicit release, ordinary snapshot expiry and the existing reaper apply.
 In-flight dispatchers keep their Arc and byte/count charge until their final
 reference drops, even after registry removal. UTC jumps do not extend the TTL.
