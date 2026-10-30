@@ -174,10 +174,9 @@ fn issuance_is_finite_bounded_exclusive_and_charged_to_real_memory() {
                 .unwrap()
         })
         .collect();
-    assert_eq!(
-        s.reserve_namespace("overflow", request(1, 1)).unwrap_err(),
-        ReserveError::Resource
-    );
+    let beyond = s.reserve_namespace("overflow", request(1, 1)).unwrap();
+    assert_eq!(beyond.status().unwrap().remaining_bytes, 1);
+    drop(beyond);
     drop(leases);
     s.reserve_namespace("overflow", request(500, 1)).unwrap();
     s.set_read_only(true);
