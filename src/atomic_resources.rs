@@ -26,7 +26,7 @@ impl OriginalBudget {
     pub fn used(&self) -> usize {
         self.0.used.load(Ordering::Acquire)
     }
-    fn backed(bytes: usize, store: Option<crate::snapshots::ScanCharge>) -> Self {
+    pub(crate) fn backed(bytes: usize, store: Option<crate::snapshots::ScanCharge>) -> Self {
         Self(Arc::new(Pool {
             limit: bytes,
             used: AtomicUsize::new(0),
@@ -34,12 +34,17 @@ impl OriginalBudget {
         }))
     }
     fn reserve(&self, bytes: usize) -> Result<Reservation, PublicationError> {
+        self.reserve_available(bytes).map_err(|_|PublicationError::Resource(7))
+    }
+    /// Preserve the actual refusal observation for another typed resource
+    /// consumer; do not reread a concurrently changing counter as its cause.
+    pub(crate) fn reserve_available(&self, bytes: usize) -> Result<Reservation, usize> {
         let mut used = self.used();
         loop {
             let next = used
                 .checked_add(bytes)
                 .filter(|n| *n <= self.0.limit)
-                .ok_or(PublicationError::Resource(7))?;
+                .ok_or(self.0.limit.saturating_sub(used))?;
             match self
                 .0
                 .used
@@ -56,7 +61,7 @@ impl OriginalBudget {
     }
 }
 #[derive(Debug)]
-struct Reservation {
+pub(crate) struct Reservation {
     budget: OriginalBudget,
     bytes: usize,
 }

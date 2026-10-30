@@ -111,3 +111,61 @@ fn manifest_file_failure_remains_incomplete() {
 fn manifest_directory_failure_remains_incomplete() {
     fault_case("manifest-directory", false);
 }
+
+#[cfg(windows)]
+#[test]
+fn funded_completion_failures_return_actual_unknown_without_witness() {
+    use crate::atomic::OriginalBudget;
+    for fault in ["completion-file", "final-directory"] {
+        let p = fixture(fault);
+        let memory = OriginalBudget::new(4 * 1024 * 1024);
+        let budget = ImageBudget::new(
+            memory.clone(),
+            ImageLimits {
+                backing_bytes: 1024 * 1024,
+                io_bytes: 16 * 1024 * 1024,
+                operations: 16 * 1024 * 1024,
+            },
+        )
+        .unwrap();
+        let baseline = memory.used();
+        let store = Store::open(
+            &p.join("funded-source"),
+            Config {
+                signal_bytes: 0,
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        FAULT.with(|f| *f.borrow_mut() = fault);
+        let result = store.capture_stopped_funded(
+            &p.join("funded-image"),
+            CaptureRequest {
+                source_label: "funded-failed-completion".into(),
+                ack: Ack::Flush,
+            },
+            &budget,
+            2 * 1024 * 1024,
+        );
+        FAULT.with(|f| *f.borrow_mut() = "");
+        let error = result.unwrap_err();
+        assert!(error.error.to_string().contains(fault));
+        assert_eq!(error.progress.output, ImageOutput::CompletionUnknown);
+        assert_eq!(error.progress.requested_ack, Some(Ack::Flush));
+        assert_eq!(error.progress.achieved_ack, None);
+        assert_eq!(error.progress.stage, ImageStage::Completion);
+        assert_eq!(
+            fs::read(p.join("funded-image/capture.complete"))
+                .unwrap()
+                .len(),
+            64
+        );
+        assert!(
+            validate_image_funded(&p.join("funded-image"), None, &budget, 1024 * 1024).is_err()
+        );
+        assert!(validate_image(&p.join("funded-image")).is_err());
+        assert_eq!(memory.used(), baseline + 2 * 1024 * 1024);
+        drop(error);
+        assert_eq!(memory.used(), baseline);
+    }
+}
