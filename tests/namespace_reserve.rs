@@ -228,6 +228,35 @@ fn conditional_remove_and_real_batch_share_account_and_retries_do_not_spend_twic
 
 #[test]
 fn atomic_counts_one_envelope_and_preserves_original_retry_and_no_prefix() {
+    fn population(s: &Store, first: u64) {
+        let expected = vec![
+            ("a".to_owned(), first, 2, b"A".to_vec()),
+            ("b".to_owned(), first + 1, 2, b"B".to_vec()),
+        ];
+        for (key, version, ack, bytes) in &expected {
+            let value = s
+                .try_get("owned", key)
+                .expect("successful value read must not fail")
+                .expect("published value must exist under the active lease");
+            assert_eq!(
+                (&value.version, &value.ack, &value.bytes),
+                (version, ack, bytes)
+            );
+        }
+        let view = s
+            .capture_namespace("owned")
+            .expect("complete published population");
+        let actual: Vec<_> = view
+            .rows()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.version, v.ack, v.bytes.clone()))
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "no missing, extra or partially published member"
+        );
+        println!("observed complete atomic lease population {actual:?}");
+    }
     let s = Store::open(&root("atomic"), config()).unwrap();
     let original = s
         .capture_namespace("owned")
@@ -241,11 +270,15 @@ fn atomic_counts_one_envelope_and_preserves_original_retry_and_no_prefix() {
             ],
         )
         .unwrap();
+    let identity = original.to_bytes();
     let bytes = 40 + original.to_bytes().len() as u64;
     let lease = s.reserve_namespace("owned", request(bytes, 1)).unwrap();
     let outcome = s
         .publish_atomic(&original, membus::now_ms() + 60_000)
         .unwrap();
+    assert_eq!((outcome.code, outcome.ack), (0, 2));
+    assert_ne!(outcome.version, 0);
+    population(&s, outcome.version);
     assert_eq!(s.state_bytes(), bytes);
     let status = lease.status().unwrap();
     assert_eq!(
@@ -262,6 +295,9 @@ fn atomic_counts_one_envelope_and_preserves_original_retry_and_no_prefix() {
         outcome
     );
     assert_eq!(lease.status().unwrap(), status);
+    assert_eq!(s.state_bytes(), bytes);
+    assert_eq!(original.to_bytes(), identity);
+    population(&s, outcome.version);
     let next = s
         .capture_namespace("owned")
         .unwrap()
@@ -275,8 +311,13 @@ fn atomic_counts_one_envelope_and_preserves_original_retry_and_no_prefix() {
         s.publish_atomic(&next, membus::now_ms() + 60_000),
         Err(PublicationError::Resource(7))
     );
-    assert!(s.get("owned", "c").is_none());
+    assert!(s
+        .try_get("owned", "c")
+        .expect("refused successor read must not fail")
+        .is_none());
     assert_eq!(lease.status().unwrap(), status);
+    assert_eq!(s.state_bytes(), bytes);
+    population(&s, outcome.version);
 }
 
 #[test]

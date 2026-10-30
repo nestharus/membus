@@ -193,6 +193,9 @@ pub struct Config {
     /// Test seam: observe or refuse state-directory name barriers before ownership.
     #[cfg(test)]
     pub state_dir_sync: Option<Arc<dyn Fn(&Path) -> io::Result<()> + Send + Sync>>,
+    /// Test seam: pause after retirement preparation releases State and chunk locks.
+    #[cfg(test)]
+    pub retirement_started: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -247,6 +250,8 @@ impl Default for Config {
             chunk_dir_sync: None,
             #[cfg(test)]
             state_dir_sync: None,
+            #[cfg(test)]
+            retirement_started: None,
         }
     }
 }

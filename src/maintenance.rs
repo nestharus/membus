@@ -25,6 +25,8 @@ mod clock_tests;
 #[cfg(test)]
 #[path = "maintenance_correction_tests.rs"]
 mod correction_tests;
+#[cfg(test)]
+mod overlap_tests;
 
 /// Retirement, expiry summaries, tombstone drops and the clock check (5.3, 5.4), shared with the tick thread.
 pub(super) struct Maint {
@@ -175,6 +177,10 @@ impl Maint {
             }
         }
         // Steps 3 and 4: delete the file, then `retired`. A held delete stays retiring and is retried.
+        #[cfg(test)]
+        if !started.is_empty() {
+            if let Some(hook) = &self.config.retirement_started { hook(); }
+        }
         let mut done = Vec::new();
         let mut freed = 0;
         {
@@ -182,6 +188,13 @@ impl Maint {
             for (id, p, bytes, keys) in started {
                 if failure.is_some() {
                     break;
+                }
+                // Preparation released this lock. A retry may already have
+                // completed (and maintenance may have pruned) this obligation.
+                // Only its still-Retiring state owns deletion/publication and
+                // discharge; hold the chunk lock through that transition.
+                if !cs.table.get(&id).is_some_and(|c| c.state == ChunkState::Retiring) {
+                    continue;
                 }
                 match fs::remove_file(&p) {
                     Ok(()) => {}
