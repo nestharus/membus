@@ -7,6 +7,30 @@ use std::{fs, path::PathBuf, sync::atomic::AtomicU64};
 static NEXT: AtomicU64 = AtomicU64::new(0);
 thread_local! {
     static BEFORE_PUBLISH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+    static MATERIALIZED: std::cell::RefCell<Option<MaterializationObserver>> = const { std::cell::RefCell::new(None) };
+}
+type MaterializationObserver =
+    Box<dyn FnMut(&Store, &[(String, SnapshotValue)], usize, Option<&Snapshot>, bool)>;
+pub(super) fn before_materialization(s: &Store) {
+    MATERIALIZED.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(s, &[], 0, None, true);
+        }
+    });
+}
+// Called immediately after actual Vec reservation, each key/reference copy and
+// Snapshot construction. The observer owns a fixed-size record, not row copies.
+pub(super) fn materialized(
+    s: &Store,
+    rows: &[(String, SnapshotValue)],
+    capacity: usize,
+    view: Option<&Snapshot>,
+) {
+    MATERIALIZED.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(s, rows, capacity, view, false);
+        }
+    });
 }
 pub(super) fn before_publish() {
     BEFORE_PUBLISH.with(|hook| {
@@ -450,17 +474,25 @@ fn process_capacity_is_checked_before_materialization() {
     put(&s, "ledger", "x", &vec![7; 600 * 1024], false);
     let mut accepted = Vec::new();
     for _ in 0..10 {
-        match s.snapshot_open_selected(
-            "ledger",
+        let (result, trace) = trace_acquisition(
+            &s,
+            "x",
             Selection::Prefix("x"),
             AcquisitionBudget {
                 max_retained_bytes: 1024 * 1024,
                 ..budget()
             },
-        ) {
-            Ok(v) => accepted.push(v),
+        );
+        eprintln!("process capacity: result={result:?} trace={trace:?}");
+        match result {
+            Ok(v) => {
+                trace.funded(v.retained_bytes as usize).unwrap();
+                assert_eq!(trace.len, 4); // before allocation, allocated rows, copied row, owned view
+                accepted.push(v);
+            }
             Err(e) => {
                 assert_eq!(e, AcquisitionError::SnapshotFull);
+                trace.refused().unwrap();
                 break;
             }
         }
@@ -471,6 +503,176 @@ fn process_capacity_is_checked_before_materialization() {
         s.snapshot_release("ledger", &v.snapshot).unwrap();
     }
     clean(&s);
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct Materialization {
+    before_allocation: bool,
+    count: usize,
+    bytes: usize,
+    row_capacity: usize,
+    rows: usize,
+    copied_key: bool,
+    watched_refs: usize,
+    watched_row: bool,
+    owned_namespace: usize,
+    owned_selector: usize,
+}
+#[derive(Clone, Copy, Debug, Default)]
+struct MaterializationTrace {
+    before_count: usize,
+    before_bytes: usize,
+    before_refs: usize,
+    observations: [Materialization; 8],
+    len: usize,
+}
+impl MaterializationTrace {
+    fn funded(&self, charge: usize) -> Result<(), &'static str> {
+        if self.len == 0 || !self.observations[0].before_allocation {
+            return Err("no actual retained materialization observed");
+        }
+        for event in &self.observations[..self.len] {
+            if event.count != self.before_count + 1 || event.bytes != self.before_bytes + charge {
+                return Err("retained materialization preceded its Store count/byte reservation");
+            }
+            if (!event.before_allocation && event.row_capacity == 0)
+                || (event.before_allocation && (event.rows != 0 || event.row_capacity != 0))
+                || (event.rows != 0 && !event.copied_key)
+                || event.watched_refs != self.before_refs + usize::from(event.watched_row)
+            {
+                return Err("actual allocated rows/key copies/entry references were not witnessed");
+            }
+        }
+        let last = self.observations[self.len - 1];
+        if last.owned_namespace == 0 || last.owned_selector == 0 {
+            return Err("owned namespace and selector were not witnessed");
+        }
+        Ok(())
+    }
+    fn refused(&self) -> Result<(), &'static str> {
+        if self.len != 0 {
+            return Err("refused acquisition transiently materialized retained metadata");
+        }
+        Ok(())
+    }
+}
+
+fn trace_acquisition(
+    s: &Store,
+    watched_key: &str,
+    selection: Selection<'_>,
+    budget: AcquisitionBudget,
+) -> (Result<SelectedView, AcquisitionError>, MaterializationTrace) {
+    use std::{cell::RefCell, rc::Rc};
+    let committed = s.committed.read().unwrap();
+    let (key, entry) = committed
+        .get_key_value(&("ledger".into(), watched_key.into()))
+        .unwrap();
+    let key_address = key.1.as_ptr() as usize;
+    let watched = entry.clone();
+    drop(committed);
+    let record = Rc::new(RefCell::new(MaterializationTrace {
+        before_count: s.scan_usage.count.load(Ordering::Acquire),
+        before_bytes: s.scan_usage.bytes.load(Ordering::Acquire),
+        before_refs: Arc::strong_count(&watched),
+        ..MaterializationTrace::default()
+    }));
+    let out = record.clone();
+    let watched_key = watched_key.to_owned();
+    MATERIALIZED.with(|hook| {
+        assert!(hook.borrow().is_none());
+        *hook.borrow_mut() = Some(Box::new(
+            move |store, rows, capacity, view, before_allocation| {
+                let mut out = out.borrow_mut();
+                assert!(
+                    out.len < out.observations.len(),
+                    "bounded observation record exhausted"
+                );
+                let watched_row = rows.iter().find(|(k, _)| k == &watched_key);
+                let (owned_namespace, owned_selector) = view.map_or((0, 0), |v| {
+                    let selector = match v.selection.as_ref().unwrap() {
+                        CapturedSelection::Prefix(p) => p.capacity(),
+                        CapturedSelection::Range(lo, hi) => lo.capacity() + hi.capacity(),
+                    };
+                    (v.ns.capacity(), selector)
+                });
+                let event = Materialization {
+                    before_allocation,
+                    count: store.scan_usage.count.load(Ordering::Acquire),
+                    bytes: store.scan_usage.bytes.load(Ordering::Acquire),
+                    row_capacity: capacity,
+                    rows: rows.len(),
+                    copied_key: watched_row
+                        .is_some_and(|(k, _)| k.as_ptr() as usize != key_address),
+                    watched_refs: Arc::strong_count(&watched),
+                    watched_row: watched_row.is_some(),
+                    owned_namespace,
+                    owned_selector,
+                };
+                let n = out.len;
+                out.observations[n] = event;
+                out.len += 1;
+            },
+        ));
+    });
+    struct Clear;
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            MATERIALIZED.with(|hook| {
+                hook.take();
+            });
+        }
+    }
+    let clear = Clear;
+    let result = s.snapshot_open_selected("ledger", selection, budget);
+    drop(clear);
+    let trace = *record.borrow();
+    (result, trace)
+}
+
+#[test]
+fn temporal_oracle_observes_funding_at_actual_row_key_reference_and_selector_materialization() {
+    let f = Fixture::new();
+    let s = Store::open(&f.0, config()).unwrap();
+    seed(&s);
+    let (result, trace) = trace_acquisition(&s, "keep/1", Selection::Prefix("keep/"), budget());
+    eprintln!("accepted materialization: result={result:?} trace={trace:?}");
+    let v = result.unwrap();
+    trace.funded(v.retained_bytes as usize).unwrap();
+    assert_eq!(trace.len, 5);
+    assert_eq!(
+        trace.observations[..5]
+            .iter()
+            .map(|e| e.rows)
+            .collect::<Vec<_>>(),
+        [0, 0, 1, 2, 2]
+    );
+    assert_eq!(v.retained_bytes, 538);
+    s.snapshot_release("ledger", &v.snapshot).unwrap();
+    clean(&s);
+}
+
+#[test]
+fn temporal_oracle_observes_no_retained_materialization_on_store_refusal() {
+    for c in [
+        Config {
+            snapshot_max: 0,
+            ..config()
+        },
+        Config {
+            snapshot_bytes: 537,
+            ..config()
+        },
+    ] {
+        let f = Fixture::new();
+        let s = Store::open(&f.0, c).unwrap();
+        seed(&s);
+        let (result, trace) = trace_acquisition(&s, "keep/1", Selection::Prefix("keep/"), budget());
+        eprintln!("refused materialization: result={result:?} trace={trace:?}");
+        assert_eq!(result.unwrap_err(), AcquisitionError::SnapshotFull);
+        trace.refused().unwrap();
+        clean(&s);
+    }
 }
 
 #[test]

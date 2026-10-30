@@ -233,9 +233,13 @@ impl Store {
 
         // Everything retained, including the selector, is allocated after Store
         // admission. The same read lock makes the reserved second pass exact.
+        #[cfg(test)]
+        tests::before_materialization(self);
         let mut rows = Vec::new();
         rows.try_reserve_exact(population)
             .map_err(|_| SnapshotFull)?;
+        #[cfg(test)]
+        tests::materialized(self, &rows, rows.capacity(), None);
         for ((namespace, key), entry) in committed.iter().take((visits / 2) as usize) {
             #[cfg(test)]
             self.capture_visits.fetch_add(1, Ordering::Relaxed);
@@ -244,6 +248,8 @@ impl Store {
                     key.clone(),
                     SnapshotValue::new(entry.clone(), workspace.clone()),
                 ));
+                #[cfg(test)]
+                tests::materialized(self, &rows, rows.capacity(), None);
             }
         }
         drop(committed);
@@ -257,6 +263,13 @@ impl Store {
             bounded_load: None,
             _charge: reservation,
         });
+        #[cfg(test)]
+        tests::materialized(
+            self,
+            &snapshot.rows,
+            snapshot.rows.capacity(),
+            Some(&snapshot),
+        );
         #[cfg(test)]
         tests::before_publish();
         let mut scans = self.scans.lock().unwrap();
