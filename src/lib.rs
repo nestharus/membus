@@ -19,6 +19,7 @@ mod atomic_wire;
 pub mod recovery_image;
 mod receiving;
 pub use receiving::DurablePlacement;
+pub mod namespace_reserve;
 #[cfg(windows)]
 pub mod pipe_io;
 use std::{

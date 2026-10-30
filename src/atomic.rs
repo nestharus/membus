@@ -746,6 +746,7 @@ impl Store {
         let id = (r.data.namespace.clone(), r.data.operation_id.clone());
         let committed = self.committed.read().unwrap();
         let mut state = self.state.lock().unwrap();
+        crate::namespace_reserve::expire(&mut state, self.clock.mono_ms());
         if let Some(outcome) = self.original_status(
             &state, &id, &fp, r.data.epoch, r.data.expires_mono, deadline,
         )? {
@@ -844,15 +845,8 @@ impl Store {
         if self.cache_limit(&state) < memory + chunk_index_bytes + store::dedup_charge(&id) {
             return Err(PublicationError::Resource(7));
         }
-        if state
-            .persisted_bytes
-            .saturating_add(state.pending_disk)
-            .saturating_add(disk)
-            > self
-                .config
-                .state_limit_bytes
-                .saturating_sub(self.config.maintenance_reserve_bytes)
-        {
+        if !crate::namespace_reserve::can_admit(&state, &r.data.namespace, disk,
+            self.config.state_limit_bytes.saturating_sub(self.config.maintenance_reserve_bytes)) {
             return Err(PublicationError::Resource(7));
         }
         if self.clock.utc_ms() >= deadline
@@ -862,6 +856,10 @@ impl Store {
             return Err(PublicationError::Expired);
         }
         // Admission: every remaining failure is uncertainty, with original identity retained.
+        if !crate::namespace_reserve::admit(&mut state, &r.data.namespace, disk,
+            self.clock.mono_ms(), self.config.state_limit_bytes.saturating_sub(self.config.maintenance_reserve_bytes)) {
+            return Err(PublicationError::Resource(7));
+        }
         let until = self.clock.mono_ms().saturating_add(self.config.retry_ms);
         state.next = next;
         self.next_issued.fetch_max(next, Ordering::SeqCst);

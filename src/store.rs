@@ -65,6 +65,7 @@ pub(super) struct State {
     pub(super) stripe_items: [usize; 4],
     pub(super) persisted_bytes: u64,
     pub(super) pending_disk: u64,
+    pub(super) namespace_reserves: crate::namespace_reserve::Book,
     pub(super) read_only: bool,
     pub(super) warming: bool,
     /// Tombstones whose index entry may drop once no other retained chunk holds their key (5.3).
@@ -655,6 +656,7 @@ impl Store {
         let chunk_index_bytes = chunks::chunk_index_charge(&k);
         let mut state = self.state.lock().unwrap();
         let mono = self.clock.mono_ms();
+        crate::namespace_reserve::expire(&mut state, mono);
         if let Some(d) = state.dedup.get(&id).filter(|_| deduplicate) {
             if d.fingerprint != fp {
                 return Outcome::error(14);
@@ -745,13 +747,9 @@ impl Store {
         if admission_bytes > self.cache_limit(&state) {
             return Outcome::error(7);
         }
-        // Ordinary admissions stop at the limit less the maintenance reserve (5.5).
-        if state.persisted_bytes + state.pending_disk + disk_bytes
-            > self
-                .config
-                .state_limit_bytes
-                .saturating_sub(self.config.maintenance_reserve_bytes)
-        {
+        // Non-spending check at the original data-limit refusal boundary.
+        if !crate::namespace_reserve::can_admit(&state, &m.ns, disk_bytes,
+            self.config.state_limit_bytes.saturating_sub(self.config.maintenance_reserve_bytes)) {
             return Outcome::error(7);
         }
         if state.reserved_bytes + queue_charge > self.config.queue_bytes
@@ -771,6 +769,12 @@ impl Store {
         let version = state.next;
         // Each assigned revision must leave a representable persisted successor.
         let Some(next) = version.checked_add(1) else { return Outcome::error(7) };
+        // Reserve/charge once, after every other pre-admission refusal. All
+        // scalar, batch-item, policy and timer-control paths enter here.
+        if !crate::namespace_reserve::admit(&mut state, &m.ns, disk_bytes,
+            self.clock.mono_ms(), self.config.state_limit_bytes.saturating_sub(self.config.maintenance_reserve_bytes)) {
+            return Outcome::error(7);
+        }
         state.next = next;
         self.next_issued.fetch_max(state.next, Ordering::SeqCst);
         let value = Value {

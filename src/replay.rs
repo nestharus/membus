@@ -1628,6 +1628,9 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
         stripe_items: [0; 4],
         persisted_bytes,
         pending_disk: 0,
+        // Live Store leases have no durable transfer/import representation.
+        // Recovered record/retry bytes remain in persisted_bytes independently.
+        namespace_reserves: crate::namespace_reserve::Book::default(),
         read_only: flags.storage_error.load(Ordering::SeqCst),
         warming: false,
         tomb_candidates,
