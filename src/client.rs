@@ -90,6 +90,8 @@ pub use m3::{Change, ScanPage, Subscription, SubscriptionStatus};
 #[path = "client_policy.rs"]
 mod policy_client;
 pub use policy_client::{Policy, PolicySetAttempt, PolicySetRequest, PolicyTable};
+#[path = "client_selected.rs"]
+mod selected_client;
 #[path = "client_timers.rs"]
 mod timer_client;
 pub use timer_client::*;

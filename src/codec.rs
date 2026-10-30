@@ -76,6 +76,8 @@ pub const ATOMIC_CAPTURE: u8 = 28;
 pub const ATOMIC_PUBLISH: u8 = 29;
 pub const ATOMIC_POPULATION: u8 = 30;
 pub const SNAPSHOT_REQUIRE_COMPLETE: u8 = 31;
+/// Additive selected-view acquisition; HELLO and existing operations are unchanged.
+pub const SNAPSHOT_OPEN_SELECTED: u8 = 32;
 const fn crc32_table() -> [u32; 256] {
     let mut table = [0; 256];
     let mut index = 0;
@@ -624,6 +626,38 @@ impl Store {
                     for metric in &self.capture_metrics {
                         p.extend(metric.load(Ordering::Relaxed).to_le_bytes());
                     }
+                    Ok(p)
+                }
+                SNAPSHOT_OPEN_SELECTED => {
+                    use crate::selected_view::{AcquisitionBudget, Selection};
+                    let kind = c.u8()?;
+                    let lower = c.bound_ref()?;
+                    let selection = match kind {
+                        0 => Selection::Prefix(lower),
+                        1 => Selection::Range {
+                            lower,
+                            upper: c.bound_ref()?,
+                        },
+                        _ => return Err(3),
+                    };
+                    let budget = AcquisitionBudget {
+                        max_candidates: c.u64()?,
+                        max_metadata_bytes: c.u64()?,
+                        max_retained_bytes: c.u64()?,
+                    };
+                    c.end()?;
+                    // Admit the entire fixed reply BEFORE creating a resident token.
+                    if max_frame < 67 {
+                        return Err(4);
+                    }
+                    let view = self.snapshot_open_selected(ns, selection, budget)
+                        .map_err(|e| e.code())?;
+                    let mut p = Vec::with_capacity(52);
+                    lp(&mut p, &view.snapshot);
+                    p.extend(view.population.to_le_bytes());
+                    p.extend(view.candidates.to_le_bytes());
+                    p.extend(view.metadata_bytes.to_le_bytes());
+                    p.extend(view.retained_bytes.to_le_bytes());
                     Ok(p)
                 }
                 SNAPSHOT_OPEN => {

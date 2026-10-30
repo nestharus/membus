@@ -103,6 +103,7 @@ window. See [Rust client usage and uncertainty](docs/RUST_CLIENT.md).
 - [Component ownership and runtime boundaries](docs/COMPONENTS.md)
 - [Instance clocks, deadlines and recovery windows](docs/CLOCK.md)
 - [Protocol, acknowledgments, refusals and snapshots](docs/KV1.md)
+- [Bounded immutable selected-view acquisition](docs/SELECTED-VIEW.md)
 - [Mutation retry comparators, encoding aliases and resource accounting](docs/RETRY_RETENTION.md)
 - [Recovered Flush prerequisites and historical backup limits](docs/RECOVERY_FLUSH.md)
 - [Recovery rename directory barriers](docs/RECOVERY-DIRECTORIES.md)

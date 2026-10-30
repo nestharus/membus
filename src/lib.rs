@@ -20,6 +20,7 @@ pub mod recovery_image;
 mod receiving;
 pub use receiving::DurablePlacement;
 pub mod namespace_reserve;
+pub mod selected_view;
 #[cfg(windows)]
 pub mod pipe_io;
 use std::{
@@ -71,6 +72,7 @@ pub use codec::{
     SCAN_KEYS_RANGE, SCAN_PREFIX, SCAN_RANGE, SIGNAL_USAGE, SNAPSHOT_OPEN, SNAPSHOT_RELEASE,
     SNAPSHOT_REQUIRE_COMPLETE,
     SUBSCRIBE, SUBSCRIPTION_STATUS, TIMER_CANCEL, TIMER_SET, TIMER_STATUS, UNSUBSCRIBE,
+    SNAPSHOT_OPEN_SELECTED,
 };
 #[cfg(test)]
 use flush_owner::{enqueue_flush, FlushWait};

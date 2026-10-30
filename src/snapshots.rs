@@ -45,9 +45,10 @@ pub(super) struct Snapshot {
     pub(super) ns: String,
     pub(super) created: u64,
     pub(super) rows: Vec<(String, SnapshotValue)>,
+    pub(super) selection: Option<crate::selected_view::CapturedSelection>,
     pub(super) cursor_hash: RandomState,
-    complete: bool,
-    bounded_load: Option<Mutex<()>>,
+    pub(super) complete: bool,
+    pub(super) bounded_load: Option<Mutex<()>>,
     // Charges survive release/expiry while a dispatcher still holds this Arc.
     pub(super) _charge: Arc<ScanCharge>,
 }
@@ -65,6 +66,19 @@ pub(super) struct SnapshotValue {
     load_attempts: AtomicUsize,
 }
 impl SnapshotValue {
+    pub(super) fn new(
+        entry: Arc<Entry>,
+        workspace: Arc<crate::read_cohort::SnapshotWorkspace>,
+    ) -> Self {
+        Self {
+            entry,
+            loaded: OnceLock::new(),
+            workspace,
+            load_gate: Mutex::new(()),
+            #[cfg(test)]
+            load_attempts: AtomicUsize::new(0),
+        }
+    }
     pub(super) fn load(&self, store: &Store, ns: &str, key: &str) -> Result<crate::ReadValue, u16> {
         if let Some(value) = self.loaded.get() {
             return Ok(value.clone());
@@ -298,6 +312,7 @@ impl Store {
             ns: ns.to_owned(),
             created,
             rows,
+            selection: None,
             cursor_hash: RandomState::new(),
             complete,
             bounded_load: bounds.map(|_| Mutex::new(())),
@@ -334,7 +349,8 @@ impl Store {
         }
         Ok(snapshot.clone())
     }
-    pub(super) fn snapshot_release(&self, ns: &str, token: &[u8]) -> Result<(), u16> {
+    /// Release a snapshot token. In-flight readers retain their existing charge.
+    pub fn snapshot_release(&self, ns: &str, token: &[u8]) -> Result<(), u16> {
         let snapshot = self.snapshot_get(ns, token)?;
         let id = u64::from_le_bytes(token[8..].try_into().unwrap());
         self.scans.lock().unwrap().snapshots.remove(&id);
@@ -414,6 +430,9 @@ impl Store {
             (supplied.to_vec(), self.snapshot_get(ns, supplied)?)
         };
         let result = (|| {
+            if snapshot.selection.as_ref().is_some_and(|s| !s.matches(is_range, lower, upper)) {
+                return Err(21);
+            }
             if !cursor.is_empty() {
                 let split = cursor.len() - 8;
                 let tag = u64::from_le_bytes(cursor[split..].try_into().unwrap());

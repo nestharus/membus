@@ -174,7 +174,7 @@ impl<T: Transport> Client<T> {
         }
         Ok(bytes)
     }
-    fn m3_frame_response<R>(
+    pub(super) fn m3_frame_response<R>(
         &mut self,
         op: u8,
         bytes: Vec<u8>,
