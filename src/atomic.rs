@@ -16,6 +16,8 @@ use std::{
 pub const MAX_POPULATION: usize = 4096;
 pub const MAX_CHANGES: usize = 128;
 include!("atomic_resources.rs");
+mod captured_backing;
+pub use captured_backing::{BackingCharge, BackingLayout};
 #[cfg(test)]
 #[path = "atomic_funding_tests.rs"]
 mod funding_tests;
