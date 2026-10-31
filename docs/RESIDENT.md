@@ -28,6 +28,21 @@ its recovered data-file sync barrier, and writes its readiness
 message before entering the selected transport. Transport/heartbeat checks are
 needed to establish that it can actually serve.
 
+Server arguments are admitted before Store marker checks, startup workers or
+readiness output. Scalar options may repeat: each occurrence is parsed and checked,
+and the last selected value is used. Cache-policy rules append in order; repeated
+`--allow-mem` switches remain enabled. Unknown options and missing values refuse.
+There is no separate successful `--help` command; incomplete invocations return
+usage on stderr with failure status.
+
+TCP admission checks literal loopback addresses and the standard default
+host/port syntax without resolving names. Hostnames, IPv6 scopes and availability
+remain delegated to the existing resolver and bind operation, which still checks
+the actual bound address. Port zero remains permitted. Windows pipe names and
+security remain subject to the existing native creation checks. A command that
+passes syntax admission can still fail startup or transport acquisition; the
+readiness message remains a Store-startup observation, not proof of a listener.
+
 ## Options and resource bounds
 
 Byte options use bytes; time options use milliseconds.

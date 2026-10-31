@@ -1,4 +1,9 @@
+<<<<<<< HEAD
 use membus::{Config, ResidentDispatch, Store};
+=======
+use membus::Store;
+mod cli;
+>>>>>>> 45be92f (Validate server CLI before acquiring resources)
 mod qualification;
 #[cfg(test)]
 mod resident_request_tests;
@@ -248,97 +253,27 @@ fn tcp(address: &str, resident: ResidentDispatch, idle_ms: u32) -> io::Result<()
 }
 fn main() -> io::Result<()> {
     let args: Vec<_> = env::args().collect();
-    if args.get(1).map(String::as_str) == Some("retirement-status") {
-        return qualification::retirement_command(&args[2..]);
-    }
-    if args.get(1).map(String::as_str) == Some("catalogue-state") {
-        return qualification::catalogue_command(&args[2..]);
-    }
-    if args.get(1).map(String::as_str) == Some("health") {
-        return health_command(&args[2..]);
-    }
-    if args.get(1).map(String::as_str) == Some("policy") {
-        return policy_command(&args[2..]);
-    }
-    if args.get(1).map(String::as_str) == Some("expiry") {
-        return expiry_command(&args[2..]);
-    }
-    if args.len() < 4 {
-        return Err(io::Error::other("usage: membus STATE_DIR tcp|pipe ADDRESS [--idle-ms N] [--heartbeat-ms N] [--state-limit-bytes N] [--flush-ms N] [--retry-ms N] [--quota N] [--index-cap N] [--capacity N] [--queue-bytes N] [--dedup-cap N] [--delay-ms N] [--allow-mem] [--snapshot-bytes N] [--snapshot-max N] [--snapshot-ttl-ms N] [--maintenance-reserve-bytes N] [--chunk-bytes N] [--rotation-ms N] [--retire-ms N]; membus health PIPE [--state-dir PATH]; membus policy PIPE get NS|set NS PREFIX forever|latest|expire:MS|clear NS PREFIX; membus expiry resume STATE_DIR"));
-    }
-    let path = PathBuf::from(&args[1]);
-    let mut config = Config::default();
-    let mut idle_ms = 60000u32;
-    let mut heartbeat_ms = 30000u64;
-    let mut reserve = None;
-    let mut i = 4;
-    while i < args.len() {
-        if args[i] == "--cache-policy" {
-            let text = args.get(i+1).ok_or_else(|| io::Error::other("missing cache policy"))?;
-            config.cache_rules.push(text.parse()?);
-            i += 2;
-            continue;
-        }
-        if args[i] == "--allow-mem" {
-            config.allow_mem = true;
-            i += 1;
-            continue;
-        }
-        let n = args
-            .get(i + 1)
-            .ok_or_else(|| io::Error::other("missing value"))?
-            .parse::<u64>()
-            .map_err(io::Error::other)?;
-        match args[i].as_str() {
-            "--signal-history" => config.signal_history = usize::try_from(n).map_err(io::Error::other)?,
-            "--signal-bytes" => config.signal_bytes = usize::try_from(n).map_err(io::Error::other)?,
-            "--state-limit-bytes" => {
-                if n == 0 {
-                    return Err(io::Error::other("state-limit-bytes must be positive"));
-                }
-                config.state_limit_bytes = n;
-            }
-            "--idle-ms" => {
-                idle_ms = u32::try_from(n)
-                    .ok()
-                    .filter(|n| *n > 0 && *n < u32::MAX)
-                    .ok_or_else(|| io::Error::other("idle-ms must be 1..4294967294"))?
-            }
-            "--heartbeat-ms" => {
-                if n != 0 && n < 100 {
-                    return Err(io::Error::other("heartbeat-ms must be zero or >=100"));
-                }
-                heartbeat_ms = n;
-            }
-            "--flush-ms" => config.flush_ms = n,
-            "--retry-ms" => config.retry_ms = n,
-            "--quota" => config.quota = n as usize,
-            "--index-cap" => config.index_cap = n as usize,
-            "--capacity" => config.capacity = n as usize,
-            "--cache-bytes" => config.cache_bytes = usize::try_from(n).map_err(io::Error::other)?,
-            "--queue-bytes" => config.queue_bytes = n as usize,
-            "--dedup-cap" => config.dedup_cap = n as usize,
-            "--delay-ms" => config.write_delay_ms = n,
-            "--snapshot-bytes" => {
-                config.snapshot_bytes = usize::try_from(n).map_err(io::Error::other)?
-            }
-            "--snapshot-max" => {
-                config.snapshot_max = usize::try_from(n).map_err(io::Error::other)?
-            }
-            "--snapshot-ttl-ms" => config.snapshot_ttl_ms = n,
-            "--maintenance-reserve-bytes" => reserve = Some(n),
-            "--chunk-bytes" => {
-                if n == 0 {
-                    return Err(io::Error::other("chunk-bytes must be positive"));
-                }
-                config.chunk_bytes = n;
-            }
-            "--rotation-ms" => config.rotation_ms = n,
-            "--retire-ms" => config.retire_ms = n,
-            _ => return Err(io::Error::other("unknown option")),
-        }
-        i += 2
-    }
+    cli::dispatch(&args, |command| match command {
+        cli::Command::Admin(admin, args) => match admin {
+            cli::Admin::Retirement => qualification::retirement_command(args),
+            cli::Admin::Catalogue => qualification::catalogue_command(args),
+            cli::Admin::Health => health_command(args),
+            cli::Admin::Policy => policy_command(args),
+            cli::Admin::Expiry => expiry_command(args),
+        },
+        cli::Command::Server(command) => start_server(command),
+    })
+}
+
+fn start_server(command: cli::Server) -> io::Result<()> {
+    let cli::Server {
+        path,
+        transport,
+        address,
+        mut config,
+        idle_ms,
+        heartbeat_ms,
+    } = command;
     // Test seam (T11 on a production copy): the import leaves one key out, so its check refuses the switch.
     if env::var_os("MEMBUS_TEST_IMPORT_DIFFERENCE").is_some() {
         config.import_inject_difference = true;
@@ -346,13 +281,6 @@ fn main() -> io::Result<()> {
     // Explicit owned-fixture seams; neither is enabled by an ordinary launch.
     config.fail_after_append = env::var_os("MEMBUS_TEST_FAIL_AFTER_APPEND").is_some();
     config.fail_recovery_sync = env::var_os("MEMBUS_TEST_FAIL_RECOVERY_SYNC").is_some();
-    // Ordinary admissions stop at the limit less a 1 GiB maintenance reserve (CHUNK-RETIREMENT.md 5.5); a limit
-    // under 8 GiB keeps an eighth, so a small test limit still admits.
-    config.maintenance_reserve_bytes =
-        reserve.unwrap_or_else(|| (1u64 << 30).min(config.state_limit_bytes / 8));
-    if config.maintenance_reserve_bytes >= config.state_limit_bytes {
-        return Err(io::Error::other("maintenance-reserve-bytes must be below state-limit-bytes"));
-    }
     let store = Arc::new(Store::open(&path, config)?);
     // membus.log's one-line replay summary; state/replay.json holds the whole record (CHUNK-RETIREMENT.md 6).
     eprintln!("{}", store.replay_report().summary());
@@ -363,11 +291,10 @@ fn main() -> io::Result<()> {
         std::process::id(),
         path.display()
     );
-    let result = match args[2].as_str() {
-        "tcp" => tcp(&args[3], workers.wire_dispatch(&store)?, idle_ms),
+    let result = match transport {
+        cli::Transport::Tcp => tcp(&address, workers.wire_dispatch(&store)?, idle_ms),
         #[cfg(windows)]
-        "pipe" => pipes(&args[3], workers.wire_dispatch(&store)?, idle_ms),
-        _ => Err(io::Error::other("unsupported transport")),
+        cli::Transport::Pipe => pipes(&address, workers.wire_dispatch(&store)?, idle_ms),
     };
     let settlement = workers.join();
     if let Err(error) = &settlement {
