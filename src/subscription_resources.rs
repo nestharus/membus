@@ -304,3 +304,73 @@ impl SubscriptionAccount {
         Ok(grant)
     }
 }
+
+#[cfg(test)]
+mod catchup_account_tests {
+    use super::*;
+    use crate::{chunks::{Clock,ManualClock,ChunkStore},cache::{Cache,CachePolicy},Config,Value};
+    use std::path::PathBuf;
+
+    #[test]
+    fn current_store_account_context_trims_real_cache_and_returns_only_its_charge() {
+        let config=Config{capacity:4*1024*1024,cache_bytes:2*1024*1024,..Config::default()};
+        let clock=Clock::new(Some(ManualClock::new(2_000_000)));
+        let cache=Arc::new(Cache::new(&config,clock));cache.trim(config.cache_bytes);
+        for version in 1..=4 {
+            cache.insert(Arc::new(Value{version,ack:1,bytes:vec![2;384*1024],tombstone:false}),
+                "authored".into(),CachePolicy::default(),true,config.cache_bytes,&AtomicBool::new(true));
+        }
+        let before_cache=cache.stats().bytes;assert!(before_cache>1024*1024);
+        let owner=Arc::new(Mutex::new(State::default()));owner.lock().unwrap().memory_reserved=512*1024;
+        let scans=Arc::new(crate::snapshots::ScanUsage::default());
+        let pressure_bytes=512*1024;
+        {let state=owner.lock().unwrap();assert!(pressure_bytes<=state.available_memory(config.capacity,0,config.memory_margin(),64*1024,0));
+            scans.bytes.store(pressure_bytes,Ordering::Release);scans.count.store(1,Ordering::Release);}
+        let selected_charge=crate::snapshots::ScanCharge{usage:scans.clone(),bytes:pressure_bytes};
+        let selected_payload=vec![7u8;pressure_bytes];
+        // This is the real metadata type's I/O-free constructor. No Store,
+        // directory, persistence backend or journal is created or substituted.
+        let chunks=Arc::new(Mutex::new(ChunkStore::new(PathBuf::new())));chunks.lock().unwrap().index_bytes=64*1024;
+        let released=Arc::new(AtomicBool::new(false));
+        let account=SubscriptionAccount{owner:Arc::downgrade(&owner),usage:owner.lock().unwrap().subscription_usage.clone(),capacity:config.capacity,
+            margin:config.memory_margin(),released:released.clone(),context:AccountContext::Store{scans:scans.clone(),chunks:Arc::downgrade(&chunks),cache:Arc::downgrade(&cache)}};
+        let mut grant=account.reserve(SubscriptionResources::encoding(896*1024,896*1024).unwrap(),false).unwrap();
+        let available=owner.lock().unwrap().available_memory(config.capacity,scans.bytes.load(Ordering::Acquire),config.memory_margin(),64*1024,0);
+        let after=cache.stats();assert!(after.bytes<=available);assert!(after.bytes<before_cache);
+        let reserved=owner.lock().unwrap().total_reserved();assert_eq!(reserved,512*1024+grant.resources().total().unwrap());
+        grant.return_to_owner();grant.return_to_owner();
+        assert_eq!(owner.lock().unwrap().total_reserved(),512*1024);assert!(released.load(Ordering::Acquire));
+        assert_eq!(scans.bytes.load(Ordering::Acquire),selected_payload.len());
+        drop(selected_payload);drop(selected_charge);assert_eq!(scans.bytes.load(Ordering::Acquire),0);
+    }
+
+    #[test]
+    fn foreign_returned_and_over_capacity_growth_preserve_actual_owner_and_parts() {
+        let config=Config{capacity:4*1024*1024,..Config::default()};
+        let owner=Arc::new(Mutex::new(State::default()));let foreign=Arc::new(Mutex::new(State::default()));
+        let account=SubscriptionAccount::for_capture(&owner,&config,Arc::new(crate::snapshots::ScanUsage::default()),0);
+        let mut grant=account.reserve(SubscriptionResources::encoding(512,512).unwrap(),false).unwrap();
+        let original=grant.resources();let before=owner.lock().unwrap().total_reserved();
+        let growth=SubscriptionResources::encoding(256,256).unwrap();
+        {
+            let mut state=foreign.lock().unwrap();let available=state.available_memory(config.capacity,0,config.memory_margin(),0,0);
+            assert_eq!(extend(&foreign,&mut state,available,&mut grant,growth),Err(ReservationError::ForeignOwner));
+            assert_eq!(state.total_reserved(),0);
+        }
+        assert_eq!(grant.resources(),original);assert_eq!(owner.lock().unwrap().total_reserved(),before);
+        {
+            let mut state=owner.lock().unwrap();let available=state.available_memory(config.capacity,0,config.memory_margin(),0,0);
+            let too_much=SubscriptionResources::encoding(available+1,0).unwrap();
+            assert_eq!(extend(&owner,&mut state,available,&mut grant,too_much),Err(ReservationError::Capacity));
+            assert_eq!(state.total_reserved(),before);assert_eq!(grant.resources(),original);
+            extend(&owner,&mut state,available,&mut grant,growth).unwrap();
+        }
+        // Actual ownership extension succeeds before the corresponding new
+        // representation is allocated; a rejected extension allocated nothing.
+        let new_buffer=vec![0u8;growth.total().unwrap()];assert_eq!(new_buffer.len(),512);
+        drop(new_buffer);grant.return_to_owner();grant.return_to_owner();
+        let mut state=owner.lock().unwrap();let available=state.available_memory(config.capacity,0,config.memory_margin(),0,0);
+        assert_eq!(extend(&owner,&mut state,available,&mut grant,growth),Err(ReservationError::Returned));
+        assert_eq!(state.total_reserved(),0);
+    }
+}

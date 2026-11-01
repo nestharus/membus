@@ -78,3 +78,11 @@ controls, due expiry sweeps and exact failed-generation removal remain linear
 registry operations; repeated failures or newly due expiry groups can still
 produce quadratic aggregate work. Legacy priority is unchanged. This describes
 source scheduling, without an operating throughput or delivery-latency guarantee.
+
+Legacy change/1 reservations distinguish the selected include-value mode. A
+key-only registration funds identifier/metadata body and frame capacities without
+reserving a payload encoder it cannot use. Value registrations still fund their
+selected frame limit up to the representable maximum payload. Retained history
+and in-flight Change payloads remain separately charged once through their shared
+owner, even for key-only recipients. This changes managed demand, not the legacy
+row/queue/history/frame policies or the finite-hint profile.
