@@ -231,7 +231,7 @@ mod catchup_accounting {
             assert!(result.is_ok(),"key-only replay should not reserve a value encoder: {result:?}");
             assert!(admitted && completed);
             let frames=&GATE.lock().unwrap().frames;assert_eq!(frames.len(),1);
-            assert_eq!(frames[0][4+56],0,"include_value remains false");
+            assert_eq!(frames[0].last(),Some(&0),"key-only body ends with include_value=false after its variable-length identifiers");
             assert!(frames[0].len()<256,"384 KiB history payload was not sent in key-only mode");
         }
     }
