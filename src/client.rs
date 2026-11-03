@@ -84,6 +84,9 @@ type Result<T> = std::result::Result<T, Error>;
 #[path = "client_m3.rs"]
 mod m3;
 pub use m3::{Change, ScanPage, Subscription, SubscriptionStatus};
+#[path = "client_policy.rs"]
+mod policy_client;
+pub use policy_client::{Policy, PolicySetAttempt, PolicySetRequest, PolicyTable};
 #[path = "client_timers.rs"]
 mod timer_client;
 pub use timer_client::*;
@@ -203,18 +206,33 @@ impl RemoveAttempt {
 /// Retains the exact request and a conservative retry horizon from BEFORE its first send.
 /// Keep this object after every uncertain result. It is an in-memory token, not a journal.
 #[derive(Debug)]
-pub struct Attempt {
-    request: MutationRequest,
+pub struct Attempt<R = MutationRequest> {
+    request: R,
     epoch: u64,
     first_send: Option<Instant>,
     retry_window_ms: u64,
 }
-impl Attempt {
-    pub fn request(&self) -> &MutationRequest {
+impl<R> Attempt<R> {
+    pub fn request(&self) -> &R {
         &self.request
     }
     pub fn epoch(&self) -> u64 {
         self.epoch
+    }
+    fn check_horizon(&self, epoch: u64) -> Result<()> {
+        if self.epoch != epoch {
+            return Err(Error::EpochChanged {
+                expected: self.epoch,
+                actual: epoch,
+            });
+        }
+        if self
+            .first_send
+            .is_some_and(|sent| sent.elapsed().as_millis() >= self.retry_window_ms as u128)
+        {
+            return Err(Error::RetryWindowExpired);
+        }
+        Ok(())
     }
 }
 pub struct Client<T: Transport> {
@@ -773,18 +791,7 @@ impl<T: Transport> Client<T> {
         self.send_mutation(&mut attempt.inner, REMOVE, d)
     }
     fn send_mutation(&mut self, attempt: &mut Attempt, op: u8, d: Deadline) -> Result<MutationReply> {
-        if attempt.epoch != self.negotiated.epoch {
-            return Err(Error::EpochChanged {
-                expected: attempt.epoch,
-                actual: self.negotiated.epoch,
-            });
-        }
-        if attempt
-            .first_send
-            .is_some_and(|sent| sent.elapsed().as_millis() >= attempt.retry_window_ms as u128)
-        {
-            return Err(Error::RetryWindowExpired);
-        }
+        attempt.check_horizon(self.negotiated.epoch)?;
         let m = &attempt.request;
         let mut bytes = self.mutation_frame(op, m, d)?;
         if !self.usable {
