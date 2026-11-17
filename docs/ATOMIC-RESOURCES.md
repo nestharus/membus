@@ -27,6 +27,12 @@ later capture to refuse. Choose an account appropriate to the complete populatio
 and planned original bodies. A refusal supplies no permission to recapture or
 replace a previously uncertain operation.
 
+Caller context/command backing can share that same captured account through
+`NamespaceView::reserve_backing`. Its complete declared layout and lifetime
+obligations are separate from original preparation; see
+[captured caller backing](ATOMIC-CAPTURED-BACKING.md). A payload count or a new
+`OriginalBudget` is not a substitute for the actual captured-account charge.
+
 The legacy `capture_namespace` keeps its conservative 4096-row profile. Its account
 includes complete measured capture storage plus one frame of original headroom;
 this can refuse earlier under a small memory allowance. Larger populations use
