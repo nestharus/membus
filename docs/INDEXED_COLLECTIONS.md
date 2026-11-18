@@ -48,6 +48,8 @@ write. Changed bytes or acknowledgment refuse; the API does not upgrade an old
 OS acknowledgment by silently rewriting immutable data.
 
 The caller opens one resident namespace snapshot and retains it across queries.
+Every query checks [complete-query eligibility](SNAPSHOT-INTEGRITY.md) on that
+token before reading the declaration or selecting any records or postings.
 Schema, head, postings and row payloads are read from that same snapshot. No GET
 of current state substitutes for a captured value. The caller owns snapshot
 release, including error paths. Snapshot expiry, missing schema/head/row, gaps,
@@ -134,6 +136,13 @@ improvement. A consumer must still demonstrate its actual query and semantics.
 evicting a useful cached value, retry with the same view, exact byte allowances,
 transport refusals, saturated arithmetic, and unexpected continuation rows.
 Cold-load counts describe the application cache, not physical-drive I/O.
+
+`cargo test --offline --locked --lib indexed::integrity_tests` uses an existing
+absolute `MEMBUS_PROVIDER_TEST_ROOT` for private fixtures. It verifies refusal
+after losing one posting or an entire posting bucket, captured eligibility
+across later health changes, and complete results with exact field bytes and
+bounded candidate work. The [Python binding](PYTHON_INDEXED.md) has its own
+inert and private-pipe controls.
 
 ## Bounded allocation and acquisition
 

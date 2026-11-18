@@ -113,6 +113,7 @@ window. See [Rust client usage and uncertainty](docs/RUST_CLIENT.md).
 - [Unresolved catalogue append recovery](docs/CATALOGUE-APPEND-RECOVERY.md)
 - [Read-only retirement inspection](docs/RETIREMENT-INSPECTION.md)
 - [Indexed append-only collections](docs/INDEXED_COLLECTIONS.md)
+- [Receiving the Python SDK](docs/PYTHON_RECEIVING.md)
 - [Disk-backed values, bounded cache and cache policy](docs/VALUE_CACHE.md)
 
 The following guides distinguish current local behavior from proposed hosted

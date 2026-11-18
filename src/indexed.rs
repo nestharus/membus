@@ -12,6 +12,9 @@ use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
+#[cfg(test)]
+mod integrity_tests;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Schema {
     /// Ordered exact field names. Each field can have zero or more byte values.
@@ -459,6 +462,7 @@ impl Collection {
         if limits.max_rows == 0 {
             return Err(Error::Invalid("query limits"));
         }
+        c.snapshot_require_complete(ns, snapshot, &format!("{op}:complete"), d)?;
         let declaration = exact(
             c,
             ns,
