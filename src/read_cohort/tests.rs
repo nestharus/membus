@@ -313,3 +313,44 @@ fn singleton_codec_and_snapshot_cache_share_payload_with_retained_charge() {
     assert_eq!((read.version,read.ack,read.tombstone),(500,1,false));assert_eq!(read.bytes,m.bytes);
     drop(cohort);assert_eq!(s.read_cohort_bytes(),64*1024);drop(read);assert_eq!(s.read_cohort_bytes(),0);
 }
+
+#[test]
+fn ordinary_mutation_respects_a_retained_read_cohort() {
+    let root = PathBuf::from(std::env::var_os("MEMBUS_COHORT_FIXTURE_ROOT").unwrap());
+    assert!(root.is_absolute() && root.is_dir());
+    let path = root.join(format!("write-admission-{}-{}", std::process::id(), now_ms()));
+    let store = Store::open(
+        &path,
+        Config {
+            capacity: 2 * 1024 * 1024,
+            cache_bytes: 0,
+            signal_bytes: 0,
+            ..Config::default()
+        },
+    )
+    .unwrap();
+    let mutation = |key: &str| Mutation {
+        ns: "ledger".into(),
+        key: key.into(),
+        op_id: key.into(),
+        deadline: now_ms() + 30_000,
+        ack: 1,
+        expected: None,
+        bytes: vec![0x71; 4096],
+        remove: false,
+    };
+    assert_eq!(store.mutate(mutation("seed")).code, 0);
+    let budget = store.cache_limit(&store.state.lock().unwrap());
+    let cohort = store.read_cohort(budget).unwrap();
+    let retained = cohort.try_get("ledger", "seed").unwrap().unwrap();
+    drop(cohort);
+    assert_eq!(store.read_cohort_bytes(), budget);
+
+    assert_eq!(store.mutate(mutation("new")).code, 7);
+    assert!(store.get_handle_result("ledger", "new").unwrap().is_none());
+    drop(retained);
+
+    assert_eq!(store.read_cohort_bytes(), 0);
+    assert_eq!(store.mutate(mutation("new")).code, 0);
+    assert!(store.get_handle_result("ledger", "new").unwrap().is_some());
+}

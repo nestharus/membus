@@ -700,19 +700,11 @@ impl Store {
             state.retired_set.remove(&k);
             state.dedup_bytes -= dedup_charge(&k);
         }
-        if state.committed_bytes
-            + state.dedup_bytes
-            + state.memory_reserved
-            + memory_charge
+        let admission_bytes = memory_charge
             + if new { index_charge(&k) } else { 0 }
             + index_charge(&k) * 2
-            + if deduplicate { dedup_charge(&id) } else { 0 }
-            + self.scan_usage.bytes.load(Ordering::Acquire)
-            + self.config.memory_margin()
-            + self.chunks.lock().unwrap().index_bytes
-            + self.signals.memory_bytes()
-            > self.config.capacity
-        {
+            + if deduplicate { dedup_charge(&id) } else { 0 };
+        if admission_bytes > self.cache_limit(&state) {
             return Outcome::error(7);
         }
         // Ordinary admissions stop at the limit less the maintenance reserve (5.5).
