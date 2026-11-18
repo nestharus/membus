@@ -50,6 +50,7 @@ struct Peer {
     reply: Vec<u8>,
     damage: Arc<Mutex<u8>>,
     max: usize,
+    max_value: u32,
 }
 impl Read for Peer {
     fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
@@ -70,6 +71,10 @@ impl Write for Peer {
                     .s
                     .dispatch_for_limit(&self.pending[4..], false, self.max);
                 self.pending.clear();
+                if op == membus::HELLO {
+                    // Successful HELLO body starts after the frame/status, then epoch and max_frame.
+                    self.reply[31..35].copy_from_slice(&self.max_value.to_le_bytes());
+                }
                 if op == membus::ATOMIC_CAPTURE {
                     match *self.damage.lock().unwrap() {
                         5 => self.reply[19..23].copy_from_slice(b"????"),
@@ -114,6 +119,15 @@ impl Transport for Peer {
     }
 }
 fn client(s: &Arc<Store>, damage: Arc<Mutex<u8>>, max: usize) -> Client<Peer> {
+    client_with_value_limit(s, damage, max, membus::MAX_VALUE as u32)
+}
+
+fn client_with_value_limit(
+    s: &Arc<Store>,
+    damage: Arc<Mutex<u8>>,
+    max: usize,
+    max_value: u32,
+) -> Client<Peer> {
     Client::handshake(
         Peer {
             s: s.clone(),
@@ -121,6 +135,7 @@ fn client(s: &Arc<Store>, damage: Arc<Mutex<u8>>, max: usize) -> Client<Peer> {
             reply: vec![],
             damage,
             max,
+            max_value,
         },
         Options::new("authored-wire", max),
         d().local,
@@ -556,6 +571,42 @@ fn local_frame_admission_and_identity_mismatch_preserve_original() {
         Err(Error::Atomic(PublicationError::IdentityMismatch))
     ));
     assert!(s.get("authored", "b").is_none());
+}
+
+#[test]
+fn unpaged_capture_obeys_the_connection_value_limit() {
+    let s = Arc::new(Store::open(&root("capture-value-limit"), config()).unwrap());
+    let damage = Arc::new(Mutex::new(0));
+    let mut writer = client(&s, damage.clone(), membus::MAX_FRAME);
+    let original = request(
+        &mut writer,
+        "original",
+        vec![FinalChange::put("row", b"abc".to_vec())],
+    );
+    let receipt = writer.publish_atomic(&original, d()).unwrap();
+
+    let mut too_small = client_with_value_limit(&s, damage.clone(), membus::MAX_FRAME, 2);
+    assert_eq!(too_small.negotiated().max_value, 2);
+    assert!(matches!(
+        too_small.capture_atomic_namespace("authored", "refuse", d()),
+        Err(Error::Protocol(_))
+    ));
+    assert!(!too_small.is_usable());
+
+    let mut exact = client_with_value_limit(&s, damage, membus::MAX_FRAME, 3);
+    assert_eq!(exact.negotiated().max_value, 3);
+    let view = exact
+        .capture_atomic_namespace("authored", "accept", d())
+        .unwrap();
+    let [(key, value)] = view.rows() else {
+        panic!("expected the entire one-row view");
+    };
+    assert_eq!(key, "row");
+    assert_eq!(value.bytes, b"abc");
+    assert_eq!(value.version, receipt.version);
+    assert_eq!(value.ack, 2);
+    assert_eq!(receipt.achieved, Ack::Flush);
+    assert!(exact.is_usable());
 }
 
 #[test]

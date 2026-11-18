@@ -110,18 +110,21 @@ impl NamespaceView {
         bytes
     }
 
-    pub(crate) fn from_wire(bytes: &[u8]) -> Result<Self, PublicationError> {
-        fn row<'a>(c: &mut Cursor<'a>) -> Result<(&'a str, u64, u8, &'a [u8]), u16> {
+    pub(crate) fn from_wire(bytes: &[u8], max_value: usize) -> Result<Self, PublicationError> {
+        fn row<'a>(
+            c: &mut Cursor<'a>,
+            max_value: usize,
+        ) -> Result<(&'a str, u64, u8, &'a [u8]), u16> {
             let key = c.bound_ref()?;
             let version = c.u64()?;
             let ack = c.u8()?;
-            let value = c.bytes(crate::MAX_VALUE)?;
+            let value = c.bytes(max_value)?;
             if !valid_id(key) || version == 0 || !matches!(ack, 1 | 2) {
                 return Err(3);
             }
             Ok((key, version, ack, value))
         }
-        fn parse(bytes: &[u8]) -> Result<NamespaceView, u16> {
+        fn parse(bytes: &[u8], max_value: usize) -> Result<NamespaceView, u16> {
             if bytes.get(..4) != Some(b"MAV1") {
                 return Err(3);
             }
@@ -139,7 +142,7 @@ impl NamespaceView {
             let encoded_rows = c.remainder();
             let mut previous = None;
             for _ in 0..count {
-                let (key, _, _, _) = row(&mut c)?;
+                let (key, _, _, _) = row(&mut c, max_value)?;
                 if previous.is_some_and(|prev| prev >= key) {
                     return Err(3);
                 }
@@ -148,7 +151,7 @@ impl NamespaceView {
             c.end()?;
             let mut c = Cursor::new(encoded_rows);
             let entries = (0..count).map(move |_| {
-                let (key, version, ack, value) = row(&mut c).expect("validated wire row");
+                let (key, version, ack, value) = row(&mut c, max_value).expect("validated wire row");
                 (key, value.len(), (version, ack, value))
             });
             let (_, rows, guards) = capture_measure(namespace, entries.clone().map(|(key, len, _)| (key, len)))
@@ -157,7 +160,7 @@ impl NamespaceView {
                 |_, (version, ack, bytes)| Ok(Value { version, ack, bytes: bytes.to_vec(), tombstone: false }))
                 .map_err(|_| 3u16)
         }
-        parse(bytes).map_err(|_| PublicationError::Invalid)
+        parse(bytes, max_value).map_err(|_| PublicationError::Invalid)
     }
     pub fn prepare(
         &self,

@@ -76,7 +76,7 @@ impl<T: Transport> Client<T> {
         let result = self
             .exchange(crate::ATOMIC_CAPTURE, &p, d.local)
             .and_then(|b| {
-                let v = NamespaceView::from_wire(decode(&b)?)
+                let v = NamespaceView::from_wire(decode(&b)?, self.negotiated().max_value)
                     .map_err(|_| Error::Protocol("incomplete atomic population"))?;
                 if v.wire_identity() != (namespace, self.negotiated().epoch) {
                     return Err(Error::Protocol("atomic capture identity"));

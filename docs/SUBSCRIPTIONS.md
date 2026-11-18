@@ -154,7 +154,8 @@ history, retention advances the floor through that change.
 
 Resume queues retained matching events and registers live changes under the
 same hub mutex. Catch-up exceeding 256 queued items, 8 MiB per registration,
-16 MiB globally or available managed memory refuses busy before registration.
+16 MiB globally refuses busy (6) before registration. Insufficient managed
+memory refuses capacity (7) before registration.
 During live overflow the subscription becomes dropped/inactive and queued work is cleared;
 the KV write still commits. Endpoint failure marks failed/inactive and clears
 queued work. Slow subscribers can delay others through the single worker and
