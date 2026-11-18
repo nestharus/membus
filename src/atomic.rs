@@ -573,9 +573,11 @@ impl Store {
                 .map(|m| m.value.as_ref().map_or(0, Vec::len))
                 .sum::<usize>()
             + 128 * r.data.changes.len();
-        // Includes envelope/decode/publication temporaries, new index, chunk holders, retry and queues.
+        // Split chunk registration out of the envelope/decode/publication,
+        // latest-index and queue reservation so it can transfer at append time.
         let index: usize = keys.iter().map(store::index_charge).sum();
-        let memory = 4 * queue + 4 * index + 4096;
+        let chunk_index_bytes: usize = keys.iter().map(crate::chunks::chunk_index_charge).sum();
+        let memory = 4 * queue + 2 * index + 4096;
         let log_index = envelope_stripe(&r.data.namespace);
         if state.reserved_bytes.saturating_add(queue) > self.config.queue_bytes
             || state.stripe_reserved[log_index].saturating_add(queue) > self.config.queue_bytes / 4
@@ -583,7 +585,7 @@ impl Store {
         {
             return Err(PublicationError::Resource(6));
         }
-        if self.cache_limit(&state) < memory.saturating_add(store::dedup_charge(&id)) {
+        if self.cache_limit(&state) < memory + chunk_index_bytes + store::dedup_charge(&id) {
             return Err(PublicationError::Resource(7));
         }
         if state
@@ -632,6 +634,7 @@ impl Store {
                 },
             );
         }
+        let chunk_index = crate::chunks::ChunkIndexReservation::reserve(&self.chunks, chunk_index_bytes);
         self.trim_cache(&state);
         drop(state);
         drop(committed);
@@ -654,6 +657,7 @@ impl Store {
                     .send(crate::append_owner::Append {
                         record,
                         ack: r.data.ack.byte(),
+                        chunk_index: Some(chunk_index.clone()),
                         done,
                     })
                     .map_err(|_| io::Error::other("stopped append owner"))
@@ -715,6 +719,7 @@ impl Store {
         }
         state.reserved_bytes -= queue;
         state.memory_reserved -= memory;
+        drop(chunk_index);
         state.pending_disk -= disk;
         state.stripe_reserved[log_index] -= queue;
         state.stripe_items[log_index] -= 1;

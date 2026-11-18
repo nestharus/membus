@@ -163,6 +163,7 @@
             .send(Append {
                 record: vec![1; 128],
                 ack: 2,
+                chunk_index: None,
                 done: done.clone(),
             })
             .unwrap();
@@ -179,6 +180,7 @@
             .send(Append {
                 record: vec![],
                 ack: 2,
+                chunk_index: None,
                 done,
             })
             .unwrap();

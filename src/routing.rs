@@ -1,5 +1,5 @@
 //! Stripe and class routing, chunk rotation, sink identity and fencing.
-use crate::chunks;
+use crate::chunks::{self, ChunkIndexReservation};
 use crate::codec::crc32;
 use crate::log_io::{append_to, sync_chunk_directory};
 use crate::store::Flags;
@@ -53,7 +53,13 @@ impl Drop for ClassReservation {
 /// Where a stripe's records go. The append owner writes through it; the flush owner syncs what it names.
 pub(super) trait Route: Send + Sync + 'static {
     /// Append one record for `stripe`: the result, the sink written (its flush identity) and the sink's end.
-    fn write(&self, stripe: usize, record: &[u8], config: &Config) -> (io::Result<()>, usize, u64);
+    fn write(
+        &self,
+        stripe: usize,
+        record: &[u8],
+        config: &Config,
+        chunk_index: Option<&ChunkIndexReservation>,
+    ) -> (io::Result<()>, usize, u64);
     /// A sink's stripe, its log while open, and the extent its close synced.
     fn sink(&self, id: usize) -> Option<(usize, Option<Arc<Mutex<Log>>>, u64)>;
     fn fence(&self, stripe: usize);
@@ -63,7 +69,13 @@ pub(super) trait Route: Send + Sync + 'static {
 pub(super) struct FixedRoute(pub(super) Vec<Arc<Mutex<Log>>>);
 #[cfg(test)]
 impl Route for FixedRoute {
-    fn write(&self, stripe: usize, record: &[u8], config: &Config) -> (io::Result<()>, usize, u64) {
+    fn write(
+        &self,
+        stripe: usize,
+        record: &[u8],
+        config: &Config,
+        _chunk_index: Option<&ChunkIndexReservation>,
+    ) -> (io::Result<()>, usize, u64) {
         let mut log = self.0[stripe].lock().unwrap();
         let result = append_to(&mut log, record, config);
         (result, stripe, log.bytes)
@@ -270,7 +282,14 @@ impl ChunkRouter {
     }
 }
 impl Route for ChunkRouter {
-    fn write(&self, stripe: usize, record: &[u8], config: &Config) -> (io::Result<()>, usize, u64) {
+    fn write(
+        &self,
+        stripe: usize,
+        record: &[u8],
+        config: &Config,
+        chunk_index: Option<&ChunkIndexReservation>,
+    ) -> (io::Result<()>, usize, u64) {
+        let chunk_index = chunk_index.expect("chunk append must own an index reservation");
         let payload = &record[16..];
         let records = match crate::atomic::route_records(payload) {
             Ok(rows) if !rows.is_empty()=>rows,
@@ -332,18 +351,20 @@ impl Route for ChunkRouter {
         if result.is_err() {
             self.fence(stripe);
         } else {
-            let mut locations=self.locations.lock().unwrap();
-            let mut cs = self.chunks.lock().unwrap();
-            for (index,(ns,key,version)) in records.iter().enumerate() {
-                locations.insert(*version, crate::value_disk::Location {
-                    class, file: c.reader.clone(), offset: end-record.len() as u64, record_len:record.len() as u64,
-                    subrecord:atomic.then_some(index as u16),
-                });
-                cs.register(c.id,&(ns.clone(),key.clone()),*version);
+            let mut locations = self.locations.lock().unwrap();
+            for (index, (_, _, version)) in records.iter().enumerate() {
+                locations.insert(
+                    *version,
+                    crate::value_disk::Location {
+                        class,
+                        file: c.reader.clone(),
+                        offset: end - record.len() as u64,
+                        record_len: record.len() as u64,
+                        subrecord: atomic.then_some(index as u16),
+                    },
+                );
             }
-            if let Some(info) = cs.table.get_mut(&c.id) {
-                info.bytes = end;
-            }
+            chunk_index.register(c.id, records, end);
         }
         (result, c.id as usize, end)
     }

@@ -12,8 +12,8 @@ use std::{
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex,
     },
     time::Instant,
 };
@@ -1341,10 +1341,60 @@ impl Summaries {
     }
 }
 
+pub(super) fn chunk_index_charge(key: &Key) -> usize {
+    2 * crate::store::index_charge(key)
+}
+
+/// One admitted append's maximum chunk-index growth, including a possible rollover.
+/// Store holds this through settlement and lends a reference to the append owner.
+pub(super) struct ChunkIndexReservation {
+    chunks: Arc<Mutex<ChunkStore>>,
+    // Updated only under the chunk lock, together with the aggregate counters.
+    remaining: AtomicUsize,
+}
+impl ChunkIndexReservation {
+    /// Called with State held, after the Store has checked managed headroom.
+    pub(super) fn reserve(chunks: &Arc<Mutex<ChunkStore>>, bytes: usize) -> Arc<Self> {
+        chunks.lock().unwrap().pending_index_bytes += bytes;
+        Arc::new(Self {
+            chunks: chunks.clone(),
+            remaining: AtomicUsize::new(bytes),
+        })
+    }
+
+    pub(super) fn register(&self, id: u64, records: Vec<(String, String, u64)>, end: u64) {
+        // State admission and health see both counters under this same lock.
+        // The router holds its stripe and never takes State here.
+        let mut chunks = self.chunks.lock().unwrap();
+        let before = chunks.index_bytes;
+        for (ns, key, version) in records {
+            chunks.register(id, &(ns, key), version);
+        }
+        let registered = chunks.index_bytes - before;
+        let remaining = self.remaining.load(Ordering::Relaxed) - registered;
+        self.remaining.store(remaining, Ordering::Relaxed);
+        chunks.pending_index_bytes -= registered;
+        if let Some(info) = chunks.table.get_mut(&id) {
+            info.bytes = end;
+        }
+    }
+}
+impl Drop for ChunkIndexReservation {
+    fn drop(&mut self) {
+        // A failed append may have registered nothing. A failed Flush can
+        // still have registered durable locations. Return only the unused part.
+        let remaining = *self.remaining.get_mut();
+        if remaining != 0 {
+            self.chunks.lock().unwrap().pending_index_bytes -= remaining;
+        }
+    }
+}
+
 /// The chunk table, its catalogue and what retirement keeps: holders, horizons and expiry summaries.
 pub struct ChunkStore {
     /// Conservative resident charge for retained chunk key references, separate from the latest-key index.
     pub index_bytes: usize,
+    pending_index_bytes: usize,
     pub dir: PathBuf,
     pub cat: Option<Catalogue>,
     pub table: BTreeMap<u64, ChunkInfo>,
@@ -1372,6 +1422,7 @@ impl ChunkStore {
     pub fn new(dir: PathBuf) -> Self {
         Self {
             index_bytes: 0,
+            pending_index_bytes: 0,
             dir,
             cat: None,
             table: BTreeMap::new(),
@@ -1391,9 +1442,14 @@ impl ChunkStore {
             incomplete_retiring: false,
         }
     }
+    pub(super) fn managed_index_bytes(&self) -> usize {
+        self.index_bytes + self.pending_index_bytes
+    }
     pub fn register(&mut self, id: u64, k: &Key, v: u64) {
         if let Some(c) = self.table.get_mut(&id) {
-            if !c.keys.contains_key(k) { self.index_bytes += 2 * crate::store::index_charge(k); }
+            if !c.keys.contains_key(k) {
+                self.index_bytes += chunk_index_charge(k);
+            }
             let e = c.keys.entry(k.clone()).or_insert((v, v));
             e.0 = e.0.min(v);
             e.1 = e.1.max(v);

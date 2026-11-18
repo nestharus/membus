@@ -404,3 +404,256 @@ fn ordinary_mutation_respects_a_retained_read_cohort() {
     assert_eq!(store.mutate(mutation("new")).code, 0);
     assert!(store.get_handle_result("ledger", "new").unwrap().is_some());
 }
+
+#[derive(Clone, Copy)]
+enum PendingReadCase {
+    OrdinaryCohort,
+    AtomicCohort,
+    OrdinarySnapshot,
+}
+
+fn pending_write_reserves_chunk_headroom(case: PendingReadCase) {
+    use crate::atomic::{AtomicAck, FinalChange};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    struct ReleaseSync<'a>(&'a (Mutex<(bool, bool)>, Condvar));
+    impl Drop for ReleaseSync<'_> {
+        fn drop(&mut self) {
+            self.0.0.lock().unwrap().1 = true;
+            self.0.1.notify_all();
+        }
+    }
+
+    let gate = Arc::new((Mutex::new((false, false)), Condvar::new()));
+    let store = Store::open(
+        &fixture_path("pending-chunk-charge"),
+        Config {
+            capacity: 2 * 1024 * 1024,
+            cache_bytes: 0,
+            signal_bytes: 0,
+            clock: Some(ManualClock::new(1_000_000)),
+            sync_test_gate: Some(gate.clone()),
+            ..Config::default()
+        },
+    )
+    .unwrap();
+    let deadline = 2_000_000;
+    let mutation = |key: &str, ack| Mutation {
+        ns: "ledger".into(),
+        key: key.into(),
+        op_id: key.into(),
+        deadline,
+        ack,
+        expected: None,
+        bytes: vec![0x71; 4096],
+        remove: false,
+    };
+    assert_eq!(store.mutate(mutation("seed", 1)).code, 0);
+    let request = matches!(case, PendingReadCase::AtomicCohort).then(|| {
+        store.capture_namespace_funded("ledger", 128 * 1024).unwrap()
+            .prepare("atomic-new", AtomicAck::Flush, vec![FinalChange::put("new", vec![0x71; 4096])])
+            .unwrap()
+    });
+    if let Some(request) = &request {
+        let budget = store.cache_limit(&store.state.lock().unwrap());
+        let cohort = store.read_cohort(budget).unwrap();
+        let retained = cohort.try_get("ledger", "seed").unwrap().unwrap();
+        drop(cohort);
+        assert_eq!(store.publish_atomic(request, deadline), Err(atomic::PublicationError::Resource(7)));
+        assert!(!store.pending("ledger", "new"));
+        assert!(store.try_get("ledger", "new").unwrap().is_none());
+        drop(retained);
+    }
+    if matches!(case, PendingReadCase::OrdinarySnapshot) {
+        let seed = store.capture_namespace_funded("frames", 128 * 1024).unwrap()
+            .prepare("envelope-seed", AtomicAck::Os, vec![FinalChange::put("row", vec![0x42; 4096])])
+            .unwrap();
+        assert_eq!(store.publish_atomic(&seed, deadline).unwrap().code, 0);
+    }
+
+    std::thread::scope(|scope| {
+        let release_sync = ReleaseSync(&gate);
+        let (reached, selected) = mpsc::channel();
+        let (resume, paused) = mpsc::channel();
+        *store.router.selection_hook.lock().unwrap() = Some((reached, paused));
+        let store = &store;
+        let writer = scope.spawn(move || match request {
+            Some(request) => store.publish_atomic(&request, deadline).unwrap(),
+            None => store.mutate(mutation("new", 2)),
+        });
+        let timeout = Duration::from_secs(10);
+        selected.recv_timeout(timeout).unwrap();
+        assert!(store.pending("ledger", "new"));
+
+        let snapshot = matches!(case, PendingReadCase::OrdinarySnapshot)
+            .then(|| store.snapshot_open("frames").unwrap());
+        let frame_bytes = snapshot.as_ref().map_or(0, |_| {
+            let entry = store::committed_get(&store.committed.read().unwrap(), "frames", "row")
+                .unwrap().clone();
+            frame_charge(&entry.location).unwrap()
+        });
+        let budget = store.cache_limit(&store.state.lock().unwrap()) - frame_bytes;
+        let cohort = store.read_cohort(budget).unwrap();
+        let retained = cohort.try_get("ledger", "seed").unwrap().unwrap();
+        drop(cohort);
+        let loaded = snapshot.map(|(token, view)| {
+            let row = view.rows[0].1.load(store, "frames", "row").unwrap();
+            store.snapshot_release("frames", &token).unwrap();
+            row
+        });
+        assert_eq!(store.read_cohort_bytes(), budget);
+        let before = store.health2();
+        let registered_before = store.chunks.lock().unwrap().index_bytes;
+
+        resume.send(()).unwrap();
+        let sync = gate.1.wait_timeout_while(gate.0.lock().unwrap(), timeout, |state| !state.0)
+            .unwrap().0;
+        assert!(sync.0, "the write must reach its Flush barrier");
+        drop(sync);
+        let pending = store.health2();
+        let registered_pending = store.chunks.lock().unwrap().index_bytes;
+        assert!(store.pending("ledger", "new"));
+        assert!(store.try_get("ledger", "new").unwrap().is_none());
+        assert_eq!(retained.bytes, vec![0x71; 4096]);
+        if let Some(row) = &loaded {
+            assert_eq!(row.bytes, vec![0x42; 4096]);
+        }
+        drop(release_sync);
+        let outcome = writer.join().unwrap();
+        let settled = store.health2();
+        eprintln!(
+            "cohort={budget} workspace={frame_bytes} registered={registered_before}->{registered_pending} managed={}->{}->{} budget={}",
+            before.memory_bytes, pending.memory_bytes, settled.memory_bytes, pending.memory_budget
+        );
+        assert_eq!((outcome.code, outcome.ack), (0, 2));
+        assert_eq!(registered_pending - registered_before, 2 * store::index_charge(&("ledger".into(), "new".into())));
+        assert_eq!(before.memory_bytes, before.memory_budget);
+        assert_eq!(pending.memory_bytes, before.memory_bytes);
+        assert!(settled.memory_bytes < settled.memory_budget);
+        assert!(!pending.storage_error && !settled.storage_error);
+        assert_eq!(store.try_get("ledger", "new").unwrap().unwrap().version, outcome.version);
+        drop(retained);
+        drop(loaded);
+        assert_eq!(store.read_cohort_bytes(), 0);
+        assert_eq!(scan_usage(store), (0, 0));
+    });
+}
+
+#[test]
+fn pending_ordinary_flush_leaves_only_available_cohort_headroom() {
+    pending_write_reserves_chunk_headroom(PendingReadCase::OrdinaryCohort);
+}
+
+#[test]
+fn pending_atomic_flush_leaves_only_available_cohort_headroom() {
+    pending_write_reserves_chunk_headroom(PendingReadCase::AtomicCohort);
+}
+
+#[test]
+fn pending_ordinary_flush_leaves_only_available_snapshot_workspace() {
+    pending_write_reserves_chunk_headroom(PendingReadCase::OrdinarySnapshot);
+}
+
+fn settled_chunk_index(store: &Store) -> usize {
+    assert_eq!(store.state.lock().unwrap().memory_reserved, 0);
+    let chunks = store.chunks.lock().unwrap();
+    assert_eq!(chunks.managed_index_bytes(), chunks.index_bytes);
+    chunks.index_bytes
+}
+
+#[test]
+fn chunk_reservations_settle_for_reused_and_rotated_keys() {
+    use crate::atomic::{AtomicAck, FinalChange};
+
+    let path = fixture_path("chunk-charge-rollover");
+    let config = Config {
+        capacity: 2 * 1024 * 1024,
+        cache_bytes: 0,
+        signal_bytes: 0,
+        chunk_bytes: 1024,
+        clock: Some(ManualClock::new(1_000_000)),
+        ..Config::default()
+    };
+    let store = Store::open(&path, config.clone()).unwrap();
+    let deadline = 2_000_000;
+    let charge = |ns: &str, key: &str| store::index_charge(&(ns.into(), key.into()));
+    let ordinary = 2 * charge("single", "key");
+    for op in ["create", "replace"] {
+        let outcome = store.mutate(Mutation {
+            ns: "single".into(), key: "key".into(), op_id: op.into(), deadline,
+            ack: 1, expected: None, bytes: op.as_bytes().to_vec(), remove: false,
+        });
+        assert_eq!(outcome.code, 0);
+        assert_eq!(settled_chunk_index(&store), ordinary);
+    }
+
+    let publish = |id, changes| {
+        let request = store.capture_namespace_funded("ledger", 128 * 1024).unwrap()
+            .prepare(id, AtomicAck::Os, changes).unwrap();
+        store.publish_atomic(&request, deadline).unwrap()
+    };
+    let old = charge("ledger", "old");
+    let new = charge("ledger", "new");
+    let first = publish("create-old", vec![FinalChange::put("old", vec![1])]);
+    assert_eq!(settled_chunk_index(&store), ordinary + 2 * old);
+    let second = publish("add-new", vec![FinalChange::put("old", vec![2]), FinalChange::put("new", vec![3])]);
+    assert_eq!(second.version, first.version + 1);
+    assert_eq!(settled_chunk_index(&store), ordinary + 2 * (old + new));
+    let third = publish("rollover", vec![FinalChange::put("old", vec![4; 4096]), FinalChange::put("new", vec![5])]);
+    assert_eq!(third.version, second.version + 2);
+    assert_eq!(settled_chunk_index(&store), ordinary + 4 * (old + new));
+    assert_eq!(store.health2().chunks_closed, 1);
+    drop(store);
+
+    let reopened = Store::open(&path, config).unwrap();
+    // Replay recounts holders once per key and keeps both chunk-key entries.
+    assert_eq!(settled_chunk_index(&reopened), ordinary + 3 * (old + new));
+    for (key, revision, bytes) in [("old", third.version, vec![4; 4096]), ("new", third.version + 1, vec![5])] {
+        let value = reopened.try_get("ledger", key).unwrap().unwrap();
+        assert_eq!((value.version, value.bytes), (revision, bytes));
+    }
+}
+
+#[test]
+fn failed_writes_return_unused_chunk_reservations() {
+    use crate::atomic::{AtomicAck, FinalChange, PublicationError};
+
+    let index = 2 * store::index_charge(&("ledger".into(), "new".into()));
+    for atomic in [false, true] {
+        for registered in [false, true] {
+            let store = Store::open(
+                &fixture_path("chunk-charge-failure"),
+                Config {
+                    capacity: 2 * 1024 * 1024,
+                    cache_bytes: 0,
+                    signal_bytes: 0,
+                    fail_partial_append: !registered,
+                    fail_sync: registered,
+                    clock: Some(ManualClock::new(1_000_000)),
+                    ..Config::default()
+                },
+            ).unwrap();
+            let deadline = 2_000_000;
+            if atomic {
+                let request = store.capture_namespace_funded("ledger", 128 * 1024).unwrap()
+                    .prepare("failed", AtomicAck::Flush, vec![FinalChange::put("new", vec![1])]).unwrap();
+                assert_eq!(store.publish_atomic(&request, deadline), Err(PublicationError::Uncertain));
+            } else {
+                let result = store.mutate(Mutation {
+                    ns: "ledger".into(), key: "new".into(), op_id: "failed".into(), deadline,
+                    ack: 2, expected: None, bytes: vec![1], remove: false,
+                });
+                assert_eq!(result.code, 16);
+            }
+            let expected = if registered { index } else { 0 };
+            assert_eq!(settled_chunk_index(&store), expected);
+            let health = store.health2();
+            assert_eq!(health.memory_bytes, store.config.memory_margin() + expected
+                + store::dedup_charge(&("ledger".into(), "failed".into())));
+            assert!(health.read_only);
+            assert!(!store.pending("ledger", "new"));
+            assert!(store.try_get("ledger", "new").unwrap().is_none());
+        }
+    }
+}

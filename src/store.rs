@@ -185,7 +185,7 @@ impl Store {
     pub(super) fn cache_limit(&self, state: &State) -> usize {
         self.config.capacity.saturating_sub(state.committed_bytes + state.dedup_bytes + state.memory_reserved
             + self.scan_usage.bytes.load(Ordering::Acquire) + self.read_cohort_bytes() + self.config.memory_margin()
-            + self.chunks.lock().unwrap().index_bytes + self.signals.memory_bytes())
+            + self.chunks.lock().unwrap().managed_index_bytes() + self.signals.memory_bytes())
     }
     pub(super) fn trim_cache(&self, state: &State) {
         self.cache.trim(self.cache_limit(state));
@@ -303,7 +303,7 @@ impl Store {
             ..Health2::default()
         };
         h.memory_bytes = h.cache.bytes + state.committed_bytes + state.dedup_bytes + state.memory_reserved
-            + self.scan_usage.bytes.load(Ordering::Acquire) + self.read_cohort_bytes() + c.memory_margin() + cs.index_bytes
+            + self.scan_usage.bytes.load(Ordering::Acquire) + self.read_cohort_bytes() + c.memory_margin() + cs.managed_index_bytes()
             + self.signals.memory_bytes();
         let mut namespaces: Vec<(String, usize)> = state
             .namespace_counts
@@ -614,6 +614,7 @@ impl Store {
         // values still consume queue slots and framing/identifier memory.
         let queue_charge = representation_bytes + m.bytes.len() + 128;
         let memory_charge = 2 * queue_charge + 2 * index_charge(&k) + 512;
+        let chunk_index_bytes = chunks::chunk_index_charge(&k);
         let mut state = self.state.lock().unwrap();
         let mono = self.clock.mono_ms();
         if let Some(d) = state.dedup.get(&id).filter(|_| deduplicate) {
@@ -702,7 +703,7 @@ impl Store {
         }
         let admission_bytes = memory_charge
             + if new { index_charge(&k) } else { 0 }
-            + index_charge(&k) * 2
+            + chunk_index_bytes
             + if deduplicate { dedup_charge(&id) } else { 0 };
         if admission_bytes > self.cache_limit(&state) {
             return Outcome::error(7);
@@ -778,6 +779,8 @@ impl Store {
             );
             self.done.notify_all();
         }
+        let chunk_index = (m.ack != 0)
+            .then(|| chunks::ChunkIndexReservation::reserve(&self.chunks, chunk_index_bytes));
         self.trim_cache(&state);
         drop(state);
         let result = if m.ack == 0 {
@@ -797,6 +800,7 @@ impl Store {
                 .send(Append {
                     record,
                     ack: m.ack,
+                    chunk_index: chunk_index.clone(),
                     done,
                 }) {
                 Ok(()) => completion
@@ -837,6 +841,7 @@ impl Store {
         let mut state = self.state.lock().unwrap();
         state.reserved_bytes -= queue_charge;
         state.memory_reserved -= memory_charge;
+        drop(chunk_index);
         state.stripe_reserved[log_index] -= queue_charge;
         state.stripe_items[log_index] -= 1;
         state.pending_disk -= disk_bytes;

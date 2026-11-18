@@ -149,8 +149,8 @@ impl Store {
             return Err(22);
         }
         let state = self.state.lock().unwrap();
-        // Atomic captures reserve under State without taking scans. Prechecks
-        // cannot authorize a reservation after waiting for that owner.
+        // Ordinary and atomic captures take scans before State. A snapshot
+        // workspace can grow under State alone, so recheck after acquiring it.
         if self.scan_usage.count.load(Ordering::Acquire) >= self.config.snapshot_max
             || self.scan_usage.bytes.load(Ordering::Acquire).checked_add(charge)
                 .is_none_or(|total| total > self.config.snapshot_bytes)

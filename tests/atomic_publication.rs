@@ -159,14 +159,17 @@ fn quota_disk_queue_index_retry_and_memory_refuse_before_any_effect() {
         let p = root(label);
         let s = Store::open(&p, c).unwrap();
         let before = s.io_metrics();
-        let r = request(
-            &s,
-            "oversize",
-            vec![
-                FinalChange::put("a", vec![1; 8192]),
-                FinalChange::put("b", vec![2; 8192]),
-            ],
-        );
+        // Fit capture and the original in the 32 KiB memory case so it reaches publication.
+        let r = s.capture_namespace_funded("authored", 24 * 1024).unwrap()
+            .prepare(
+                "oversize",
+                AtomicAck::Flush,
+                vec![
+                    FinalChange::put("a", vec![1; 8192]),
+                    FinalChange::put("b", vec![2; 8192]),
+                ],
+            )
+            .unwrap();
         assert!(
             matches!(publish(&s, &r), Err(PublicationError::Resource(_))),
             "{label}"

@@ -144,10 +144,13 @@ bytes alongside read latency.
 Snapshots seek their namespace in the ordered latest-key index and capture keys
 and immutable record locations under the existing full-payload reservation.
 Opening a view, reading keys and refusing an oversized page load no payloads.
-Selected values load through the revision cache and are pinned once per view;
-repeated pages reuse those Arcs, including with caching disabled or after a key
-changes. A per-row gate coordinates first loads without retaining errors. A
-selected load failure returns error 16 and raises `storage_error`.
+Singleton records load through the revision cache. Envelope rows share their
+interpreted frame through the snapshot's workspace, which is charged against
+the snapshot byte limit and the managed-memory budget. Loaded rows are pinned
+once per view and reused on later pages, including with caching disabled or
+after a key changes. A per-row gate coordinates first loads without retaining
+errors. Workspace capacity refusal returns 22 and leaves `storage_error`
+unchanged. Integrity or I/O failures return 16 and set `storage_error`.
 
 Capturing another view releases the registry mutex before waiting on the index,
 so admitted views can still page or release. Reservation limits are rechecked
