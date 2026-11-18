@@ -263,6 +263,40 @@ fn scans_disabled_refuses_before_header_and_retains_no_charge() {
         0
     );
 }
+
+#[test]
+fn subscription_and_timer_offers_advertise_scans_independently() {
+    for (label, subscriptions, timers) in [
+        ("subscription-scans", true, false),
+        ("timer-scans", false, true),
+    ] {
+        let (peer, root) = peer_fixture(label, 128, Fault::None);
+        let (store, trace) = (peer.store.clone(), peer.trace.clone());
+        let mut options = Options::new("scan-discovery-control", 4096);
+        assert!(!options.scans);
+        options.subscriptions = subscriptions;
+        let mut client = Client::handshake_with_features(
+            peer,
+            options,
+            crate::client::AdditionalFeatures { timers },
+            deadline().local,
+        )
+        .unwrap();
+        assert!(client.negotiated().scans);
+        assert_eq!(client.negotiated().subscriptions, subscriptions);
+        assert_eq!(client.feature_limits().timers.is_some(), timers);
+        let view = client
+            .capture_atomic_namespace_bounded("authored", "read", limits(), deadline())
+            .unwrap();
+        assert_eq!(view.rows().len(), 300);
+        assert_eq!(
+            trace.lock().unwrap().requests.last().unwrap()[8],
+            crate::SNAPSHOT_RELEASE
+        );
+        assert_eq!(store.scan_usage.bytes.load(Ordering::Acquire), 0);
+        save(&trace, &root, &store);
+    }
+}
 #[test]
 fn enabled_pages_retain_exact_token_epoch_horizon_values_and_release() {
     for page_limit in [1, 2, crate::MAX_BATCH as u16] {

@@ -100,6 +100,9 @@ impl<T: Transport> Client<T> {
         if n + 13 > self.negotiated().max_frame {
             return Err(Error::Invalid("atomic frame limit"));
         }
+        if !r.fits_value_limit(self.negotiated().max_value) {
+            return Err(Error::Invalid("value limit"));
+        }
         let mut p = self.prefix(r.operation_id(), r.namespace(), d)?;
         crate::lp(&mut p, &r.to_bytes());
         let id = self.begin_exchange(p.len(), d.local)?;

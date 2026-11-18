@@ -3,7 +3,7 @@
 This binding uses the existing Client transport once per call. It never reconnects
 or retries a mutation. Only a complete validated population can prepare an original.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum
 import hashlib
 import os
@@ -158,6 +158,7 @@ class Original:
     operation_id: str
     epoch: int
     ack: Ack
+    _max_put_bytes: int = field(repr=False, compare=False)
 
     @classmethod
     def from_bytes(cls, raw):
@@ -196,6 +197,7 @@ class Original:
         if not 1 <= n <= max_changes:
             raise Invalid('final count')
         keys = set()
+        max_put_bytes = 0
         for _ in range(n):
             key = r.text()
             remove, = r.unpack('<B')
@@ -203,9 +205,11 @@ class Original:
             if key in keys or remove not in (0, 1) or remove and value:
                 raise Invalid('final set')
             keys.add(key)
+            max_put_bytes = max(max_put_bytes, len(value))
         r.end()
         obj = object.__new__(cls)
-        for k, v in dict(raw=raw, namespace=ns, operation_id=op, epoch=epoch, ack=ack).items():
+        for k, v in dict(raw=raw, namespace=ns, operation_id=op, epoch=epoch, ack=ack,
+                         _max_put_bytes=max_put_bytes).items():
             object.__setattr__(obj, k, v)
         return obj
 
@@ -229,12 +233,14 @@ def _reply(raw):
     raise Refused(names[status], code)
 
 
-def _request_payload(client, ns, op, suffix, deadline):
+def _request_payload(client, ns, op, suffix, deadline, *, publication=False):
     _identifier(ns)
     _identifier(op)
     if type(deadline) is not int or not 0 < deadline < 2**64:
         raise Invalid('explicit Unix millisecond deadline required')
     if client.channel is None:
+        if publication:
+            raise Refused('Unavailable')
         raise Invalid('explicit connected client required')
     if int(time.time()*1000) >= deadline:
         raise Refused('Expired')
@@ -244,8 +250,22 @@ def _request_payload(client, ns, op, suffix, deadline):
     return struct.pack('<Q', deadline)+lp(op)+lp(ns)+suffix
 
 
-def _exchange(client, opcode, ns, op, suffix, deadline):
-    return client.exchange(opcode, _request_payload(client, ns, op, suffix, deadline), deadline)
+def _capture_exchange(client, opcode, payload, deadline):
+    try:
+        return client.exchange(opcode, payload, deadline)
+    except Refusal:
+        # An associated outer refusal leaves the stream synchronized.
+        raise
+    except BaseException:
+        client.close()
+        raise
+
+
+def _negotiated_max_value(client):
+    max_value = getattr(client, 'max_value', None)
+    if type(max_value) is not int or not 1 <= max_value <= MAX_VALUE:
+        raise Invalid('invalid negotiated value limit')
+    return max_value
 
 
 def capture(client, namespace, limits, read_id, deadline):
@@ -263,8 +283,9 @@ def capture(client, namespace, limits, read_id, deadline):
     page_limit = getattr(client, 'max_batch', None)
     if type(page_limit) is not int or not 1 <= page_limit <= MAX_BATCH:
         raise Invalid('invalid scan page limit')
+    max_value = _negotiated_max_value(client)
     try:
-        raw = _reply(client.exchange(30, payload, deadline))
+        raw = _reply(_capture_exchange(client, 30, payload, deadline))
         r = _Reader(raw)
         if r.take(4) != b'MAS2' or r.text() != namespace:
             raise Invalid('capture identity')
@@ -291,7 +312,8 @@ def capture(client, namespace, limits, read_id, deadline):
             # Canonical scan operation on the exact retained token. Direct exchange
             # prevents legacy call() reconnect/retry behavior in this binding.
             suffix = lp(token)+lp(cursor)+struct.pack('<HI', page_limit, client.max_frame)+lp(b'')
-            page = _Reader(_exchange(client, 11, namespace, read_id, suffix, deadline))
+            payload = _request_payload(client, namespace, read_id, suffix, deadline)
+            page = _Reader(_capture_exchange(client, 11, payload, deadline))
             returned, next_cursor = page.blob(16), page.blob(2096)
             done, n = page.unpack('<BH')
             if (returned != token or done not in (0, 1) or bool(done) == bool(next_cursor)
@@ -300,7 +322,7 @@ def capture(client, namespace, limits, read_id, deadline):
             for _ in range(n):
                 key = page.text()
                 present, version, ack = page.unpack('<BQB')
-                value = page.blob(MAX_VALUE)
+                value = page.blob(max_value)
                 if present != 1 or not version or ack not in (1, 2) or rows and rows[-1].key.encode() >= key.encode():
                     raise Invalid('atomic row/order')
                 charged += 2*len(key.encode())+640+2*len(value)
@@ -324,16 +346,17 @@ def capture(client, namespace, limits, read_id, deadline):
         primary = e
         raise
     finally:
-        try:
-            cleanup = int(time.time()*1000)+1000
-            if _exchange(client, 13, namespace, read_id, lp(token), cleanup):
-                raise Invalid('release tail')
-        except BaseException as e:
-            if primary is None:
-                if isinstance(e, Invalid):
+        if client.channel is not None:
+            try:
+                cleanup = int(time.time()*1000)+1000
+                payload = _request_payload(client, namespace, read_id, lp(token), cleanup)
+                if _capture_exchange(client, 13, payload, cleanup):
                     client.close()
-                raise
-            primary.add_note(f'capture release failed: {e}')
+                    raise Invalid('release tail')
+            except BaseException as e:
+                if primary is None:
+                    raise
+                primary.add_note(f'capture release failed: {e}')
         if isinstance(primary, Invalid):
             client.close()
 
@@ -341,9 +364,17 @@ def capture(client, namespace, limits, read_id, deadline):
 class Publication:
     """Original and endpoint custody. Every uncertainty is retained after refusals/success."""
     def __init__(self, client, original):
-        self.original = original
-        self.endpoint = (client.transport, client.address)
+        self._original = original
+        self._endpoint = (client.transport, client.address)
         self.uncertainties = []
+
+    @property
+    def original(self):
+        return self._original
+
+    @property
+    def endpoint(self):
+        return self._endpoint
 
     def persist_new(self, path):
         path = Path(path)
@@ -405,17 +436,12 @@ class Publication:
             raise Invalid('original endpoint mismatch')
         o = self.original
         # Perform all local admission before entering the possibly-sent region.
-        suffix = lp(o.raw)
-        _identifier(o.namespace)
-        _identifier(o.operation_id)
-        if type(deadline) is not int or not 0 < deadline < 2**64:
-            raise Invalid('explicit Unix millisecond deadline required')
-        if client.channel is None or int(time.time()*1000) >= deadline:
-            raise Refused('Unavailable' if client.channel is None else 'Expired')
-        if 29+len(o.namespace.encode())+len(o.operation_id.encode())+len(suffix) > client.max_frame:
+        payload = _request_payload(client, o.namespace, o.operation_id, lp(o.raw), deadline,
+                                   publication=True)
+        if o._max_put_bytes > _negotiated_max_value(client):
             raise Refused('Resource', 4)
         try:
-            raw = _reply(_exchange(client, 29, o.namespace, o.operation_id, suffix, deadline))
+            raw = _reply(client.exchange(29, payload, deadline))
             r = _Reader(raw)
             version, ack = r.unpack('<QB')
             r.end()

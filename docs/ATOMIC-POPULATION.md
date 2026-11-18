@@ -22,13 +22,13 @@ original.persist_new(independent_new_custody_path)?;
 let receipt = client.publish_atomic(&original, deadline)?;
 ```
 
-The Rust remote method requires `Options.scans = true` during the existing
-handshake. A client without negotiated scans receives
-`Error::Invalid("scans unavailable")` locally, before opcode 30 opens or charges
-a server snapshot.
-`Options::new` keeps its scans-disabled default. This prerequisite applies to
-the paged bounded method; the legacy unpaged atomic capture keeps its existing
-contract. The in-process Store method needs no client negotiation.
+The bounded method requires the scan refusal vocabulary (20, 21 and 22) in
+HELLO. Set `Options.scans = true` to request that vocabulary on a scans-only
+connection. Existing subscription and timer offers also advertise it when
+supported. Those extensions retain their own discovery and controls. A baseline
+19-code connection refuses the bounded call locally with
+`Error::Invalid("scans unavailable")`. The unpaged opcode 28 and native Store
+capture keep their existing admission contracts.
 
 Those numerical limits are an authored qualification profile, not established
 live workload requirements or guaranteed resource admission. The in-process
@@ -54,7 +54,9 @@ individual publication units. No complete view is reconstructed from current GET
 
 Both clients attempt same-token release after an associated page reply fails
 payload validation. A transport or frame-association failure can prevent release.
-The provider keeps its original fixed expiry in that case.
+The channel is discarded and the provider keeps its original fixed expiry.
+Pages use the read deadline and the negotiated page and per-value limits.
+Release uses a fresh one-second budget when the stream remains associated.
 
 The capture charge on this implementation is:
 
@@ -110,9 +112,10 @@ Wire opcode 30 opens this bounded capture; `MAS2` carries its header. Publicatio
 uses existing opcode 29 with MAR2. Old servers refuse unsupported capture or the
 unknown original encoding. Existing HELLO fields, negotiated refusal vocabulary,
 wire defaults, MAV1/MAR1 and the legacy 128-member per-item BATCH are unchanged.
-Default unpaged capture retains its 4,096-row limit and MAR1 retains its
-128-change limit. Main's funded library capture can prepare a larger enumerable
-MAR1 guard within its original-byte and resource bounds. The public MAR1
+Unpaged capture and opcode 29 MAR1 retain the 4,096-row enumerable limit.
+MAR1 retains its 128-change limit. Main's funded library capture and native
+publisher support larger enumerable MAR1 originals within their byte and
+resource bounds. The public MAR1
 borrowed projection continues to require an enumerable original. Owned
 decoding and the provider's envelope decoder accept the compact MAR2 guard.
 

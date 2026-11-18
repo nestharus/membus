@@ -67,6 +67,11 @@ not claim Rust's monotonic whole-call transport behavior. Cleanup uses a fresh
 bounded read deadline, preserves the primary capture error and reports any
 cleanup failure. Expiry releases server custody through the existing registry;
 it is never converted into a partial complete view.
+Capture uses the connection's per-value limit before accepting any page row.
+After transport loss or a reply association failure the binding closes the
+channel. An ordinary call requires a fresh stream, and the authentic server
+token keeps its original expiry. A publication that exceeds the connected
+value limit is refused locally and keeps the same original and uncertainty.
 
 This source does not bind stopped-store recovery, issue grants, integrate an
 application adapter, acquire an old dataset, change retention, or prove safe live

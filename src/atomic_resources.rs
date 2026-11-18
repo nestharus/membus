@@ -164,6 +164,12 @@ impl<'a> BorrowedOriginal<'a> {
         Self::from_canonical_bytes(bytes)
     }
     pub(crate) fn from_canonical_bytes(bytes: &'a [u8]) -> Result<Self, PublicationError> {
+        Self::decode(bytes, usize::MAX)
+    }
+    fn from_wire_bytes(bytes: &'a [u8]) -> Result<Self, PublicationError> {
+        Self::decode(bytes, MAX_POPULATION)
+    }
+    fn decode(bytes: &'a [u8], enumerable_max: usize) -> Result<Self, PublicationError> {
         let wide = match bytes.get(..4) {
             Some(b"MAR1") => false,
             Some(b"MAR2") => true,
@@ -176,7 +182,7 @@ impl<'a> BorrowedOriginal<'a> {
         {
             return Err(PublicationError::Invalid);
         }
-        fn parse(bytes: &[u8], wide: bool) -> Result<BorrowedOriginal<'_>, u16> {
+        fn parse(bytes: &[u8], wide: bool, enumerable_max: usize) -> Result<BorrowedOriginal<'_>, u16> {
             let mut c = Cursor::new(&bytes[4..]);
             let namespace = c.bound_ref()?;
             let operation_id = c.bound_ref()?;
@@ -201,7 +207,7 @@ impl<'a> BorrowedOriginal<'a> {
             };
             let population_count = if wide { 0 } else { c.u32()? as usize };
             // Every nonempty key/revision requires at least 13 literal bytes.
-            if population_count > c.remainder().len() / 13 {
+            if population_count > enumerable_max || population_count > c.remainder().len() / 13 {
                 return Err(3);
             }
             let population = c.remainder();
@@ -241,7 +247,7 @@ impl<'a> BorrowedOriginal<'a> {
                 change_count,
             })
         }
-        let parsed = parse(bytes, wide).map_err(|_| PublicationError::Invalid)?;
+        let parsed = parse(bytes, wide, enumerable_max).map_err(|_| PublicationError::Invalid)?;
         valid_namespace(parsed.namespace)?;
         Ok(parsed)
     }

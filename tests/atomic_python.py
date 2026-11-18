@@ -18,6 +18,7 @@ class Fake:
     def __init__(self, replies):
         self.transport, self.address, self.epoch, self.max_frame = 'pipe', 'authored-pipe', 42, MAX_FRAME
         self.codes, self.max_batch = CODES, MAX_BATCH
+        self.max_value = MAX_VALUE
         self.channel, self.replies, self.calls = object(), list(replies), []
     def close(self):
         self.channel=None
@@ -57,8 +58,8 @@ class WirePeer:
         return chunk
 
 
-def hello(page_limit, last_code=25):
-    payload = struct.pack('<QIIHBQH', 42, MAX_FRAME, MAX_VALUE, page_limit, 0, 86400000, last_code)
+def hello(page_limit, last_code=25, *, max_value=MAX_VALUE):
+    payload = struct.pack('<QIIHBQH', 42, MAX_FRAME, max_value, page_limit, 0, 86400000, last_code)
     for code in range(1, last_code + 1):
         name, transient = CODES[code]
         payload += struct.pack('<HB', code, transient) + lp(name)
@@ -204,6 +205,45 @@ class Controls(unittest.TestCase):
         self.assertEqual(p.publish(successor,deadline_ms(5))['version'],9)
         self.assertEqual(p.original.raw,o.raw);self.assertEqual(len(p.uncertainties),1)
 
+    def test_value_preflight_keeps_exact_uncertain_original_on_successor(self):
+        initial, view_ = view()
+        original = view_.prepare('value-original', Ack.FLUSH, [
+            Change('remove', None), Change('replace', b'1234567'), Change('insert', b'1234')])
+        publication = Publication(initial, original)
+        initial.replies = [TimeoutError('after send')]
+        with self.assertRaises(Uncertain) as error:
+            publication.publish(initial, deadline_ms(5))
+        self.assertIs(error.exception.original, original)
+        with self.assertRaises(AttributeError):
+            publication.original = view_.prepare('changed', Ack.OS, [Change('replace', b'x')])
+        narrow_peer = WirePeer([hello(1, max_value=3)])
+        narrow = narrow_peer.connect()
+        with self.assertRaisesRegex(Refused, 'Resource') as error:
+            publication.publish(narrow, deadline_ms(5))
+        self.assertEqual(error.exception.resource, 4)
+        self.assertEqual([op for op, _ in narrow_peer.calls], [1])
+        self.assertEqual(len(publication.uncertainties), 1)
+        wide = Fake([b'MAW1\0' + struct.pack('<QB', 31, 2)])
+        receipt = publication.publish(wide, deadline_ms(5))
+        self.assertEqual(receipt, dict(version=31, ack=Ack.FLUSH, epoch=42))
+        self.assertTrue(wide.calls[0][1].endswith(lp(original.raw)))
+        self.assertEqual(len(publication.uncertainties), 1)
+
+    def test_capture_transport_failure_closes_but_associated_refusal_does_not(self):
+        for failure in (TimeoutError('capture timed out'), ConnectionError('partial capture reply')):
+            client = Fake([failure])
+            with self.assertRaises(type(failure)) as caught:
+                capture(client, 'authored', LIMITS, 'read', deadline_ms(5))
+            self.assertIs(caught.exception, failure)
+            self.assertIsNone(client.channel)
+            self.assertEqual([op for op, _ in client.calls], [30])
+        peer = WirePeer([hello(1), Refusal(5), b'\0'])
+        client = peer.connect()
+        with self.assertRaises(Refusal):
+            capture(client, 'authored', LIMITS, 'read', deadline_ms(5))
+        self.assertIsNone(client.get('authored', 'ordinary'))
+        self.assertEqual([op for op, _ in peer.calls], [1, 30, 2])
+
     def test_wrong_ack_unknown_status_and_malformed_success_are_uncertain(self):
         for reply in (b'MAW1\0'+struct.pack('<QB',1,1),b'MAW1\xff',b'MAW1\0',b'MAW1\0'+struct.pack('<QB',0,2)):
             c,v=view();p=Publication(c,v.prepare('x',Ack.FLUSH,[Change('a',b'A')]))
@@ -270,13 +310,20 @@ def native(pipe,root):
     else:raise AssertionError('lost native reply was not uncertain')
     assert p.uncertainties
     c=connect(1)
+    assert c.max_value == 3
+    try:p.publish(c,deadline_ms(20))
+    except Refused as e:assert (e.status,e.resource)==('Resource',4)
+    else:raise AssertionError('narrow successor sent the uncertain original')
+    assert len(p.uncertainties)==1 and c.channel is not None
+    c.close()
+    c=connect(2)
     known=p.publish(c,deadline_ms(20));assert known['ack']==Ack.FLUSH
     complete=capture(c,'authored',LIMITS,'capture-1',deadline_ms(20));assert len(complete.rows)==3068
     assert dict((r.key,r.value) for r in complete.rows)['sequence']==struct.pack('<Q',3065)
     assert dict((r.key,r.value) for r in complete.rows)['row/0000000000001533']==b'x'*59499
     p2=Publication(c,complete.prepare('after',Ack.OS,[Change('rust',b'newer')]))
     p2.publish(c,deadline_ms(20));c.close()
-    c=connect(2)
+    c=connect(3)
     q=Publication.restore(c,root/'original.custody');replayed=q.publish(c,deadline_ms(20))
     assert replayed['version']==known['version'] and q.uncertainties
     assert c.get('authored','rust',op_id='read-newer',deadline=deadline_ms(10))['value']==b'newer'
@@ -293,19 +340,58 @@ def native_matrix(pipe, root, limit, mode):
     try:
         assert client.max_batch == limit
         view = capture(client, 'authored', LIMITS, 'native-matrix-read', deadline_ms(20))
-        assert mode == 'complete'
+        assert mode in ('complete', 'value-publish')
         assert [(row.key, row.value, row.ack) for row in view.rows] == [
-            (f'key-{n:03}', f'{root.name}:{n}'.encode(), Ack.FLUSH)
+            (f'key-{n:03}', bytes((n, 19, 0)) if mode == 'value-publish'
+             else f'{root.name}:{n}'.encode(), Ack.FLUSH)
             for n in range(129)
         ]
-        original = view.prepare('native-matrix-original', Ack.FLUSH, [Change('settled', root.name.encode())])
+        if mode == 'value-publish':
+            assert client.max_value == 3
+            rejected = Publication(client, view.prepare('value-too-large', Ack.FLUSH, [
+                Change('key-000', b'1234567'), Change('key-001', None), Change('new', b'1234')]))
+            try:
+                rejected.publish(client, deadline_ms(10))
+            except Refused as error:
+                assert (error.status, error.resource) == ('Resource', 4)
+                assert rejected.uncertainties == [] and client.channel is not None
+            else:
+                raise AssertionError('oversized publication reached the provider')
+            changes = [Change('settled', b'A\0B'), Change('key-002', None)]
+        else:
+            changes = [Change('settled', root.name.encode())]
+        original = view.prepare('native-matrix-original', Ack.FLUSH, changes)
         publication = Publication(client, original)
         publication.persist_new(root/'matrix.custody')
         assert publication.publish(client, deadline_ms(10))['ack'] == Ack.FLUSH
     except Invalid as error:
-        assert mode == 'over-count' and str(error) == 'incomplete atomic page'
+        assert (mode == 'over-count' and str(error) == 'incomplete atomic page'
+                or mode == 'value-read' and str(error) == 'encoded bound')
+        assert client.channel is None
     except Refusal as error:
         assert mode == 'release-refused' and error.code == 20
+    finally:
+        client.close()
+
+
+def native_stalled_header(pipe, root):
+    root = Path(root)
+    client = Client(pipe, transport='pipe', timeout=10)
+    try:
+        try:
+            capture(client, 'authored', LIMITS, 'stalled-header', deadline_ms(.25))
+        except TimeoutError:
+            assert client.channel is None
+            (root/'client-timed-out').write_bytes(b'channel closed')
+        else:
+            raise AssertionError('stalled header did not time out')
+        until = time.monotonic() + 12
+        while not (root/'fresh-listener').is_file():
+            assert time.monotonic() < until
+            time.sleep(.01)
+        result = client.get('authored', 'current', op_id='fresh-read', deadline=deadline_ms(5),
+                            retry_transport=False)
+        assert result['value'] == root.name.encode() and result['ack'] == Ack.OS
     finally:
         client.close()
 
@@ -313,4 +399,5 @@ def native_matrix(pipe, root, limit, mode):
 if __name__=='__main__':
     if len(sys.argv)>1 and sys.argv[1]=='--native':native(*sys.argv[2:])
     elif len(sys.argv)>1 and sys.argv[1]=='--native-matrix':native_matrix(*sys.argv[2:])
+    elif len(sys.argv)>1 and sys.argv[1]=='--native-stalled-header':native_stalled_header(*sys.argv[2:])
     else:unittest.main()

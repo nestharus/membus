@@ -46,6 +46,9 @@ atomic envelope. No second transaction encoding or original-attempt renewal exis
 Request MAR1 remains bounded by MAX_FRAME/3; the complete frame must fit the
 negotiated bound. Native resident ingress reservations and whole provider atomic
 admission still apply. Read/capture identifiers do not become publication identities.
+Opcode 29 accepts at most 4,096 enumerable MAR1 guard rows. Native funded MAR1
+originals and the separately bounded MAR2 format keep their own limits.
+Both bindings check the negotiated per-value bound before sending a publication.
 The provider associates and validates the original before reserving shared
 managed memory for the owning decode. Retained results remain available even
 when the provider cannot fund a new original.
@@ -67,6 +70,8 @@ There is no partial-population success, pagination or refresh of the original
 view horizon. The decoder validates the complete population and tail before
 allocating owning row values. Empty complete population is valid only for this
 explicitly selected namespace; it proves no historical handover.
+The provider funds its materialized capture, peak cold read workspace and one
+encoded reply. Publication preparation backing belongs to the client.
 
 Publication success is u64 nonzero first version and u8 exact requested Ack.
 The complete final set is still one original request, one durable envelope and
@@ -90,6 +95,9 @@ malformed/unknown replies, uncertainty codes and RestartUncertain become
 Reconnect explicitly and submit only those same retained original bytes. Original
 provider epoch and fixed horizon stay unchanged; a new connection cannot extend
 or reconstruct them. Read/capture protocol failures return no view.
+If a successor advertises a lower frame or value limit, local refusal leaves
+the original and any prior uncertainty intact. Reconciliation still requires
+the exact original on a connection that can admit it.
 
 The server checks retained original outcomes before a new deadline/view/epoch.
 Thus an exact duplicate after restart can reconcile a retained success, while

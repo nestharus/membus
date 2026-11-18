@@ -1,6 +1,7 @@
 //! Authored provider-bound transports; every selected Store is retained explicitly.
 use membus::{
     atomic::{AtomicAck, AtomicRequest, FinalChange, PublicationError},
+    atomic_population::PopulationLimits,
     client::*,
     Config, Store,
 };
@@ -295,6 +296,148 @@ fn finite_hint_offer_receives_no_affirmative_contract() {
     assert_eq!(&renew[17..], b"\0\0MAW1\x05");
     let cancel = s.dispatch(&membus::frame(30, 4, &finite_receipt)[4..]);
     assert_eq!(&cancel[17..], &3u16.to_le_bytes());
+}
+
+#[test]
+fn legacy_mar1_wire_limit_preserves_native_funded_population() {
+    let fixture = root("mar1-wire-limit");
+    let clock = membus::ManualClock::new(membus::now_ms());
+    clock.advance(1);
+    let s = Store::open(
+        &fixture,
+        Config {
+            clock: Some(clock),
+            ..config()
+        },
+    )
+    .unwrap();
+    let limits = PopulationLimits {
+        max_keys: 4097,
+        max_capture_bytes: 48 * 1024 * 1024,
+        max_changes: 4096,
+        max_original_bytes: (membus::MAX_FRAME / 3) as u32,
+    };
+    let seed = s
+        .capture_namespace_bounded("authored", limits)
+        .unwrap()
+        .prepare(
+            "seed",
+            AtomicAck::Flush,
+            (0..4096)
+                .map(|n| FinalChange::put(&format!("key-{n:04}"), vec![1]))
+                .collect(),
+        )
+        .unwrap();
+    s.publish_atomic(&seed, d().unix_ms).unwrap();
+    let first = s
+        .capture_namespace_funded("authored", 2 * 1024 * 1024)
+        .unwrap();
+    let first = first
+        .prepare(
+            "wire-4096",
+            AtomicAck::Flush,
+            vec![FinalChange::put("key-4096", vec![1])],
+        )
+        .unwrap();
+    let make_frame = |r: &AtomicRequest| {
+        let mut p = d().unix_ms.to_le_bytes().to_vec();
+        membus::lp(&mut p, r.operation_id().as_bytes());
+        membus::lp(&mut p, r.namespace().as_bytes());
+        membus::lp(&mut p, &r.to_bytes());
+        membus::frame(29, 1, &p)
+    };
+    let wire = make_frame(&first);
+    let reply = s.dispatch(&wire[4..]);
+    assert_eq!(&reply[17..24], b"\0\0MAW1\0");
+    assert_eq!(u64::from_le_bytes(reply[24..32].try_into().unwrap()), 4097);
+    assert_eq!(reply[32..], [2]);
+    std::fs::write(fixture.join("mar1-4096.bin"), first.to_bytes()).unwrap();
+    std::fs::write(fixture.join("request-4096.bin"), wire).unwrap();
+    std::fs::write(fixture.join("reply-4096.bin"), reply).unwrap();
+
+    let view = s
+        .capture_namespace_funded("authored", 2 * 1024 * 1024)
+        .unwrap();
+    assert_eq!(view.rows().len(), 4097);
+    let original = view
+        .prepare(
+            "native-4097",
+            AtomicAck::Flush,
+            vec![FinalChange::put("marker", vec![2])],
+        )
+        .unwrap();
+    let raw = original.to_bytes();
+    assert_eq!(
+        membus::atomic::BorrowedOriginal::from_bytes(&raw)
+            .unwrap()
+            .population()
+            .count(),
+        4097
+    );
+    assert_eq!(AtomicRequest::from_bytes(&raw).unwrap().to_bytes(), raw);
+    let wire = make_frame(&original);
+    let before = s.io_metrics();
+    let reply = s.dispatch(&wire[4..]);
+    assert_eq!(&reply[17..], b"\0\0MAW1\x05");
+    assert_eq!(s.io_metrics(), before);
+    assert!(s.get("authored", "marker").is_none());
+    let outcome = s.publish_atomic(&original, d().unix_ms).unwrap();
+    assert_eq!((outcome.version, outcome.ack), (4098, 2));
+    assert_eq!(s.io_metrics().0 - before.0, (raw.len() + 40) as u64);
+    assert_eq!(s.io_metrics().2 - before.2, 1);
+    std::fs::write(fixture.join("mar1-4097.bin"), raw).unwrap();
+    std::fs::write(fixture.join("request-4097.bin"), wire).unwrap();
+    std::fs::write(fixture.join("reply-4097.bin"), reply).unwrap();
+}
+
+#[test]
+fn legacy_capture_funds_small_reply_and_obeys_shared_snapshot_limits() {
+    let request = |ns: &[u8]| {
+        let mut p = d().unix_ms.to_le_bytes().to_vec();
+        membus::lp(&mut p, b"capture");
+        membus::lp(&mut p, ns);
+        membus::frame(28, 2, &p)
+    };
+    let wire = request(b"empty");
+    let fixture = root("legacy-capture-budget");
+    std::fs::write(fixture.join("request-empty.bin"), &wire).unwrap();
+    for (label, bytes, success) in [
+        ("incumbent", 1024 * 1024, true),
+        ("exact", 1086, true),
+        ("short", 1085, false),
+    ] {
+        let s = Store::open(
+            &fixture.join(label),
+            Config {
+                snapshot_bytes: bytes,
+                snapshot_max: 1,
+                ..config()
+            },
+        )
+        .unwrap();
+        let before = s.health2().memory_bytes;
+        let reply = s.dispatch(&wire[4..]);
+        if success {
+            assert_eq!(reply.len(), 57);
+            assert_eq!(&reply[17..28], b"\0\0MAW1\0MAV1");
+            let mut c = membus::Cursor::new(&reply[28..]);
+            assert_eq!(c.text().unwrap(), "empty");
+            assert_eq!(c.u64().unwrap(), s.epoch);
+            assert_ne!(c.u64().unwrap(), 0);
+            assert_eq!(c.u32().unwrap(), 0);
+            c.end().unwrap();
+            if label == "incumbent" {
+                let held = s.capture_namespace_funded("other", 1029).unwrap();
+                assert_eq!(&s.dispatch(&wire[4..])[17..], b"\0\0MAW1\x04\x07\0");
+                drop(held);
+                assert_eq!(s.dispatch(&wire[4..]).len(), 57);
+            }
+        } else {
+            assert_eq!(&reply[17..], b"\0\0MAW1\x04\x07\0");
+        }
+        assert_eq!(s.health2().memory_bytes, before);
+        std::fs::write(fixture.join(format!("{label}-reply.bin")), reply).unwrap();
+    }
 }
 
 #[test]

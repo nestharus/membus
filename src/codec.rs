@@ -410,9 +410,12 @@ impl Store {
                 let result = if self.clock.utc_ms() >= deadline {
                     Err(crate::atomic::PublicationError::Expired)
                 } else {
-                    self.capture_namespace_for_wire(ns, max_frame.saturating_sub(20))
+                    self.capture_namespace_for_wire(ns, max_frame.saturating_sub(20), id)
                 };
-                return Ok(DispatchReply::Payload(crate::atomic_wire::encode(result)));
+                return Ok(match result {
+                    Ok(frame) => DispatchReply::Framed(frame),
+                    Err(error) => DispatchReply::Payload(crate::atomic_wire::encode(Err(error))),
+                });
             }
             if op == ATOMIC_PUBLISH {
                 let bytes = c.bytes(MAX_FRAME / 3)?;

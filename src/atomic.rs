@@ -12,7 +12,7 @@ use std::{
     sync::{atomic::Ordering, mpsc, Arc},
 };
 
-/// Conservative legacy capture profile. Funded capture has no row-count cutoff.
+/// Legacy wire and default capture ceiling. Native funded capture uses its account.
 pub const MAX_POPULATION: usize = 4096;
 pub const MAX_CHANGES: usize = 128;
 include!("atomic_resources.rs");
@@ -92,9 +92,11 @@ impl NamespaceView {
         (&self.namespace, self.epoch)
     }
 
-    fn wire_bytes(&self, size: usize) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(size);
-        bytes.extend(b"MAV1");
+    fn wire_reply(&self, id: u64) -> Vec<u8> {
+        let size = 28 + self.namespace.len() + self.rows.iter()
+            .map(|(key, value)| 17 + key.len() + value.bytes.len()).sum::<usize>();
+        let mut bytes = codec::reply_header(crate::ATOMIC_CAPTURE, id, 0, size + 5);
+        bytes.extend(b"MAW1\0MAV1");
         crate::lp(&mut bytes, self.namespace.as_bytes());
         bytes.extend(self.epoch.to_le_bytes());
         bytes.extend(self.expires_mono.to_le_bytes());
@@ -372,6 +374,10 @@ impl AtomicRequest {
         }
     }
     pub(crate) fn requested_ack(&self) -> u8 { self.data.ack.byte() }
+    pub(crate) fn fits_value_limit(&self, max_value: usize) -> bool {
+        self.data.changes.iter().all(|change| change.value.as_ref()
+            .is_none_or(|value| value.len() <= max_value))
+    }
     fn mutations(&self) -> Vec<Mutation> {
         self.data
             .changes
@@ -482,10 +488,8 @@ impl Store {
     pub fn capture_namespace(&self, namespace: &str) -> Result<NamespaceView, PublicationError> {
         self.capture_atomic(namespace, None, None)
     }
-    pub(crate) fn capture_namespace_for_wire(&self, namespace: &str, max: usize) -> Result<Vec<u8>, PublicationError> {
-        self.capture_atomic(namespace, None, Some(max)).map(|view| view.wire_bytes(
-            28 + namespace.len() + view.rows.iter().map(|(key, value)| 17 + key.len() + value.bytes.len()).sum::<usize>()
-        ))
+    pub(crate) fn capture_namespace_for_wire(&self, namespace: &str, max: usize, id: u64) -> Result<Vec<u8>, PublicationError> {
+        self.capture_atomic(namespace, None, Some(max)).map(|view| view.wire_reply(id))
     }
     /// Reserve the entire finite account against actual snapshot and memory
     /// headroom before materializing the complete population. Requests prepared
@@ -505,13 +509,12 @@ impl Store {
     ) -> Result<NamespaceView, PublicationError> {
         valid_namespace(namespace)?;
         if let Some(max) = wire_max {
-            Self::atomic_wire_size(namespace, &self.committed.read().unwrap(), max)?;
+            Self::atomic_wire_capture_charge(namespace, &self.committed.read().unwrap(), max)?;
         }
         let _gate = self.admission_gate.write().unwrap();
         let committed = self.committed.read().unwrap();
-        if let Some(max) = wire_max {
-            Self::atomic_wire_size(namespace, &committed, max)?;
-        }
+        let wire_bytes = wire_max.map(|max| Self::atomic_wire_capture_charge(namespace, &committed, max))
+            .transpose()?;
         if !self.atomic_compatible(namespace, &committed) {
             return Err(PublicationError::Unsupported);
         }
@@ -526,9 +529,10 @@ impl Store {
             return Err(PublicationError::Resource(4));
         }
         let minimum = add(rows, guards)?;
-        let bytes = match requested {
-            Some(n) => n,
-            None => add(minimum, crate::MAX_FRAME)?,
+        let bytes = match (requested, wire_bytes) {
+            (Some(n), _) => n,
+            (None, Some(encoding_and_workspace)) => add(minimum, encoding_and_workspace)?,
+            (None, None) => add(minimum, crate::MAX_FRAME)?,
         };
         if bytes < minimum {
             return Err(PublicationError::Resource(7));
@@ -583,8 +587,9 @@ impl Store {
             },
         )
     }
-    fn atomic_wire_size(namespace: &str, committed: &store::Committed, max: usize) -> Result<(), PublicationError> {
+    fn atomic_wire_capture_charge(namespace: &str, committed: &store::Committed, max: usize) -> Result<usize, PublicationError> {
         let mut size = 28 + namespace.len();
+        let mut workspace = 0;
         for (i, ((_, key), entry)) in committed.range((namespace.to_owned(), String::new())..)
             .take_while(|((ns, _), _)| ns == namespace).filter(|(_, e)| !e.tombstone).enumerate()
         {
@@ -595,11 +600,23 @@ impl Store {
             if i >= MAX_POPULATION || size > max {
                 return Err(PublicationError::Resource(4));
             }
+            let extent = usize::try_from(entry.location.record_len)
+                .ok().filter(|n| (16..=crate::MAX_FRAME + 16).contains(n))
+                .ok_or(PublicationError::Uncertain)?;
+            // Cold loads are serial. An envelope read also synthesizes one record,
+            // whose temporary mutation and growing encoding can coexist.
+            let decode = if entry.location.subrecord.is_some() {
+                3 * (entry.len + namespace.len() + key.len() + crate::MAX_ID + 64)
+            } else {
+                0
+            };
+            workspace = workspace.max(add(extent, decode)?);
         }
         if size > max {
             return Err(PublicationError::Resource(4));
         }
-        Ok(())
+        // One complete framed reply, including its 19-byte header and MAW1 status.
+        add(add(size, 24)?, workspace)
     }
     pub(crate) fn atomic_compatible(&self, ns: &str, committed: &store::Committed) -> bool {
         // Initial additive capability supports FOREVER only, including all prefix policies.
@@ -617,7 +634,7 @@ impl Store {
     pub(crate) fn publish_atomic_for_wire(
         &self, ns: &str, op: &str, bytes: &[u8], deadline: u64,
     ) -> Result<Outcome, PublicationError> {
-        let original = BorrowedOriginal::from_canonical_bytes(bytes)?;
+        let original = BorrowedOriginal::from_wire_bytes(bytes)?;
         if original.namespace() != ns || original.operation_id() != op {
             return Err(PublicationError::IdentityMismatch);
         }
