@@ -582,7 +582,8 @@ impl Store {
                 let value = if wire_max.is_some() {
                     self.read_entry(namespace, key, entry)
                 } else {
-                    entry.read(namespace, key)
+                    // Native capture reads the retained entry outside the shared cache.
+                    self.read_entry_uncached(namespace, key, entry)
                 };
                 value
                     .map(|v| (*v).clone())

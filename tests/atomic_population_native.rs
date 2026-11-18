@@ -727,3 +727,253 @@ fn supported_python_whole_burst_original_custody_and_native_restart() {
     assert!(s.get("authored", "never").is_none());
     assert_eq!(s.get("authored", "rust").unwrap().bytes, b"newer");
 }
+
+const HEALTH_CAPTURE_ACCOUNT: usize = 8192;
+
+struct CaptureHealthFixture {
+    store: Store,
+    root: PathBuf,
+    log: PathBuf,
+    original: Vec<u8>,
+    damaged: Vec<u8>,
+    revisions: [u64; 2],
+}
+
+impl CaptureHealthFixture {
+    fn new(root: PathBuf, cache_bytes: usize) -> Self {
+        let store = Store::open(
+            &root.join("state"),
+            Config {
+                cache_bytes,
+                snapshot_max: 1,
+                clock: Some(ManualClock::new(membus::now_ms())),
+                ..config()
+            },
+        )
+        .unwrap();
+        let put = |key: &str, len| {
+            let outcome = store.mutate(membus::Mutation {
+                ns: "authored".into(),
+                key: key.into(),
+                op_id: format!("put-{key}-{len}"),
+                bytes: vec![7; len],
+                deadline: membus::now_ms() + 30_000,
+                ack: 1,
+                expected: None,
+                remove: false,
+            });
+            assert_eq!(outcome.code, 0);
+            assert_ne!(outcome.version, 0);
+            outcome.version
+        };
+        let damaged_revision = put("key", 16);
+        let log = fs::read_dir(root.join("state/chunks/forever"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "log"))
+            .unwrap();
+        let original = fs::read(&log).unwrap();
+        assert_eq!(&original[..4], b"MBK1");
+        let mut damaged = original.clone();
+        damaged[16] ^= 1;
+        fs::write(root.join("authored-original.frame"), &original).unwrap();
+        fs::write(root.join("authored-damaged.frame"), &damaged).unwrap();
+        // The healthy row sorts first, so a failed capture has already read it.
+        let first_revision = put("first", 4);
+        Self {
+            store,
+            root,
+            log,
+            original,
+            damaged,
+            revisions: [first_revision, damaged_revision],
+        }
+    }
+
+    fn write_frame(&self, bytes: &[u8]) {
+        let mut file = fs::OpenOptions::new().write(true).open(&self.log).unwrap();
+        file.write_all(bytes).unwrap();
+        file.flush().unwrap();
+    }
+
+    fn assert_complete(&self, view: &membus::atomic::NamespaceView) {
+        assert_eq!(view.rows().len(), 2);
+        for (((key, value), (expected, len)), revision) in view
+            .rows()
+            .iter()
+            .zip([("first", 4), ("key", 16)])
+            .zip(self.revisions)
+        {
+            assert_eq!(key, expected);
+            assert_eq!(
+                (value.version, value.ack, value.tombstone),
+                (revision, 1, false)
+            );
+            assert_eq!(value.bytes, vec![7; len]);
+        }
+    }
+}
+
+fn observe_native_capture_health(funded: bool) {
+    use membus::atomic::PublicationError;
+    let label = if funded {
+        "funded-health"
+    } else {
+        "native-health"
+    };
+    let (root, _) = private_fixture(label);
+    let fixture = CaptureHealthFixture::new(root, if funded { 64 * 1024 } else { 0 });
+    let store = &fixture.store;
+    let capture = || {
+        if funded {
+            store.capture_namespace_funded("authored", HEALTH_CAPTURE_ACCOUNT)
+        } else {
+            store.capture_namespace("authored")
+        }
+    };
+    assert!(!store.storage_error());
+    if funded {
+        // Prove the damaged key has an eligible resident value before the fault.
+        assert_eq!(
+            store.try_get("authored", "key").unwrap().unwrap().bytes,
+            [7; 16]
+        );
+        assert!(store.cache_stats().entries > 0);
+        let hits = store.cache_stats().hits;
+        assert!(store.try_get("authored", "key").unwrap().is_some());
+        assert_eq!(store.cache_stats().hits, hits + 1);
+    }
+    let cache_usage = || {
+        let c = store.cache_stats();
+        (
+            c.hits,
+            c.misses,
+            c.cold_reads,
+            c.coalesced_reads,
+            c.entries,
+            c.bytes,
+        )
+    };
+    let cache = cache_usage();
+    let memory = || store.health2().memory_bytes;
+    let idle = memory();
+    let view = capture().unwrap();
+    fixture.assert_complete(&view);
+    assert!(!store.storage_error());
+    if funded {
+        assert_eq!(memory(), idle + HEALTH_CAPTURE_ACCOUNT);
+        let original = view
+            .prepare(
+                "hold-charge",
+                AtomicAck::Os,
+                vec![FinalChange::remove("key")],
+            )
+            .unwrap();
+        drop(view);
+        assert_eq!(memory(), idle + HEALTH_CAPTURE_ACCOUNT);
+        assert!(matches!(capture(), Err(PublicationError::Resource(7))));
+        assert!(!store.storage_error());
+        drop(original);
+    } else {
+        drop(view);
+    }
+    assert_eq!(memory(), idle);
+
+    fixture.write_frame(&fixture.damaged);
+    let result = capture();
+    assert!(matches!(result, Err(PublicationError::Uncertain)));
+    assert_eq!(memory(), idle);
+    let sticky = store.storage_error();
+    assert_eq!(store.health2().storage_error, sticky);
+    println!("{label}: Uncertain, no view, idle account restored, storage_error={sticky}");
+
+    fixture.write_frame(&fixture.original);
+    fixture.assert_complete(&capture().unwrap());
+    assert_eq!(memory(), idle);
+    assert_eq!(cache_usage(), cache);
+    assert_eq!(store.storage_error(), sticky);
+    assert!(
+        sticky,
+        "failed native backing read must latch storage_error"
+    );
+}
+
+#[test]
+fn capture_storage_health_native_latches_backing_error() {
+    observe_native_capture_health(false);
+}
+
+#[test]
+fn capture_storage_health_funded_bypasses_cache_and_latches_backing_error() {
+    observe_native_capture_health(true);
+}
+
+#[test]
+fn capture_storage_health_wire_keeps_complete_view_and_typed_backing_error() {
+    use membus::atomic::PublicationError;
+    let (root, address) = private_fixture("wire-health");
+    let fixture = CaptureHealthFixture::new(root, 0);
+    let store = &fixture.store;
+    let idle = store.health2().memory_bytes;
+    let mut server = matrix_pipe(&address).unwrap();
+    let deadline = || Deadline {
+        unix_ms: membus::now_ms() + 10_000,
+        local: Instant::now() + Duration::from_secs(10),
+    };
+
+    std::thread::scope(|scope| {
+        let receive = scope.spawn(|| {
+            let mut client = Client::connect_pipe(
+                std::path::Path::new(&address),
+                Options::new("authored-wire-health", 4096),
+                deadline().local,
+            )
+            .unwrap();
+            let mut capture = |id| client.capture_atomic_namespace("authored", id, deadline());
+            fixture.assert_complete(&capture("positive").unwrap());
+            assert!(matches!(
+                capture("damaged"),
+                Err(Error::Atomic(PublicationError::Uncertain))
+            ));
+            assert!(matches!(
+                capture("restored"),
+                Err(Error::Atomic(PublicationError::Unavailable))
+            ));
+            assert!(client.is_usable());
+        });
+        server.connect_until(deadline().local).unwrap();
+        for (index, op) in [
+            membus::HELLO,
+            membus::ATOMIC_CAPTURE,
+            membus::ATOMIC_CAPTURE,
+            membus::ATOMIC_CAPTURE,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let request = pipe_request(&mut server, op).unwrap();
+            if index == 2 {
+                fixture.write_frame(&fixture.damaged);
+            } else if index == 3 {
+                fixture.write_frame(&fixture.original);
+            }
+            let reply = store.dispatch_for_limit(&request, false, 4096);
+            match index {
+                1 => assert!(!store.storage_error()),
+                2 | 3 => {
+                    let status: &[u8] = if index == 2 { b"MAW1\x07" } else { b"MAW1\x0a" };
+                    assert_eq!(&reply[19..], status);
+                    assert!(store.health2().storage_error);
+                    assert_eq!(store.health2().memory_bytes, idle);
+                }
+                _ => {}
+            }
+            fs::write(fixture.root.join(format!("wire-reply-{index}.bin")), &reply).unwrap();
+            server.write_all(&reply).unwrap();
+        }
+        receive.join().unwrap();
+    });
+    // Two cold reads per attempted capture; the sticky refusal reads neither row.
+    assert_eq!(store.cache_stats().cold_reads, 4);
+    println!("wire: complete positive view, status-only Uncertain and sticky Unavailable");
+}

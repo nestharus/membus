@@ -182,7 +182,7 @@ impl Store {
         }
         let _reader = self.cold_reader();
         self.cache.cold();
-        let value = entry.read(ns, key).inspect_err(|_| { self.flags.storage_error.store(true, Ordering::SeqCst); })?;
+        let value = self.read_entry_uncached(ns, key, entry)?;
         if self.scan_usage.released.swap(false, Ordering::AcqRel)
             | self.read_usage.released.swap(false, Ordering::AcqRel)
             | self.subscription_released.swap(false, Ordering::AcqRel) {
@@ -193,6 +193,16 @@ impl Store {
         }
         self.cache.insert(value.clone(), label, policy, false, self.config.cache_bytes, &entry.cacheable);
         Ok(value)
+    }
+    pub(super) fn read_entry_uncached(
+        &self,
+        ns: &str,
+        key: &str,
+        entry: &crate::value_disk::Entry,
+    ) -> io::Result<Arc<Value>> {
+        entry.read(ns, key).inspect_err(|_| {
+            self.flags.storage_error.store(true, Ordering::SeqCst);
+        })
     }
     pub fn cache_stats(&self) -> crate::CacheStats { self.cache.stats() }
     pub(super) fn signal_budget<'a>(&'a self, state: &'a State) -> crate::subscription_resources::Budget<'a> {
