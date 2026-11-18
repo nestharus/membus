@@ -283,10 +283,19 @@ class TypedReplies(unittest.TestCase):
 
 
 
-    def test_unknown_raw_call_keeps_baseline_retry_and_bytes(self):
+    def test_unknown_raw_call_sends_once_and_keeps_associated_bytes(self):
         c = self.client(99, b'raw reply')
-        self.assertEqual(c.call(99, 'authored', b'raw', 'original', DEADLINE), b'raw reply')
-        self.identity(99, 2)
+        with self.assertRaises(ConnectionError) as caught:
+            self.invoke(c, 99)
+        self.assertIs(caught.exception, self.first_loss)
+        self.identity(99, 1)
+        self.assertEqual(self.connects, [])
+        self.assertIsNone(c.channel)
+
+        c = self.client(99, b'raw reply', loss=False)
+        self.assertEqual(self.invoke(c, 99), b'raw reply')
+        self.identity(99, 1)
+        self.assertEqual(self.connects, [])
 
     def test_snapshot_and_timer_creation_still_send_once(self):
         for op in (10, 16, 21, 22):

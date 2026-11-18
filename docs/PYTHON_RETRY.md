@@ -33,8 +33,21 @@ on put; existing positional put calls and legacy call overrides keep their
 signature. Other wrappers forward it through their existing keyword options.
 Overrides that bypass Client.call retain their own settlement responsibility.
 
-Other raw/read/status calls retain baseline retry and decoding responsibilities.
-Snapshot/subscription/timer creation remains single-send. Outer refusal framing,
-durable application custody, native clients, indexed/atomic publication, caller
-admission, service deployment and capacity are separate contracts. Sampling and
-checking a retry horizon cannot make a delayed send atomic with server admission.
+Client.call allows transport retries for the bounded mutations above and an
+explicit list of reads and status operations. This includes GET and GET_MANY,
+health and metrics, known-token scans and release, subscription and timer
+status, policy and key status reads, and the default-profile snapshot
+eligibility check (31). A read retry sends the original payload and deadline.
+An associated refusal, including unsupported, ends the call.
+
+Snapshot opens, scans with an empty snapshot token, subscription registration,
+timer set and cancel, and unclassified raw commands are single-send. Opcodes
+28–30 are single-send through Client.call. They carry atomic capture,
+publication and bounded capture on the default profile, and create, renew and
+cancel on the affirmative finite-hint profile. The Python SDK uses the default
+HELLO profile. The Python atomic binding uses its own single-exchange path.
+
+Outer refusal framing, durable application custody, native clients,
+indexed/atomic publication, caller admission, service deployment and capacity
+are separate contracts. Sampling and checking a retry horizon cannot make a
+delayed send atomic with server admission.

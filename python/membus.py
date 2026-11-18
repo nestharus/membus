@@ -448,6 +448,9 @@ class Client:
         deadline = deadline or deadline_ms(self.timeout)
         payload = _call_prefix(deadline, op_id, ns) + suffix
         creates_snapshot = opcode in (10, 16, 21, 22) or (opcode in (11, 12, 14, 15) and suffix[:4] == b'\x00' * 4)
+        # Dispatch contracts, including generic callers, determine retry policy.
+        # Known-token scans/release and read/status operations retain their policy.
+        read_retry = opcode in (2, 3, 8, 9, 11, 12, 13, 14, 15, 18, 19, 20, 23, 25, 26, 27, 31)
         bounded_retry = opcode in (4, 5, 6, 7, 17, 24)
         original = lost = None
         for attempt in range(2):
@@ -502,7 +505,7 @@ class Client:
                 if original is not None and transport_error and lost is None:
                     lost = error
                 if (not transport_error or not retry_transport or creates_snapshot or attempt
-                        or int(time.time()*1000) >= deadline
+                        or not (read_retry or bounded_retry) or int(time.time()*1000) >= deadline
                         or (original is not None and
                             time.monotonic_ns() - original.first_send_ns >= original.retry_ms * 1_000_000)):
                     if lost is not None:
