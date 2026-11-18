@@ -36,10 +36,15 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|b| format!("{b:02x}")).collect()
 }
 fn request(op: u8, ns: &str, key: &str) -> Vec<u8> {
+    // POLICY_SET and PUT share the caller namespace's retry table. Separate the
+    // opcodes and hash the full key so the identity fits even at the key limit.
+    let mut key_hash = chunks::Sha256::new();
+    key_hash.update(key.as_bytes());
+    let op_id = format!("storage-receive/v1/{op}/{}", key_hash.hex());
     let mut b = vec![1, 0, 0, 0, op];
     b.extend(17u64.to_le_bytes());
     b.extend((now_ms() + 30_000).to_le_bytes());
-    lp(&mut b, format!("receiving/{key}").as_bytes());
+    lp(&mut b, op_id.as_bytes());
     lp(&mut b, ns.as_bytes());
     b
 }
@@ -190,5 +195,77 @@ fn main() -> ExitCode {
             eprintln!("{e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retained_policy_and_put_retries_at_policy_key_limit() -> io::Result<()> {
+        let output = PathBuf::from(
+            std::env::var_os("MEMBUS_TEST_OUTPUT").unwrap_or_else(|| ".test-output".into()),
+        );
+        fs::create_dir_all(&output)?;
+        let path = output.join(format!(
+            "receiving-retry-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir(&path)?;
+        let cfg = Config {
+            flush_ms: 0,
+            ..Default::default()
+        };
+        let ns = "q";
+        // The on-disk policy key includes the namespace and its separator byte.
+        let key_limit = MAX_ID - ns.len() - 1;
+        let prefix = "é".repeat((key_limit - 2) / 2);
+        let first = format!("{prefix}aa");
+        let second = format!("{prefix}ab");
+        assert_eq!(ns.len() + 1 + first.len(), MAX_ID);
+        let set_latest = |store: &Store, key: &str| {
+            let mut payload = Vec::new();
+            lp(&mut payload, key.as_bytes());
+            payload.push(1);
+            payload.extend(0u64.to_le_bytes());
+            call(store, POLICY_SET, ns, key, &payload)
+        };
+        let put = |store: &Store, key: &str, value: &[u8]| {
+            let mut payload = Vec::new();
+            lp(&mut payload, key.as_bytes());
+            payload.push(2);
+            lp(&mut payload, value);
+            call(store, PUT, ns, key, &payload)
+        };
+        let store = Store::open(&path, cfg.clone())?;
+        let policy_reply = set_latest(&store, &first)?;
+        let put_reply = put(&store, &first, b"first")?;
+        assert_eq!(policy_reply[27], 2);
+        assert_eq!(put_reply[27], 2);
+        drop(store);
+
+        let reopened = Store::open(&path, cfg)?;
+        assert_eq!(set_latest(&reopened, &first)?, policy_reply);
+        assert_eq!(put(&reopened, &first, b"first")?, put_reply);
+        assert_eq!(
+            put(&reopened, &first, b"changed").unwrap_err().to_string(),
+            "wire operation 4 refused code 14"
+        );
+        policy(&reopened, ns, &first)?;
+        let second_policy_reply = set_latest(&reopened, &second)?;
+        let second_put_reply = put(&reopened, &second, b"second")?;
+        assert_ne!(second_policy_reply, policy_reply);
+        assert_ne!(second_put_reply, put_reply);
+        for (key, value, reply) in [
+            (&first, b"first".as_slice(), put_reply),
+            (&second, b"second", second_put_reply),
+        ] {
+            let version = u64::from_le_bytes(reply[19..27].try_into().unwrap());
+            read(&reopened, ns, key, value, version)?;
+        }
+        drop(reopened);
+        fs::remove_dir_all(path)
     }
 }
