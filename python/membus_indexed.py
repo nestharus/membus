@@ -3,7 +3,10 @@
 Publication tokens are caller-owned, in-memory custody, not durable journals.
 See docs/PYTHON_INDEXED.md for retained staging and recovery boundaries.
 """
+from asyncio import CancelledError as AsyncCancelledError
 from concurrent.futures import CancelledError
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import IntEnum
 import re
@@ -11,7 +14,7 @@ import struct
 import time
 import zlib
 
-from membus import Client, Decoder, EpochChanged, MAX_FRAME, MAX_VALUE, Refusal, lp
+from membus import Client, Decoder, EpochChanged, MAX_FRAME, MAX_VALUE, Refusal, _ExchangeEvidence, lp
 
 MAX_ID = 1024
 U64_MAX = 2**64 - 1
@@ -52,6 +55,28 @@ class Uncertain(Error):
         self.operation_id = request.operation_id
         self.cleanup_errors = ()
         super().__init__(f'uncertain operation {self.operation_id}: {cause}')
+
+
+_cancellation_types = ContextVar('indexed_cancellation_types', default=())
+
+
+@contextmanager
+def cancellation_exceptions(*types: type[Exception]):
+    """Register exact application cancellation classes for this calling context."""
+    for cls in types:
+        if (not isinstance(cls, type) or not issubclass(cls, Exception) or
+                issubclass(cls, Refusal) or cls in (Exception, OSError, ValueError, Corrupt, struct.error)):
+            raise TypeError('dedicated application cancellation exception class required')
+    token = _cancellation_types.set(_cancellation_types.get() + types)
+    try:
+        yield
+    finally:
+        _cancellation_types.reset(token)
+
+
+def _cancelled(error):
+    return (isinstance(error, (KeyboardInterrupt, SystemExit, GeneratorExit, CancelledError, AsyncCancelledError)) or
+            any(type(error) is cls for cls in _cancellation_types.get()))
 
 
 class Ack(IntEnum):
@@ -154,6 +179,7 @@ class _Mutation:
 @dataclass
 class _Custody:
     oldest_first_send: float | None = None
+    retry_ms: int | None = None
 
 
 @dataclass(frozen=True)
@@ -298,8 +324,6 @@ class Collection:
     def _prepare(self, c, namespace, operation, ack, record):
         _identifier(namespace)
         _identifier(operation)
-        # Longest control suffix used by append's nested declaration.
-        _identifier(operation + ':declare:head-reconcile')
         if not isinstance(ack, Ack):
             raise Invalid('explicit Ack.OS or Ack.FLUSH required')
         _integer(c.retry_ms, 0, U64_MAX, 'negotiated retry horizon')
@@ -313,21 +337,28 @@ class Collection:
         if not 1024 <= c.max_frame <= MAX_FRAME or not 1 <= c.max_value <= MAX_VALUE:
             raise Invalid('negotiated frame/value limits')
         head_size = len(_head(0))
-        def preflight(key, size, op, label):
+
+        def immutable(key, size, op, label):
+            _identifier(op + ':read')
             _identifier(op + ':reconcile')
             self._admit_put(c, namespace, key, size, op, label)
         base = operation + ':declare' if record is not None else operation
-        preflight(self._schema_key, len(self._declaration), base + ':schema', 'declaration')
-        preflight(self._head_key, head_size, base + ':head-init', 'head')
+        immutable(self._schema_key, len(self._declaration), base + ':schema', 'declaration')
+        self._admit_put(c, namespace, self._head_key, head_size, base + ':head-init', 'head')
+        _identifier(base + ':head-read')
+        _identifier(base + ':head-reconcile')
         if record is not None:
             size = self.encoded_len(record)
-            preflight(self._row_key(record.ordinal), size, operation + ':row', 'record')
-            preflight(self._head_key, head_size, operation + ':commit', 'head')
+            immutable(self._row_key(record.ordinal), size, operation + ':row', 'record')
+            self._admit_put(c, namespace, self._head_key, head_size, operation + ':commit', 'head')
+            _identifier(operation + ':boundary')
+            _identifier(operation + ':existing')
+            _identifier(operation + ':commit-reconcile')
             for index, values in enumerate(record.fields):
                 if values:
                     # Every CRC bucket has the same eight-digit spelling width.
-                    preflight(self._key(f'i/{index:02x}/00000000/{record.ordinal:020d}'), 8,
-                              f'{operation}:i{index}-00000000', 'posting')
+                    key = self._key(f'i/{index:02x}/00000000/{record.ordinal:020d}')
+                    immutable(key, 8, f'{operation}:i{index}-00000000', 'posting')
 
     @staticmethod
     def _admit_put(c, namespace, key, size, op, label):
@@ -355,9 +386,15 @@ class Collection:
             raise Invalid('publication endpoint changed; equal epoch does not authorize another history')
         if c.epoch != p.epoch:
             raise EpochChanged(p.epoch, c.epoch)
-        first = p._custody.oldest_first_send
-        if first is not None and (time.monotonic() - first) * 1000 >= p.retry_ms:
-            raise RetryWindowExpired('original publication retry horizon elapsed; reconcile original custody')
+        _integer(c.retry_ms, 0, U64_MAX, 'negotiated retry horizon')
+        if c.retry_ms == 0:
+            raise Unsupported('indexed publication requires a positive executing retry horizon')
+        custody = p._custody
+        previous = p.retry_ms if custody.retry_ms is None else custody.retry_ms
+        custody.retry_ms = min(previous, c.retry_ms)
+        first = custody.oldest_first_send
+        if first is not None and time.monotonic() >= first + custody.retry_ms / 1000:
+            raise RetryWindowExpired('publication retry horizon elapsed; reconcile original custody')
 
     def _get(self, c, p, key, op, d):
         self._check(c, p, d)
@@ -372,6 +409,7 @@ class Collection:
         self._admit_put(c, p.namespace, key, len(body), op, 'mutation')
         deadline = _deadline(d)
         channel = c.channel
+        evidence = _ExchangeEvidence(channel)
         if m.first_send is None:
             m.first_send = time.monotonic()
             first = p._custody.oldest_first_send
@@ -379,18 +417,18 @@ class Collection:
         try:
             with c._defer_error_close():
                 result = c.put(p.namespace, key, body, ack=p.ack, expected=expected,
-                               op_id=op, deadline=deadline, retry_transport=False)
+                               op_id=op, deadline=deadline, retry_transport=False, _evidence=evidence)
             if (not isinstance(result, dict) or type(result.get('version')) is not int or
                     not 1 <= result['version'] <= U64_MAX or result.get('ack') != p.ack):
                 raise Corrupt('mutation achieved acknowledgment/revision')
             return result
         except BaseException as cause:
-            if (isinstance(cause, Refusal) and cause._associated and
-                    cause.code not in (16, 17) and cause.code in c.codes):
+            if cause is evidence.refusal and c.channel is channel and cause.code not in (16, 17):
                 raise
             error = Uncertain(p, m.request, cause)
             p._uncertainties.append(error)
-            interrupted = not isinstance(cause, (Refusal, OSError, ValueError, struct.error, Corrupt))
+            interrupted = (_cancelled(cause) or
+                           not isinstance(cause, (Refusal, OSError, ValueError, struct.error, Corrupt)))
             if c.channel is channel:
                 c.channel = None
             # A physical close can fail. Give an ordinary I/O failure one
@@ -400,7 +438,7 @@ class Collection:
                     channel.close()
                 except BaseException as cleanup:
                     error.cleanup_errors += (cleanup,)
-                    if not interrupted and (not isinstance(cleanup, Exception) or isinstance(cleanup, CancelledError)):
+                    if not interrupted and _cancelled(cleanup):
                         raise
                     if not isinstance(cleanup, OSError):
                         break

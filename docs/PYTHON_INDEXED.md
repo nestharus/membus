@@ -70,10 +70,9 @@ declared fields belongs to the application codec.
   `Publication` containing the immutable original request, endpoint, epoch and
   conservative retry horizon. Preparation performs no I/O. It preflights each
   planned mutation's exact value and frame bounds before any publication effect.
-  A negotiated zero retry horizon raises `Unsupported` during preparation,
-  before any schema, head, row or posting effect. This binding cannot safely
-  complete that configuration; positive horizons remain fixed bounds, not a
-  promise that every admitted publication will finish within them.
+  A negotiated zero retry horizon raises `Unsupported` during preparation or
+  execution, before any publication request. Positive horizons bound how long
+  execution can proceed after the first mutation send.
 - `declare(client, publication, deadline)` establishes only the immutable schema
   and head. `append(client, publication, deadline)` reserves the immutable row,
   writes deduplicated CRC candidate postings, then CAS-publishes head. Both
@@ -140,30 +139,39 @@ it to Rust's per-transfer monotonic transport contract. Clock jumps during an I/
 remain that transport's limitation.
 
 `Conflict` describes immutable/schema/ordinal/publication disagreement.
-`Refusal` preserves the Client's exact code: committed conflict 12, pending
-conflict 19, retry expiry 13, identity mismatch 14, quota 8 and other refusals stay
-distinct. Transient classification is not retry permission. Codes 16/17,
-transport loss, malformed mutation reply or wrong achieved Ack raise `Uncertain`
-with the original Publication, MutationRequest, operation ID, epoch and cause.
+Only a validated refusal for the current conditional PUT can settle it. Code 12
+triggers reconciliation. Pending conflict 19, retry expiry 13, identity mismatch
+14, quota 8 and other definitive codes retain their `Refusal` type and code.
+Codes 16/17, refusals from outside that exchange, transport loss, malformed
+mutation reply or wrong achieved Ack raise `Uncertain` with the original
+Publication, MutationRequest, operation ID, epoch and cause.
 The token's `uncertainties` tuple retains every such original observation even
 when a later explicit reconciliation succeeds or refuses.
 
 The binding records `Uncertain` on the same publication before detaching and
-closing the channel. `Uncertain.cleanup_errors` retains any secondary close
-failures. An interruption during a possibly sent mutation, including caller
-cancellation raised as an exception, propagates the original exception. An
-interruption during cleanup propagates if a transport or reply failure led to
-cleanup. The uncertainty still names that first failure. The binding never
-reconnects or resends in that invocation.
+closing the channel. `Uncertain.cleanup_errors` retains close failures.
+Keyboard interrupts, process and generator exits, and the standard `asyncio`
+and `concurrent.futures` `CancelledError` classes propagate as the original
+exception at the mutation receipt boundary. The same exceptions propagate
+during cleanup if an ordinary mutation failure came first. An application can
+use `with cancellation_exceptions(StopRequested):` around `declare` or `append`
+to give a dedicated `Exception` class the same contract. The registration
+matches exact classes in the current Python context and requires no signal
+handler integration. Other unexpected exceptions at the receipt boundary
+propagate after custody is recorded. Ordinary I/O, refusal and unregistered
+application exceptions during close stay in `cleanup_errors`. When cancellation
+propagates from cleanup, the retained uncertainty still names the original
+mutation failure. The binding never reconnects or resends in that invocation.
 
 An application may explicitly reconnect the same Client/endpoint and revisit
 the SAME Publication with a fresh bounded deadline, within its original epoch
 and conservative horizon from the first mutation send. No automatic loop does
 so. Changed epoch, changed endpoint or elapsed horizon refuse before sending.
-The earliest original send is retained incrementally as mutations accumulate;
-later sends, successful reconciliation and reconnects never renew that bound
-or clear previous uncertainties. A short positive horizon can expire with
-retained staging; expiration supplies no absence or replacement permission.
+Each positive executing offer can shorten the retained bound from the first
+mutation send. A later wider offer cannot lengthen it. Later sends, successful
+reconciliation and reconnects retain the earliest timestamp and previous
+uncertainties. A short positive horizon can expire with retained staging.
+Expiration supplies no absence or replacement permission.
 A matching epoch on another endpoint is not lineage. Even the same endpoint
 can have been restored; external authority and application reconciliation are
 still required. This API cannot establish recovery authority from copied epoch.

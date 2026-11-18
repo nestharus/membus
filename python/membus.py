@@ -39,11 +39,18 @@ class NotAvailable(Exception):
         super().__init__(f'{call} is not available on this server')
 
 class Refusal(Exception):
-    def __init__(self, code, codes=None, *, _associated=False):
+    def __init__(self, code, codes=None):
         self.code = code
-        self._associated = _associated
         self.name, self.transient = (codes or CODES).get(code, ('unknown_refusal', False))
         super().__init__(self.name)
+
+
+class _ExchangeEvidence:
+    """One call's exact raw refusal, populated only by its reply decoder."""
+    def __init__(self, channel):
+        self.channel = channel
+        self.refusal = None
+
 
 class CallOriginal(NamedTuple):
     """In-memory evidence of one call; retaining it does not authorize a resend."""
@@ -267,9 +274,10 @@ class Client:
                 raise ConnectionError('zero write')
             position += count
 
-    def exchange(self, opcode, payload, deadline):
+    def exchange(self, opcode, payload, deadline, *, _evidence=None):
         self.request_id += 1
-        encoded=frame(opcode,self.request_id,payload)
+        sent_id = self.request_id
+        encoded=frame(opcode,sent_id,payload)
         if len(encoded)-4>getattr(self,'max_frame',MAX_FRAME): raise Refusal(4)
         self.write_all(encoded, deadline)
         count, = struct.unpack('<I', self.read_exact(4, deadline))
@@ -278,7 +286,7 @@ class Client:
             raise ValueError('reply frame size')
         body = self.read_exact(count, deadline)
         major, minor, op, request_id, code = struct.unpack('<HHBQH', body[:15])
-        if (major, minor, op, request_id) != (1, 0, opcode|128, self.request_id):
+        if (major, minor, op, request_id) != (1, 0, opcode|128, sent_id) or self.request_id != sent_id:
             self._close_on_error()
             raise ValueError('reply association')
         if code:
@@ -286,19 +294,25 @@ class Client:
             if code not in codes or len(body) != 15:
                 self._close_on_error()
                 raise ValueError('invalid refusal reply')
-            raise Refusal(code, codes, _associated=True)
+            refusal = Refusal(code, codes)
+            if _evidence is not None and self.channel is _evidence.channel:
+                _evidence.refusal = refusal
+            raise refusal
         return body[15:]
 
-    def call(self, opcode, ns, suffix=b'', op_id=None, deadline=None, *, retry_transport=True):
+    def call(self, opcode, ns, suffix=b'', op_id=None, deadline=None, *, retry_transport=True, _evidence=None):
         """At most one resend. See docs/PYTHON_RETRY.md for custody and limits."""
         op_id = op_id or str(uuid.uuid4())
         deadline = deadline or deadline_ms(self.timeout)
         payload = struct.pack('<Q', deadline)+lp(op_id)+lp(ns)+suffix
         creates_snapshot = opcode in (10, 16, 21, 22) or (opcode in (11, 12, 14, 15) and suffix[:4] == b'\x00' * 4)
         bounded_retry = opcode in (4, 5, 6, 7, 17, 24)
+        exchange_options = {} if _evidence is None else {'_evidence': _evidence}
         original = lost = None
         for attempt in range(2):
             try:
+                if _evidence is not None and self.channel is not _evidence.channel:
+                    raise ConnectionError('indexed exchange channel changed before send')
                 if self.channel is None: self.connect(deadline)
                 if bounded_retry and retry_transport:
                     if original is None:
@@ -314,7 +328,7 @@ class Client:
                             raise TimeoutError('original retry horizon elapsed')
                         if int(time.time()*1000) >= deadline:
                             raise TimeoutError('original request deadline elapsed')
-                reply = self.exchange(opcode, payload, deadline)
+                reply = self.exchange(opcode, payload, deadline, **exchange_options)
                 # An associated success frame is not yet a typed settlement.
                 # Validate while the original request and first loss are in scope.
                 if opcode in (4, 5, 6):
@@ -392,13 +406,16 @@ class Client:
         count, = d.unpack('<H')
         return [d.value() for _ in range(count)]
 
-    def put(self, ns, key, value, ack=1, expected=None, op_id=None, deadline=None, *, retry_transport=True):
+    def put(self, ns, key, value, ack=1, expected=None, op_id=None, deadline=None, *,
+            retry_transport=True, _evidence=None):
         opcode = 4 if expected is None else 5
         suffix = lp(key)+struct.pack('<B',ack)
         if expected is not None:
             suffix += struct.pack('<Q',expected)
         suffix += lp(value)
         options = {} if retry_transport else {'retry_transport': False}
+        if _evidence is not None:
+            options['_evidence'] = _evidence
         version, achieved = struct.unpack('<QB', self.call(opcode,ns,suffix,op_id,deadline,**options))
         return {'version':version,'ack':achieved}
 

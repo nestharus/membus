@@ -141,7 +141,7 @@ class PublicationWireControls(unittest.TestCase):
     def setUp(self):
         from batch_refusal_python import BytePeer, response
 
-        self.cap, self.frame = 4096, MAX_FRAME
+        self.cap, self.frame, self.retry_ms = 4096, MAX_FRAME, 120000
         self.peers, self.writes, self.values = [], [], {}
         self.receipt, self.target = None, ':commit'
 
@@ -151,7 +151,7 @@ class PublicationWireControls(unittest.TestCase):
             op, request_id = struct.unpack_from('<BQ', packet, 8)
             if op == 1:
                 codes = [(code, entry) for code, entry in CODES.items() if code <= 19]
-                hello = struct.pack('<QIIHBQH', 7, self.frame, self.cap, 128, 0, 120000, len(codes))
+                hello = struct.pack('<QIIHBQH', 7, self.frame, self.cap, 128, 0, self.retry_ms, len(codes))
                 hello += b''.join(struct.pack('<HB', code, transient) + lp(name)
                                   for code, (name, transient) in codes)
                 return response(op, request_id, hello)
@@ -336,6 +336,72 @@ class PublicationWireControls(unittest.TestCase):
         self.assertEqual(p.uncertainties, (caught.exception,))
         self.assertEqual(p._custody.oldest_first_send, sent)
         self.assertEqual(request.first_send, sent)
+
+    def test_executing_zero_and_permanent_positive_contraction(self):
+        c, col = self.client, self.collection
+        for append in (False, True):
+            with self.subTest(append=append):
+                def connect(retry_ms):
+                    c.close()
+                    self.retry_ms = retry_ms
+                    c.connect(deadline_ms())
+                    self.assertEqual(c.retry_ms, retry_ms)
+
+                connect(120000)
+                d = Deadline.after(10)
+                now = __import__('time').monotonic()
+                ns = f'contract-{append}'
+                if append:
+                    p = col.prepare_append(c, ns, Record(1, (), b''), 'original', Ack.FLUSH)
+                    execute = col.append
+                    self.target = ':row'
+                else:
+                    p = col.prepare_declaration(c, ns, 'original', Ack.FLUSH)
+                    execute = col.declare
+                    self.target = ':schema'
+
+                connect(0)
+                with self.assertRaises(Unsupported):
+                    execute(c, p, d)
+                self.assertEqual(len(c.channel.packets), 1)
+                self.assertIsNone(p._custody.oldest_first_send)
+                self.assertFalse(p._mutations)
+
+                connect(100)
+                self.receipt = 'lost-before'
+                with patch('membus_indexed.time.monotonic', return_value=now):
+                    with self.assertRaises(Uncertain) as caught:
+                        execute(c, p, d)
+                original = caught.exception
+                m = p._mutations[original.operation_id]
+                self.assertIs(m.request, original.request)
+                self.assertEqual((m.first_send, p._custody.oldest_first_send), (now, now))
+
+                self.receipt = None
+                for retry_ms, elapsed, error in ((0, .001, Unsupported), (10, .010, RetryWindowExpired),
+                                                 (120000, .010, RetryWindowExpired)):
+                    connect(retry_ms)
+                    with patch('membus_indexed.time.monotonic', return_value=now + elapsed):
+                        with self.assertRaises(error):
+                            execute(c, p, d)
+                    self.assertEqual(len(c.channel.packets), 1)
+                    self.assertEqual(p.uncertainties, (original,))
+                    self.assertIs(m.request, original.request)
+                    self.assertEqual((p.retry_ms, m.first_send, p._custody.oldest_first_send),
+                                     (120000, now, now))
+
+    def test_exact_current_cas_refusal_reconciles_and_keeps_channel(self):
+        c, col = self.client, self.collection
+        p = col.prepare_append(c, 'fixture', Record(1, (), b''), 'original', Ack.FLUSH)
+        self.receipt = 12
+        with self.assertRaisesRegex(Conflict, 'boundary changed'):
+            col.append(c, p, Deadline.after(10))
+        last = Decoder(c.channel.packets[-1][17:])
+        last.unpack('<Q')
+        self.assertEqual(c.channel.packets[-1][8], 2)
+        self.assertEqual(last.blob(), b'original:commit-reconcile')
+        self.assertEqual(p.uncertainties, ())
+        self.assertEqual(c.get('fixture', col._head_key)['value'], b'MBIX1H' + bytes(8))
 
 
 class SnapshotContractControls(unittest.TestCase):
@@ -589,7 +655,7 @@ class PrivateIPC(unittest.TestCase):
         class Loss(Client):
             armed = True
             sends = 0
-            def exchange(inner, opcode, payload, deadline):
+            def exchange(inner, opcode, payload, deadline, **options):
                 if opcode == 5:
                     d = Decoder(payload)
                     d.unpack('<Q')
@@ -598,9 +664,9 @@ class PrivateIPC(unittest.TestCase):
                         inner.armed = False
                         inner.sends += 1
                         if after:
-                            super(Loss, inner).exchange(opcode, payload, deadline)
+                            super(Loss, inner).exchange(opcode, payload, deadline, **options)
                         raise ConnectionError('authored response loss at exchange boundary')
-                return super(Loss, inner).exchange(opcode, payload, deadline)
+                return super(Loss, inner).exchange(opcode, payload, deadline, **options)
         c = self.client(Loss)
         self.addCleanup(c.close)
         return c
@@ -717,11 +783,8 @@ class PrivateIPC(unittest.TestCase):
         # The same original is explicitly resumed, never a replacement identity.
         c.connect(int(__import__('time').time() * 1000) + 30000)
         original = p.uncertainties[0]
-        with patch.object(c, 'put', side_effect=Refusal(8, c.codes, _associated=True)):
-            with self.assertRaises(Refusal):
-                self.col.append(c, p, Deadline.after(30))
-        self.assertEqual(p.uncertainties, (original,))
         self.col.append(c, p, Deadline.after(30))
+        self.assertEqual(p.uncertainties, (original,))
         self.assertEqual(self.query().records, (row(1),))
 
     def test_expired_horizon_refuses_before_any_send(self):
@@ -767,17 +830,34 @@ class PrivateIPC(unittest.TestCase):
             self.assertIs(caught.exception.publication, p)
             self.assertIsNone(c.channel)
 
-    def test_definitive_conflict_pending_and_uncertain_refusals_stay_distinct(self):
-        for code in (12, 19, 16, 17, 14, 13, 8):
-            col = Collection('refusal_' + uuid.uuid4().hex, SCHEMA)
-            c = self.client()
-            self.addCleanup(c.close)
-            p = self.prepare(row(1), client=c, col=col)
-            with patch.object(c, 'put', side_effect=Refusal(code, c.codes, _associated=True)):
-                expected = Uncertain if code in (16, 17) else (Corrupt if code == 12 else Refusal)
-                with self.assertRaises(expected):
-                    col.append(c, p, Deadline.after(30))
-            self.assertEqual(len(p.uncertainties), int(code in (16, 17)))
+    def test_current_native_conflict_reconciles(self):
+        col, c = self.col, self.c
+        p = self.prepare(row(1))
+        observer = self.client()
+        self.addCleanup(observer.close)
+        write = c.write_all
+        requests = []
+
+        def race(frame, deadline):
+            request = Decoder(frame[17:])
+            request.unpack('<Q')
+            op = request.blob().decode()
+            requests.append(op)
+            if op == p.operation + ':commit':
+                previous = observer.get(self.namespace, col._head_key)
+                observer.put(self.namespace, col._head_key, previous['value'],
+                             expected=previous['version'], ack=Ack.FLUSH)
+            return write(frame, deadline)
+
+        channel = c.channel
+        with patch.object(c, 'write_all', side_effect=race):
+            with self.assertRaisesRegex(Conflict, 'boundary changed'):
+                col.append(c, p, Deadline.after(30))
+        self.assertEqual(requests.count(p.operation + ':commit'), 1)
+        self.assertEqual(requests[-1], p.operation + ':commit-reconcile')
+        self.assertEqual(p.uncertainties, ())
+        self.assertIs(c.channel, channel)
+        self.assertEqual(c.get(self.namespace, col._head_key)['value'], b'MBIX1H' + bytes(8))
 
     def test_expired_snapshot_and_missing_committed_row_refuse(self):
         self.append(row(1))
