@@ -54,7 +54,7 @@ class Uncertain(Error):
         self.epoch = publication.epoch
         self.operation_id = request.operation_id
         self.cleanup_errors = ()
-        super().__init__(f'uncertain operation {self.operation_id}: {cause}')
+        super().__init__(f'uncertain operation {self.operation_id}')
 
 
 _cancellation_types = ContextVar('indexed_cancellation_types', default=())
@@ -408,8 +408,8 @@ class Collection:
             raise Conflict('original mutation identity cannot be rebound')
         self._admit_put(c, p.namespace, key, len(body), op, 'mutation')
         deadline = _deadline(d)
-        channel = c.channel
-        evidence = _ExchangeEvidence(channel)
+        evidence = _ExchangeEvidence(c)
+        channel = evidence.channel
         if m.first_send is None:
             m.first_send = time.monotonic()
             first = p._custody.oldest_first_send
@@ -423,14 +423,14 @@ class Collection:
                 raise Corrupt('mutation achieved acknowledgment/revision')
             return result
         except BaseException as cause:
-            if cause is evidence.refusal and c.channel is channel and cause.code not in (16, 17):
+            if evidence.confirms(cause) and cause.code not in (16, 17):
                 raise
             error = Uncertain(p, m.request, cause)
             p._uncertainties.append(error)
-            interrupted = (_cancelled(cause) or
-                           not isinstance(cause, (Refusal, OSError, ValueError, struct.error, Corrupt)))
             if c.channel is channel:
                 c.channel = None
+            interrupted = (_cancelled(cause) or
+                           not isinstance(cause, (Refusal, OSError, ValueError, struct.error, Corrupt)))
             # A physical close can fail. Give an ordinary I/O failure one
             # further close on the detached channel, without delaying cancellation.
             for _ in range(1 if interrupted else 2):

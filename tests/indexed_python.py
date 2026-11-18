@@ -2,6 +2,7 @@
 import concurrent.futures
 import os
 import pathlib
+import signal
 import struct
 import sys
 import threading
@@ -280,6 +281,66 @@ class PublicationWireControls(unittest.TestCase):
                     self.assertIs(c.channel, channel)
                     self.assertIsNotNone(c.get(namespace, self.collection._head_key))
 
+    def test_wire_refusal_evidence_stays_with_the_current_request_channel_and_error(self):
+        c, col = self.client, self.collection
+        self.receipt = 14
+        exchange = c.exchange
+        for mode in ('exact', 'different-request', 'different-error', 'later-exchange', 'different-channel'):
+            with self.subTest(mode=mode):
+                if c.channel is None:
+                    c.connect(deadline_ms())
+                channel = c.channel
+                p = col.prepare_append(c, mode, Record(1, (), b''), 'original', Ack.OS)
+                errors = []
+                replacement = object()
+
+                def override(opcode, payload, deadline):
+                    request = Decoder(payload)
+                    request.unpack('<Q')
+                    if opcode != 5 or request.blob() != b'original:commit':
+                        return exchange(opcode, payload, deadline)
+                    if mode == 'different-request':
+                        # Same opcode, request number and channel, different CAS bytes.
+                        payload = payload[:-1] + bytes([payload[-1] ^ 1])
+                    try:
+                        return exchange(opcode, payload, deadline)
+                    except Refusal as error:
+                        self.assertEqual(error.code, 14)
+                        if mode == 'different-error':
+                            errors.append(Refusal(error.code))
+                            raise errors[-1] from error
+                        errors.append(error)
+                        if mode == 'later-exchange':
+                            get_payload = struct.pack('<Q', deadline) + lp('later') + lp(mode) + lp(col._head_key)
+                            exchange(2, get_payload, deadline)
+                        if mode == 'different-channel':
+                            c.channel = replacement
+                        raise
+
+                before, peers = len(self.writes), len(self.peers)
+                try:
+                    with patch.object(c, 'exchange', side_effect=override):
+                        with self.assertRaises(Refusal if mode == 'exact' else Uncertain) as caught:
+                            col.append(c, p, Deadline.after(10))
+                    self.assertEqual(len(self.peers), peers)
+                    self.assertEqual([w[0] for w in self.writes[before:]].count('original:commit'), 1)
+                    error, = errors
+                    if mode == 'exact':
+                        self.assertIs(caught.exception, error)
+                        self.assertEqual(p.uncertainties, ())
+                        self.assertIs(c.channel, channel)
+                        self.assertEqual(channel.closed, 0)
+                    else:
+                        uncertain, = p.uncertainties
+                        self.assertIs(caught.exception, uncertain)
+                        self.assertIs(uncertain.cause, error)
+                        self.assertIs(uncertain.request, p._mutations['original:commit'].request)
+                        self.assertIs(c.channel, replacement if mode == 'different-channel' else None)
+                        self.assertEqual(channel.closed, 1)
+                finally:
+                    if c.channel is replacement:
+                        c.channel = None
+
     def test_reconnect_rechecks_complete_value_and_frame_before_any_request(self):
         c, col = self.client, self.collection
         for index, (append, value, frame, payload, fits) in enumerate((
@@ -498,6 +559,10 @@ class LocalControls(unittest.TestCase):
 
 
 class PrivateIPC(unittest.TestCase):
+    class ExistingExchange(Client):
+        def exchange(self, opcode, payload, deadline):
+            return super().exchange(opcode, payload, deadline)
+
     @classmethod
     def setUpClass(cls):
         cls.pipe = os.environ['MEMBUS_PYTHON_INDEXED_PIPE']
@@ -655,7 +720,7 @@ class PrivateIPC(unittest.TestCase):
         class Loss(Client):
             armed = True
             sends = 0
-            def exchange(inner, opcode, payload, deadline, **options):
+            def exchange(inner, opcode, payload, deadline):
                 if opcode == 5:
                     d = Decoder(payload)
                     d.unpack('<Q')
@@ -664,9 +729,9 @@ class PrivateIPC(unittest.TestCase):
                         inner.armed = False
                         inner.sends += 1
                         if after:
-                            super(Loss, inner).exchange(opcode, payload, deadline, **options)
+                            super(Loss, inner).exchange(opcode, payload, deadline)
                         raise ConnectionError('authored response loss at exchange boundary')
-                return super(Loss, inner).exchange(opcode, payload, deadline, **options)
+                return super(Loss, inner).exchange(opcode, payload, deadline)
         c = self.client(Loss)
         self.addCleanup(c.close)
         return c
@@ -740,6 +805,138 @@ class PrivateIPC(unittest.TestCase):
                         result = col.query(self.c, self.namespace, token, q, Limits(2, MAX_VALUE),
                                            'receipt-observer', Deadline.after(30))
                         self.assertEqual((result.through, result.records), (1, (record,)))
+
+    def test_registered_receipt_and_close_cancellation_with_builtin_integer_format_limit(self):
+        from membus_indexed import cancellation_exceptions
+
+        class ApplicationStop(Exception):
+            pass
+
+        self.addCleanup(sys.set_int_max_str_digits, sys.get_int_max_str_digits())
+        sys.set_int_max_str_digits(4300)
+        huge = 10**4300
+        receipt_stop, close_stop = ApplicationStop(huge), ApplicationStop(huge)
+        with self.assertRaises(ValueError):
+            str(receipt_stop)
+        with self.assertRaises(ValueError):
+            str(close_stop)
+        loss = ConnectionResetError('before final receipt body')
+        close_io = OSError('first close failed')
+        cases = ((ApplicationStop(123), ()), (receipt_stop, ()), (receipt_stop, (close_io,)),
+                 (receipt_stop, (close_stop,)), (loss, (close_stop,)), (loss, (close_io, close_stop)))
+        record = Record(1, (), b'\xf7\0')
+        for index, (cause, cleanup) in enumerate(cases):
+            with self.subTest(case=index), cancellation_exceptions(ApplicationStop):
+                col = Collection('format_' + uuid.uuid4().hex, Schema(()))
+                namespace = self.namespace + '-' + str(index)
+                c = self.client()
+                channel, write, read = c.channel, c.write_all, c.read_exact
+                physical_close = channel.close
+                self.addCleanup(physical_close)
+                self.addCleanup(c.close)
+                p = col.prepare_append(c, namespace, record, 'original', Ack.FLUSH)
+                target = (5, 'original:commit')
+                writes, first_sends, closes = [], {}, []
+                before_commit, observed = [], []
+
+                def capture(data, deadline):
+                    request = Decoder(data[17:])
+                    request.unpack('<Q')
+                    opcode, operation = data[8], request.blob().decode()
+                    writes.append((opcode, operation))
+                    if opcode == 5:
+                        first_sends[operation] = p._mutations[operation].first_send
+                    if (opcode, operation) == target:
+                        head = self.c.get(namespace, col._head_key, retry_transport=False)
+                        self.assertEqual(head['value'], b'MBIX1H' + bytes(8))
+                        before_commit.append(head['version'])
+                    return write(data, deadline)
+
+                def after_length(count, deadline):
+                    if count == 24 and writes[-1] == target:
+                        head = self.c.get(namespace, col._head_key, retry_transport=False)
+                        self.assertEqual((head['value'], head['ack']), (b'MBIX1H\x01' + bytes(7), Ack.FLUSH))
+                        observed.append(head['version'])
+                        if cause is loss:
+                            raise loss
+                        signal.raise_signal(signal.SIGINT)
+                    return read(count, deadline)
+
+                def interrupt(*args):
+                    raise cause
+
+                def close():
+                    self.assertIsNone(c.channel)
+                    error, = p.uncertainties
+                    self.assertIs(error.cause, cause)
+                    self.assertIs(error.request, p._mutations[target[1]].request)
+                    n = len(closes)
+                    self.assertEqual(error.cleanup_errors, cleanup[:n])
+                    closes.append(error)
+                    if n + 1 == max(1, len(cleanup)):
+                        physical_close()
+                    if n < len(cleanup):
+                        raise cleanup[n]
+
+                handler = signal.signal(signal.SIGINT, interrupt)
+                try:
+                    with (patch.object(c, 'write_all', side_effect=capture),
+                          patch.object(c, 'read_exact', side_effect=after_length),
+                          patch.object(c, 'connect', side_effect=AssertionError('reconnect')) as reconnect,
+                          patch.object(channel, 'close', side_effect=close)):
+                        with self.assertRaises(ApplicationStop) as caught:
+                            col.append(c, p, Deadline.after(30))
+                    reconnect.assert_not_called()
+                finally:
+                    signal.signal(signal.SIGINT, handler)
+
+                error, = p.uncertainties
+                self.assertIs(caught.exception, close_stop if cause is loss else cause)
+                self.assertIs(error.publication, p)
+                self.assertIs(error.cause, cause)
+                self.assertEqual(error.cleanup_errors, cleanup)
+                self.assertEqual(closes, [error] * max(1, len(cleanup)))
+                self.assertEqual(str(error), 'uncertain operation original:commit')
+                self.assertIsNone(c.channel)
+                self.assertIsNone(channel.handle)
+                self.assertEqual(writes.count(target), 1)
+                version, = observed
+                request = error.request
+                self.assertEqual((request.namespace, request.key, request.value, request.ack, error.epoch),
+                                 (namespace, col._head_key, b'MBIX1H\x01' + bytes(7), Ack.FLUSH, c.epoch))
+                self.assertEqual(before_commit, [request.expected])
+                self.assertLess(request.expected, version)
+                self.assertEqual(p._mutations[target[1]].first_send, first_sends[target[1]])
+                self.assertEqual(p._custody.oldest_first_send, min(first_sends.values()))
+                self.assertEqual(self.c.get(namespace, col._row_key(1))['value'], col._encode(record))
+
+    def test_existing_exchange_override_supports_raw_and_indexed_calls(self):
+        c, col = self.client(self.ExistingExchange), self.col
+        self.addCleanup(c.close)
+        c.put('raw', 'key', b'probe')
+        self.assertEqual(c.get('raw', 'key')['value'], b'probe')
+        channel = c.channel
+        declaration = col.prepare_declaration(c, self.namespace, 'existing', Ack.OS)
+        with patch.object(c, 'write_all', wraps=c.write_all) as write:
+            col.declare(c, declaration, Deadline.after(30))
+        self.assertEqual([call.args[0][8] for call in write.call_args_list], [2, 5, 2, 5])
+        self.assertEqual(declaration.uncertainties, ())
+        self.assertEqual(self.c.get(self.namespace, col._head_key)['value'], b'MBIX1H' + bytes(8))
+        publication = self.prepare(row(1), client=c)
+        self.assertEqual(col.append(c, publication, Deadline.after(30)).through, 1)
+        self.assertEqual(publication.uncertainties, ())
+        self.assertIs(c.channel, channel)
+        self.assertEqual(self.query().records, (row(1),))
+
+        namespace = self.namespace + '-mismatch'
+        self.c.put(namespace, 'different-key', b'first', expected=0, op_id='definitive:schema')
+        refused = col.prepare_declaration(c, namespace, 'definitive', Ack.OS)
+        with self.assertRaises(Refusal) as caught:
+            col.declare(c, refused, Deadline.after(30))
+        self.assertEqual(caught.exception.code, 14)
+        self.assertEqual(refused.uncertainties, ())
+        self.assertIs(c.channel, channel)
+        self.assertIsNone(c.get(namespace, col._schema_key))
 
     def test_uncertain_original_commit_preserved_on_explicit_reconnect(self):
         c = self.loss_client(':commit')
@@ -831,8 +1028,9 @@ class PrivateIPC(unittest.TestCase):
             self.assertIsNone(c.channel)
 
     def test_current_native_conflict_reconciles(self):
-        col, c = self.col, self.c
-        p = self.prepare(row(1))
+        col, c = self.col, self.client(self.ExistingExchange)
+        self.addCleanup(c.close)
+        p = self.prepare(row(1), client=c)
         observer = self.client()
         self.addCleanup(observer.close)
         write = c.write_all

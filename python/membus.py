@@ -47,9 +47,16 @@ class Refusal(Exception):
 
 class _ExchangeEvidence:
     """One call's exact raw refusal, populated only by its reply decoder."""
-    def __init__(self, channel):
-        self.channel = channel
-        self.refusal = None
+    def __init__(self, client):
+        self.client, self.channel = client, client.channel
+        self.request = self.outcome = None
+
+    def confirms(self, error):
+        if self.outcome is None:
+            return False
+        sent_id, code, refusal = self.outcome
+        return (error is refusal and error.code == code and
+                self.client.channel is self.channel and self.client.request_id == sent_id)
 
 
 class CallOriginal(NamedTuple):
@@ -274,7 +281,9 @@ class Client:
                 raise ConnectionError('zero write')
             position += count
 
-    def exchange(self, opcode, payload, deadline, *, _evidence=None):
+    def exchange(self, opcode, payload, deadline):
+        channel = self.channel
+        evidence = getattr(self, '_active_exchange_evidence', None)
         self.request_id += 1
         sent_id = self.request_id
         encoded=frame(opcode,sent_id,payload)
@@ -295,8 +304,10 @@ class Client:
                 self._close_on_error()
                 raise ValueError('invalid refusal reply')
             refusal = Refusal(code, codes)
-            if _evidence is not None and self.channel is _evidence.channel:
-                _evidence.refusal = refusal
+            if (evidence is not None and evidence.client is self and
+                    self.channel is channel is evidence.channel and
+                    evidence.request == (sent_id, opcode, payload)):
+                evidence.outcome = sent_id, code, refusal
             raise refusal
         return body[15:]
 
@@ -307,7 +318,6 @@ class Client:
         payload = struct.pack('<Q', deadline)+lp(op_id)+lp(ns)+suffix
         creates_snapshot = opcode in (10, 16, 21, 22) or (opcode in (11, 12, 14, 15) and suffix[:4] == b'\x00' * 4)
         bounded_retry = opcode in (4, 5, 6, 7, 17, 24)
-        exchange_options = {} if _evidence is None else {'_evidence': _evidence}
         original = lost = None
         for attempt in range(2):
             try:
@@ -328,7 +338,17 @@ class Client:
                             raise TimeoutError('original retry horizon elapsed')
                         if int(time.time()*1000) >= deadline:
                             raise TimeoutError('original request deadline elapsed')
-                reply = self.exchange(opcode, payload, deadline, **exchange_options)
+                # Keep the three-argument exchange hook. A nested call gets its
+                # own scope, and a direct exchange must match the exact request.
+                previous = getattr(self, '_active_exchange_evidence', None)
+                self._active_exchange_evidence = _evidence
+                try:
+                    if _evidence is not None:
+                        _evidence.request = (self.request_id + 1, opcode, payload)
+                        _evidence.outcome = None
+                    reply = self.exchange(opcode, payload, deadline)
+                finally:
+                    self._active_exchange_evidence = previous
                 # An associated success frame is not yet a typed settlement.
                 # Validate while the original request and first loss are in scope.
                 if opcode in (4, 5, 6):

@@ -130,6 +130,8 @@ The additive `retry_transport=False` option on `Client.call` and `Client.put`
 disables their legacy reconnect/retry. The binding always selects this option.
 It requires an explicitly connected Client and never changes an uncertain send
 into an implicit retry. Ordinary Client defaults remain unchanged.
+An `exchange(self, opcode, payload, deadline)` override can forward those three
+arguments to `super().exchange` to keep the same reply validation.
 
 `Deadline` carries explicit Unix admission milliseconds and a local monotonic
 preflight boundary. `Deadline.after(seconds)` creates both. Each Client call is
@@ -149,7 +151,9 @@ The token's `uncertainties` tuple retains every such original observation even
 when a later explicit reconciliation succeeds or refuses.
 
 The binding records `Uncertain` on the same publication before detaching and
-closing the channel. `Uncertain.cleanup_errors` retains close failures.
+closing the channel. Constructing the record does not format the original
+exception. `Uncertain.cause` holds that exact object and
+`Uncertain.cleanup_errors` retains close failures.
 Keyboard interrupts, process and generator exits, and the standard `asyncio`
 and `concurrent.futures` `CancelledError` classes propagate as the original
 exception at the mutation receipt boundary. The same exceptions propagate
