@@ -16,11 +16,33 @@ struct Page {
     code: u16,
     reply_bytes: usize,
 }
+#[derive(Clone, Copy, Debug)]
+enum Receipt {
+    Loss,
+    BadProof,
+    Refusal(u16),
+}
+#[derive(Default)]
+struct PublicationWire {
+    value_cap: Option<u32>,
+    receipt: Option<Receipt>,
+    requests: Vec<(u8, usize)>,
+    drops: usize,
+}
 struct Local {
     store: Arc<Store>,
     input: Vec<u8>,
     output: io::Cursor<Vec<u8>>,
     pages: Arc<Mutex<Vec<Page>>>,
+    publication: Option<Arc<Mutex<PublicationWire>>>,
+    lose_receipt: bool,
+}
+impl Drop for Local {
+    fn drop(&mut self) {
+        if let Some(wire) = &self.publication {
+            wire.lock().unwrap().drops += 1;
+        }
+    }
 }
 impl Write for Local {
     fn write(&mut self, input: &[u8]) -> io::Result<usize> {
@@ -29,7 +51,40 @@ impl Write for Local {
             let n = u32::from_le_bytes(self.input[..4].try_into().unwrap()) as usize;
             if self.input.len() == n + 4 {
                 let body = &self.input[4..];
-                let reply = self.store.dispatch(body);
+                let mut reply = None;
+                if let Some(wire) = &self.publication {
+                    let mut wire = wire.lock().unwrap();
+                    wire.requests.push((body[4], n));
+                    if body[4] == membus::HELLO {
+                        let mut hello = self.store.dispatch(body);
+                        if let Some(cap) = wire.value_cap {
+                            hello[31..35].copy_from_slice(&cap.to_le_bytes());
+                        }
+                        reply = Some(hello);
+                    } else if body[4] == membus::CONDITIONAL_PUT {
+                        let mut fields = Cursor::new(&body[13..]);
+                        fields.u64().unwrap();
+                        if fields.text().unwrap().ends_with(":commit") {
+                            match wire.receipt {
+                                Some(Receipt::Loss) => self.lose_receipt = true,
+                                Some(Receipt::BadProof) => {
+                                    let mut malformed = self.store.dispatch(body);
+                                    malformed[19..27].fill(0);
+                                    reply = Some(malformed);
+                                }
+                                Some(Receipt::Refusal(code)) => {
+                                    let mut refusal = 15u32.to_le_bytes().to_vec();
+                                    refusal.extend_from_slice(&body[..13]);
+                                    refusal[8] |= 128;
+                                    refusal.extend_from_slice(&code.to_le_bytes());
+                                    reply = Some(refusal);
+                                }
+                                None => (),
+                            }
+                        }
+                    }
+                }
+                let reply = reply.unwrap_or_else(|| self.store.dispatch(body));
                 if matches!(body[4], SCAN_PREFIX | SCAN_RANGE) {
                     let mut c = Cursor::new(&body[13..]);
                     c.u64().unwrap();
@@ -59,6 +114,12 @@ impl Write for Local {
 }
 impl Read for Local {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if self.lose_receipt && self.output.position() == 4 {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "authored head receipt loss",
+            ));
+        }
         self.output.read(out)
     }
 }
@@ -125,6 +186,14 @@ fn fixture(label: &str) -> (Fixture, Arc<Store>, Arc<Mutex<Vec<Page>>>) {
     (f, store, Arc::new(Mutex::new(Vec::new())))
 }
 fn client(store: Arc<Store>, pages: Arc<Mutex<Vec<Page>>>, max: usize) -> Client<Local> {
+    local_client(store, pages, max, None)
+}
+fn local_client(
+    store: Arc<Store>,
+    pages: Arc<Mutex<Vec<Page>>>,
+    max: usize,
+    publication: Option<Arc<Mutex<PublicationWire>>>,
+) -> Client<Local> {
     let mut options = Options::new("indexed-admission-control", max);
     options.scans = true;
     Client::handshake(
@@ -133,6 +202,8 @@ fn client(store: Arc<Store>, pages: Arc<Mutex<Vec<Page>>>, max: usize) -> Client
             pages,
             input: Vec::new(),
             output: io::Cursor::new(Vec::new()),
+            publication,
+            lose_receipt: false,
         },
         options,
         deadline().local,
@@ -417,4 +488,228 @@ fn minimum_range_bounds_acquisition_before_initial_and_continuation_pages() {
     assert!(pages.lock().unwrap().is_empty());
     c.snapshot_release("ledger", &token, "extreme-release", deadline()).unwrap();
     assert!(!store.storage_error());
+}
+
+fn mutation_frames(wire: &Mutex<PublicationWire>) -> Vec<usize> {
+    wire.lock()
+        .unwrap()
+        .requests
+        .iter()
+        .filter_map(|&(op, size)| (op == membus::CONDITIONAL_PUT).then_some(size))
+        .collect()
+}
+
+#[test]
+fn indexed_publication_admits_complete_values_before_any_request() {
+    let (_fixture, store, pages) = fixture("publication-values");
+    let collection = Collection::new("small", Schema { fields: vec![] }).unwrap();
+    let row = Record {
+        ordinal: 1,
+        fields: vec![],
+        payload: vec![],
+    };
+    for append in [false, true] {
+        for cap in [7, 8, 13, 14, 15, 19, 20, 21] {
+            let ns = format!("small-{append}-{cap}");
+            let wire = Arc::new(Mutex::new(PublicationWire {
+                value_cap: Some(cap),
+                ..Default::default()
+            }));
+            let mut c = local_client(store.clone(), pages.clone(), MAX_FRAME, Some(wire.clone()));
+            assert_eq!(c.negotiated().max_value, cap as usize);
+            let result = if append {
+                collection
+                    .append(&mut c, &ns, &row, "original", Ack::Flush, deadline())
+                    .map(|_| ())
+            } else {
+                collection.declare(&mut c, &ns, "original", Ack::Flush, deadline())
+            };
+            let fits = cap >= if append { 20 } else { 14 };
+            if fits {
+                result.unwrap();
+                let frames = mutation_frames(&wire);
+                assert_eq!(frames.len(), if append { 4 } else { 2 });
+                assert_eq!(
+                    store.try_get(&ns, "x/small/schema").unwrap().unwrap().bytes,
+                    b"MBIX1S\0\0"
+                );
+                let head = store.try_get(&ns, "x/small/head").unwrap().unwrap();
+                assert_eq!(
+                    head.bytes,
+                    [b"MBIX1H".as_slice(), &u64::from(append).to_le_bytes()].concat()
+                );
+                if append {
+                    assert!(
+                        collection
+                            .append(&mut c, &ns, &row, "original", Ack::Flush, deadline())
+                            .unwrap()
+                            .already_committed
+                    );
+                } else {
+                    collection
+                        .declare(&mut c, &ns, "original", Ack::Flush, deadline())
+                        .unwrap();
+                }
+                assert_eq!(mutation_frames(&wire), frames);
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(Error::Client(ClientError::Invalid("value limit")))
+                ));
+                assert_eq!(wire.lock().unwrap().requests.len(), 1);
+                for key in [
+                    "x/small/schema",
+                    "x/small/head",
+                    "x/small/r/00000000000000000001",
+                ] {
+                    assert!(store.try_get(&ns, key).unwrap().is_none());
+                }
+            }
+            assert!(c.is_usable());
+        }
+    }
+}
+
+#[test]
+fn indexed_publication_admits_exact_mutation_frame_boundary_before_any_request() {
+    let (_fixture, store, pages) = fixture("publication-frames");
+    for (case, exact) in [
+        ("schema", 1024),
+        ("row", 1024),
+        ("posting", 1024),
+        ("schema", 1025),
+        ("row", 1025),
+        ("posting", 1025),
+    ] {
+        let ns = format!("{case}-{exact}");
+        let mut op = "original".to_string();
+        let mut schema = Schema { fields: vec![] };
+        let mut row = Record {
+            ordinal: 1,
+            fields: vec![],
+            payload: vec![],
+        };
+        match case {
+            "schema" => schema
+                .fields
+                .push("s".repeat(exact - (46 + ns.len() + 14 + 15 + 12))),
+            "row" => row
+                .payload
+                .resize(exact - (46 + ns.len() + 30 + 12 + 20), 1),
+            "posting" => {
+                schema.fields.push("tag".into());
+                row.fields.push(vec![vec![]]);
+                op = "p".repeat(exact - (46 + ns.len() + 42 + 12 + 8));
+            }
+            _ => unreachable!(),
+        }
+        let collection = Collection::new("small", schema).unwrap();
+        let wire = Arc::new(Mutex::new(PublicationWire::default()));
+        let mut c = local_client(store.clone(), pages.clone(), 1024, Some(wire.clone()));
+        let result = if case == "schema" {
+            collection.declare(&mut c, &ns, &op, Ack::Os, deadline())
+        } else {
+            collection
+                .append(&mut c, &ns, &row, &op, Ack::Os, deadline())
+                .map(|_| ())
+        };
+        if exact == 1024 {
+            result.unwrap();
+            assert_eq!(mutation_frames(&wire).into_iter().max(), Some(exact));
+        } else {
+            assert!(matches!(
+                result,
+                Err(Error::Client(ClientError::Invalid("frame limit")))
+            ));
+            assert_eq!(wire.lock().unwrap().requests.len(), 1);
+            assert!(store.try_get(&ns, "x/small/schema").unwrap().is_none());
+            assert!(store.try_get(&ns, "x/small/head").unwrap().is_none());
+        }
+    }
+}
+
+#[test]
+fn indexed_publication_retires_only_unsettled_transport() {
+    let (_fixture, store, pages) = fixture("publication-custody");
+    let collection = Collection::new("small", Schema { fields: vec![] }).unwrap();
+    let row = Record {
+        ordinal: 1,
+        fields: vec![],
+        payload: vec![],
+    };
+    let outcomes = [
+        None,
+        Some(Receipt::Loss),
+        Some(Receipt::BadProof),
+        Some(Receipt::Refusal(16)),
+        Some(Receipt::Refusal(17)),
+        Some(Receipt::Refusal(8)),
+        Some(Receipt::Refusal(13)),
+        Some(Receipt::Refusal(14)),
+        Some(Receipt::Refusal(19)),
+    ];
+    for (index, receipt) in outcomes.into_iter().enumerate() {
+        let ns = format!("receipt-{index}");
+        let wire = Arc::new(Mutex::new(PublicationWire {
+            receipt,
+            ..Default::default()
+        }));
+        let mut c = local_client(store.clone(), pages.clone(), MAX_FRAME, Some(wire.clone()));
+        let result = collection.append(&mut c, &ns, &row, "original", Ack::Flush, deadline());
+        let uncertain = matches!(
+            receipt,
+            Some(Receipt::Loss | Receipt::BadProof | Receipt::Refusal(16 | 17))
+        );
+        assert_eq!(mutation_frames(&wire).len(), 4);
+        assert_eq!(wire.lock().unwrap().drops, usize::from(uncertain));
+        assert_eq!(c.is_usable(), !uncertain);
+        let head = store.try_get(&ns, "x/small/head").unwrap().unwrap().bytes;
+        assert_eq!(
+            &head[6..],
+            &u64::from(!matches!(receipt, Some(Receipt::Refusal(_)))).to_le_bytes()
+        );
+        if uncertain {
+            let Err(Error::Client(ClientError::Uncertain {
+                epoch,
+                operation_id,
+                cause,
+            })) = result
+            else {
+                panic!("lost original uncertainty: {result:?}");
+            };
+            assert_eq!(operation_id, "original:commit");
+            assert_eq!(epoch, c.negotiated().epoch);
+            match (receipt, *cause) {
+                (Some(Receipt::Loss), ClientError::Transport(e)) => {
+                    assert_eq!(e.kind(), io::ErrorKind::ConnectionReset);
+                    assert_eq!(e.to_string(), "authored head receipt loss");
+                }
+                (
+                    Some(Receipt::BadProof),
+                    ClientError::Protocol("mutation achieved acknowledgement"),
+                ) => (),
+                (Some(Receipt::Refusal(code)), ClientError::Refused(r)) => assert_eq!(r.code, code),
+                (mode, cause) => panic!("unexpected cause for {mode:?}: {cause:?}"),
+            }
+            assert!(matches!(
+                c.get(&ns, "x/small/head", "inspect", deadline()),
+                Err(ClientError::Invalid(_))
+            ));
+        } else {
+            if let Some(Receipt::Refusal(code)) = receipt {
+                assert!(
+                    matches!(result, Err(Error::Client(ClientError::Refused(r))) if r.code == code)
+                );
+            } else {
+                assert_eq!(result.unwrap().through, 1);
+            }
+            assert_eq!(
+                c.get(&ns, "x/small/head", "inspect", deadline())
+                    .unwrap()
+                    .unwrap()
+                    .bytes,
+                head
+            );
+        }
+    }
 }

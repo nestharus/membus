@@ -39,8 +39,9 @@ class NotAvailable(Exception):
         super().__init__(f'{call} is not available on this server')
 
 class Refusal(Exception):
-    def __init__(self, code, codes=None):
+    def __init__(self, code, codes=None, *, _associated=False):
         self.code = code
+        self._associated = _associated
         self.name, self.transient = (codes or CODES).get(code, ('unknown_refusal', False))
         super().__init__(self.name)
 
@@ -164,7 +165,8 @@ class Pipe:
 
     def close(self):
         if self.handle:
-            self.k.CloseHandle(self.handle)
+            if not self.k.CloseHandle(self.handle):
+                raise ctypes.WinError(ctypes.get_last_error())
             self.handle = None
 
 class Client:
@@ -218,9 +220,23 @@ class Client:
             raise EpochChanged(previous,self.epoch)
 
     def close(self):
-        if self.channel:
-            self.channel.close()
-            self.channel = None
+        channel, self.channel = self.channel, None
+        if channel is not None:
+            channel.close()
+
+    @contextlib.contextmanager
+    def _defer_error_close(self):
+        # The indexed caller must record a possibly sent mutation before close.
+        previous = getattr(self, '_error_close_deferred', False)
+        self._error_close_deferred = True
+        try:
+            yield
+        finally:
+            self._error_close_deferred = previous
+
+    def _close_on_error(self):
+        if not getattr(self, '_error_close_deferred', False):
+            self.close()
 
     def read_exact(self, count, deadline):
         output = bytearray()
@@ -258,19 +274,19 @@ class Client:
         self.write_all(encoded, deadline)
         count, = struct.unpack('<I', self.read_exact(4, deadline))
         if not 15 <= count <= getattr(self,'max_frame',MAX_FRAME):
-            self.close()
+            self._close_on_error()
             raise ValueError('reply frame size')
         body = self.read_exact(count, deadline)
         major, minor, op, request_id, code = struct.unpack('<HHBQH', body[:15])
         if (major, minor, op, request_id) != (1, 0, opcode|128, self.request_id):
-            self.close()
+            self._close_on_error()
             raise ValueError('reply association')
         if code:
             codes = getattr(self, 'codes', CODES)
             if code not in codes or len(body) != 15:
-                self.close()
+                self._close_on_error()
                 raise ValueError('invalid refusal reply')
-            raise Refusal(code, codes)
+            raise Refusal(code, codes, _associated=True)
         return body[15:]
 
     def call(self, opcode, ns, suffix=b'', op_id=None, deadline=None, *, retry_transport=True):
@@ -323,7 +339,7 @@ class Client:
             except Exception as error:
                 transport_error = isinstance(error, (OSError, ConnectionError))
                 if transport_error or lost is not None:
-                    self.close()
+                    self._close_on_error()
                 if original is not None and transport_error and lost is None:
                     lost = error
                 if (not transport_error or not retry_transport or creates_snapshot or attempt

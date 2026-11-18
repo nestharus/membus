@@ -39,11 +39,16 @@ head's condition protects publication, not mutation of immutable rows: rows and
 postings are never updated by this API. Existing keyed KV updates remain valid
 outside these immutable records. The control record is not an authored row.
 
+Declaration and append validate the full set of prospective mutation values
+and frames against the executing client's negotiated limits before the first
+request. Append includes its nested declaration, row, postings and final head.
+
 Interruption before the head leaves staged data outside the committed boundary.
 An explicit revisit with the same immutable record can reconcile it. The API
 does not retry a mutation, invent a caller operation ID, change epochs, or label
 an uncertain result absent. Shared-client uncertainty and definitive refusals
-remain distinguishable. Already committed identical rows reconcile without a
+remain distinguishable. The indexed client retires its transport after an
+uncertain mutation. Already committed identical rows reconcile without a
 write. Changed bytes or acknowledgment refuse; the API does not upgrade an old
 OS acknowledgment by silently rewriting immutable data.
 

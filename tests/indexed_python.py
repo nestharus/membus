@@ -11,7 +11,7 @@ from dataclasses import replace
 from unittest.mock import patch
 
 sys.path.insert(0, os.environ.get('MEMBUS_PYTHON_SDK_ROOT', str(pathlib.Path(__file__).resolve().parents[1] / 'python')))
-from membus import Client, Decoder, Refusal, EpochChanged, NotAvailable, MAX_FRAME, MAX_VALUE, CODES, lp
+from membus import Client, Decoder, Refusal, EpochChanged, NotAvailable, MAX_FRAME, MAX_VALUE, CODES, deadline_ms, lp
 
 
 def no_retry_control():
@@ -135,6 +135,207 @@ class PreparationControls(unittest.TestCase):
 def row(n, ident=None, reference=b'repeated', payload=None):
     return Record(n, ((ident or str(n).encode(),), (reference, reference), (b'prior', b'prior')),
                   payload if payload is not None else b'{"ordinal":' + str(n).encode() + b',"n":9007199254740993}')
+
+
+class PublicationWireControls(unittest.TestCase):
+    def setUp(self):
+        from batch_refusal_python import BytePeer, response
+
+        self.cap, self.frame = 4096, MAX_FRAME
+        self.peers, self.writes, self.values = [], [], {}
+        self.receipt, self.target = None, ':commit'
+
+        def answer(packet):
+            peer = self.peers[-1]
+            peer.pending.clear()
+            op, request_id = struct.unpack_from('<BQ', packet, 8)
+            if op == 1:
+                codes = [(code, entry) for code, entry in CODES.items() if code <= 19]
+                hello = struct.pack('<QIIHBQH', 7, self.frame, self.cap, 128, 0, 120000, len(codes))
+                hello += b''.join(struct.pack('<HB', code, transient) + lp(name)
+                                  for code, (name, transient) in codes)
+                return response(op, request_id, hello)
+            request = Decoder(packet[17:])
+            deadline, = request.unpack('<Q')
+            logical, namespace, key = (request.blob().decode() for _ in range(3))
+            current = self.values.get((namespace, key))
+            if op == 2:
+                value = b'\0' if current is None else b'\1' + struct.pack('<QB', *current[:2]) + lp(current[2])
+                return response(op, request_id, value)
+            self.assertEqual(op, 5)
+            ack, expected = request.unpack('<BQ')
+            value = request.blob()
+            self.assertLessEqual(len(value), self.cap)
+            self.assertLessEqual(len(packet) - 4, self.frame)
+            self.writes.append((logical, namespace, key, value, ack, expected, deadline))
+            if logical.endswith(self.target):
+                if isinstance(self.receipt, int):
+                    return response(op, request_id, b'', self.receipt)
+                if self.receipt == 'lost-before':
+                    return b''
+            self.assertEqual(expected, current[0] if current else 0)
+            revision = len(self.writes)
+            self.values[namespace, key] = (revision, ack, value)
+            if logical.endswith(self.target) and self.receipt == 'association':
+                request_id += 1
+            return response(op, request_id, struct.pack('<QB', revision, ack))
+
+        def connect(*args):
+            peer = BytePeer(answer)
+            self.peers.append(peer)
+            return peer
+
+        self.enterContext(patch('membus.Pipe', side_effect=connect))
+        self.client = Client('publication-wire', transport='pipe')
+        self.addCleanup(self.client.close)
+        self.collection = Collection('small', Schema(()))
+
+    def test_retains_first_failure_before_cleanup_and_detaches_exact_channel(self):
+        from concurrent.futures import CancelledError
+
+        cases = [('loss', ('io',)), ('loss', ('io', 'io')), ('loss', ('io', 'cancel')),
+                 ('association', ('io',)), ('unassociated', ()),
+                 (16, ('interrupt',)), (17, ('cancel',)), ('cancel', ('io',)),
+                 (16, ('refusal',)), (8, ()), (13, ()), (14, ()), (19, ()), (None, ())]
+        for index, (receipt, cleanup) in enumerate(cases):
+            with self.subTest(receipt=receipt, cleanup=cleanup):
+                c = self.client
+                if index:
+                    c.close()
+                if c.channel is None:
+                    c.connect(deadline_ms())
+                channel = c.channel
+                self.receipt = receipt
+                namespace = f'fixture-{index}'
+                p = self.collection.prepare_append(c, namespace, Record(1, (), b''), 'original', Ack.FLUSH)
+                deadline = Deadline.after(10)
+                loss = ConnectionResetError('receipt body loss')
+                cancel = CancelledError('caller cancellation')
+                unassociated = Refusal(8)
+                secondary = {'io': OSError('physical close'), 'interrupt': KeyboardInterrupt(),
+                             'cancel': CancelledError('cleanup cancellation'), 'refusal': Refusal(12)}
+                read_exact = c.read_exact
+
+                def read(size, until):
+                    if size == 24 and self.writes[-1][0] == 'original:commit':
+                        if receipt == 'loss':
+                            raise loss
+                        if receipt == 'cancel':
+                            raise cancel
+                        if receipt == 'unassociated':
+                            raise unassociated
+                    return read_exact(size, until)
+
+                attempts = []
+
+                def close():
+                    self.assertIsNone(c.channel)
+                    error, = p.uncertainties
+                    m = p._mutations['original:commit']
+                    self.assertIs(error.request, m.request)
+                    self.assertLess(p._custody.oldest_first_send, m.first_send)
+                    self.assertEqual((error.request.expected, error.request.ack),
+                                     (self.writes[-1][5], Ack.FLUSH))
+                    n = len(attempts)
+                    attempts.append(error)
+                    if n < len(cleanup):
+                        raise secondary[cleanup[n]]
+
+                before, peers = len(self.writes), len(self.peers)
+                with patch.object(c, 'read_exact', side_effect=read), patch.object(channel, 'close', side_effect=close):
+                    if receipt is None:
+                        self.assertEqual(self.collection.append(c, p, deadline).through, 1)
+                    elif receipt in (8, 13, 14, 19):
+                        with self.assertRaises(Refusal) as caught:
+                            self.collection.append(c, p, deadline)
+                        self.assertEqual(caught.exception.code, receipt)
+                    else:
+                        promoted = cancel if receipt == 'cancel' else next(
+                            (secondary[k] for k in cleanup if k in ('interrupt', 'cancel')), None)
+                        with self.assertRaises(type(promoted) if promoted else Uncertain) as caught:
+                            self.collection.append(c, p, deadline)
+                        error, = p.uncertainties
+                        self.assertIs(error.publication, p)
+                        self.assertIs(caught.exception, promoted or error)
+                        self.assertEqual(error.cleanup_errors, tuple(secondary[k] for k in cleanup))
+                        self.assertTrue(all(attempt is error for attempt in attempts))
+                        self.assertEqual(len(attempts), 2 if cleanup[:1] == ('io',) and receipt != 'cancel' else 1)
+                        if receipt in (16, 17):
+                            self.assertEqual(error.cause.code, receipt)
+                        elif receipt == 'association':
+                            self.assertIsInstance(error.cause, ValueError)
+                        elif receipt == 'unassociated':
+                            self.assertIs(error.cause, unassociated)
+                        else:
+                            self.assertIs(error.cause, cancel if receipt == 'cancel' else loss)
+                        if promoted is None:
+                            self.assertIs(error.__cause__, error.cause)
+                        self.assertIsNone(c.channel)
+                self.assertEqual(len(self.peers), peers)
+                self.assertEqual([w[0] for w in self.writes[before:]],
+                                 ['original:declare:schema', 'original:declare:head-init', 'original:row', 'original:commit'])
+                self.assertTrue(all(0 < w[-1] <= deadline.unix_ms for w in self.writes[before:]))
+                if not p.uncertainties:
+                    self.assertEqual(attempts, [])
+                    self.assertIs(c.channel, channel)
+                    self.assertIsNotNone(c.get(namespace, self.collection._head_key))
+
+    def test_reconnect_rechecks_complete_value_and_frame_before_any_request(self):
+        c, col = self.client, self.collection
+        for index, (append, value, frame, payload, fits) in enumerate((
+                (False, 8, MAX_FRAME, b'', False), (False, 13, MAX_FRAME, b'', False),
+                (False, 14, MAX_FRAME, b'', True), (True, 13, MAX_FRAME, b'', False),
+                (True, 19, MAX_FRAME, b'', False), (True, 20, MAX_FRAME, b'', True),
+                (True, 4096, 1024, bytes(907), True), (True, 4096, 1024, bytes(908), False))):
+            with self.subTest(append=append, value=value, frame=frame, payload=len(payload)):
+                namespace = f'fixture-{index}'
+                c.close()
+                self.cap, self.frame = 4096, MAX_FRAME
+                c.connect(deadline_ms())
+                if append:
+                    p = col.prepare_append(c, namespace, Record(1, (), payload), 'original', Ack.FLUSH)
+                else:
+                    p = col.prepare_declaration(c, namespace, 'original', Ack.FLUSH)
+                c.close()
+                self.cap, self.frame = value, frame
+                c.connect(deadline_ms())
+                self.assertEqual(c.epoch, p.epoch)
+                before = len(self.writes)
+                execute = col.append if append else col.declare
+                if fits:
+                    execute(c, p, Deadline.after(10))
+                    self.assertEqual(len(self.writes) - before, 4 if append else 2)
+                    before = len(self.writes)
+                    execute(c, p, Deadline.after(10))
+                    self.assertEqual(len(self.writes), before)
+                else:
+                    with self.assertRaises(Unsupported):
+                        execute(c, p, Deadline.after(10))
+                    self.assertEqual(len(c.channel.packets), 1)
+                    self.assertEqual(len(self.writes), before)
+                    self.assertIsNone(p._custody.oldest_first_send)
+                    self.assertFalse(any(ns == namespace for ns, _ in self.values))
+
+    def test_reduced_successor_keeps_uncertain_original_and_first_send(self):
+        c, col = self.client, self.collection
+        p = col.prepare_declaration(c, 'fixture', 'original', Ack.FLUSH)
+        self.target, self.receipt = ':schema', 'lost-before'
+        with self.assertRaises(Uncertain) as caught:
+            col.declare(c, p, Deadline.after(10))
+        request = p._mutations['original:schema']
+        sent = request.first_send
+        self.assertIs(p.uncertainties[0].request, request.request)
+        self.assertEqual(p._custody.oldest_first_send, sent)
+        self.cap, self.receipt = 13, None
+        c.connect(deadline_ms())
+        with self.assertRaises(Unsupported):
+            col.declare(c, p, Deadline.after(10))
+        self.assertEqual(len(c.channel.packets), 1)
+        self.assertEqual(len(self.writes), 1)
+        self.assertFalse(self.values)
+        self.assertEqual(p.uncertainties, (caught.exception,))
+        self.assertEqual(p._custody.oldest_first_send, sent)
+        self.assertEqual(request.first_send, sent)
 
 
 class SnapshotContractControls(unittest.TestCase):
@@ -516,7 +717,7 @@ class PrivateIPC(unittest.TestCase):
         # The same original is explicitly resumed, never a replacement identity.
         c.connect(int(__import__('time').time() * 1000) + 30000)
         original = p.uncertainties[0]
-        with patch.object(c, 'put', side_effect=Refusal(8)):
+        with patch.object(c, 'put', side_effect=Refusal(8, c.codes, _associated=True)):
             with self.assertRaises(Refusal):
                 self.col.append(c, p, Deadline.after(30))
         self.assertEqual(p.uncertainties, (original,))
@@ -572,7 +773,7 @@ class PrivateIPC(unittest.TestCase):
             c = self.client()
             self.addCleanup(c.close)
             p = self.prepare(row(1), client=c, col=col)
-            with patch.object(c, 'put', side_effect=Refusal(code)):
+            with patch.object(c, 'put', side_effect=Refusal(code, c.codes, _associated=True)):
                 expected = Uncertain if code in (16, 17) else (Corrupt if code == 12 else Refusal)
                 with self.assertRaises(expected):
                     col.append(c, p, Deadline.after(30))

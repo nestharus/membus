@@ -69,17 +69,18 @@ declared fields belongs to the application codec.
   `prepare_append(client, namespace, record, operation, ack)` return a frozen
   `Publication` containing the immutable original request, endpoint, epoch and
   conservative retry horizon. Preparation performs no I/O. It preflights each
-  planned mutation's frame size and checks the serialized declaration head
-  against the negotiated value limit before any publication effect. A negotiated
-  zero retry horizon raises `Unsupported` during preparation, before any
-  schema, head, row or posting effect. This multi-step binding cannot safely
+  planned mutation's exact value and frame bounds before any publication effect.
+  A negotiated zero retry horizon raises `Unsupported` during preparation,
+  before any schema, head, row or posting effect. This binding cannot safely
   complete that configuration; positive horizons remain fixed bounds, not a
   promise that every admitted publication will finish within them.
 - `declare(client, publication, deadline)` establishes only the immutable schema
   and head. `append(client, publication, deadline)` reserves the immutable row,
-  writes deduplicated CRC candidate postings, then CAS-publishes head. It returns
-  `AppendReceipt(through, already_committed)`. This is the existing participating
-  writer protocol, not an atomic BATCH or a transaction with independent keys.
+  writes deduplicated CRC candidate postings, then CAS-publishes head. Both
+  check the whole publication against the executing client's limits before the
+  first request, including when the caller presents an original after reconnect.
+  Append returns `AppendReceipt(through, already_committed)` using the existing
+  participating writer protocol.
 - `query(client, namespace, snapshot, query, limits, operation, deadline)` returns
   `Read(through, records, encoded_bytes_read)` from one explicit 16-byte snapshot.
   Queries are `All()`, inclusive `Ordinals(first,last)`, or `Equal(field,bytes)`.
@@ -147,10 +148,13 @@ with the original Publication, MutationRequest, operation ID, epoch and cause.
 The token's `uncertainties` tuple retains every such original observation even
 when a later explicit reconciliation succeeds or refuses.
 
-An interruption during a possibly sent mutation leaves the original interrupt
-in flight and records an `Uncertain` with that cause on the same Publication.
-The binding closes or invalidates the connection during unwind. There is no
-reconnect or resend in that invocation.
+The binding records `Uncertain` on the same publication before detaching and
+closing the channel. `Uncertain.cleanup_errors` retains any secondary close
+failures. An interruption during a possibly sent mutation, including caller
+cancellation raised as an exception, propagates the original exception. An
+interruption during cleanup propagates if a transport or reply failure led to
+cleanup. The uncertainty still names that first failure. The binding never
+reconnects or resends in that invocation.
 
 An application may explicitly reconnect the same Client/endpoint and revisit
 the SAME Publication with a fresh bounded deadline, within its original epoch

@@ -129,7 +129,7 @@ pub struct SubscribeOptions {
 fn parse<T>(v: std::result::Result<T, u16>) -> Result<T> {
     v.map_err(|_| Error::Protocol("malformed reply"))
 }
-fn identifier(s: &str) -> Result<()> {
+pub(crate) fn identifier(s: &str) -> Result<()> {
     if s.is_empty() || s.len() > MAX_ID {
         Err(Error::Invalid("identifier length"))
     } else {
@@ -239,7 +239,7 @@ impl<R> Attempt<R> {
     }
 }
 pub struct Client<T: Transport> {
-    io: T,
+    io: Option<T>,
     request_id: u64,
     negotiated: Negotiated,
     pub(crate) usable: bool,
@@ -307,7 +307,7 @@ impl<T: Transport> Client<T> {
             return Err(Error::Invalid("max_frame"));
         }
         let mut this = Self {
-            io,
+            io: Some(io),
             request_id: 0,
             usable: true,
             feature_limits: FeatureLimits::default(),
@@ -482,6 +482,10 @@ impl<T: Transport> Client<T> {
     pub fn is_usable(&self) -> bool {
         self.usable
     }
+    pub(crate) fn retire_transport(&mut self) {
+        self.usable = false;
+        drop(self.io.take());
+    }
     pub(crate) fn exchange(&mut self, op: u8, p: &[u8], until: Instant) -> Result<ReplyPayload> {
         let id = self.begin_exchange(p.len(), until)?;
         let bytes = frame(op, id, p);
@@ -515,11 +519,15 @@ impl<T: Transport> Client<T> {
         until: Instant,
     ) -> Result<ReplyPayload> {
         self.usable = false;
+        let io = self
+            .io
+            .as_mut()
+            .ok_or(Error::Invalid("connection requires reconnect"))?;
         let b = (|| -> Result<Vec<u8>> {
             let mut rest = bytes;
             while !rest.is_empty() {
-                self.io.deadline(until).map_err(Error::Transport)?;
-                let n = self.io.write(rest).map_err(Error::Transport)?;
+                io.deadline(until).map_err(Error::Transport)?;
+                let n = io.write(rest).map_err(Error::Transport)?;
                 if n == 0 {
                     return Err(Error::Transport(io::Error::new(
                         io::ErrorKind::WriteZero,
@@ -529,13 +537,13 @@ impl<T: Transport> Client<T> {
                 rest = &rest[n..];
             }
             let mut size = [0; 4];
-            self.read_exact_before(&mut size, until)?;
+            Self::read_exact_before(io, &mut size, until)?;
             let size = u32::from_le_bytes(size) as usize;
             if !(15..=self.negotiated.max_frame).contains(&size) {
                 return Err(Error::Protocol("reply frame bound"));
             }
             let mut b = vec![0; size];
-            self.read_exact_before(&mut b, until)?;
+            Self::read_exact_before(io, &mut b, until)?;
             Ok(b)
         })()?;
         let mut c = Cursor::new(&b);
@@ -576,10 +584,10 @@ impl<T: Transport> Client<T> {
         self.usable = true;
         Ok(ReplyPayload(b))
     }
-    fn read_exact_before(&mut self, mut b: &mut [u8], until: Instant) -> Result<()> {
+    fn read_exact_before(io: &mut T, mut b: &mut [u8], until: Instant) -> Result<()> {
         while !b.is_empty() {
-            self.io.deadline(until).map_err(Error::Transport)?;
-            let n = self.io.read(b).map_err(Error::Transport)?;
+            io.deadline(until).map_err(Error::Transport)?;
+            let n = io.read(b).map_err(Error::Transport)?;
             if n == 0 {
                 return Err(Error::Transport(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -775,29 +783,41 @@ impl<T: Transport> Client<T> {
         }
         Ok(size)
     }
-    fn mutation_payload_len(&self, m: &MutationRequest) -> Result<usize> {
-        identifier(&m.key)?;
-        if m.value.len() > self.negotiated.max_value {
+    fn mutation_payload_len(
+        &self,
+        operation_id: &str,
+        namespace: &str,
+        key: &str,
+        value_len: usize,
+        conditional: bool,
+    ) -> Result<usize> {
+        identifier(key)?;
+        if value_len > self.negotiated.max_value {
             return Err(Error::Invalid("value limit"));
         }
-        identifier(&m.operation_id)?;
-        identifier(&m.namespace)?;
+        identifier(operation_id)?;
+        identifier(namespace)?;
         // All variable lengths are validated above. The payload contains the
         // deadline, three identifiers, acknowledgment, optional CAS comparator
         // and the length-prefixed value; the frame header is separate.
         Ok(8 + 3 * 4
-            + m.operation_id.len()
-            + m.namespace.len()
-            + m.key.len()
+            + operation_id.len()
+            + namespace.len()
+            + key.len()
             + 1
-            + if m.expected.is_some() { 8 } else { 0 }
+            + if conditional { 8 } else { 0 }
             + 4
-            + m.value.len())
+            + value_len)
     }
     fn mutation_frame(&self, op: u8, m: &MutationRequest, d: Deadline) -> Result<Vec<u8>> {
         // Fill the request ID only after admission; refused sends consume none.
-        let payload_len = self.mutation_payload_len(m)?
-            - if op == REMOVE { 4 + m.value.len() } else { 0 };
+        let payload_len = self.mutation_payload_len(
+            &m.operation_id,
+            &m.namespace,
+            &m.key,
+            m.value.len(),
+            m.expected.is_some(),
+        )? - if op == REMOVE { 4 + m.value.len() } else { 0 };
         let mut p = crate::codec::frame_header(op, 0, payload_len);
         p.extend(d.unix_ms.to_le_bytes());
         lp(&mut p, m.operation_id.as_bytes());
@@ -814,7 +834,23 @@ impl<T: Transport> Client<T> {
     }
     /// Pure preflight sharing the encoder's validated size. No send or readiness claim.
     pub fn validate_mutation(&self, request: &MutationRequest) -> Result<usize> {
-        let size = self.mutation_payload_len(request)? + 13;
+        self.validate_mutation_size(
+            &request.operation_id,
+            &request.namespace,
+            &request.key,
+            request.value.len(),
+            request.expected.is_some(),
+        )
+    }
+    pub(crate) fn validate_mutation_size(
+        &self,
+        operation_id: &str,
+        namespace: &str,
+        key: &str,
+        value_len: usize,
+        conditional: bool,
+    ) -> Result<usize> {
+        let size = self.mutation_payload_len(operation_id, namespace, key, value_len, conditional)? + 13;
         if size > self.negotiated.max_frame {
             return Err(Error::Invalid("frame limit"));
         }

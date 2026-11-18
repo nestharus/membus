@@ -5,7 +5,7 @@
 //! A row and its declared postings precede the committed ordinal boundary.
 //! Queries use one caller-owned resident snapshot, including schema and boundary.
 use crate::{
-    client::{self, Ack, Client, Deadline, MutationRequest, Transport},
+    client::{self, Ack, Attempt, Client, Deadline, MutationRequest, Transport},
     crc32, lp, Cursor, MAX_ID, MAX_VALUE,
 };
 use std::borrow::Cow;
@@ -239,8 +239,18 @@ impl Collection {
             .expect("writing strings and integers into a String is infallible");
         key
     }
-    fn encode(&self, row: &Record) -> Result<Vec<u8>> {
-        let mut b = Vec::with_capacity(self.encoded_len(row)?);
+    fn posting(&self, op: &str, field: usize, bucket: u32, ordinal: u64) -> (String, String) {
+        let mut key = String::with_capacity(self.name.len() + 37);
+        write!(
+            &mut key,
+            "x/{}/i/{field:02x}/{bucket:08x}/{ordinal:020}",
+            self.name
+        )
+        .expect("writing strings and integers into a String is infallible");
+        (key, format!("{op}:i{field}-{bucket:08x}"))
+    }
+    fn encode(&self, row: &Record, size: usize) -> Vec<u8> {
+        let mut b = Vec::with_capacity(size);
         b.extend(b"MBIX1R");
         b.extend(row.ordinal.to_le_bytes());
         b.extend((row.fields.len() as u16).to_le_bytes());
@@ -251,7 +261,7 @@ impl Collection {
             }
         }
         lp(&mut b, &row.payload);
-        Ok(b)
+        b
     }
     fn decode(&self, mut b: Vec<u8>) -> Result<Record> {
         if b.len() < 16 || &b[..6] != b"MBIX1R" {
@@ -302,6 +312,35 @@ impl Collection {
         ack: Ack,
         d: Deadline,
     ) -> Result<()> {
+        self.preflight_declaration(c, ns, op)?;
+        self.publish_declaration(c, ns, op, ack, d)
+    }
+    fn preflight_declaration<T: Transport>(&self, c: &Client<T>, ns: &str, op: &str) -> Result<()> {
+        preflight_immutable(
+            c,
+            ns,
+            &self.schema_key,
+            &format!("{op}:schema"),
+            self.declaration.len(),
+        )?;
+        c.validate_mutation_size(
+            &format!("{op}:head-init"),
+            ns,
+            &self.head_key,
+            head(0).len(),
+            true,
+        )?;
+        client::identifier(&format!("{op}:head-reconcile"))?;
+        Ok(())
+    }
+    fn publish_declaration<T: Transport>(
+        &self,
+        c: &mut Client<T>,
+        ns: &str,
+        op: &str,
+        ack: Ack,
+        d: Deadline,
+    ) -> Result<()> {
         immutable(
             c,
             ns,
@@ -325,7 +364,7 @@ impl Collection {
                     ack,
                     expected: Some(0),
                 })?;
-                match c.mutate(&mut a, d) {
+                match mutate(c, &mut a, d) {
                     Ok(_) => (),
                     Err(client::Error::Refused(r)) if r.code == 12 => {
                         count(
@@ -353,8 +392,25 @@ impl Collection {
         ack: Ack,
         d: Deadline,
     ) -> Result<AppendReceipt> {
-        let body = self.encode(row)?;
-        self.declare(c, ns, &format!("{op}:declare"), ack, d)?;
+        let size = self.encoded_len(row)?;
+        let declaration = format!("{op}:declare");
+        self.preflight_declaration(c, ns, &declaration)?;
+        let row_key = self.row_key(row.ordinal);
+        let row_op = format!("{op}:row");
+        preflight_immutable(c, ns, &row_key, &row_op, size)?;
+        let commit = format!("{op}:commit");
+        let boundary = head(row.ordinal);
+        c.validate_mutation_size(&commit, ns, &self.head_key, boundary.len(), true)?;
+        client::identifier(&format!("{commit}:reconcile"))?;
+        for (i, values) in row.fields.iter().enumerate() {
+            if !values.is_empty() {
+                // The CRC is always spelled with eight hex digits.
+                let (key, operation) = self.posting(op, i, 0, row.ordinal);
+                preflight_immutable(c, ns, &key, &operation, size_of::<u64>())?;
+            }
+        }
+        let body = self.encode(row, size);
+        self.publish_declaration(c, ns, &declaration, ack, d)?;
         let key = self.head_key.as_ref();
         let h = c
             .get(ns, key, &format!("{op}:boundary"), d)?
@@ -362,7 +418,7 @@ impl Collection {
         let through = count(&h.bytes)?;
         if row.ordinal <= through {
             let v = c
-                .get(ns, &self.row_key(row.ordinal), &format!("{op}:existing"), d)?
+                .get(ns, &row_key, &format!("{op}:existing"), d)?
                 .ok_or(Error::Corrupt("committed row missing"))?;
             if v.bytes != body || v.ack != ack {
                 return Err(Error::Conflict("committed row differs"));
@@ -380,28 +436,21 @@ impl Collection {
         immutable(
             c,
             ns,
-            &self.row_key(row.ordinal),
+            &row_key,
             Cow::Owned(body),
-            &format!("{op}:row"),
+            &row_op,
             ack,
             d,
         )?;
         for (i, values) in row.fields.iter().enumerate() {
             let mut publish = |bucket| {
-                // Validated schemas have at most 64 fields: two hex digits.
-                let mut key = String::with_capacity(self.name.len() + 37);
-                write!(
-                    &mut key,
-                    "x/{}/i/{i:02x}/{bucket:08x}/{:020}",
-                    self.name, row.ordinal
-                )
-                .expect("writing strings and integers into a String is infallible");
+                let (key, operation) = self.posting(op, i, bucket, row.ordinal);
                 immutable(
                     c,
                     ns,
                     &key,
                     Cow::Owned(row.ordinal.to_le_bytes().to_vec()),
-                    &format!("{op}:i{i}-{bucket:08x}"),
+                    &operation,
                     ack,
                     d,
                 )
@@ -418,14 +467,14 @@ impl Collection {
             }
         }
         let mut a = c.prepare(MutationRequest {
-            operation_id: format!("{op}:commit"),
+            operation_id: commit,
             namespace: ns.into(),
             key: key.into(),
-            value: head(row.ordinal),
+            value: boundary,
             ack,
             expected: Some(h.version),
         })?;
-        match c.mutate(&mut a, d) {
+        match mutate(c, &mut a, d) {
             Ok(_) => Ok(AppendReceipt {
                 through: row.ordinal,
                 already_committed: false,
@@ -673,6 +722,30 @@ impl Collection {
         })
     }
 }
+fn preflight_immutable<T: Transport>(
+    c: &Client<T>,
+    ns: &str,
+    key: &str,
+    op: &str,
+    size: usize,
+) -> Result<()> {
+    client::identifier(&format!("{op}:reconcile"))?;
+    c.validate_mutation_size(op, ns, key, size, true)?;
+    Ok(())
+}
+
+fn mutate<T: Transport>(
+    c: &mut Client<T>,
+    attempt: &mut Attempt,
+    d: Deadline,
+) -> std::result::Result<client::MutationReply, client::Error> {
+    let result = c.mutate(attempt, d);
+    if matches!(result, Err(client::Error::Uncertain { .. })) {
+        c.retire_transport();
+    }
+    result
+}
+
 #[allow(clippy::too_many_arguments)]
 fn immutable<T: Transport>(
     c: &mut Client<T>,
@@ -699,7 +772,7 @@ fn immutable<T: Transport>(
         ack,
         expected: Some(0),
     })?;
-    match c.mutate(&mut a, d) {
+    match mutate(c, &mut a, d) {
         Ok(_) => Ok(()),
         Err(client::Error::Refused(r)) if r.code == 12 => {
             let v = c

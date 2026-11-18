@@ -3,6 +3,7 @@
 Publication tokens are caller-owned, in-memory custody, not durable journals.
 See docs/PYTHON_INDEXED.md for retained staging and recovery boundaries.
 """
+from concurrent.futures import CancelledError
 from dataclasses import dataclass, field
 from enum import IntEnum
 import re
@@ -10,7 +11,7 @@ import struct
 import time
 import zlib
 
-from membus import Client, Decoder, EpochChanged, MAX_VALUE, Refusal, lp
+from membus import Client, Decoder, EpochChanged, MAX_FRAME, MAX_VALUE, Refusal, lp
 
 MAX_ID = 1024
 U64_MAX = 2**64 - 1
@@ -49,6 +50,7 @@ class Uncertain(Error):
         self.publication, self.request, self.cause = publication, request, cause
         self.epoch = publication.epoch
         self.operation_id = request.operation_id
+        self.cleanup_errors = ()
         super().__init__(f'uncertain operation {self.operation_id}: {cause}')
 
 
@@ -300,38 +302,42 @@ class Collection:
         _identifier(operation + ':declare:head-reconcile')
         if not isinstance(ack, Ack):
             raise Invalid('explicit Ack.OS or Ack.FLUSH required')
-        if record is not None:
-            if self.encoded_len(record) > c.max_value:
-                raise Unsupported('record exceeds negotiated value bound')
-        if len(self._declaration) > c.max_value:
-            raise Unsupported('declaration exceeds negotiated value bound')
-        if not 1024 <= c.max_frame <= 16 * 1024 * 1024 or not 1 <= c.max_value <= MAX_VALUE:
-            raise Invalid('negotiated frame/value limits')
         _integer(c.retry_ms, 0, U64_MAX, 'negotiated retry horizon')
+        self._preflight(c, namespace, operation, record)
         if c.retry_ms == 0:
             raise Unsupported('indexed publication requires a positive retry horizon; no effects prepared')
-        head_size = len(_head(0))
-        if head_size > c.max_value:
-            raise Unsupported('head exceeds negotiated value bound')
-        def preflight(key, size, op):
-            _identifier(op)
-            _identifier(op + ':reconcile')
-            body = 13 + 8 + sum(4 + len(s.encode('utf8')) for s in (op, key, namespace)) + 1 + 8 + 4 + size
-            if body > c.max_frame:
-                raise Unsupported('complete publication exceeds a negotiated mutation frame bound')
-        base = operation + ':declare' if record is not None else operation
-        preflight(self._schema_key, len(self._declaration), base + ':schema')
-        preflight(self._head_key, head_size, base + ':head-init')
-        if record is not None:
-            preflight(self._row_key(record.ordinal), self.encoded_len(record), operation + ':row')
-            preflight(self._head_key, head_size, operation + ':commit')
-            for index, values in enumerate(record.fields):
-                for value in values:
-                    bucket = zlib.crc32(value)
-                    preflight(self._key(f'i/{index:02x}/{bucket:08x}/{record.ordinal:020d}'), 8,
-                              f'{operation}:i{index}-{bucket:08x}')
         return Publication(self._name, self.schema, namespace, operation, ack, record, c.epoch, c.retry_ms,
                            c.address, c.transport)
+
+    def _preflight(self, c, namespace, operation, record):
+        if not 1024 <= c.max_frame <= MAX_FRAME or not 1 <= c.max_value <= MAX_VALUE:
+            raise Invalid('negotiated frame/value limits')
+        head_size = len(_head(0))
+        def preflight(key, size, op, label):
+            _identifier(op + ':reconcile')
+            self._admit_put(c, namespace, key, size, op, label)
+        base = operation + ':declare' if record is not None else operation
+        preflight(self._schema_key, len(self._declaration), base + ':schema', 'declaration')
+        preflight(self._head_key, head_size, base + ':head-init', 'head')
+        if record is not None:
+            size = self.encoded_len(record)
+            preflight(self._row_key(record.ordinal), size, operation + ':row', 'record')
+            preflight(self._head_key, head_size, operation + ':commit', 'head')
+            for index, values in enumerate(record.fields):
+                if values:
+                    # Every CRC bucket has the same eight-digit spelling width.
+                    preflight(self._key(f'i/{index:02x}/00000000/{record.ordinal:020d}'), 8,
+                              f'{operation}:i{index}-00000000', 'posting')
+
+    @staticmethod
+    def _admit_put(c, namespace, key, size, op, label):
+        for text in (op, key, namespace):
+            _identifier(text)
+        if size > c.max_value:
+            raise Unsupported(f'{label} exceeds negotiated value bound')
+        body = 13 + 8 + sum(4 + len(s.encode('utf8')) for s in (op, key, namespace)) + 1 + 8 + 4 + size
+        if body > c.max_frame:
+            raise Unsupported(f'{label} exceeds negotiated mutation frame bound')
 
     def prepare_declaration(self, c: Client, namespace: str, operation: str, ack: Ack) -> Publication:
         return self._prepare(c, namespace, operation, ack, None)
@@ -363,43 +369,46 @@ class Collection:
         m = p._mutations.setdefault(op, _Mutation(request))
         if m.request != request:
             raise Conflict('original mutation identity cannot be rebound')
-        for text in (op, key, p.namespace):
-            _identifier(text)
-        size = 13 + 8 + sum(4 + len(s.encode('utf8')) for s in (op, key, p.namespace)) + 1 + 8 + 4 + len(body)
-        if len(body) > c.max_value or size > c.max_frame:
-            raise Unsupported('mutation exceeds negotiated value/frame bound')
+        self._admit_put(c, p.namespace, key, len(body), op, 'mutation')
         deadline = _deadline(d)
+        channel = c.channel
         if m.first_send is None:
             m.first_send = time.monotonic()
             first = p._custody.oldest_first_send
             p._custody.oldest_first_send = m.first_send if first is None else min(first, m.first_send)
         try:
-            result = c.put(p.namespace, key, body, ack=p.ack, expected=expected,
-                           op_id=op, deadline=deadline, retry_transport=False)
-            if type(result.get('version')) is not int or not 1 <= result['version'] <= U64_MAX or result.get('ack') != p.ack:
+            with c._defer_error_close():
+                result = c.put(p.namespace, key, body, ack=p.ack, expected=expected,
+                               op_id=op, deadline=deadline, retry_transport=False)
+            if (not isinstance(result, dict) or type(result.get('version')) is not int or
+                    not 1 <= result['version'] <= U64_MAX or result.get('ack') != p.ack):
                 raise Corrupt('mutation achieved acknowledgment/revision')
             return result
-        except Refusal as e:
-            if e.code not in (16, 17) and e.code in c.codes:
+        except BaseException as cause:
+            if (isinstance(cause, Refusal) and cause._associated and
+                    cause.code not in (16, 17) and cause.code in c.codes):
                 raise
-            cause = e
-        except (OSError, ConnectionError, ValueError, struct.error, Corrupt) as e:
-            cause = e
-        except BaseException as e:
-            if isinstance(e, Exception):
-                raise
-            p._uncertainties.append(Uncertain(p, m.request, e))
-            try:
-                c.close()
-            except BaseException:
-                # A failed close can leave Client.channel set. Invalidate it
-                # while the original interruption still owns the unwind.
+            error = Uncertain(p, m.request, cause)
+            p._uncertainties.append(error)
+            interrupted = not isinstance(cause, (Refusal, OSError, ValueError, struct.error, Corrupt))
+            if c.channel is channel:
                 c.channel = None
-            raise
-        c.close()
-        error = Uncertain(p, m.request, cause)
-        p._uncertainties.append(error)
-        raise error from cause
+            # A physical close can fail. Give an ordinary I/O failure one
+            # further close on the detached channel, without delaying cancellation.
+            for _ in range(1 if interrupted else 2):
+                try:
+                    channel.close()
+                except BaseException as cleanup:
+                    error.cleanup_errors += (cleanup,)
+                    if not interrupted and (not isinstance(cleanup, Exception) or isinstance(cleanup, CancelledError)):
+                        raise
+                    if not isinstance(cleanup, OSError):
+                        break
+                else:
+                    break
+            if interrupted:
+                raise
+            raise error from cause
 
     def _immutable(self, c, p, key, body, op, d):
         v = self._get(c, p, key, op + ':read', d)
@@ -438,6 +447,7 @@ class Collection:
         self._check(c, publication, deadline)
         if publication.record is not None:
             raise Invalid('declaration token required')
+        self._preflight(c, publication.namespace, publication.operation, None)
         self._declare(c, publication, publication.operation, deadline)
 
     def append(self, c: Client, publication: Publication, deadline: Deadline) -> AppendReceipt:
@@ -446,6 +456,7 @@ class Collection:
         row = p.record
         if row is None:
             raise Invalid('append token required')
+        self._preflight(c, p.namespace, p.operation, row)
         body = self._encode(row)
         self._declare(c, p, p.operation + ':declare', d)
         h = self._get(c, p, self._head_key, p.operation + ':boundary', d)
