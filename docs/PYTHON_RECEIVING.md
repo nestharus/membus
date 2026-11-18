@@ -42,6 +42,13 @@ format. Ordinary `Client.call` keeps its documented
 [transport retry behavior](PYTHON_RETRY.md). Ordinary BATCH retains
 per-item outcomes from the connection's negotiated refusal vocabulary.
 
+After HELLO, a nonzero outer refusal code on an associated frame must belong
+to that vocabulary and have an empty payload. An unknown code or trailing
+payload invalidates the reply and closes the channel. If an atomic or indexed
+mutation may already have been sent, its publication retains the original
+and the resulting uncertainty. Valid outer refusals 16 and 17 also leave
+these publications uncertain.
+
 Qualify the chosen binary and the staged SDK together on an owned Windows
 fixture. Exercise the indexed token check and bounded atomic capture using
 their public entry points and the provider profile the application will use.

@@ -592,6 +592,32 @@ class PublicationWireControls(unittest.TestCase):
                     self.assertEqual((p.retry_ms, m.first_send, p._custody.oldest_first_send),
                                      (120000, now, now))
 
+    def test_prior_commit_loss_survives_associated_quota_refusal_and_success(self):
+        c, col = self.client, self.collection
+        p = col.prepare_append(c, 'fixture', Record(1, (), b''), 'original', Ack.FLUSH)
+        deadline = Deadline.after(10)
+        self.receipt = 'lost-before'
+        with self.assertRaises(Uncertain) as lost:
+            col.append(c, p, deadline)
+        self.assertIsNone(c.channel)
+        self.assertIs(lost.exception.publication, p)
+
+        c.connect(deadline.unix_ms)
+        channel = c.channel
+        self.receipt = 8
+        with self.assertRaises(Refusal) as refused:
+            col.append(c, p, deadline)
+        self.assertEqual(refused.exception.code, 8)
+        self.assertIs(c.channel, channel)
+        self.assertEqual(p.uncertainties, (lost.exception,))
+
+        self.receipt = None
+        self.assertEqual(col.append(c, p, deadline).through, 1)
+        self.assertEqual(p.uncertainties, (lost.exception,))
+        commits = [write for write in self.writes if write[0] == 'original:commit']
+        self.assertEqual(len(commits), 3)
+        self.assertEqual([write[:6] for write in commits], [commits[0][:6]] * 3)
+
     def test_exact_current_cas_refusal_reconciles_and_keeps_channel(self):
         c, col = self.client, self.collection
         p = col.prepare_append(c, 'fixture', Record(1, (), b''), 'original', Ack.FLUSH)

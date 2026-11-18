@@ -8,11 +8,14 @@ the first negotiated retry horizon. This evidence is not a durable receipt or
 an authorization to replay. BATCH retains every embedded item identity and Ack.
 
 A transport failure may lead to one resend of the identical payload, with a new
-transport request ID. The original endpoint, epoch, deadline and retry horizon
-must still match after reconnect. A new handshake cannot extend that horizon.
-Zero horizon allows only the first send. A subsequent refusal, protocol error,
-reconnect failure or typed validation error retains the first transport cause
-and original evidence in CallUncertain; last_error names the later error.
+transport request ID. The elapsed monotonic time must be strictly less than the
+first negotiated horizon both after loss and before resend. The endpoint and
+epoch must still match, and the original deadline must still be in the future.
+A successor may offer a different horizon. The original call keeps its first
+horizon. Zero horizon allows only the first send. A subsequent refusal, protocol
+error, reconnect failure or typed validation error retains the first transport
+cause and original evidence in CallUncertain. Its last_error names the later
+error.
 Reconcile original intentions before deciding on another call. A separate call
 does not inherit this custody. There is no cross-call automatic replay.
 
@@ -50,4 +53,6 @@ HELLO profile. The Python atomic binding uses its own single-exchange path.
 Outer refusal framing, durable application custody, native clients,
 indexed/atomic publication, caller admission, service deployment and capacity
 are separate contracts. Sampling and checking a retry horizon cannot make a
-delayed send atomic with server admission.
+delayed send atomic with server admission. After retired-ID eviction or restart,
+an expired ID can become unknown and execute again. The provider describes
+these limits in [KV1](KV1.md) and [retry retention](RETRY_RETENTION.md).

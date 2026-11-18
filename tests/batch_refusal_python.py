@@ -124,8 +124,24 @@ class BatchRefusals(unittest.TestCase):
     def test_empty_batch(self):
         self.assertEqual(self.batch(self.client(outcomes()), []), [])
 
+    def test_unadmitted_code_remains_protocol_error(self):
+        c = self.client(outcomes((60000, 0, 0)))
+        with self.assertRaisesRegex(ValueError, 'invalid batch outcome'):
+            self.batch(c)
+        self.assertEqual(len(self.peer.packets), 2)
 
+    def test_unadmitted_optional_mapped_code_remains_error(self):
+        c = self.client(outcomes((25, 0, 0)))
+        with self.assertRaisesRegex(ValueError, 'invalid batch outcome'):
+            self.batch(c)
 
+    def test_bad_count_ack_truncation_and_tail(self):
+        for tail in (outcomes(), outcomes((0, 91, 3)), outcomes((0, 91, 2))[:-1], outcomes((0, 91, 2))+b'X'):
+            with self.subTest(tail=tail):
+                c = self.client(tail)
+                with self.assertRaises((ValueError, struct.error)):
+                    self.batch(c)
+                self.assertEqual(len(self.peer.packets), 2)
 
     def test_outer_negotiated_refusal_remains_exception(self):
         c = self.client(b'', [(60000, ('authored_extension', True))], outer=60000)
@@ -135,6 +151,13 @@ class BatchRefusals(unittest.TestCase):
                          (60000, 'authored_extension', True))
         self.assertIs(c.channel, self.peer)
 
+    def test_outer_unadmitted_refusal_and_tail_stay_errors(self):
+        for code, tail in [(60000, b''), (12, b'X')]:
+            with self.subTest(code=code):
+                c = self.client(tail, outer=code)
+                with self.assertRaisesRegex(ValueError, 'invalid refusal reply'):
+                    self.batch(c)
+                self.assertIsNone(c.channel)
 
     def test_invalid_negotiation_is_not_admitted(self):
         codes = {k: v for k, v in membus.CODES.items() if k <= 19}

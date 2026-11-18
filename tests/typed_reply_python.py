@@ -124,7 +124,7 @@ class TypedReplies(unittest.TestCase):
         return payload
 
     def uncertain(self, error, op, *, sends=2):
-        self.assertEqual(type(error).__name__, 'CallUncertain')
+        self.assertIsInstance(error, membus.CallUncertain)
         original = error.original
         self.assertEqual(tuple(original), (('authored', 'finite'), 7, op, 'original', 'authored', self.identity(op, sends), 123_000_000_000, 10))
         self.assertIs(error.cause, self.first_loss)
@@ -214,6 +214,20 @@ class TypedReplies(unittest.TestCase):
                             self.assertEqual(caught.exception.code, code)
                             self.identity(op, 1)
 
+    def test_refusal_tail_is_validated_with_or_without_loss(self):
+        for op in (4, 5, 6, 7, 17):
+            for loss in (False, True):
+                with self.subTest(op=op, loss=loss):
+                    self.ns = 123_000_000_000
+                    c = self.client(op, b'\x00', loss=loss, code=12)
+                    with self.assertRaises(Exception) as caught: self.invoke(c, op)
+                    if loss:
+                        self.uncertain(caught.exception, op)
+                        self.assertIsInstance(caught.exception.last_error, ValueError)
+                    else:
+                        self.assertIs(type(caught.exception), ValueError)
+                        self.identity(op, 1)
+                    self.assertIsNone(c.channel)
 
     def test_opt_out_keeps_first_transport_error_and_one_send(self):
         for op in (4, 5, 6, 7, 17):
