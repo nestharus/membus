@@ -285,7 +285,8 @@ class PublicationWireControls(unittest.TestCase):
         c, col = self.client, self.collection
         self.receipt = 14
         exchange = c.exchange
-        for mode in ('exact', 'different-request', 'different-error', 'later-exchange', 'different-channel'):
+        for mode in ('exact', 'different-request', 'restored-buffer', 'different-error',
+                     'later-exchange', 'different-channel'):
             with self.subTest(mode=mode):
                 if c.channel is None:
                     c.connect(deadline_ms())
@@ -293,8 +294,16 @@ class PublicationWireControls(unittest.TestCase):
                 p = col.prepare_append(c, mode, Record(1, (), b''), 'original', Ack.OS)
                 errors = []
                 replacement = object()
+                buffer = original = None
+                write_all = c.write_all
+
+                def write(data, deadline):
+                    write_all(data, deadline)
+                    if buffer is not None:
+                        buffer[:] = original
 
                 def override(opcode, payload, deadline):
+                    nonlocal buffer, original
                     request = Decoder(payload)
                     request.unpack('<Q')
                     if opcode != 5 or request.blob() != b'original:commit':
@@ -302,6 +311,11 @@ class PublicationWireControls(unittest.TestCase):
                     if mode == 'different-request':
                         # Same opcode, request number and channel, different CAS bytes.
                         payload = payload[:-1] + bytes([payload[-1] ^ 1])
+                    if mode == 'restored-buffer':
+                        original = payload
+                        buffer = bytearray(payload)
+                        buffer[-1] ^= 1
+                        payload = buffer
                     try:
                         return exchange(opcode, payload, deadline)
                     except Refusal as error:
@@ -319,7 +333,8 @@ class PublicationWireControls(unittest.TestCase):
 
                 before, peers = len(self.writes), len(self.peers)
                 try:
-                    with patch.object(c, 'exchange', side_effect=override):
+                    with (patch.object(c, 'exchange', side_effect=override),
+                          patch.object(c, 'write_all', side_effect=write)):
                         with self.assertRaises(Refusal if mode == 'exact' else Uncertain) as caught:
                             col.append(c, p, Deadline.after(10))
                     self.assertEqual(len(self.peers), peers)
@@ -340,6 +355,132 @@ class PublicationWireControls(unittest.TestCase):
                 finally:
                     if c.channel is replacement:
                         c.channel = None
+
+    def test_success_requires_the_serialized_request_and_decoded_receipt(self):
+        c, col = self.client, self.collection
+        exchange = c.exchange
+        for mode in ('forwarded-buffer', 'different-request', 'substituted-reply'):
+            with self.subTest(mode=mode):
+                if c.channel is None:
+                    c.connect(deadline_ms())
+                channel = c.channel
+                p = col.prepare_append(c, mode, Record(1, (), b''), 'original', Ack.OS)
+
+                def override(opcode, payload, deadline):
+                    request = Decoder(payload)
+                    request.unpack('<Q')
+                    if opcode != 5 or request.blob() != b'original:commit':
+                        return exchange(opcode, payload, deadline)
+                    data = bytearray(payload)
+                    if mode == 'different-request':
+                        data[-1] ^= 1
+                    reply = exchange(opcode, data, deadline)
+                    return bytes(bytearray(reply)) if mode == 'substituted-reply' else reply
+
+                before = len(self.writes)
+                with patch.object(c, 'exchange', side_effect=override):
+                    if mode == 'forwarded-buffer':
+                        self.assertEqual(col.append(c, p, Deadline.after(10)).through, 1)
+                        self.assertIs(c.channel, channel)
+                        self.assertEqual(p.uncertainties, ())
+                    else:
+                        with self.assertRaises(Uncertain) as caught:
+                            col.append(c, p, Deadline.after(10))
+                        self.assertEqual(p.uncertainties, (caught.exception,))
+                        self.assertIsInstance(caught.exception.cause, ValueError)
+                        self.assertIsNone(c.channel)
+                self.assertEqual([w[0] for w in self.writes[before:]].count('original:commit'), 1)
+
+    def test_transfer_rechecks_channel_at_each_physical_segment_and_receipt(self):
+        from batch_refusal_python import BytePeer
+
+        c, col = self.client, self.collection
+        exchange, write_all, put = c.exchange, c.write_all, c.put
+        cases = ('before-exchange', 'before-write', 'partial-write', 'after-write', 'partial-prefix',
+                 'before-body', 'partial-body', 'after-body', 'after-exchange', 'after-put')
+        for mode in cases:
+            with self.subTest(mode=mode):
+                c.close()
+                c.connect(deadline_ms())
+                channel = c.channel
+                io, read_exact = channel.io, c.read_exact
+                replacement = BytePeer(lambda _: b'')
+                p = col.prepare_append(c, mode, Record(1, (), b''), 'original', Ack.OS)
+                active = False
+                segments = []
+
+                def rotate():
+                    self.assertIs(c.channel, channel)
+                    c.channel = replacement
+
+                def override(opcode, payload, deadline):
+                    nonlocal active
+                    request = Decoder(payload)
+                    request.unpack('<Q')
+                    active = opcode == 5 and request.blob() == b'original:commit'
+                    if active and mode == 'before-exchange':
+                        rotate()
+                    result = exchange(opcode, payload, deadline)
+                    if active and mode == 'after-exchange':
+                        rotate()
+                    return result
+
+                def write(data, deadline):
+                    if active and mode == 'before-write':
+                        rotate()
+                    write_all(data, deadline)
+                    if active and mode == 'after-write':
+                        rotate()
+
+                def read(count, deadline):
+                    if active and count == 24 and mode == 'before-body':
+                        rotate()
+                    result = read_exact(count, deadline)
+                    if active and count == 24 and mode == 'after-body':
+                        rotate()
+                    return result
+
+                def physical(data, count, deadline, write):
+                    if active:
+                        self.assertIs(c.channel, channel)
+                        segments.append((write, count))
+                    result = io(data, count, deadline, write)
+                    if active and ((write and mode == 'partial-write') or
+                                   (not write and (count, mode) in ((4, 'partial-prefix'), (24, 'partial-body')))):
+                        rotate()
+                    return result
+
+                def mutation(*args, **kwargs):
+                    result = put(*args, **kwargs)
+                    if active and mode == 'after-put':
+                        rotate()
+                    return result
+
+                before = len(self.writes)
+                with (patch.object(c, 'exchange', side_effect=override),
+                      patch.object(c, 'write_all', side_effect=write),
+                      patch.object(c, 'read_exact', side_effect=read),
+                      patch.object(c, 'put', side_effect=mutation),
+                      patch.object(channel, 'io', side_effect=physical),
+                      patch.object(replacement, 'io', side_effect=AssertionError('replacement transfer'))):
+                    with self.assertRaises(Uncertain) as caught:
+                        col.append(c, p, Deadline.after(10))
+                self.assertEqual(p.uncertainties, (caught.exception,))
+                self.assertIs(caught.exception.request, p._mutations['original:commit'].request)
+                self.assertEqual([w[0] for w in self.writes[before:]].count('original:commit'),
+                                 int(mode not in cases[:3]))
+                reads = [count for write, count in segments if not write]
+                expected_reads = {'partial-prefix': [4], 'before-body': [4, 1],
+                                  'partial-body': [4, 1, 24]}
+                if mode in cases[:4] or mode in expected_reads:
+                    self.assertEqual(reads, expected_reads.get(mode, []))
+                if mode in cases[:2]:
+                    self.assertEqual(segments, [])
+                if mode == 'partial-write':
+                    self.assertEqual(len(segments), 1)
+                self.assertEqual(channel.closed, 1)
+                self.assertIs(c.channel, replacement)
+                self.assertEqual(replacement.closed, 0)
 
     def test_reconnect_rechecks_complete_value_and_frame_before_any_request(self):
         c, col = self.client, self.collection

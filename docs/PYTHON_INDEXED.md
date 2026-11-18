@@ -132,6 +132,9 @@ It requires an explicitly connected Client and never changes an uncertain send
 into an implicit retry. Ordinary Client defaults remain unchanged.
 An `exchange(self, opcode, payload, deadline)` override can forward those three
 arguments to `super().exchange` to keep the same reply validation.
+Indexed mutations bind the serialized request and decoded outcome to the
+preflight channel. A replaced channel or a substituted reply leaves the
+publication uncertain. A replacement installed by the owner stays attached.
 
 `Deadline` carries explicit Unix admission milliseconds and a local monotonic
 preflight boundary. `Deadline.after(seconds)` creates both. Each Client call is

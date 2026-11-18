@@ -46,17 +46,70 @@ class Refusal(Exception):
 
 
 class _ExchangeEvidence:
-    """One call's exact raw refusal, populated only by its reply decoder."""
-    def __init__(self, client):
+    """The indexed mutation's request and its associated raw outcome."""
+    def __init__(self, client, opcode, deadline, prefix, value):
         self.client, self.channel = client, client.channel
-        self.request = self.outcome = None
+        self.request = opcode, client.request_id + 1
+        self.deadline = deadline
+        self.prefix, self.value = prefix, value
+        self.outcome = None
+
+    def check_channel(self, client):
+        if client is not self.client:
+            raise ValueError('indexed exchange client changed')
+        if self.client.channel is not self.channel:
+            raise ConnectionError('indexed exchange channel changed')
+
+    def record(self, encoded, code, result):
+        # Read the identity from the immutable bytes used for transport.
+        opcode, sent_id = struct.unpack_from('<BQ', encoded, 8)
+        payload = memoryview(encoded)[17:]
+        split = len(self.prefix)
+        if ((opcode, sent_id) == self.request and payload[:split] == self.prefix and
+                payload[split:] == self.value):
+            self.outcome = code, result
+
+    def _current(self):
+        return (self.client.channel is self.channel and
+                self.client.request_id == self.request[1])
 
     def confirms(self, error):
         if self.outcome is None:
             return False
-        sent_id, code, refusal = self.outcome
-        return (error is refusal and error.code == code and
-                self.client.channel is self.channel and self.client.request_id == sent_id)
+        code, result = self.outcome
+        return bool(code and error is result and error.code == code and self._current())
+
+    def require_reply(self, reply):
+        self.check_channel(self.client)
+        if self.outcome is None or self.outcome[0] or reply is not self.outcome[1] or not self._current():
+            raise ValueError('indexed exchange reply association')
+
+    def confirms_mutation(self, version, ack):
+        return (self.outcome is not None and self.outcome[0] == 0 and
+                struct.unpack('<QB', self.outcome[1]) == (version, ack) and self._current())
+
+
+class _IndexedTransfer:
+    """A single serialized exchange on the indexed preflight channel."""
+    def __init__(self, evidence, sent_id, encoded):
+        self.evidence, self.sent_id = evidence, sent_id
+        self.channel = evidence.channel
+        self.to_write, self.to_read = encoded, None
+        self.written, self.received = False, None
+
+    def check(self):
+        self.evidence.check_channel(self.evidence.client)
+        if self.evidence.client.request_id != self.sent_id:
+            raise ValueError('indexed exchange interrupted by another request')
+
+    def read(self, client, count, deadline):
+        self.check()
+        self.to_read, self.received = count, None
+        result = client.read_exact(count, deadline)
+        self.check()
+        if result is None or result is not self.received:
+            raise ValueError('indexed exchange read association')
+        return result
 
 
 class CallOriginal(NamedTuple):
@@ -86,6 +139,15 @@ def lp(value):
     if isinstance(value, str):
         value = value.encode('utf8')
     return struct.pack('<I', len(value)) + value
+
+def _call_prefix(deadline, op_id, namespace):
+    return struct.pack('<Q', deadline) + lp(op_id) + lp(namespace)
+
+def _put_prefix(key, ack, expected):
+    suffix = lp(key) + struct.pack('<B', ack)
+    if expected is not None:
+        suffix += struct.pack('<Q', expected)
+    return suffix
 
 def frame(opcode, request_id, payload):
     body = struct.pack('<HHBQ', 1, 0, opcode, request_id) + payload
@@ -199,7 +261,9 @@ class Client:
                 self.channel.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             else:
                 self.channel = Pipe(self.address, deadline)
-            response = self.exchange(1, struct.pack('<IB', MAX_FRAME, self.allow_mem)+lp('python-stdlib;timers=1;subscribe=1;scans=1'), deadline)
+            # An explicit connect owns its HELLO, including inside an exchange hook.
+            with self._exchange_scope(None):
+                response = self.exchange(1, struct.pack('<IB', MAX_FRAME, self.allow_mem)+lp('python-stdlib;timers=1;subscribe=1;scans=1'), deadline)
             decoder = Decoder(response)
             epoch, max_frame, max_value, max_batch, mem, retry_ms = decoder.unpack('<QIIHBQ')
             count, = decoder.unpack('<H')
@@ -252,48 +316,115 @@ class Client:
         if not getattr(self, '_error_close_deferred', False):
             self.close()
 
+    @contextlib.contextmanager
+    def _exchange_scope(self, evidence):
+        previous_evidence = getattr(self, '_active_exchange_evidence', None)
+        previous_transfer = getattr(self, '_indexed_transfer', None)
+        self._active_exchange_evidence = evidence
+        self._indexed_transfer = None
+        try:
+            yield
+        finally:
+            self._indexed_transfer = previous_transfer
+            self._active_exchange_evidence = previous_evidence
+
+    def _transfer_for_io(self):
+        transfer = getattr(self, '_indexed_transfer', None)
+        if transfer is None and getattr(self, '_active_exchange_evidence', None) is not None:
+            raise ValueError('indexed exchange I/O outside serialized request')
+        return transfer
+
+    def _io_channel(self, transfer):
+        if transfer is None:
+            return self.channel
+        transfer.check()
+        return transfer.channel
+
     def read_exact(self, count, deadline):
+        transfer = self._transfer_for_io()
+        if transfer is not None:
+            transfer.check()
+            if count != transfer.to_read or deadline != transfer.evidence.deadline:
+                raise ValueError('unexpected indexed exchange read')
+            transfer.to_read = None
         output = bytearray()
         while len(output) < count:
             if int(time.time()*1000) >= deadline:
                 raise TimeoutError('read deadline; outcome uncertain after send')
+            channel = self._io_channel(transfer)
             if self.transport == 'tcp':
-                self.channel.settimeout(max(.001,(deadline-int(time.time()*1000))/1000))
-                chunk = self.channel.recv(count-len(output))
+                channel.settimeout(max(.001,(deadline-int(time.time()*1000))/1000))
+                chunk = self._io_channel(transfer).recv(count-len(output))
             else:
-                chunk = self.channel.io(None, count-len(output), deadline, False)
+                chunk = channel.io(None, count-len(output), deadline, False)
+            if transfer is not None:
+                transfer.check()
             if not chunk:
                 raise ConnectionError('partial frame')
             output.extend(chunk)
-        return bytes(output)
+        result = bytes(output)
+        if transfer is not None:
+            transfer.received = result
+        return result
 
     def write_all(self, data, deadline):
+        transfer = self._transfer_for_io()
+        if transfer is not None:
+            transfer.check()
+            if (transfer.to_write is None or type(data) is not bytes or data != transfer.to_write or
+                    deadline != transfer.evidence.deadline):
+                raise ValueError('unexpected indexed exchange write')
+            transfer.to_write = None
         position = 0
         while position < len(data):
             if int(time.time()*1000) >= deadline:
                 raise TimeoutError('write deadline; partial send uncertain')
+            channel = self._io_channel(transfer)
             if self.transport == 'tcp':
-                self.channel.settimeout(max(.001,(deadline-int(time.time()*1000))/1000))
-                count = self.channel.send(data[position:])
+                channel.settimeout(max(.001,(deadline-int(time.time()*1000))/1000))
+                count = self._io_channel(transfer).send(data[position:])
             else:
-                count = self.channel.io(data[position:], len(data)-position, deadline, True)
+                count = channel.io(data[position:], len(data)-position, deadline, True)
+            if transfer is not None:
+                transfer.check()
             if not count:
                 raise ConnectionError('zero write')
             position += count
+        if transfer is not None:
+            transfer.written = True
 
     def exchange(self, opcode, payload, deadline):
-        channel = self.channel
         evidence = getattr(self, '_active_exchange_evidence', None)
+        if evidence is not None:
+            evidence.check_channel(self)
+            if deadline != evidence.deadline:
+                raise ValueError('indexed exchange deadline changed')
         self.request_id += 1
         sent_id = self.request_id
         encoded=frame(opcode,sent_id,payload)
         if len(encoded)-4>getattr(self,'max_frame',MAX_FRAME): raise Refusal(4)
+        previous = getattr(self, '_indexed_transfer', None)
+        transfer = None if evidence is None else _IndexedTransfer(evidence, sent_id, encoded)
+        self._indexed_transfer = transfer
+        try:
+            return self._exchange_frame(opcode, sent_id, encoded, deadline, transfer)
+        finally:
+            self._indexed_transfer = previous
+
+    def _exchange_frame(self, opcode, sent_id, encoded, deadline, transfer):
+        if transfer is not None:
+            transfer.check()
         self.write_all(encoded, deadline)
-        count, = struct.unpack('<I', self.read_exact(4, deadline))
+        if transfer is not None:
+            transfer.check()
+            if not transfer.written:
+                raise ValueError('indexed exchange write association')
+        prefix = self.read_exact(4, deadline) if transfer is None else transfer.read(self, 4, deadline)
+        count, = struct.unpack('<I', prefix)
         if not 15 <= count <= getattr(self,'max_frame',MAX_FRAME):
             self._close_on_error()
             raise ValueError('reply frame size')
-        body = self.read_exact(count, deadline)
+        body = self.read_exact(count, deadline) if transfer is None else transfer.read(self, count, deadline)
         major, minor, op, request_id, code = struct.unpack('<HHBQH', body[:15])
         if (major, minor, op, request_id) != (1, 0, opcode|128, sent_id) or self.request_id != sent_id:
             self._close_on_error()
@@ -303,26 +434,26 @@ class Client:
             if code not in codes or len(body) != 15:
                 self._close_on_error()
                 raise ValueError('invalid refusal reply')
-            refusal = Refusal(code, codes)
-            if (evidence is not None and evidence.client is self and
-                    self.channel is channel is evidence.channel and
-                    evidence.request == (sent_id, opcode, payload)):
-                evidence.outcome = sent_id, code, refusal
-            raise refusal
-        return body[15:]
+        result = Refusal(code, codes) if code else body[15:]
+        if transfer is not None:
+            transfer.check()
+            transfer.evidence.record(encoded, code, result)
+        if code:
+            raise result
+        return result
 
     def call(self, opcode, ns, suffix=b'', op_id=None, deadline=None, *, retry_transport=True, _evidence=None):
         """At most one resend. See docs/PYTHON_RETRY.md for custody and limits."""
         op_id = op_id or str(uuid.uuid4())
         deadline = deadline or deadline_ms(self.timeout)
-        payload = struct.pack('<Q', deadline)+lp(op_id)+lp(ns)+suffix
+        payload = _call_prefix(deadline, op_id, ns) + suffix
         creates_snapshot = opcode in (10, 16, 21, 22) or (opcode in (11, 12, 14, 15) and suffix[:4] == b'\x00' * 4)
         bounded_retry = opcode in (4, 5, 6, 7, 17, 24)
         original = lost = None
         for attempt in range(2):
             try:
-                if _evidence is not None and self.channel is not _evidence.channel:
-                    raise ConnectionError('indexed exchange channel changed before send')
+                if _evidence is not None:
+                    _evidence.check_channel(self)
                 if self.channel is None: self.connect(deadline)
                 if bounded_retry and retry_transport:
                     if original is None:
@@ -338,17 +469,11 @@ class Client:
                             raise TimeoutError('original retry horizon elapsed')
                         if int(time.time()*1000) >= deadline:
                             raise TimeoutError('original request deadline elapsed')
-                # Keep the three-argument exchange hook. A nested call gets its
-                # own scope, and a direct exchange must match the exact request.
-                previous = getattr(self, '_active_exchange_evidence', None)
-                self._active_exchange_evidence = _evidence
-                try:
-                    if _evidence is not None:
-                        _evidence.request = (self.request_id + 1, opcode, payload)
-                        _evidence.outcome = None
+                # Keep the three-argument hook and give nested calls their own scope.
+                with self._exchange_scope(_evidence):
                     reply = self.exchange(opcode, payload, deadline)
-                finally:
-                    self._active_exchange_evidence = previous
+                if _evidence is not None:
+                    _evidence.require_reply(reply)
                 # An associated success frame is not yet a typed settlement.
                 # Validate while the original request and first loss are in scope.
                 if opcode in (4, 5, 6):
@@ -429,10 +554,7 @@ class Client:
     def put(self, ns, key, value, ack=1, expected=None, op_id=None, deadline=None, *,
             retry_transport=True, _evidence=None):
         opcode = 4 if expected is None else 5
-        suffix = lp(key)+struct.pack('<B',ack)
-        if expected is not None:
-            suffix += struct.pack('<Q',expected)
-        suffix += lp(value)
+        suffix = _put_prefix(key, ack, expected) + lp(value)
         options = {} if retry_transport else {'retry_transport': False}
         if _evidence is not None:
             options['_evidence'] = _evidence

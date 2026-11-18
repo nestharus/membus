@@ -14,7 +14,8 @@ import struct
 import time
 import zlib
 
-from membus import Client, Decoder, EpochChanged, MAX_FRAME, MAX_VALUE, Refusal, _ExchangeEvidence, lp
+from membus import (Client, Decoder, EpochChanged, MAX_FRAME, MAX_VALUE, Refusal,
+                    _ExchangeEvidence, _call_prefix, _put_prefix, lp)
 
 MAX_ID = 1024
 U64_MAX = 2**64 - 1
@@ -408,7 +409,8 @@ class Collection:
             raise Conflict('original mutation identity cannot be rebound')
         self._admit_put(c, p.namespace, key, len(body), op, 'mutation')
         deadline = _deadline(d)
-        evidence = _ExchangeEvidence(c)
+        prefix = _call_prefix(deadline, op, p.namespace) + _put_prefix(key, p.ack, expected)
+        evidence = _ExchangeEvidence(c, 5, deadline, prefix + struct.pack('<I', len(body)), body)
         channel = evidence.channel
         if m.first_send is None:
             m.first_send = time.monotonic()
@@ -418,9 +420,13 @@ class Collection:
             with c._defer_error_close():
                 result = c.put(p.namespace, key, body, ack=p.ack, expected=expected,
                                op_id=op, deadline=deadline, retry_transport=False, _evidence=evidence)
-            if (not isinstance(result, dict) or type(result.get('version')) is not int or
-                    not 1 <= result['version'] <= U64_MAX or result.get('ack') != p.ack):
+            if not isinstance(result, dict):
                 raise Corrupt('mutation achieved acknowledgment/revision')
+            version, ack = result.get('version'), result.get('ack')
+            if type(version) is not int or not 1 <= version <= U64_MAX or ack != p.ack:
+                raise Corrupt('mutation achieved acknowledgment/revision')
+            if not evidence.confirms_mutation(version, ack):
+                raise Corrupt('indexed mutation receipt association')
             return result
         except BaseException as cause:
             if evidence.confirms(cause) and cause.code not in (16, 17):
