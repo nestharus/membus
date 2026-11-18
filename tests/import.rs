@@ -82,8 +82,14 @@ fn new_import_covers_original_flush_retry_history_before_readonly_backup_switch(
         (fs::canonicalize(&p).unwrap(), fs::metadata(&p).unwrap().len(), chunks::sha256_file(&p).unwrap())
     }).collect();
     let failed = Store::open(&dir, Config { fail_recovery_sync: true, ..Config::default() });
-    assert!(failed.is_err(), "the source barrier must precede the import switch");
-    assert!(!dir.join("chunks").exists());
+    let error = failed.err().expect("the source barrier must precede the import switch");
+    assert!(error.to_string().contains("test injected recovery sync failure"));
+    let chunks = dir.join("chunks");
+    assert!(chunks.is_dir());
+    assert!(fs::read_dir(&chunks).unwrap().next().is_none());
+    assert_eq!(fs::read(dir.join("epoch")).unwrap(), 7u64.to_le_bytes());
+    assert!(!dir.join("chunks.import").exists());
+    assert!(!dir.join("chunks.pre-import-8").exists());
     assert!(!dir.join("legacy-8").exists());
     for (p, _, hash) in &originals {
         assert_eq!(chunks::sha256_file(p).unwrap(), *hash);

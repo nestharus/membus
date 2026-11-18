@@ -34,8 +34,10 @@ require exactly one policy row in NS: that KEY prefix with Latest. An unrelated 
 refuses even when the requested key still routes Latest. The receiver separately verifies
 that the exact namespace, key and revision have one validated frame in the active Latest
 catalogue placement. A chunk can contain keys from several prefixes or namespaces. Its
-opener label records the policy at chunk creation. Duplicate retained frames, missing
-placement evidence and other physical classes refuse even when policy and readback agree.
+opener label records the policy at chunk creation. Duplicate active frames, missing
+placement evidence and other active classes refuse even when policy and readback agree.
+Non-serving copies awaiting retirement or kept as immutable import backups can still
+exist. The receipt does not certify their removal or whole-root physical uniqueness.
 
 Run on an exclusively held private working copy. Normal startup may advance epoch, append
 closure records or finish resolved replay before a later policy, value, version or
