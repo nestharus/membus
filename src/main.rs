@@ -30,16 +30,12 @@ fn serve<S: Read + Write>(
     store: Arc<Store>,
     ingress: Arc<AtomicUsize>,
 ) -> io::Result<()> {
-    let mut hello = false;
-    let mut allow_mem = false;
-    let mut max_frame = membus::MAX_FRAME;
-    let mut subscribe = false;
-    let mut timers = false;
+    let mut connection = membus::ConnectionDispatch::default();
     loop {
         let mut head = [0u8; 4];
         stream.read_exact(&mut head)?;
         let n = u32::from_le_bytes(head) as usize;
-        if n < 13 || n > max_frame {
+        if n < 13 || n > connection.max_frame() {
             stream.write_all(&membus::reply(0, 0, if n < 13 { 3 } else { 4 }, &[]))?;
             return Ok(());
         }
@@ -56,56 +52,12 @@ fn serve<S: Read + Write>(
         let _frame = FramePermit(ingress.clone(), n);
         let mut b = vec![0; n];
         stream.read_exact(&mut b)?;
-        if !hello && b[4] != membus::HELLO {
-            stream.write_all(&membus::reply(
-                b[4],
-                u64::from_le_bytes(b[5..13].try_into().unwrap()),
-                3,
-                &[],
-            ))?;
-            return Ok(());
-        }
-        if hello && b[4] == membus::HELLO {
-            stream.write_all(&membus::reply(
-                b[4],
-                u64::from_le_bytes(b[5..13].try_into().unwrap()),
-                3,
-                &[],
-            ))?;
-            continue;
-        }
-        let mut response = if hello && (membus::SUBSCRIBE..=membus::SIGNAL_USAGE).contains(&b[4]) && !subscribe {
-            membus::reply(b[4], u64::from_le_bytes(b[5..13].try_into().unwrap()), 2, &[])
-        } else if hello && (membus::TIMER_SET..=membus::TIMER_STATUS).contains(&b[4]) && !timers {
-            membus::reply(b[4], u64::from_le_bytes(b[5..13].try_into().unwrap()), 2, &[])
-        } else { store.dispatch_for_limit(&b, allow_mem, max_frame) };
-        if response.len() - 4 > max_frame {
-            response = membus::reply(
-                b[4],
-                u64::from_le_bytes(b[5..13].try_into().unwrap()),
-                4,
-                &[],
-            );
-        }
+        let was_ready = connection.is_ready();
+        let response = connection.dispatch(&store, &b);
         let code = u16::from_le_bytes(response[17..19].try_into().unwrap());
         stream.write_all(&response)?;
-        if code == 1 {
+        if code == 1 || (!was_ready && !connection.is_ready()) {
             return Ok(());
-        }
-        if !hello {
-            if code != 0 {
-                return Ok(());
-            }
-            allow_mem = b[17] != 0;
-            max_frame =
-                (u32::from_le_bytes(b[13..17].try_into().unwrap()) as usize).min(membus::MAX_FRAME);
-            hello = true;
-            let mut c = membus::Cursor::new(&b[13..]);
-            let _ = c.u32().unwrap(); // checked by successful hello above
-            let _ = c.u8().unwrap();
-            let client = c.text().unwrap();
-            subscribe = client.split(';').skip(1).any(|feature| feature == "subscribe=1");
-            timers = client.split(';').skip(1).any(|feature| feature == "timers=1");
         }
     }
 }

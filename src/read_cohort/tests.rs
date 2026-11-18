@@ -92,7 +92,7 @@ fn fixture(label: &str) -> (PathBuf, Arc<Store>, usize) {
     let config = Config { capacity: 2*1024*1024, cache_bytes: 0, signal_bytes: 0, snapshot_bytes: 1024*1024,
         snapshot_ttl_ms: 1000, clock: Some(chunks::ManualClock::new(1_000_000)), cache_rules: vec![], ..Config::default() };
     let clock = chunks::Clock::new(config.clock.clone());
-    let state = Arc::new(Mutex::new(store::State {pending: HashMap::new(), metadata: HashMap::new(),
+    let state = Arc::new(Mutex::new(store::State {subscription_usage: Default::default(), pending: HashMap::new(), metadata: HashMap::new(),
         namespace_counts: HashMap::from([("n".into(),8)]),keys:9,committed_bytes:9*store::index_charge(&("n".into(),"source/2".into())),
         dedup_bytes:0,dedup:HashMap::new(),policy_publishing:HashSet::new(),retired:VecDeque::new(),retired_set:HashSet::new(),
         expiry:VecDeque::new(),next:19,reserved_bytes:0,memory_reserved:0,stripe_reserved:[0;4],stripe_items:[0;4],
@@ -118,7 +118,7 @@ fn fixture(label: &str) -> (PathBuf, Arc<Store>, usize) {
         cold_readers:(Mutex::new(0),Condvar::new()),
         read_usage:Arc::new(read_cohort::ReadUsage::default()),
         scans:Arc::new(Mutex::new(ScanState {next:1,snapshots:HashMap::new()})),scan_usage:Arc::new(ScanUsage::default()),
-        scan_reaper:None,ticker:None,state,done:Condvar::new(),maint,router,chunks,policies,next_issued,flags,path:path.clone(),
+        subscription_released: Default::default(), scan_reaper:None,ticker:None,state,done:Condvar::new(),maint,router,chunks,policies,next_issued,flags,path:path.clone(),
         report:Mutex::new(chunks::ReplayReport::default()),appenders:vec![],flush_owner:None,batch_gate:Mutex::new(()),
         admission_gate,policy_updates:Mutex::new(()),class_reservations,policy_after_commit:Mutex::new(None),
         policy_join_observed:Mutex::new(None),config,epoch:1,_owner:owner});

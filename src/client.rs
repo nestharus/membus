@@ -74,6 +74,8 @@ pub enum Error {
         actual: u64,
     },
     RetryWindowExpired,
+    /// No stronger contract was selected; creating a legacy registration is not a fallback.
+    SubscriptionContractUnavailable(crate::subscription_contract::Unavailable),
 }
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -242,6 +244,7 @@ pub struct Client<T: Transport> {
     negotiated: Negotiated,
     pub(crate) usable: bool,
     feature_limits: FeatureLimits,
+    finite_hints: bool,
 }
 // Own the bounded reply body through typed decoding. Constructed only after
 // header association and status validation; decoders borrow past that header.
@@ -276,6 +279,26 @@ impl<T: Transport> Client<T> {
         additional: AdditionalFeatures,
         until: Instant,
     ) -> Result<Self> {
+        Self::handshake_inner(io, options, additional, until, 0)
+    }
+    /// Require the stronger process-owned subscription contract during HELLO.
+    /// Version-one discovery cannot select the finite-hint profile. Use
+    /// handshake_finite_hints for that explicit agreement; no fallback is made.
+    pub fn handshake_requiring_owned_subscriptions(
+        io: T,
+        options: Options,
+        additional: AdditionalFeatures,
+        until: Instant,
+    ) -> Result<Self> {
+        Self::handshake_inner(io, options, additional, until, 1)
+    }
+    fn handshake_inner(
+        io: T,
+        options: Options,
+        additional: AdditionalFeatures,
+        until: Instant,
+        contract_version: u8,
+    ) -> Result<Self> {
         identifier(&options.identity)?;
         if options.identity.contains(';') {
             return Err(Error::Invalid("identity contains feature delimiter"));
@@ -288,6 +311,7 @@ impl<T: Transport> Client<T> {
             request_id: 0,
             usable: true,
             feature_limits: FeatureLimits::default(),
+            finite_hints:false,
             negotiated: Negotiated {
                 epoch: 0,
                 max_frame: options.max_frame,
@@ -306,6 +330,7 @@ impl<T: Transport> Client<T> {
         let features = [
             if additional.timers { ";timers=1" } else { "" },
             if options.subscriptions { ";subscribe=1" } else { "" },
+            if contract_version==2 {crate::subscription_contract::FINITE_HELLO_FEATURE} else if contract_version==1 { crate::subscription_contract::HELLO_FEATURE } else { "" },
             if options.scans { ";scans=1" } else { "" },
         ];
         let identity_len = options.identity.len()
@@ -415,7 +440,19 @@ impl<T: Transport> Client<T> {
         if refusals.contains_key(&25) {
             this.feature_limits.timers = Some(TimerLimits::parse(&mut c)?);
         }
-        parse(c.end())?;
+        if contract_version==1 {
+            let reason = crate::subscription_contract::decode_discovery(c.remainder())
+                .map_err(|_| Error::Protocol("subscription contract discovery"))?;
+            return Err(Error::SubscriptionContractUnavailable(reason));
+        }
+        if contract_version==2 {
+            if !refusals.contains_key(&24) {return Err(Error::Protocol("finite hint refusal vocabulary"));}
+            if c.remainder()!=crate::subscription_contract::FINITE_DISCOVERY {
+                if let Ok(reason)=crate::subscription_contract::decode_discovery(c.remainder()) {return Err(Error::SubscriptionContractUnavailable(reason));}
+                return Err(Error::Protocol("finite hint profile discovery"));
+            }
+            this.finite_hints=true;
+        }else{parse(c.end())?;}
         this.negotiated = Negotiated {
             epoch,
             max_frame,
@@ -429,6 +466,13 @@ impl<T: Transport> Client<T> {
         };
         Ok(this)
     }
+    pub(crate) fn require_atomic_wire(&self) -> Result<()> {
+        if self.finite_hints {
+            return Err(Error::Invalid("atomic wire operations unavailable on a finite hint connection"));
+        }
+        Ok(())
+    }
+
     pub fn negotiated(&self) -> &Negotiated {
         &self.negotiated
     }
@@ -903,3 +947,7 @@ impl Client<crate::pipe_io::Pipe> {
         )
     }
 }
+
+#[path="client_finite.rs"]
+mod finite_client;
+pub use finite_client::{HintAttempt,HintCreationState};

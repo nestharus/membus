@@ -1,6 +1,15 @@
 //! Epoch-scoped change retention and one bounded, independent delivery owner.
 use crate::{lp, Config, Value, MAX_ID};
-use std::{collections::{HashMap, VecDeque}, io, sync::{atomic::{AtomicBool, Ordering}, Arc, Condvar, Mutex}, thread, time::Duration};
+use std::{io, sync::{Arc, Condvar, Mutex}, thread, time::Duration};
+
+#[path = "signals/finite.rs"]
+mod finite;
+use finite::*;
+#[path="signals/legacy.rs"]
+mod legacy;
+use legacy::*;
+#[path="signals/worker.rs"]
+mod worker;
 
 const SUB_MAX: usize = 64;
 const SUB_ITEMS: usize = 256;
@@ -19,55 +28,92 @@ struct Change {
     key: String,
     value: Arc<Value>,
     charge: usize,
+    allocation: Option<crate::subscription_resources::SubscriptionReservation>,
 }
 struct Subscription {
     id: u64,
     ns: String,
     prefix: String,
-    endpoint: String,
+    slot: Option<LegacySlotRef>,
     values: bool,
     frame_max: usize,
     active: bool,
     status: u8,
-    queue: VecDeque<Arc<Change>>,
+    queue: std::collections::LinkedList<ChangeRef>,
     bytes: usize, // includes delivery in flight
     written: u64,
     failed: u64,
     dropped: u64,
     last: u64,
+    allocation: Option<crate::subscription_resources::SubscriptionReservation>,
 }
 struct State {
     head: u64,
     floor: u64, // a resume at floor is valid; earlier history is gone
     next: u64,
-    ring: VecDeque<Arc<Change>>,
+    ring: std::collections::LinkedList<History>,
     ring_bytes: usize,
     queue_bytes: usize,
-    subs: Vec<Subscription>,
-    turn: usize,
+    subs: std::collections::LinkedList<Subscription>,
+    finite: std::collections::LinkedList<FiniteSubscription>,
+    // A lower bound on every retained expiry. Renewal/removal may leave it
+    // early; only a due full sweep advances it. No extra registry is retained.
+    finite_expiry:Option<u64>,
     stop: bool,
+    #[cfg(test)]
+    worker_visits:(usize,usize),
 }
 #[cfg(windows)]
 type Connection = crate::pipe_io::Pipe;
 #[cfg(not(windows))]
 type Connection = ();
+#[cfg(test)]
+type Sink = fn(&str, &[u8], u32, &mut Option<Connection>, &crate::chunks::Clock) -> io::Result<()>;
+type DeliverySink = dyn Fn(&str, &[u8], u32, &mut Option<Connection>, &crate::chunks::Clock) -> io::Result<()> + Send;
 pub struct Hub {
     epoch: u64,
     ring_max: usize,
     ring_budget: usize,
     state: Arc<(Mutex<State>, Condvar)>,
-    released: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
+    clock: crate::chunks::Clock,
+    #[cfg(test)]
+    account: std::sync::OnceLock<crate::subscription_resources::SubscriptionAccount>,
 }
-/// The share available to signals and the value cache while Store holds State.
-pub(super) struct Budget<'a> {
-    pub(super) bytes: usize,
-    pub(super) cache: &'a crate::cache::Cache,
+/// Existing concrete layouts, shared with prospective resource demand builders.
+pub(crate) fn registration_allocation_bytes() -> usize {
+    2*(std::mem::size_of::<Subscription>()+2*std::mem::size_of::<usize>())
 }
-impl Budget<'_> {
-    fn fund(&self, signal_bytes: usize) {
-        self.cache.shrink(self.bytes - signal_bytes);
-    }
+pub(crate) fn connection_allocation_bytes()->usize {legacy::slot_allocation_bytes()}
+pub(crate) fn queue_link_allocation_bytes()->usize {2*std::mem::size_of::<usize>()+std::mem::size_of::<ChangeRef>()}
+pub(crate) fn change_allocation_bytes() -> usize {
+    // Arc strong/weak counters for Change and Value, plus a retained Arc link.
+    std::mem::size_of::<Change>() + std::mem::size_of::<Value>()
+        + 4 * std::mem::size_of::<usize>() + std::mem::size_of::<Arc<Change>>()
+}
+/// Prospective managed representation charge for the unchanged legacy Hub.
+/// This is reserved even while quiet. Kernel buffers/handles and allocator RSS
+/// are not measured; the Store margin remains separate. No policy is enlarged.
+#[cfg(test)]
+pub(crate) fn legacy_memory_reservation(history_items: usize, history_bytes: usize) -> usize {
+    use std::mem::size_of;
+    // A retained Change charges at least 256. Include the append-before-evict
+    // slot and replay collection, with backing growth for both VecDeques.
+    let history_slots = history_items.min(history_bytes / 256).saturating_add(1);
+    let links = history_slots.saturating_mul(4).saturating_add(8)
+        .saturating_mul(size_of::<Arc<Change>>());
+    // Actual row, owned identifier strings, queue backing and connection-map
+    // bookkeeping. The existing legacy queue/registration bounds still govern.
+    let row = size_of::<Subscription>().saturating_add(3 * MAX_ID)
+        .saturating_add(2 * (SUB_ITEMS + 1) * size_of::<Arc<Change>>())
+        .saturating_add(4 * size_of::<(u64, Option<Connection>)>());
+    let transient_change = 256usize.saturating_add(2 * MAX_ID).saturating_add(crate::MAX_VALUE);
+    // encode holds body and framed buffers at once, each with growth slack.
+    history_bytes.saturating_add(QUEUE_BYTES).saturating_add(links)
+        // Shared Hub/State/clock/list metadata is present even with no rows.
+        .saturating_add(size_of::<State>()).saturating_add(size_of::<Hub>())
+        .saturating_add(SUB_MAX.saturating_mul(row)).saturating_add(transient_change)
+        .saturating_add(4 * (crate::MAX_FRAME + 4))
 }
 fn token(epoch: u64, seq: u64) -> Vec<u8> {
     let mut b = epoch.to_le_bytes().to_vec();
@@ -82,16 +128,21 @@ fn parse_token(epoch: u64, b: &[u8], code: u16) -> Result<u64, u16> {
 }
 fn clear(sub: &mut Subscription) -> usize {
     let bytes: usize = sub.queue.iter().map(|c| c.charge).sum();
+    sub.bytes -= bytes;
     sub.dropped += sub.queue.len() as u64;
     sub.queue.clear();
-    sub.bytes -= bytes;
+    if let Some(grant)=sub.allocation.as_mut() {
+        let retained=grant.resources().retained;
+        if retained!=0 {let mut queue=grant.split(crate::subscription_resources::SubscriptionResources{retained,..Default::default()}).expect("owned queue backing");queue.return_to_owner();}
+    }
     bytes
 }
 fn encode(epoch: u64, id: u64, change: &Change, values: bool) -> Vec<u8> {
-    let mut b = b"MBC1".to_vec();
+    let mut b = Vec::with_capacity(wire_size(change,values));
+    b.extend_from_slice(b"MBC1");
     b.extend(1u16.to_le_bytes());
-    b.extend(token(epoch, id));
-    b.extend(token(epoch, change.seq));
+    b.extend(epoch.to_le_bytes());b.extend(id.to_le_bytes());
+    b.extend(epoch.to_le_bytes());b.extend(change.seq.to_le_bytes());
     lp(&mut b, change.ns.as_bytes());
     lp(&mut b, change.key.as_bytes());
     b.extend(change.value.version.to_le_bytes());
@@ -99,182 +150,38 @@ fn encode(epoch: u64, id: u64, change: &Change, values: bool) -> Vec<u8> {
     b.push(change.value.tombstone as u8);
     b.push(values as u8);
     if values { lp(&mut b, &change.value.bytes); }
-    let mut frame = (b.len() as u32).to_le_bytes().to_vec();
+    let mut frame = Vec::with_capacity(b.len()+4);
+    frame.extend((b.len() as u32).to_le_bytes());
     frame.extend(b);
     frame
+}
+enum Job {
+    Legacy(u64,LegacySlotRef,bool,ChangeRef),
+    Hint(crate::subscription_contract::HintBinding,Arc<HintSlot>,u64,u32,u64,u64),
 }
 impl Hub {
     pub(crate) fn stop_for_capture(&mut self) -> io::Result<()> {
         {
             let mut s=self.state.0.lock().unwrap();
-            if s.subs.iter().any(|sub|sub.active || sub.bytes!=0) || s.queue_bytes!=0 {
+            if !s.finite.is_empty() || s.subs.iter().any(|sub|sub.active || sub.bytes!=0) || s.queue_bytes!=0 {
                 return Err(io::Error::other("signal delivery owner/subscription is not settled"));
             }
             s.stop=true;self.state.1.notify_all();
         }
         if let Some(worker)=self.worker.take() {worker.join().map_err(|_|io::Error::other("signal owner panicked"))?;}
+        {let mut s=self.state.0.lock().unwrap();while let Some(row)=s.subs.pop_front(){drop(row);}while let Some(change)=s.ring.pop_front(){drop(change);}s.ring_bytes=0;}
         Ok(())
     }
 
     pub fn new(epoch: u64, config: &Config, clock: crate::chunks::Clock) -> Self {
         Self::with_sink(epoch, config, deliver, clock)
     }
-    fn with_sink(epoch: u64, config: &Config,
-        sink: impl Fn(&str, &[u8], u32, &mut Option<Connection>, &crate::chunks::Clock) -> io::Result<()> + Send + 'static,
-        clock: crate::chunks::Clock,
-    ) -> Self {
+    fn with_sink(epoch: u64, config: &Config, sink: impl Fn(&str, &[u8], u32, &mut Option<Connection>, &crate::chunks::Clock) -> io::Result<()> + Send + 'static, clock: crate::chunks::Clock) -> Self {
         let state = Arc::new((Mutex::new(State { head: 0, floor: 0, next: 1,
-            ring: VecDeque::new(), ring_bytes: 0, queue_bytes: 0,
-            subs: Vec::new(), turn: 0, stop: false }), Condvar::new()));
-        let owner = state.clone();
-        let released = Arc::new(AtomicBool::new(false));
-        let worker_released = released.clone();
-        let worker = thread::spawn(move || {
-            let mut connections: HashMap<u64, Option<Connection>> = HashMap::new();
-            loop {
-                let job = {
-                    let (lock, wake) = &*owner;
-                    let mut s = lock.lock().unwrap();
-                    loop {
-                        connections.retain(|id, _| s.subs.iter().any(|sub| sub.id == *id && sub.active));
-                        if s.stop { return; }
-                        let mut job = None;
-                        let count = s.subs.len();
-                        for offset in 0..count {
-                            let n = (s.turn + offset) % count;
-                            let sub = &mut s.subs[n];
-                            if let Some(change) = sub.queue.pop_front() {
-                                job = Some((sub.id, sub.endpoint.clone(), sub.values, change));
-                                s.turn = (n + 1) % count;
-                                break;
-                            }
-                        }
-                        if let Some(job) = job { break job; }
-                        s = wake.wait(s).unwrap();
-                    }
-                };
-                let (id, endpoint, values, change) = job;
-                // Encoding and all endpoint I/O are outside the publication/hub lock.
-                let result = sink(&endpoint, &encode(epoch, id, &change, values), WRITE_MS,
-                    connections.entry(id).or_default(), &clock);
-                let (charge, seq) = (change.charge, change.seq);
-                drop(change);
-                let mut s = owner.0.lock().unwrap();
-                s.queue_bytes -= charge;
-                if let Some(sub) = s.subs.iter_mut().find(|sub| sub.id == id) {
-                    sub.bytes -= charge;
-                    if result.is_ok() {
-                        sub.written += 1;
-                        sub.last = seq;
-                        if sub.active { sub.status = if sub.queue.is_empty() { WRITTEN } else { QUEUED }; }
-                    } else {
-                        sub.failed += 1;
-                        if sub.active { sub.status = FAILED; }
-                        sub.active = false;
-                        let freed = clear(sub);
-                        s.queue_bytes -= freed;
-                    }
-                }
-                worker_released.store(true, Ordering::Release);
-            }
-        });
-        Self { epoch, ring_max: config.signal_history, ring_budget: config.signal_bytes, state, released, worker: Some(worker) }
-    }
-    /// Store holds State and, for KV changes, the committed write lock. The
-    /// worker never takes State or the cache admission lock.
-    pub(super) fn publish(&self, ns: &str, key: &str, value: Arc<Value>, budget: &Budget<'_>) {
-        let mut s = self.state.0.lock().unwrap();
-        let Some(seq) = s.head.checked_add(1) else {
-            // Sequence exhaustion explicitly fences all streams, never reuses ids.
-            for sub in &mut s.subs { sub.active = false; sub.status = DROPPED; }
-            return;
-        };
-        let charge = 256 + ns.len() + key.len() + value.bytes.capacity();
-        let before = s.ring_bytes + s.queue_bytes;
-        // Keep existing deliveries, including the worker's in-flight charge.
-        // History yields oldest first. A change that cannot be retained moves
-        // the floor through its sequence so resume never skips the gap.
-        let ring_budget = self.ring_budget.min(budget.bytes.saturating_sub(s.queue_bytes));
-        while s.ring.len() >= self.ring_max || s.ring_bytes + charge > ring_budget {
-            let Some(old) = s.ring.pop_front() else { break; };
-            s.ring_bytes -= old.charge;
-            s.floor = old.seq;
-        }
-        let retain = self.ring_max != 0 && charge <= ring_budget;
-        let ring_bytes = s.ring_bytes + if retain { charge } else { 0 };
-        let queue_budget = QUEUE_BYTES.min(budget.bytes.saturating_sub(ring_bytes));
-        let mut queue_bytes = s.queue_bytes;
-        let mut enqueue = [false; SUB_MAX];
-        for (sub, enqueue) in s.subs.iter_mut().zip(&mut enqueue) {
-            if sub.active && sub.ns == ns && key.starts_with(&sub.prefix) {
-                if wire_size(ns, key, &value, sub.values) > sub.frame_max || sub.queue.len() >= SUB_ITEMS
-                    || sub.bytes + charge > SUB_BYTES || queue_bytes + charge > queue_budget {
-                    sub.active = false;
-                    sub.status = DROPPED;
-                    queue_bytes -= clear(sub);
-                    sub.dropped += 1;
-                } else {
-                    *enqueue = true;
-                    queue_bytes += charge;
-                }
-            }
-        }
-        // Reclaim cache capacity before any new history or queued reference
-        // becomes resident. Evictions and discarded queues already yielded.
-        if ring_bytes + queue_bytes > before {
-            budget.fund(ring_bytes + queue_bytes);
-        }
-        s.head = seq;
-        if !retain { s.floor = seq; }
-        if retain || enqueue.contains(&true) {
-            let change = Arc::new(Change { seq, ns: ns.into(), key: key.into(), value, charge });
-            if retain { s.ring.push_back(change.clone()); }
-            for (sub, enqueue) in s.subs.iter_mut().zip(enqueue) {
-                if enqueue {
-                    sub.queue.push_back(change.clone());
-                    sub.bytes += charge;
-                    sub.status = QUEUED;
-                }
-            }
-        }
-        s.ring_bytes = ring_bytes;
-        s.queue_bytes = queue_bytes;
-        self.state.1.notify_one();
-    }
-    pub(super) fn subscribe(&self, ns: &str, prefix: String, endpoint: String, values: bool, cursor: &[u8], protocol: &str, frame_max: usize, budget: &Budget<'_>) -> Result<Vec<u8>, u16> {
-        if protocol != "membus.change/1" { return Err(2); }
-        if !(1024..=crate::MAX_FRAME).contains(&frame_max) { return Err(4); }
-        if !valid_endpoint(&endpoint) || prefix.len() > MAX_ID { return Err(3); }
-        let mut s = self.state.0.lock().unwrap();
-        let start = if cursor.is_empty() { s.head } else { parse_token(self.epoch, cursor, 23)? };
-        if start < s.floor || start > s.head { return Err(23); }
-        let matches = |c: &&Arc<Change>| c.seq > start && c.ns == ns && c.key.starts_with(&prefix);
-        let (mut items, mut bytes) = (0, 0);
-        for c in s.ring.iter().filter(matches) {
-            if wire_size(&c.ns, &c.key, &c.value, values) > frame_max { return Err(4); }
-            items += 1;
-            bytes += c.charge;
-        }
-        // Refuse oversize catch-up instead of returning a silently partial stream.
-        if items > SUB_ITEMS || bytes > SUB_BYTES || s.queue_bytes + bytes > QUEUE_BYTES
-            || (bytes != 0 && s.ring_bytes + s.queue_bytes + bytes > budget.bytes) { return Err(6); }
-        if s.subs.len() == SUB_MAX {
-            if let Some(n) = s.subs.iter().position(|sub| !sub.active && sub.bytes == 0) { s.subs.remove(n); }
-            else { return Err(6); }
-        }
-        let id = s.next;
-        s.next = id.checked_add(1).ok_or(7u16)?;
-        if bytes != 0 { budget.fund(s.ring_bytes + s.queue_bytes + bytes); }
-        let queue = s.ring.iter().filter(matches).cloned().collect();
-        let status = if items == 0 { WRITTEN } else { QUEUED };
-        s.subs.push(Subscription { id, ns: ns.into(), prefix, endpoint, values, frame_max,
-            active: true, status, queue, bytes, written: 0, failed: 0, dropped: 0, last: start });
-        s.queue_bytes += bytes;
-        let mut reply = Vec::new();
-        lp(&mut reply, &token(self.epoch, id));
-        lp(&mut reply, &token(self.epoch, start));
-        self.state.1.notify_one();
-        Ok(reply)
+            ring: Default::default(), ring_bytes: 0, queue_bytes: 0,
+            subs: Default::default(), finite: Default::default(), finite_expiry:None, #[cfg(test)] worker_visits:(0,0), stop: false }), Condvar::new()));
+        let worker = worker::DeliveryWorker::start(epoch,state.clone(),Box::new(sink),clock.clone());
+        Self { epoch, ring_max: config.signal_history, ring_budget: config.signal_bytes, state, worker: Some(worker), clock, #[cfg(test)] account:Default::default() }
     }
     pub fn unsubscribe(&self, ns: &str, b: &[u8]) -> Result<(), u16> {
         let id = parse_token(self.epoch, b, 24)?;
@@ -282,9 +189,9 @@ impl Hub {
         let sub = s.subs.iter_mut().find(|sub| sub.id == id && sub.ns == ns).ok_or(24u16)?;
         sub.active = false;
         sub.status = CANCELLED;
+        drop(sub.slot.take());
         let freed = clear(sub);
         s.queue_bytes -= freed;
-        if freed != 0 { self.released.store(true, Ordering::Release); }
         self.state.1.notify_one();
         Ok(())
     }
@@ -306,12 +213,14 @@ impl Hub {
             self.ring_budget as u64, QUEUE_BYTES as u64] { p.extend(n.to_le_bytes()); }
         p
     }
+    #[cfg(test)]
+    pub(crate) fn memory_reservation_bytes(&self) -> usize {
+        self.account.get().map_or(0,|account|account.usage.bytes.load(std::sync::atomic::Ordering::Acquire))
+    }
+    #[cfg(test)]
     pub(crate) fn memory_bytes(&self) -> usize {
         let s = self.state.0.lock().unwrap();
         s.ring_bytes + s.queue_bytes
-    }
-    pub(super) fn take_released(&self) -> bool {
-        self.released.swap(false, Ordering::AcqRel)
     }
     pub fn hello_limits(&self) -> Vec<u8> {
         let mut p = 1u16.to_le_bytes().to_vec(); // membus.change/1
@@ -339,8 +248,8 @@ fn valid_endpoint(s: &str) -> bool {
         && !s[9..].contains(['/', ':'])
         && s[9..].split('\\').all(|part| !part.is_empty() && part != "." && part != ".." && !part.ends_with(['.', ' ']))
 }
-fn wire_size(ns: &str, key: &str, value: &Value, values: bool) -> usize {
-    57 + ns.len() + key.len() + if values { 4 + value.bytes.len() } else { 0 }
+fn wire_size(c: &Change, values: bool) -> usize {
+    57 + c.ns.len() + c.key.len() + if values { 4 + c.value.bytes.len() } else { 0 }
 }
 #[cfg(windows)]
 fn deliver(endpoint: &str, payload: &[u8], timeout: u32, connection: &mut Option<Connection>, clock: &crate::chunks::Clock) -> io::Result<()> {
@@ -373,22 +282,18 @@ fn deliver(_: &str, _: &[u8], _: u32, _: &mut Option<Connection>, _: &crate::chu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{cache::{Cache, CachePolicy}, chunks::Clock};
-
     fn ok(_: &str, _: &[u8], _: u32, _: &mut Option<Connection>, _: &crate::chunks::Clock) -> io::Result<()> { Ok(()) }
     fn value(n: u64) -> Arc<Value> { Arc::new(Value { version: n, ack: 1, bytes: vec![42], tombstone: false }) }
     #[test]
     fn retention_gap_and_filter_resume() {
-        let config = Config { signal_history: 2, ..Config::default() };
-        let h = Hub::with_sink(7, &config, ok, Clock::new(None));
-        let cache = Cache::new(&config, Clock::new(None));
-        let budget = Budget { bytes: config.capacity, cache: &cache };
-        h.publish("quota", "event/1", value(1), &budget);
-        h.publish("other", "event/2", value(2), &budget);
-        h.publish("quota", "state/3", value(3), &budget);
-        assert_eq!(h.subscribe("quota", "event/".into(), r"\\.\pipe\test".into(), false, &token(7, 0), "membus.change/1", crate::MAX_FRAME, &budget).err(), Some(23));
-        assert_eq!(h.subscribe("quota", "".into(), r"\\.\pipe\test".into(), false, &token(6, 3), "membus.change/1", crate::MAX_FRAME, &budget).err(), Some(23));
-        let r = h.subscribe("quota", "state/".into(), r"\\.\pipe\test".into(), true, &token(7, 1), "membus.change/1", crate::MAX_FRAME, &budget).unwrap();
+        let h = Hub::with_sink(7, &Config { signal_history: 2, ..Config::default() }, ok, crate::chunks::Clock::new(None));
+        let _account=h.capture_account(&Config {signal_history:2,..Config::default()});
+        h.publish("quota", "event/1", value(1));
+        h.publish("other", "event/2", value(2));
+        h.publish("quota", "state/3", value(3));
+        assert_eq!(h.subscribe("quota", "event/".into(), r"\\.\pipe\test".into(), false, &token(7, 0), "membus.change/1", crate::MAX_FRAME).err(), Some(23));
+        assert_eq!(h.subscribe("quota", "".into(), r"\\.\pipe\test".into(), false, &token(6, 3), "membus.change/1", crate::MAX_FRAME).err(), Some(23));
+        let r = h.subscribe("quota", "state/".into(), r"\\.\pipe\test".into(), true, &token(7, 1), "membus.change/1", crate::MAX_FRAME).unwrap();
         let sub = &r[4..20];
         let until = std::time::Instant::now() + Duration::from_secs(1);
         while h.status("quota", sub).unwrap()[1] != WRITTEN && std::time::Instant::now() < until { thread::yield_now(); }
@@ -401,55 +306,84 @@ mod tests {
     }
     #[test]
     fn oversized_replay_is_explicit_and_endpoints_are_local() {
-        let config = Config::default();
-        let h = Hub::with_sink(7, &config, ok, Clock::new(None));
-        let cache = Cache::new(&config, Clock::new(None));
-        let budget = Budget { bytes: config.capacity, cache: &cache };
-        for n in 1..=257 { h.publish("quota", "event/x", value(n), &budget); }
-        assert_eq!(h.subscribe("quota", "".into(), r"\\.\pipe\test".into(), false, &token(7, 0), "membus.change/1", crate::MAX_FRAME, &budget).err(), Some(6));
-        assert_eq!(h.subscribe("quota", "".into(), r"\\remote\pipe\x".into(), false, &[], "membus.change/1", crate::MAX_FRAME, &budget).err(), Some(3));
-        assert_eq!(h.subscribe("quota", "".into(), r"\\.\pipe\..\GLOBALROOT\x".into(), false, &[], "membus.change/1", crate::MAX_FRAME, &budget).err(), Some(3));
-        assert_eq!(h.subscribe("quota", "".into(), r"\\.\pipe\test".into(), false, &[], "other/1", crate::MAX_FRAME, &budget).err(), Some(2));
+        let h = Hub::with_sink(7, &Config::default(), ok, crate::chunks::Clock::new(None));
+        let _account=h.capture_account(&Config::default());
+        for n in 1..=257 { h.publish("quota", "event/x", value(n)); }
+        assert_eq!(h.subscribe("quota", "".into(), r"\\.\pipe\test".into(), false, &token(7, 0), "membus.change/1", crate::MAX_FRAME).err(), Some(6));
+        assert_eq!(h.subscribe("quota", "".into(), r"\\remote\pipe\x".into(), false, &[], "membus.change/1", crate::MAX_FRAME).err(), Some(3));
+        assert_eq!(h.subscribe("quota", "".into(), r"\\.\pipe\..\GLOBALROOT\x".into(), false, &[], "membus.change/1", crate::MAX_FRAME).err(), Some(3));
+        assert_eq!(h.subscribe("quota", "".into(), r"\\.\pipe\test".into(), false, &[], "other/1", crate::MAX_FRAME).err(), Some(2));
+    }
+
+
+    struct Funding {
+        owner: Arc<Mutex<crate::store::State>>,
+        cache: crate::cache::Cache,
+        released: Arc<std::sync::atomic::AtomicBool>,
+        bytes: usize,
+    }
+    impl Funding {
+        fn new(config: &Config, bytes: usize) -> Self {
+            let cache = crate::cache::Cache::new(config, crate::chunks::Clock::new(None));
+            cache.trim(bytes);
+            Self { owner: Arc::new(Mutex::new(crate::store::State::default())),
+                cache, released: Default::default(), bytes }
+        }
+        fn within<T>(&self, f: impl FnOnce(&crate::subscription_resources::Budget<'_>) -> T) -> T {
+            let state = self.owner.lock().unwrap();
+            f(&crate::subscription_resources::Budget::new(&self.owner, &state, self.bytes,
+                0, 0, 0, 0, Some(&self.cache), &self.released))
+        }
+        fn owned(&self) -> usize {
+            self.owner.lock().unwrap().subscription_usage.bytes.load(std::sync::atomic::Ordering::Acquire)
+        }
     }
 
     #[test]
     fn history_replacement_funds_net_growth_before_cache_admission() {
+        use crate::cache::CachePolicy;
         let config = Config { signal_history: 1, signal_bytes: 2048, ..Config::default() };
-        let h = Hub::with_sink(7, &config, ok, Clock::new(None));
-        let cache = Cache::new(&config, Clock::new(None));
-        let budget = Budget { bytes: 2048, cache: &cache };
-        cache.trim(budget.bytes);
+        let h = Hub::with_sink(7, &config, ok, crate::chunks::Clock::new(None));
+        let funding = Funding::new(&config, 16 * 1024);
+        funding.owner.lock().unwrap().memory_reserved = funding.bytes - 2048;
+        funding.cache.trim(2048);
         let payload = |version, len| Arc::new(Value { version, ack: 1, bytes: vec![42; len], tombstone: false });
+        let publish = |v| funding.within(|b| h.publish_locked("n", "k", v, b));
         let first = payload(1, 300);
         let first_owner = Arc::downgrade(&first);
-        h.publish("n", "k", first, &budget);
-        let charge = h.memory_bytes();
-        assert_eq!(charge, 558);
-        cache.insert(payload(10, 800), "test".into(), CachePolicy::default(), false, budget.bytes, &AtomicBool::new(true));
-        let resident = cache.stats().bytes;
-        assert!(resident > budget.bytes - 2 * charge);
+        publish(first);
+        let charge = funding.owned();
+        assert_eq!(h.memory_bytes(), 558);
+        assert_eq!(charge, publication_demand(1, 1, 300, true).unwrap().total().unwrap());
+        funding.cache.insert(payload(10, 800), "test".into(), CachePolicy::default(), false, funding.bytes,
+            &std::sync::atomic::AtomicBool::new(true));
+        let resident = funding.cache.stats().bytes;
+        assert!(resident > 2048 - 2 * charge);
 
-        h.publish("n", "k", payload(2, 300), &budget);
-        assert_eq!(h.memory_bytes(), charge);
-        assert_eq!(cache.stats().bytes, resident);
+        publish(payload(2, 300));
+        assert_eq!(funding.owned(), charge);
+        assert_eq!(funding.cache.stats().bytes, resident);
         assert!(first_owner.upgrade().is_none());
         assert_eq!(h.state.0.lock().unwrap().floor, 1);
 
-        h.publish("n", "k", payload(3, 1100), &budget);
+        publish(payload(3, 1100));
         assert_eq!(h.memory_bytes(), 1358);
-        assert_eq!(cache.stats().limit, budget.bytes - 1358);
-        assert_eq!(cache.stats().bytes, 0);
-        h.publish("n", "k", payload(4, 2048), &budget);
+        assert_eq!(funding.cache.stats().limit, 2048 - funding.owned());
+        assert_eq!(funding.cache.stats().bytes, 0);
+        publish(payload(4, 2048));
+        assert_eq!(funding.owned(), 0);
         assert_eq!(h.memory_bytes(), 0);
-        let sub = |start| h.subscribe("n", "".into(), r"\\.\pipe\test".into(), false,
-            &token(7, start), "membus.change/1", crate::MAX_FRAME, &budget);
-        assert_eq!(sub(3).err(), Some(23));
-        assert!(sub(4).is_ok());
+        assert_eq!(h.state.0.lock().unwrap().floor, 4);
+        funding.owner.lock().unwrap().memory_reserved = 0;
+        let register = |start| funding.within(|b| h.subscribe_locked("n", "".into(), r"\\.\pipe\test".into(),
+            false, &token(7, start), "membus.change/1", 1024, b));
+        assert_eq!(register(3), Err(23));
+        assert!(register(4).is_ok());
     }
 
     #[test]
     fn queued_and_in_flight_deliveries_keep_their_charge_through_eviction_and_drop() {
-        use std::sync::mpsc;
+        use std::{sync::mpsc, time::Instant};
         let config = Config { signal_history: 1, ..Config::default() };
         let (entered, delivery) = mpsc::channel();
         let (complete, proceed) = mpsc::channel();
@@ -457,69 +391,69 @@ mod tests {
         let h = Hub::with_sink(7, &config, move |_, frame, _, _, _| {
             entered.send(frame.to_vec()).unwrap();
             proceed.recv_timeout(timeout).map_err(io::Error::other)
-        }, Clock::new(None));
-        let cache = Cache::new(&config, Clock::new(None));
+        }, crate::chunks::Clock::new(None));
+        let funding = Funding::new(&config, 16 * 1024);
+        let live = funding.within(|b| h.subscribe_locked("n", "".into(), r"\\.\pipe\test".into(),
+            true, &[], "membus.change/1", 1024, b)).unwrap();
+        let id = &live[4..20];
+        let publish = |v| funding.within(|b| h.publish_locked("n", "k", v, b));
+        let initial = funding.owned();
         let charge = 259;
-        let budget = Budget { bytes: 3 * charge, cache: &cache };
-        cache.trim(budget.bytes);
-        let sub = |cursor: &[u8]| h.subscribe("n", "".into(), r"\\.\pipe\test".into(), true, cursor,
-            "membus.change/1", crate::MAX_FRAME, &budget).map(|reply| reply[4..20].to_vec());
-        let live = sub(&[]).unwrap();
         let first = value(1);
         let first_owner = Arc::downgrade(&first);
-        h.publish("n", "k", first, &budget);
+        publish(first);
         let frame = delivery.recv_timeout(timeout).unwrap();
         assert_eq!(parse_token(7, &frame[26..42], 23).unwrap(), 1);
         assert_eq!(frame.last(), Some(&42));
         assert_eq!(h.memory_bytes(), 2 * charge);
 
-        h.publish("n", "k", value(2), &budget);
-        assert_eq!(h.memory_bytes(), budget.bytes);
-        assert_eq!(cache.stats().limit, 0);
-        let status = h.status("n", &live).unwrap();
+        publish(value(2));
+        let body = publication_demand(1, 1, 1, false).unwrap().total().unwrap();
+        let ring = publication_demand(1, 1, 1, true).unwrap().total().unwrap() - body;
+        assert_eq!(funding.owned(), initial + 2 * body + ring);
+        assert_eq!(h.memory_bytes(), 3 * charge);
+        assert!(first_owner.upgrade().is_some());
+        let status = h.status("n", id).unwrap();
         assert_eq!(u32::from_le_bytes(status[2..6].try_into().unwrap()), 1);
         assert_eq!(u64::from_le_bytes(status[6..14].try_into().unwrap()), (2 * charge) as u64);
-        assert!(first_owner.upgrade().is_some());
 
-        h.publish("n", "k", value(3), &budget);
-        assert_eq!(&h.status("n", &live).unwrap()[..2], &[0, DROPPED]);
-        assert_eq!(h.memory_bytes(), 2 * charge);
-        let replay = sub(&token(7, 2)).unwrap();
-        assert_eq!(h.memory_bytes(), budget.bytes);
-        assert_eq!(sub(&token(7, 2)), Err(6));
-        assert_eq!(h.state.0.lock().unwrap().subs.len(), 2);
-        h.unsubscribe("n", &replay).unwrap();
-        assert!(h.take_released());
-        assert_eq!(h.memory_bytes(), 2 * charge);
-        assert!(first_owner.upgrade().is_some());
-
-        complete.send(()).unwrap();
-        let start = std::time::Instant::now();
-        while !h.take_released() && start.elapsed() < timeout { thread::yield_now(); }
+        // Take every remaining byte. The oldest queued value still owns its
+        // body after the ring node yields, so the next publication must drop it.
+        let available = funding.within(|b| b.available());
+        let pressure = funding.within(|b| b.reserve(crate::subscription_resources::SubscriptionResources {
+            metadata: available, ..Default::default()
+        }, false)).unwrap();
+        publish(value(3));
+        assert_eq!(&h.status("n", id).unwrap()[..2], &[0, DROPPED]);
         assert_eq!(h.memory_bytes(), charge);
+        assert!(first_owner.upgrade().is_some());
+        let blocked = funding.owned();
+        complete.send(()).unwrap();
+        let deadline = Instant::now() + timeout;
+        while h.memory_bytes() != 0 && Instant::now() < deadline { thread::yield_now(); }
+        assert_eq!(h.memory_bytes(), 0);
         assert!(first_owner.upgrade().is_none());
-        let status = h.status("n", &live).unwrap();
+        assert!(funding.owned() < blocked);
+        let status = h.status("n", id).unwrap();
         assert_eq!(&status[..2], &[0, DROPPED]);
         assert_eq!(u64::from_le_bytes(status[14..22].try_into().unwrap()), 1);
         assert_eq!(u64::from_le_bytes(status[30..38].try_into().unwrap()), 2);
+        h.unsubscribe("n", id).unwrap();
+        drop(pressure);
     }
 
     #[test]
     fn catch_up_shrinks_store_cache_until_the_last_delivery_owner_releases() {
         use crate::{codec, ManualClock, Mutation, Store};
-        use std::{path::PathBuf, sync::mpsc};
+        use std::{path::PathBuf, sync::mpsc, time::Instant};
 
         const CAPACITY: usize = 2 * 1024 * 1024;
         let path = PathBuf::from(std::env::var_os("MEMBUS_TEST_OUTPUT").unwrap_or_else(|| ".test-output".into()))
             .join(format!("signal-catch-up-{}-{}", std::process::id(), crate::now_ms()));
         let mut store = Store::open(&path, Config {
-            capacity: CAPACITY,
-            cache_bytes: CAPACITY,
-            signal_history: 1,
-            tick_ms: 3_600_000,
-            retire_ms: 3_600_000,
-            clock: Some(ManualClock::new(1_000_000)),
-            ..Config::default()
+            capacity: CAPACITY, cache_bytes: CAPACITY, signal_history: 1,
+            tick_ms: 3_600_000, retire_ms: 3_600_000,
+            clock: Some(ManualClock::new(1_000_000)), ..Config::default()
         }).unwrap();
         let (entered, delivery) = mpsc::channel();
         let (complete, proceed) = mpsc::channel();
@@ -528,18 +462,26 @@ mod tests {
             entered.send(()).unwrap();
             proceed.recv_timeout(timeout).map_err(io::Error::other)
         }, store.clock.clone());
-        for (ns, key) in [("other", "cold"), ("ledger", "row")] {
-            let outcome = store.mutate(Mutation {
+        for (ns, key) in [("ledger", "row"), ("other", "cold")] {
+            assert_eq!(store.mutate(Mutation {
                 ns: ns.into(), key: key.into(), op_id: key.into(), deadline: 2_000_000,
                 ack: 1, expected: None, bytes: vec![42; 4096], remove: false,
-            });
-            assert_eq!(outcome.code, 0);
+            }).code, 0);
         }
+        // Put the catch-up row last, so it is the single retained history row.
+        assert_eq!(store.mutate(Mutation {
+            ns: "ledger".into(), key: "row".into(), op_id: "tail".into(), deadline: 2_000_000,
+            ack: 1, expected: None, bytes: vec![42; 4096], remove: false,
+        }).code, 0);
         let charge = store.signals.memory_bytes();
         assert_eq!(charge, 4361);
+        let frame_max = 8192;
+        let endpoint = r"\\.\pipe\test";
+        let registration = row_demand(6, 0, endpoint.len(), frame_max).unwrap();
+        let bytes = registration.total().unwrap();
         let leftover = 1024;
         let available = store.cache_limit(&store.state.lock().unwrap());
-        let cohort = store.read_cohort(available - charge - leftover).unwrap();
+        let cohort = store.read_cohort(available - bytes - leftover).unwrap();
         let retained = cohort.try_get("ledger", "row").unwrap().unwrap();
         drop(cohort);
         let subscribe = || {
@@ -547,11 +489,11 @@ mod tests {
             lp(&mut request, b"subscribe");
             lp(&mut request, b"ledger");
             lp(&mut request, b"");
-            lp(&mut request, br"\\.\pipe\test");
+            lp(&mut request, endpoint.as_bytes());
             request.push(1);
-            lp(&mut request, &token(store.epoch, 1));
+            lp(&mut request, &token(store.epoch, 2));
             lp(&mut request, b"membus.change/1");
-            request.extend((crate::MAX_FRAME as u32).to_le_bytes());
+            request.extend((frame_max as u32).to_le_bytes());
             store.dispatch(&codec::frame(codec::SUBSCRIBE, 1, &request)[4..])
         };
         let reply_code = |b: &[u8]| u16::from_le_bytes(b[17..19].try_into().unwrap());
@@ -559,7 +501,7 @@ mod tests {
         assert_eq!(reply_code(&reply), 0);
         let id = &reply[23..39];
         delivery.recv_timeout(timeout).unwrap();
-        assert_eq!(reply_code(&subscribe()), 6);
+        assert_eq!(reply_code(&subscribe()), 7);
         let blocked = store.health2();
         assert_eq!(blocked.cache.limit, leftover);
         assert!(blocked.memory_bytes <= blocked.memory_budget);
@@ -570,16 +512,52 @@ mod tests {
         assert_eq!(store.signals.memory_bytes(), 2 * charge);
 
         complete.send(()).unwrap();
-        let start = std::time::Instant::now();
-        while store.signals.memory_bytes() != charge && start.elapsed() < timeout { thread::yield_now(); }
+        let deadline = Instant::now() + timeout;
+        while store.signals.memory_bytes() != charge && Instant::now() < deadline { thread::yield_now(); }
         assert_eq!(store.signals.memory_bytes(), charge);
         assert_eq!(store.cache_stats().limit, leftover);
         assert_eq!(store.try_get("other", "cold").unwrap().unwrap().bytes[0], 42);
         let settled = store.health2();
-        assert_eq!(settled.cache.limit, leftover + charge);
+        assert_eq!(settled.cache.limit, leftover + registration.retained + registration.in_flight + registration.encoding);
         assert!(settled.cache.bytes > 0);
         assert!(settled.memory_bytes <= settled.memory_budget);
         assert_eq!(retained.bytes, vec![42; 4096]);
         assert_eq!(store.signals.status("ledger", id).unwrap()[1], CANCELLED);
     }
+
+
 }
+
+#[cfg(test)]
+mod contract_seam_tests {
+    use super::*;
+    fn inert(_: &str, _: &[u8], _: u32, _: &mut Option<Connection>, _: &crate::chunks::Clock) -> io::Result<()> { Ok(()) }
+    #[test]
+    fn actual_64_quiet_legacy_registrations_do_not_expire() {
+        let manual = crate::chunks::ManualClock::new(900_000);
+        let hub = Hub::with_sink(91, &Config { signal_history: 0, signal_bytes: 0, ..Config::default() }, inert, crate::chunks::Clock::new(Some(manual.clone())));
+        let _account=hub.capture_account(&Config{signal_history:0,signal_bytes:0,..Config::default()});
+        let mut tokens = Vec::new();
+        for i in 0..64 {
+            let reply = hub.subscribe("authored", "".into(), format!(r"\\.\pipe\inert-{i}"), false, &[], "membus.change/1", 1024).unwrap();
+            tokens.push(reply[4..20].to_vec());
+        }
+        manual.advance(1_000_000);
+        manual.jump_utc(-700_000);
+        assert_eq!(hub.subscribe("authored", "".into(), r"\\.\pipe\inert-65".into(), false, &[], "membus.change/1", 1024), Err(6));
+        assert_eq!(hub.memory_bytes(), 0);
+        for token in &tokens { assert_eq!(hub.status("authored", token).unwrap()[0], 1); }
+        for token in tokens { hub.unsubscribe("authored", &token).unwrap(); }
+        let mut hub = hub;
+        hub.stop_for_capture().unwrap();
+    }
+
+}
+
+#[cfg(test)]
+#[path="signals/quiet_compat_tests.rs"]
+mod quiet_compat_tests;
+
+#[cfg(test)]
+#[path="signals/worker_tests.rs"]
+mod worker_tests;

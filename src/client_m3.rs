@@ -223,6 +223,7 @@ impl<T: Transport> Client<T> {
     }
     /// Require complete-query eligibility for the supplied immutable capture.
     pub fn snapshot_require_complete(&mut self, ns: &str, snapshot: &[u8; 16], op: &str, d: Deadline) -> Result<()> {
+        self.require_atomic_wire()?;
         if !self.negotiated.scans {
             return Err(Error::Invalid("scans unavailable"));
         }
