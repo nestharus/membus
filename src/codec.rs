@@ -297,7 +297,64 @@ pub(super) fn mutation_bytes(m: &Mutation, version: u64, at: u64) -> Vec<u8> {
     lp(&mut b, &m.bytes);
     b
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Extension {
+    Atomic,
+    FiniteHints,
+}
+
+fn subscription_profile(identity: &str, subscribe: bool, connected: bool)
+    -> Result<(Extension, &'static [u8]), u16>
+{
+    use crate::subscription_contract::{DISCOVERY, FINITE_DISCOVERY};
+    let mut owned = false;
+    let mut finite = false;
+    for feature in identity.split(';').skip(1) {
+        owned |= feature == "subscription-contract=1";
+        finite |= feature == "subscription-contract=2";
+    }
+    match (owned, connected && subscribe && finite) {
+        (true, true) => Err(2),
+        (true, false) => Ok((Extension::Atomic, DISCOVERY)),
+        (false, true) => Ok((Extension::FiniteHints, FINITE_DISCOVERY)),
+        (false, false) => Ok((Extension::Atomic, &[])),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn append_subscription_contract_discovery(identity: &str, payload: &mut Vec<u8>) {
+    let subscribe = identity.split(';').skip(1).any(|feature| feature == "subscribe=1");
+    payload.extend_from_slice(subscription_profile(identity, subscribe, true).unwrap().1);
+}
+
+#[derive(Clone, Copy)]
+struct NegotiatedConnection {
+    max_frame: usize,
+    allow_mem: bool,
+    subscribe: bool,
+    timers: bool,
+    extension: Extension,
+}
+
+/// Wire negotiation and opcode selection for exactly one transport connection.
+#[derive(Default)]
+pub struct ConnectionDispatch {
+    negotiated: Option<NegotiatedConnection>,
+}
+impl ConnectionDispatch {
+    pub fn is_ready(&self) -> bool { self.negotiated.is_some() }
+
+    pub fn max_frame(&self) -> usize {
+        self.negotiated.map_or(MAX_FRAME, |hello| hello.max_frame)
+    }
+
+    pub fn dispatch(&mut self, store: &Store, body: &[u8]) -> Vec<u8> {
+        store.dispatch_frame(body, false, self.max_frame(), Some(self))
+    }
+}
+
 enum DispatchReply {
+    Hello(Vec<u8>, NegotiatedConnection),
     Payload(Vec<u8>),
     Framed(Vec<u8>),
 }
@@ -309,6 +366,11 @@ impl Store {
         self.dispatch_for_limit(b, allow_mem, MAX_FRAME)
     }
     pub fn dispatch_for_limit(&self, b: &[u8], allow_mem: bool, max_frame: usize) -> Vec<u8> {
+        self.dispatch_frame(b, allow_mem, max_frame, None)
+    }
+    fn dispatch_frame(&self, b: &[u8], allow_mem: bool, max_frame: usize,
+        connection: Option<&mut ConnectionDispatch>) -> Vec<u8>
+    {
         let max_frame = max_frame.min(MAX_FRAME);
         if b.len() > max_frame {
             return reply(
@@ -326,6 +388,20 @@ impl Store {
             Ok(h) => h,
             Err(code) => return reply(0, 0, code, &[]),
         };
+        let negotiated = connection.as_ref().and_then(|session| session.negotiated);
+        if connection.is_some() && (op == HELLO) == negotiated.is_some() {
+            return reply(op, id, 3, &[]);
+        }
+        let extension = negotiated.map_or(Extension::Atomic, |hello| hello.extension);
+        let allow_mem = negotiated.map_or(allow_mem, |hello| hello.allow_mem);
+        if let Some(hello) = negotiated {
+            if (!hello.subscribe && (SUBSCRIBE..=SIGNAL_USAGE).contains(&op))
+                || (!hello.timers && (TIMER_SET..=TIMER_STATUS).contains(&op))
+                || (extension == Extension::FiniteHints && op == SNAPSHOT_REQUIRE_COMPLETE)
+            {
+                return reply(op, id, 2, &[]);
+            }
+        }
         if major != 1 || minor != 0 {
             return reply(op, id, 1, &[]);
         }
@@ -341,8 +417,9 @@ impl Store {
                 if mem > 1 {
                     return Err(3);
                 }
+                let selected_max = MAX_FRAME.min(max);
                 let mut p = self.epoch.to_le_bytes().to_vec();
-                p.extend((MAX_FRAME.min(max) as u32).to_le_bytes());
+                p.extend((selected_max as u32).to_le_bytes());
                 p.extend((MAX_VALUE as u32).to_le_bytes());
                 p.extend((MAX_BATCH as u16).to_le_bytes());
                 p.push(self.config.allow_mem as u8);
@@ -382,7 +459,11 @@ impl Store {
                 if timers {
                     p.extend(timers::hello_limits());
                 }
-                return Ok(DispatchReply::Payload(p));
+                let (extension, discovery) = subscription_profile(&client, subscribe, connection.is_some())?;
+                p.extend_from_slice(discovery);
+                return Ok(DispatchReply::Hello(p, NegotiatedConnection {
+                    max_frame: selected_max, allow_mem: mem != 0, subscribe, timers, extension,
+                }));
             }
             let deadline = c.u64()?;
             // These identifiers belong to the request for this dispatch only.
@@ -404,6 +485,12 @@ impl Store {
                     return Err(o.code);
                 }
                 return Ok(DispatchReply::Payload(o.bytes()));
+            }
+            if extension == Extension::FiniteHints && (ATOMIC_CAPTURE..=ATOMIC_POPULATION).contains(&op) {
+                if self.clock.utc_ms() >= deadline {
+                    return Err(5);
+                }
+                return self.finite_control(op, ns, &mut c).map(DispatchReply::Payload);
             }
             if op == ATOMIC_CAPTURE {
                 c.end()?;
@@ -503,7 +590,7 @@ impl Store {
                     let frame_max = c.u32()? as usize;
                     c.end()?;
                     let state = self.state.lock().unwrap();
-                    self.signals.subscribe(
+                    self.signals.subscribe_locked(
                         ns,
                         prefix,
                         endpoint,
@@ -672,6 +759,12 @@ impl Store {
             .map(DispatchReply::Payload)
         })();
         match result {
+            Ok(DispatchReply::Hello(p, hello)) if p.len() + 15 <= max_frame.min(hello.max_frame) => {
+                if let Some(connection) = connection {
+                    connection.negotiated = Some(hello);
+                }
+                reply(op, id, 0, &p)
+            }
             Ok(DispatchReply::Payload(p)) if p.len() + 15 <= max_frame => reply(op, id, 0, &p),
             Ok(DispatchReply::Framed(p)) if p.len() <= max_frame + 4 => p,
             Ok(_) => reply(op, id, 4, &[]),
@@ -724,6 +817,31 @@ impl Store {
         debug_assert_eq!(response.len(), payload_len + 19);
         Ok(response)
     }
+    fn finite_control(&self, op: u8, ns: &str, c: &mut Cursor<'_>) -> Result<Vec<u8>, u16> {
+        use crate::subscription_contract::*;
+        if op == FINITE_CREATE {
+            let options = HintOptions {
+                profile: c.u16()?,
+                lifetime_ms: c.u64()?,
+                write_ms: c.u32()?,
+                incarnation: c.bytes(16)?.try_into().map_err(|_| 3u16)?,
+                recipient: c.bytes(16)?.try_into().map_err(|_| 3u16)?,
+            };
+            let prefix = c.bound_ref()?;
+            let endpoint = c.text_ref()?;
+            c.end()?;
+            return Ok(self.subscribe_finite_hints(ns, prefix, endpoint, options)?.bytes().to_vec());
+        }
+        let receipt = HintReceipt::decode(c.bytes(64)?)?;
+        c.end()?;
+        if op == FINITE_CANCEL {
+            self.cancel_finite_hints(ns, receipt)?;
+            Ok(Vec::new())
+        } else {
+            Ok(self.renew_finite_hints(ns, receipt)?.bytes().to_vec())
+        }
+    }
+
 }
 fn parse_mutation(
     c: &mut Cursor<'_>,

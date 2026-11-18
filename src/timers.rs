@@ -238,7 +238,7 @@ fn publish_and_checkpoint(store:&Store,t:&Timer,progress:Progress,persist:impl F
     // Generic ephemeral wake. The injected refusal unit seam uses this same production ordering.
     {
         let state = store.state.lock().unwrap();
-        store.signals.publish(&t.schedule.ns,&t.schedule.key,Arc::new(Value {version:t.generation,ack:1,
+        store.signals.publish_locked(&t.schedule.ns,&t.schedule.key,Arc::new(Value {version:t.generation,ack:1,
             bytes:progress.signal(&t.schedule),tombstone:false}), &store.signal_budget(&state));
         store.trim_cache(&state);
     }

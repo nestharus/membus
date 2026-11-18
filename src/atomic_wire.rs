@@ -71,6 +71,7 @@ impl<T: Transport> Client<T> {
         operation: &str,
         d: Deadline,
     ) -> Result<NamespaceView, Error> {
+        self.require_atomic_wire()?;
         let p = self.prefix(operation, namespace, d)?;
         let result = self
             .exchange(crate::ATOMIC_CAPTURE, &p, d.local)
@@ -95,6 +96,7 @@ impl<T: Transport> Client<T> {
         r: &AtomicRequest,
         d: Deadline,
     ) -> Result<MutationReply, Error> {
+        self.require_atomic_wire()?;
         let n = 8 + 8 + r.namespace().len() + r.operation_id().len() + 4 + r.encoded_len();
         // Local bounds and connection/deadline admission precede mutation entry.
         if n + 13 > self.negotiated().max_frame {

@@ -936,7 +936,7 @@ impl Store {
         if success {
             let budget = self.signal_budget(&state);
             for (i, m) in mutations.iter().enumerate() {
-                self.signals.publish(
+                self.signals.publish_locked(
                     &m.ns,
                     &m.key,
                     Arc::new(Value {

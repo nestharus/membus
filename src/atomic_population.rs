@@ -317,6 +317,7 @@ impl<T: Transport> Client<T> {
         limits: PopulationLimits,
         d: Deadline,
     ) -> Result<PopulationView, Error> {
+        self.require_atomic_wire()?;
         limits.validate().map_err(Error::Atomic)?;
         // Paging and release must both be available before retaining a server view.
         if !self.negotiated().scans {

@@ -42,7 +42,9 @@ pub(super) struct Dedup {
     pub(super) replayed_chunk: u64,
     pub(super) outcome: Option<Outcome>,
 }
+#[cfg_attr(test, derive(Default))]
 pub(super) struct State {
+    pub(crate) subscription_usage: Arc<crate::subscription_resources::SubscriptionUsage>,
     pub(super) pending: HashMap<(String, String), Meta>,
     pub(super) metadata: HashMap<(String, String), Meta>,
     pub(super) namespace_counts: HashMap<String, usize>,
@@ -69,6 +71,16 @@ pub(super) struct State {
     pub(super) tomb_candidates: HashSet<(String, String)>,
 }
 impl State {
+    pub(crate) fn total_reserved(&self)->usize {self.memory_reserved.saturating_add(self.subscription_usage.bytes.load(Ordering::Acquire))}
+    /// Current non-cache ownership, including actually granted subscription storage.
+    /// The Store captures external owners under its existing admission guard.
+    pub(super) fn available_memory(&self, capacity: usize, snapshots: usize,
+        margin: usize, chunk_index: usize, read_cohorts: usize) -> usize {
+        [self.committed_bytes, self.dedup_bytes, self.total_reserved(),
+            snapshots, margin, chunk_index, read_cohorts].into_iter()
+            .try_fold(0usize, |n, v| n.checked_add(v))
+            .map_or(0, |owned| capacity.saturating_sub(owned))
+    }
     pub(super) fn release_namespace(&mut self, ns: &str) {
         if let Some(count) = self.namespace_counts.get_mut(ns) {
             *count -= 1;
@@ -173,7 +185,7 @@ impl Store {
         let value = entry.read(ns, key).inspect_err(|_| { self.flags.storage_error.store(true, Ordering::SeqCst); })?;
         if self.scan_usage.released.swap(false, Ordering::AcqRel)
             | self.read_usage.released.swap(false, Ordering::AcqRel)
-            | self.signals.take_released() {
+            | self.subscription_released.swap(false, Ordering::AcqRel) {
             // Recompute from current charges, rather than adding released bytes
             // to a stale limit. New captures and writes serialize on state.
             // Hot hits never take this path or the state lock.
@@ -183,14 +195,16 @@ impl Store {
         Ok(value)
     }
     pub fn cache_stats(&self) -> crate::CacheStats { self.cache.stats() }
-    pub(super) fn signal_budget(&self, state: &State) -> crate::signals::Budget<'_> {
-        let used = state.committed_bytes + state.dedup_bytes + state.memory_reserved
-            + self.scan_usage.bytes.load(Ordering::Acquire) + self.read_cohort_bytes() + self.config.memory_margin()
-            + self.chunks.lock().unwrap().managed_index_bytes();
-        crate::signals::Budget { bytes: self.config.capacity.saturating_sub(used), cache: &self.cache }
+    pub(super) fn signal_budget<'a>(&'a self, state: &'a State) -> crate::subscription_resources::Budget<'a> {
+        crate::subscription_resources::Budget::new(
+            &self.state, state, self.config.capacity,
+            self.scan_usage.bytes.load(Ordering::Acquire), self.config.memory_margin(),
+            self.chunks.lock().unwrap().managed_index_bytes(), self.read_cohort_bytes(),
+            Some(&self.cache), &self.subscription_released,
+        )
     }
     pub(super) fn cache_limit(&self, state: &State) -> usize {
-        self.signal_budget(state).bytes.saturating_sub(self.signals.memory_bytes())
+        self.signal_budget(state).available()
     }
     pub(super) fn trim_cache(&self, state: &State) {
         self.cache.trim(self.cache_limit(state));
@@ -307,9 +321,9 @@ impl Store {
             retired_bytes: cs.retired_bytes,
             ..Health2::default()
         };
-        h.memory_bytes = h.cache.bytes + state.committed_bytes + state.dedup_bytes + state.memory_reserved
-            + self.scan_usage.bytes.load(Ordering::Acquire) + self.read_cohort_bytes() + c.memory_margin() + cs.managed_index_bytes()
-            + self.signals.memory_bytes();
+        h.memory_bytes = h.cache.bytes + state.committed_bytes + state.dedup_bytes + state.total_reserved()
+            + self.scan_usage.bytes.load(Ordering::Acquire) + self.read_cohort_bytes()
+            + c.memory_margin() + cs.managed_index_bytes();
         let mut namespaces: Vec<(String, usize)> = state
             .namespace_counts
             .iter()
@@ -886,7 +900,7 @@ impl Store {
         // Return the write's working charge before funding history and live
         // delivery, and keep committed publication ordered through the handoff.
         if let Some(value) = signal {
-            self.signals.publish(&m.ns, &m.key, value, &self.signal_budget(&state));
+            self.signals.publish_locked(&m.ns, &m.key, value, &self.signal_budget(&state));
         }
         self.trim_cache(&state);
         self.done.notify_all();

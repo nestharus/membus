@@ -4,6 +4,8 @@ pub mod chunks;
 #[cfg(test)]
 extern crate self as membus;
 mod signals;
+pub mod subscription_resources;
+pub mod subscription_contract;
 mod timers;
 pub use chunks::{Class, ManualClock, POLICY_NS};
 pub mod client;
@@ -57,7 +59,7 @@ use append_owner::{AppendHandle, AppendOwner};
 use codec::mutation_bytes;
 pub use codec::{
     ATOMIC_CAPTURE, ATOMIC_POPULATION, ATOMIC_PUBLISH,
-    crc32, frame, lp, read_frame, read_frame_limit, reply, Cursor, BATCH, CAPTURE_METRICS, CODES,
+    crc32, frame, lp, read_frame, read_frame_limit, reply, ConnectionDispatch, Cursor, BATCH, CAPTURE_METRICS, CODES,
     CONDITIONAL_PUT, GET, GET_MANY, GET_STATUS, HEALTH, HEALTH2, HELLO, IO_METRICS, MAX_BATCH,
     MAX_FRAME, MAX_ID, MAX_VALUE, POLICY_GET, POLICY_SET, PUT, REMOVE, SCAN_KEYS_PREFIX,
     SCAN_KEYS_RANGE, SCAN_PREFIX, SCAN_RANGE, SIGNAL_USAGE, SNAPSHOT_OPEN, SNAPSHOT_RELEASE,
@@ -261,6 +263,7 @@ pub struct Store {
     read_usage: Arc<read_cohort::ReadUsage>,
     scans: Arc<Mutex<ScanState>>,
     scan_usage: Arc<ScanUsage>,
+    subscription_released: Arc<AtomicBool>,
     scan_reaper: Option<(mpsc::Sender<()>, std::thread::JoinHandle<()>)>,
     /// The idle tick (5.2): closes finite-class chunks past their age and rewrites a large catalogue.
     ticker: Option<(mpsc::Sender<()>, std::thread::JoinHandle<()>)>,
@@ -454,8 +457,9 @@ impl Store {
         let (appenders, flush_owner) = start_routed_owners(router.clone(), 4, &config, clock.clone());
         let committed = Arc::new(RwLock::new(committed.into_iter().collect::<store::Committed>()));
         let cache = Arc::new(cache::Cache::new(&config, clock.clone()));
-        cache.trim(config.capacity.saturating_sub(state.committed_bytes + state.dedup_bytes
-            + chunks.lock().unwrap().index_bytes + config.memory_margin()));
+        cache.trim(state.available_memory(config.capacity, 0, config.memory_margin(),
+            chunks.lock().unwrap().managed_index_bytes(),
+            0));
         let state = Arc::new(Mutex::new(state));
         let admission_gate = Arc::new(RwLock::new(()));
         let maint = Arc::new(Maint {
@@ -497,6 +501,7 @@ impl Store {
             read_usage: Arc::new(read_cohort::ReadUsage::default()),
             scans,
             scan_usage: Arc::new(ScanUsage::default()),
+            subscription_released: Arc::new(AtomicBool::new(false)),
             scan_reaper: Some((stop, reaper)),
             ticker,
             state,

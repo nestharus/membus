@@ -26,6 +26,10 @@ The example requires an explicitly connected client bound by its owner to the
 correct dataset/endpoint and an unused custody path. Store epoch is not an
 authenticated dataset identity or independent recovery authority.
 
+The default HELLO profile retains atomic opcodes 28–31. The affirmative finite
+hint profile assigns 28–30 to its own controls on that connection and refuses
+31. See [finite hints](FINITE-HINTS.md).
+
 ## Additive wire
 
 All integers are little endian. The existing kv/1 frame/header, HELLO, refusal
