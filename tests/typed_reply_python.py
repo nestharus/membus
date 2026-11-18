@@ -309,4 +309,70 @@ class TypedReplies(unittest.TestCase):
         self.identity(4, 1)
         self.assertEqual(self.connects, [])
 
+
+    def test_unknown_outer_refusal_closes_the_channel(self):
+        c = self.client(2, b'', loss=False, code=60_000)
+        with self.assertRaisesRegex(ValueError, 'invalid refusal reply'):
+            c.exchange(2, b'authored request', DEADLINE)
+        self.assertIsNone(c.channel)
+        self.assertEqual(self.first.closed, 1)
+        self.assertEqual(len(self.first.packets), 1)
+
+    def test_known_outer_refusal_rejects_trailing_bytes(self):
+        for code in (2, 12, 16, 17):
+            with self.subTest(code=code):
+                c = self.client(2, b'\x00', loss=False, code=code)
+                with self.assertRaisesRegex(ValueError, 'invalid refusal reply'):
+                    c.exchange(2, b'authored request', DEADLINE)
+                self.assertIsNone(c.channel)
+                self.assertEqual(self.first.closed, 1)
+
+    def test_outer_refusal_uses_the_negotiated_vocabulary(self):
+        without_code = {code: row for code, row in membus.CODES.items() if code != 25}
+        for negotiated in (without_code, {}):
+            with self.subTest(codes=len(negotiated)):
+                c = self.client(2, b'', loss=False, code=25)
+                c.codes = negotiated
+                with self.assertRaisesRegex(ValueError, 'invalid refusal reply'):
+                    c.exchange(2, b'authored request', DEADLINE)
+                self.assertEqual(self.first.closed, 1)
+
+    def test_valid_outer_refusals_keep_the_channel_and_associated_details(self):
+        negotiated = {**membus.CODES, 60_000: ('authored_extension', True)}
+        for code, details in negotiated.items():
+            with self.subTest(code=code):
+                c = self.client(2, b'', loss=False, code=code)
+                c.codes = negotiated
+                with self.assertRaises(membus.Refusal) as caught:
+                    c.exchange(2, b'authored request', DEADLINE)
+                self.assertEqual(caught.exception.code, code)
+                self.assertEqual((caught.exception.name, caught.exception.transient), details)
+                self.assertIs(c.channel, self.first)
+                self.assertEqual(self.first.closed, 0)
+
+    def test_bootstrap_outer_refusal_uses_the_default_vocabulary(self):
+        c = self.client(1, b'', loss=False, code=1)
+        del c.codes
+        with self.assertRaises(membus.Refusal) as caught:
+            c.exchange(1, b'hello', DEADLINE)
+        self.assertEqual(caught.exception.code, 1)
+        self.assertEqual(self.first.closed, 0)
+
+        c = self.client(1, b'', loss=False, code=60_000)
+        del c.codes
+        with self.assertRaisesRegex(ValueError, 'invalid refusal reply'):
+            c.exchange(1, b'hello', DEADLINE)
+        self.assertEqual(self.first.closed, 1)
+
+    def test_outer_refusal_follows_association_and_leaves_success_bytes_opaque(self):
+        c = self.client(2, b'opaque success', loss=False)
+        self.assertEqual(c.exchange(2, b'request', DEADLINE), b'opaque success')
+        self.assertEqual(self.first.closed, 0)
+
+        c = self.client(2, b'', loss=False, code=12)
+        self.first.action = lambda packet: response(2, 2, b'', 12)
+        with self.assertRaisesRegex(ValueError, 'association'):
+            c.exchange(2, b'request', DEADLINE)
+        self.assertEqual(self.first.closed, 1)
+
 if __name__ == '__main__': unittest.main(verbosity=2)

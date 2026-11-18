@@ -266,7 +266,11 @@ class Client:
             self.close()
             raise ValueError('reply association')
         if code:
-            raise Refusal(code, getattr(self, 'codes', CODES))
+            codes = getattr(self, 'codes', CODES)
+            if code not in codes or len(body) != 15:
+                self.close()
+                raise ValueError('invalid refusal reply')
+            raise Refusal(code, codes)
         return body[15:]
 
     def call(self, opcode, ns, suffix=b'', op_id=None, deadline=None, *, retry_transport=True):
