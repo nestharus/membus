@@ -72,6 +72,10 @@ pub const POLICY_SET: u8 = 24;
 pub const POLICY_GET: u8 = 25;
 pub const GET_STATUS: u8 = 26;
 pub const HEALTH2: u8 = 27;
+pub const ATOMIC_CAPTURE: u8 = 28;
+pub const ATOMIC_PUBLISH: u8 = 29;
+pub const ATOMIC_POPULATION: u8 = 30;
+pub const SNAPSHOT_REQUIRE_COMPLETE: u8 = 31;
 const fn crc32_table() -> [u32; 256] {
     let mut table = [0; 256];
     let mut index = 0;
@@ -100,6 +104,7 @@ pub fn lp(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend((bytes.len() as u32).to_le_bytes());
     out.extend(bytes);
 }
+#[derive(Clone)]
 pub struct Cursor<'a> {
     b: &'a [u8],
     p: usize,
@@ -139,7 +144,7 @@ impl<'a> Cursor<'a> {
     pub fn text(&mut self) -> Result<String, u16> {
         Ok(self.text_ref()?.to_owned())
     }
-    fn text_ref(&mut self) -> Result<&'a str, u16> {
+    pub(super) fn text_ref(&mut self) -> Result<&'a str, u16> {
         let s = std::str::from_utf8(self.bytes(MAX_ID)?).map_err(|_| 3u16)?;
         if s.is_empty() {
             return Err(3);
@@ -400,6 +405,31 @@ impl Store {
                 }
                 return Ok(DispatchReply::Payload(o.bytes()));
             }
+            if op == ATOMIC_CAPTURE {
+                c.end()?;
+                let result = if self.clock.utc_ms() >= deadline {
+                    Err(crate::atomic::PublicationError::Expired)
+                } else {
+                    self.capture_namespace_for_wire(ns, max_frame.saturating_sub(20))
+                };
+                return Ok(DispatchReply::Payload(crate::atomic_wire::encode(result)));
+            }
+            if op == ATOMIC_PUBLISH {
+                let bytes = c.bytes(MAX_FRAME / 3)?;
+                c.end()?;
+                let result = self.publish_atomic_for_wire(ns, _op_id, bytes, deadline).map(|o| o.bytes());
+                return Ok(DispatchReply::Payload(crate::atomic_wire::encode(result)));
+            }
+            if op == ATOMIC_POPULATION {
+                let limits = crate::atomic_population::PopulationLimits::decode(&mut c)?;
+                c.end()?;
+                let result = if self.clock.utc_ms() >= deadline {
+                    Err(crate::atomic::PublicationError::Expired)
+                } else {
+                    self.atomic_population_header(ns, limits, max_frame.saturating_sub(20))
+                };
+                return Ok(DispatchReply::Payload(crate::atomic_wire::encode(result)));
+            }
             if self.clock.utc_ms() >= deadline && op != POLICY_SET {
                 return Err(5);
             }
@@ -517,6 +547,12 @@ impl Store {
                     let token = c.bytes(16)?;
                     c.end()?;
                     self.snapshot_release(ns, token)?;
+                    Ok(Vec::new())
+                }
+                SNAPSHOT_REQUIRE_COMPLETE => {
+                    let token = c.bytes(16)?;
+                    c.end()?;
+                    self.snapshot_require_complete(ns, token)?;
                     Ok(Vec::new())
                 }
                 GET => {

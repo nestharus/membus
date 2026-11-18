@@ -46,11 +46,13 @@ pub(super) struct Snapshot {
     pub(super) created: u64,
     pub(super) rows: Vec<(String, SnapshotValue)>,
     pub(super) cursor_hash: RandomState,
+    complete: bool,
+    bounded_load: Option<Mutex<()>>,
     // Charges survive release/expiry while a dispatcher still holds this Arc.
     pub(super) _charge: Arc<ScanCharge>,
 }
 pub(super) struct SnapshotValue {
-    entry: Arc<Entry>,
+    pub(super) entry: Arc<Entry>,
     // The snapshot's full-payload reservation covers values pinned on first use.
     // Never resolve through the current key: replacement and retirement may have
     // removed this exact revision from the live index and resident cache.
@@ -89,12 +91,72 @@ pub(super) struct ScanState {
     pub(super) next: u64,
     pub(super) snapshots: HashMap<u64, Arc<Snapshot>>,
 }
+impl Snapshot {
+    pub(super) fn load_at(&self, store: &Store, at: usize) -> Result<crate::ReadValue, u16> {
+        let (key, value) = &self.rows[at];
+        let Some(gate) = self.bounded_load.as_ref().filter(|_| value.entry.location.subrecord.is_some()) else {
+            return value.load(store, &self.ns, key);
+        };
+        if let Some(loaded) = value.loaded.get() {
+            return Ok(loaded.clone());
+        }
+        let _load = gate.lock().unwrap();
+        if let Some(loaded) = value.loaded.get() {
+            return Ok(loaded.clone());
+        }
+        let result = self.load_bounded_envelope(store, value);
+        if result.is_err() {
+            store.flags.storage_error.store(true, Ordering::SeqCst);
+        }
+        result
+    }
+
+    fn load_bounded_envelope(&self, store: &Store, target: &SnapshotValue) -> Result<crate::ReadValue, u16> {
+        let _reader = store.cold_reader();
+        store.cache.cold();
+        let location = &target.entry.location;
+        let encoded = location.whole_payload().map_err(|_| 16u16)?;
+        let envelope = crate::atomic::decode_envelope(&encoded).map_err(|_| 16u16)?;
+        let request = envelope.request;
+        let ack = request.requested_ack().byte();
+        let members = || request.changes().enumerate().filter_map(|(index, (key, value))| {
+            let row = self.rows.binary_search_by(|(name, _)| name.as_str().cmp(key)).ok()?;
+            let row = &self.rows[row].1;
+            let version = envelope.first + index as u64;
+            (row.entry.version == version).then_some((row, index, key, version, value))
+        });
+        // Validate every captured member from this extent before installing any of them.
+        let mut found = false;
+        for (row, index, key, version, value) in members() {
+            let entry = &row.entry;
+            if !entry.location.same_frame(location) || entry.location.subrecord != Some(index as u16) {
+                return Err(16);
+            }
+            entry.check_identity(&self.ns, key, (request.namespace(), key, version, ack, value.is_none(), value.map_or(0, <[u8]>::len)))
+                .map_err(|_| 16u16)?;
+            found |= std::ptr::eq(row, target);
+        }
+        if !found {
+            return Err(16);
+        }
+        for (row, _, _, version, value) in members() {
+            let value = Arc::new(crate::Value {
+                version, ack, bytes: value.unwrap_or_default().to_vec(), tombstone: false,
+            });
+            let _ = row.loaded.set(crate::ReadValue::snapshot(value, self._charge.clone()));
+        }
+        Ok(target.loaded.get().unwrap().clone())
+    }
+}
 impl Store {
     pub(super) fn purge_scans(&self, state: &mut ScanState) {
         let now = self.clock.mono_ms();
         state.snapshots.retain(|_, s| now.saturating_sub(s.created) < self.config.snapshot_ttl_ms);
     }
     pub(super) fn snapshot_open(&self, ns: &str) -> Result<(Vec<u8>, Arc<Snapshot>), u16> {
+        self.snapshot_open_bounded(ns, None)
+    }
+    pub(super) fn snapshot_open_bounded(&self, ns: &str, bounds: Option<(usize, usize)>) -> Result<(Vec<u8>, Arc<Snapshot>), u16> {
         let created = self.clock.mono_ms();
         {
             let mut scans = self.scans.lock().unwrap();
@@ -111,6 +173,12 @@ impl Store {
         self.capture_waiters.fetch_sub(1, Ordering::SeqCst);
         let lock_acquired = self.clock.mono_ns();
         let mut charge = 256usize.checked_add(ns.len()).ok_or(22u16)?;
+        if let Some((_, max_bytes)) = bounds {
+            charge = charge.checked_add(crate::atomic_population::CAPTURE_WORKSPACE_BYTES).ok_or(22u16)?;
+            if charge > max_bytes {
+                return Err(22);
+            }
+        }
         let mut row_count = 0usize;
         for ((_, key), value) in committed
             .range((ns.to_owned(), String::new())..)
@@ -129,6 +197,12 @@ impl Store {
                     .and_then(|n| n.checked_add(value.len))
                     .ok_or(22u16)?;
                 row_count += 1;
+                if let Some((max_keys, max_bytes)) = bounds {
+                    charge = charge.checked_add(512 + key.len() + value.len).ok_or(22u16)?;
+                    if row_count > max_keys || charge > max_bytes {
+                        return Err(22);
+                    }
+                }
             }
         }
         let charge_end = self.clock.mono_ns();
@@ -149,6 +223,8 @@ impl Store {
             return Err(22);
         }
         let state = self.state.lock().unwrap();
+        let complete = !state.read_only && !state.warming
+            && !self.flags.storage_error.load(Ordering::SeqCst);
         // Ordinary and atomic captures take scans before State. A snapshot
         // workspace can grow under State alone, so recheck after acquiring it.
         if self.scan_usage.count.load(Ordering::Acquire) >= self.config.snapshot_max
@@ -223,6 +299,8 @@ impl Store {
             created,
             rows,
             cursor_hash: RandomState::new(),
+            complete,
+            bounded_load: bounds.map(|_| Mutex::new(())),
             _charge: reservation,
         });
         if self.clock.mono_ms().saturating_sub(snapshot.created) >= self.config.snapshot_ttl_ms {
@@ -236,6 +314,9 @@ impl Store {
         let mut token = self.epoch.to_le_bytes().to_vec();
         token.extend(id.to_le_bytes());
         Ok((token, snapshot))
+    }
+    pub(super) fn snapshot_require_complete(&self, ns: &str, token: &[u8]) -> Result<(), u16> {
+        if self.snapshot_get(ns, token)?.complete { Ok(()) } else { Err(16) }
     }
     pub(super) fn snapshot_get(&self, ns: &str, token: &[u8]) -> Result<Arc<Snapshot>, u16> {
         if token.len() != 16 {
@@ -388,10 +469,10 @@ impl Store {
             }
             p.push((next == end) as u8);
             p.extend(((next - at) as u16).to_le_bytes());
-            for (key, value) in &rows[at..next] {
+            for (offset, (key, _)) in rows[at..next].iter().enumerate() {
                 lp(&mut p, key.as_bytes());
                 if !keys_only {
-                    let loaded = value.load(self, ns, key)?;
+                    let loaded = snapshot.load_at(self, at + offset)?;
                     encode_value(&mut p, Some(&loaded));
                 }
             }

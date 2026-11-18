@@ -73,6 +73,7 @@ impl Drop for Reservation {
 #[derive(Debug)]
 struct Population {
     rows: Vec<(String, u64)>,
+    guard: Option<crate::atomic_population::PopulationGuard>,
     _charge: Reservation,
 }
 #[derive(Debug)]
@@ -150,20 +151,32 @@ pub struct BorrowedOriginal<'a> {
     ack: AtomicAck,
     population: &'a [u8],
     population_count: usize,
+    guard: Option<crate::atomic_population::PopulationGuard>,
     changes: &'a [u8],
     change_count: usize,
 }
 impl<'a> BorrowedOriginal<'a> {
+    /// Borrow an exact, enumerable MAR1 original.
     pub fn from_bytes(bytes: &'a [u8]) -> Result<Self, PublicationError> {
+        if bytes.get(..4) != Some(b"MAR1") {
+            return Err(PublicationError::Invalid);
+        }
+        Self::from_canonical_bytes(bytes)
+    }
+    pub(crate) fn from_canonical_bytes(bytes: &'a [u8]) -> Result<Self, PublicationError> {
+        let wide = match bytes.get(..4) {
+            Some(b"MAR1") => false,
+            Some(b"MAR2") => true,
+            _ => return Err(PublicationError::Invalid),
+        };
         if bytes
             .len()
-            .checked_add(29)
+            .checked_add(if wide { 0 } else { 29 })
             .is_none_or(|n| n > crate::MAX_FRAME / 3)
-            || bytes.get(..4) != Some(b"MAR1")
         {
             return Err(PublicationError::Invalid);
         }
-        fn parse(bytes: &[u8]) -> Result<BorrowedOriginal<'_>, u16> {
+        fn parse(bytes: &[u8], wide: bool) -> Result<BorrowedOriginal<'_>, u16> {
             let mut c = Cursor::new(&bytes[4..]);
             let namespace = c.bound_ref()?;
             let operation_id = c.bound_ref()?;
@@ -177,7 +190,16 @@ impl<'a> BorrowedOriginal<'a> {
                 2 => AtomicAck::Flush,
                 _ => return Err(3),
             };
-            let population_count = c.u32()? as usize;
+            let guard = if wide {
+                let guard = crate::atomic_population::PopulationGuard::decode(&mut c)?;
+                if epoch == 0 || expires_mono == 0 || bytes.len() > guard.limits.max_original_bytes as usize {
+                    return Err(3);
+                }
+                Some(guard)
+            } else {
+                None
+            };
+            let population_count = if wide { 0 } else { c.u32()? as usize };
             // Every nonempty key/revision requires at least 13 literal bytes.
             if population_count > c.remainder().len() / 13 {
                 return Err(3);
@@ -193,25 +215,18 @@ impl<'a> BorrowedOriginal<'a> {
             }
             let population = &population[..population.len() - c.remainder().len()];
             let change_count = c.u16()? as usize;
-            if change_count == 0 || change_count > MAX_CHANGES {
+            if change_count == 0
+                || change_count > guard.as_ref().map_or(MAX_CHANGES, |g| usize::from(g.limits.max_changes))
+                || change_count > c.remainder().len() / 10
+            {
                 return Err(3);
             }
             let changes = c.remainder();
-            let mut keys = [None; MAX_CHANGES];
-            for i in 0..change_count {
-                let key = c.bound_ref()?;
-                let remove = c.u8()?;
-                let value = c.bytes(crate::MAX_VALUE)?;
-                if !valid_id(key)
-                    || keys[..i].contains(&Some(key))
-                    || remove > 1
-                    || remove == 1 && !value.is_empty()
-                {
-                    return Err(3);
-                }
-                keys[i] = Some(key);
+            if change_count <= MAX_CHANGES {
+                validate_change_keys(changes, &mut [0; MAX_CHANGES][..change_count])?;
+            } else {
+                validate_wide_change_keys(changes, change_count)?;
             }
-            c.end()?;
             Ok(BorrowedOriginal {
                 bytes,
                 namespace,
@@ -221,11 +236,12 @@ impl<'a> BorrowedOriginal<'a> {
                 ack,
                 population,
                 population_count,
+                guard,
                 changes,
                 change_count,
             })
         }
-        let parsed = parse(bytes).map_err(|_| PublicationError::Invalid)?;
+        let parsed = parse(bytes, wide).map_err(|_| PublicationError::Invalid)?;
         valid_namespace(parsed.namespace)?;
         Ok(parsed)
     }
@@ -275,6 +291,15 @@ impl<'a> BorrowedOriginal<'a> {
             (key, if remove == 1 { None } else { Some(value) })
         })
     }
+    fn matches_current<'b>(&self, current: impl Iterator<Item = (&'b str, u64)>) -> bool
+    where
+        'a: 'b,
+    {
+        if let Some(guard) = &self.guard {
+            return crate::atomic_population::population_digest(current) == (guard.count, guard.digest);
+        }
+        current.eq(self.population())
+    }
     pub fn to_owned(&self, budget: &OriginalBudget) -> Result<AtomicRequest, PublicationError> {
         let population_bytes = self
             .population()
@@ -307,6 +332,7 @@ impl<'a> BorrowedOriginal<'a> {
                 expires_mono: self.expires_mono,
                 population: Arc::new(Population {
                     rows: population,
+                    guard: self.guard.clone(),
                     _charge: population_charge,
                 }),
                 ack: self.ack,
@@ -335,6 +361,43 @@ impl<'a> BorrowedOriginal<'a> {
     pub(crate) fn mutations(&self) -> impl Iterator<Item = Mutation> + '_ {
         self.changes().map(|(k, v)| self.mutation(k, v))
     }
+}
+
+fn live_population<'a>(
+    namespace: &'a str, committed: &'a store::Committed,
+) -> impl Iterator<Item = (&'a str, u64)> {
+    committed.range((namespace.to_owned(), String::new())..)
+        .take_while(move |((ns, _), _)| ns == namespace)
+        .filter(|(_, entry)| !entry.tombstone)
+        .map(|((_, key), entry)| (key.as_str(), entry.version))
+}
+
+// Sort validated frame offsets, leaving the immutable original in caller order.
+// The wider stack frame is used only for MAR2 requests above the MAR1 limit.
+#[inline(never)]
+fn validate_wide_change_keys(bytes: &[u8], count: usize) -> Result<(), u16> {
+    let mut offsets = [0; u16::MAX as usize];
+    validate_change_keys(bytes, &mut offsets[..count])
+}
+
+fn validate_change_keys(bytes: &[u8], offsets: &mut [u32]) -> Result<(), u16> {
+    let mut c = Cursor::new(bytes);
+    for offset in offsets.iter_mut() {
+        *offset = (bytes.len() - c.remainder().len()) as u32;
+        let key = c.bound_ref()?;
+        let remove = c.u8()?;
+        let value = c.bytes(crate::MAX_VALUE)?;
+        if !valid_id(key) || remove > 1 || remove == 1 && !value.is_empty() {
+            return Err(3);
+        }
+    }
+    c.end()?;
+    let key_at = |offset: u32| Cursor::new(&bytes[offset as usize..]).bound_ref().unwrap();
+    offsets.sort_unstable_by(|left, right| key_at(*left).cmp(key_at(*right)));
+    if offsets.windows(2).any(|pair| key_at(pair[0]) == key_at(pair[1])) {
+        return Err(3);
+    }
+    Ok(())
 }
 
 // The caller holds the same complete committed-index interval for measurement
@@ -374,6 +437,7 @@ fn capture_complete<'a, T: Copy>(
         rows,
         population: Arc::new(Population {
             rows: population,
+            guard: None,
             _charge: population_charge,
         }),
         budget,

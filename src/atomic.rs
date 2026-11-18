@@ -88,6 +88,75 @@ impl NamespaceView {
     pub fn rows(&self) -> &[(String, Value)] {
         &self.rows
     }
+    pub(crate) fn wire_identity(&self) -> (&str, u64) {
+        (&self.namespace, self.epoch)
+    }
+
+    fn wire_bytes(&self, size: usize) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(size);
+        bytes.extend(b"MAV1");
+        crate::lp(&mut bytes, self.namespace.as_bytes());
+        bytes.extend(self.epoch.to_le_bytes());
+        bytes.extend(self.expires_mono.to_le_bytes());
+        bytes.extend((self.rows.len() as u32).to_le_bytes());
+        for (key, value) in &self.rows {
+            crate::lp(&mut bytes, key.as_bytes());
+            bytes.extend(value.version.to_le_bytes());
+            bytes.push(value.ack);
+            crate::lp(&mut bytes, &value.bytes);
+        }
+        bytes
+    }
+
+    pub(crate) fn from_wire(bytes: &[u8]) -> Result<Self, PublicationError> {
+        fn row<'a>(c: &mut Cursor<'a>) -> Result<(&'a str, u64, u8, &'a [u8]), u16> {
+            let key = c.bound_ref()?;
+            let version = c.u64()?;
+            let ack = c.u8()?;
+            let value = c.bytes(crate::MAX_VALUE)?;
+            if !valid_id(key) || version == 0 || !matches!(ack, 1 | 2) {
+                return Err(3);
+            }
+            Ok((key, version, ack, value))
+        }
+        fn parse(bytes: &[u8]) -> Result<NamespaceView, u16> {
+            if bytes.get(..4) != Some(b"MAV1") {
+                return Err(3);
+            }
+            let mut c = Cursor::new(&bytes[4..]);
+            let namespace = c.text_ref()?;
+            if !valid_id(namespace) {
+                return Err(3);
+            }
+            let epoch = c.u64()?;
+            let expires = c.u64()?;
+            let count = c.u32()? as usize;
+            if epoch == 0 || expires == 0 || count > MAX_POPULATION || count > c.remainder().len() / 18 {
+                return Err(3);
+            }
+            let encoded_rows = c.remainder();
+            let mut previous = None;
+            for _ in 0..count {
+                let (key, _, _, _) = row(&mut c)?;
+                if previous.is_some_and(|prev| prev >= key) {
+                    return Err(3);
+                }
+                previous = Some(key);
+            }
+            c.end()?;
+            let mut c = Cursor::new(encoded_rows);
+            let entries = (0..count).map(move |_| {
+                let (key, version, ack, value) = row(&mut c).expect("validated wire row");
+                (key, value.len(), (version, ack, value))
+            });
+            let (_, rows, guards) = capture_measure(namespace, entries.clone().map(|(key, len, _)| (key, len)))
+                .map_err(|_| 3u16)?;
+            capture_complete(namespace, epoch, expires, OriginalBudget::new(rows + guards + crate::MAX_FRAME), entries,
+                |_, (version, ack, bytes)| Ok(Value { version, ack, bytes: bytes.to_vec(), tombstone: false }))
+                .map_err(|_| 3u16)
+        }
+        parse(bytes).map_err(|_| PublicationError::Invalid)
+    }
     pub fn prepare(
         &self,
         id: &str,
@@ -149,7 +218,77 @@ pub struct AtomicRequest {
     data: Arc<OriginalData>,
 }
 
+struct OriginalEncoding<'a> {
+    namespace: &'a str,
+    id: &'a str,
+    epoch: u64,
+    expires: u64,
+    ack: AtomicAck,
+    population: &'a [(String, u64)],
+    guard: Option<&'a crate::atomic_population::PopulationGuard>,
+    changes: &'a [FinalChange],
+}
+impl OriginalEncoding<'_> {
+    fn write(&self, mut write: impl FnMut(&[u8])) {
+        fn lp(write: &mut impl FnMut(&[u8]), bytes: &[u8]) {
+            write(&(bytes.len() as u32).to_le_bytes());
+            write(bytes);
+        }
+        write(if self.guard.is_some() { b"MAR2" } else { b"MAR1" });
+        lp(&mut write, self.namespace.as_bytes());
+        lp(&mut write, self.id.as_bytes());
+        write(&self.epoch.to_le_bytes());
+        write(&self.expires.to_le_bytes());
+        write(&[self.ack.byte()]);
+        if let Some(guard) = self.guard {
+            write(&guard.wire_bytes());
+        } else {
+            write(&(self.population.len() as u32).to_le_bytes());
+            for (key, revision) in self.population {
+                lp(&mut write, key.as_bytes());
+                write(&revision.to_le_bytes());
+            }
+        }
+        write(&(self.changes.len() as u16).to_le_bytes());
+        for change in self.changes {
+            lp(&mut write, change.key.as_bytes());
+            write(&[change.value.is_none() as u8]);
+            lp(&mut write, change.value.as_deref().unwrap_or_default());
+        }
+    }
+}
+
 impl AtomicRequest {
+    pub(crate) fn prepare_bounded(
+        namespace: &str,
+        id: &str,
+        epoch: u64,
+        expires: u64,
+        guard: &crate::atomic_population::PopulationGuard,
+        ack: AtomicAck,
+        changes: Vec<FinalChange>,
+    ) -> Result<Self, PublicationError> {
+        if !valid_id(id) || changes.is_empty() || changes.len() > usize::from(guard.limits.max_changes) {
+            return Err(PublicationError::Invalid);
+        }
+        let mut len = 85 + namespace.len() + id.len();
+        for change in &changes {
+            if !valid_id(&change.key) || change.value.as_ref().is_some_and(|v| v.len() > crate::MAX_VALUE) {
+                return Err(PublicationError::Invalid);
+            }
+            len = add(len, 9 + change.key.len() + change.value.as_ref().map_or(0, Vec::len))?;
+        }
+        if len > guard.limits.max_original_bytes as usize {
+            return Err(PublicationError::Resource(4));
+        }
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(len).map_err(|_| PublicationError::Resource(7))?;
+        OriginalEncoding {
+            namespace, id, epoch, expires, ack, population: &[], guard: Some(guard), changes: &changes,
+        }.write(|part| bytes.extend_from_slice(part));
+        drop(changes);
+        Self::from_bytes(&bytes)
+    }
     pub fn operation_id(&self) -> &str {
         &self.data.operation_id
     }
@@ -159,6 +298,9 @@ impl AtomicRequest {
     /// Exact whole-population comparison, including insertion/removal phantoms.
     /// The caller must obtain the complete ordered interval under its own gate.
     pub fn matches_population<'a>(&'a self, current: impl Iterator<Item = (&'a str, u64)>) -> bool {
+        if let Some(guard) = &self.data.population.guard {
+            return crate::atomic_population::population_digest(current) == (guard.count, guard.digest);
+        }
         current.eq(self
             .data
             .population
@@ -167,35 +309,20 @@ impl AtomicRequest {
             .map(|(k, v)| (k.as_str(), *v)))
     }
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut b = b"MAR1".to_vec();
-        crate::lp(&mut b, self.data.namespace.as_bytes());
-        crate::lp(&mut b, self.data.operation_id.as_bytes());
-        b.extend(self.data.epoch.to_le_bytes());
-        b.extend(self.data.expires_mono.to_le_bytes());
-        b.push(self.data.ack.byte());
-        b.extend((self.data.population.rows.len() as u32).to_le_bytes());
-        for (k, v) in &self.data.population.rows {
-            crate::lp(&mut b, k.as_bytes());
-            b.extend(v.to_le_bytes());
-        }
-        b.extend((self.data.changes.len() as u16).to_le_bytes());
-        for c in &self.data.changes {
-            crate::lp(&mut b, c.key.as_bytes());
-            b.push(c.value.is_none() as u8);
-            crate::lp(&mut b, c.value.as_deref().unwrap_or_default());
-        }
+        let mut b = Vec::with_capacity(self.encoded_len());
+        self.encoding().write(|bytes| b.extend_from_slice(bytes));
         b
     }
-    fn encoded_len(&self) -> usize {
+    pub(crate) fn encoded_len(&self) -> usize {
         35 + self.data.namespace.len()
             + self.data.operation_id.len()
-            + self
+            + if self.data.population.guard.is_some() { 50 } else { self
                 .data
                 .population
                 .rows
                 .iter()
                 .map(|(k, _)| 12 + k.len())
-                .sum::<usize>()
+                .sum::<usize>() }
             + self
                 .data
                 .changes
@@ -204,7 +331,7 @@ impl AtomicRequest {
                 .sum::<usize>()
     }
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, PublicationError> {
-        let borrowed = BorrowedOriginal::from_bytes(bytes)?;
+        let borrowed = BorrowedOriginal::from_canonical_bytes(bytes)?;
         // Compatibility convenience: a bounded per-original account whose
         // ownership is retained by the decoded original. Aggregate callers use
         // from_bytes_funded with their shared account instead.
@@ -215,7 +342,7 @@ impl AtomicRequest {
         bytes: &[u8],
         budget: &OriginalBudget,
     ) -> Result<Self, PublicationError> {
-        BorrowedOriginal::from_bytes(bytes)?.to_owned(budget)
+        BorrowedOriginal::from_canonical_bytes(bytes)?.to_owned(budget)
     }
     /// New-only caller-owned custody file. Never replaces a possibly sent original.
     pub fn persist_new(&self, path: &Path) -> io::Result<()> {
@@ -229,30 +356,22 @@ impl AtomicRequest {
     }
     pub(crate) fn fingerprint(&self) -> [u8; 32] {
         let mut h = Sha256::new();
-        // Stream the exact canonical bytes before admission without allocating a frame.
-        fn lp(h: &mut Sha256, b: &[u8]) {
-            h.update(&(b.len() as u32).to_le_bytes());
-            h.update(b);
-        }
-        h.update(b"MAR1");
-        lp(&mut h, self.data.namespace.as_bytes());
-        lp(&mut h, self.data.operation_id.as_bytes());
-        h.update(&self.data.epoch.to_le_bytes());
-        h.update(&self.data.expires_mono.to_le_bytes());
-        h.update(&[self.data.ack.byte()]);
-        h.update(&(self.data.population.rows.len() as u32).to_le_bytes());
-        for (k, v) in &self.data.population.rows {
-            lp(&mut h, k.as_bytes());
-            h.update(&v.to_le_bytes());
-        }
-        h.update(&(self.data.changes.len() as u16).to_le_bytes());
-        for c in &self.data.changes {
-            lp(&mut h, c.key.as_bytes());
-            h.update(&[c.value.is_none() as u8]);
-            lp(&mut h, c.value.as_deref().unwrap_or_default());
-        }
+        self.encoding().write(|bytes| h.update(bytes));
         h.finish()
     }
+    fn encoding(&self) -> OriginalEncoding<'_> {
+        OriginalEncoding {
+            namespace: &self.data.namespace,
+            id: &self.data.operation_id,
+            epoch: self.data.epoch,
+            expires: self.data.expires_mono,
+            ack: self.data.ack,
+            population: &self.data.population.rows,
+            guard: self.data.population.guard.as_ref(),
+            changes: &self.data.changes,
+        }
+    }
+    pub(crate) fn requested_ack(&self) -> u8 { self.data.ack.byte() }
     fn mutations(&self) -> Vec<Mutation> {
         self.data
             .changes
@@ -298,7 +417,7 @@ pub(crate) fn decode_envelope(b: &[u8]) -> Result<Envelope<'_>, u16> {
     if first == 0 || c.u8()? != 2 || c.u16()? != 1 {
         return Err(3);
     }
-    let request = BorrowedOriginal::from_bytes(c.bytes(crate::MAX_FRAME / 3)?).map_err(|_| 3u16)?;
+    let request = BorrowedOriginal::from_canonical_bytes(c.bytes(crate::MAX_FRAME / 3)?).map_err(|_| 3u16)?;
     c.end()?;
     if ack != request.ack.byte() || first.checked_add(request.change_count as u64).is_none() {
         return Err(3);
@@ -317,32 +436,29 @@ pub(crate) fn subrecord(b: &[u8], index: u16) -> Result<Vec<u8>, u16> {
     Ok(codec::mutation_bytes(&m, e.first + index as u64, e.at))
 }
 
-/// Visit a frame's records after the same full validation used by a point read.
-pub(crate) fn visit_subrecords<'a>(
-    b: &'a [u8],
-    mut visit: impl FnMut(u16, codec::RecordView<'a>),
-) -> Result<(), u16> {
-    let envelope = decode_envelope(b)?;
-    let request = &envelope.request;
-    #[cfg(test)]
-    {
-        crate::read_work_tests::work(2, 1);
-        crate::read_work_tests::work(3, request.change_count);
+impl<'a> Envelope<'a> {
+    /// Visit a frame's records after the same full validation used by a point read.
+    pub(crate) fn visit(&self, mut visit: impl FnMut(u16, codec::RecordView<'a>)) {
+        let request = &self.request;
+        #[cfg(test)]
+        {
+            crate::read_work_tests::work(2, 1);
+            crate::read_work_tests::work(3, request.change_count);
+        }
+        for (i, (key, value)) in request.changes().enumerate() {
+            visit(i as u16, codec::RecordView {
+                at: self.at,
+                version: self.first + i as u64,
+                ack: request.ack.byte(),
+                remove: value.is_none(),
+                ns: request.namespace,
+                key,
+                op_id: request.operation_id,
+                expected: None,
+                bytes: value.unwrap_or_default(),
+            });
+        }
     }
-    for (i, (key, value)) in request.changes().enumerate() {
-        visit(i as u16, codec::RecordView {
-            at: envelope.at,
-            version: envelope.first + i as u64,
-            ack: request.ack.byte(),
-            remove: value.is_none(),
-            ns: request.namespace,
-            key,
-            op_id: request.operation_id,
-            expected: None,
-            bytes: value.unwrap_or_default(),
-        });
-    }
-    Ok(())
 }
 
 pub(crate) fn route_records(b: &[u8]) -> Result<Vec<(String, String, u64)>, u16> {
@@ -364,7 +480,12 @@ pub(crate) fn envelope_stripe(ns: &str) -> usize {
 
 impl Store {
     pub fn capture_namespace(&self, namespace: &str) -> Result<NamespaceView, PublicationError> {
-        self.capture_atomic(namespace, None)
+        self.capture_atomic(namespace, None, None)
+    }
+    pub(crate) fn capture_namespace_for_wire(&self, namespace: &str, max: usize) -> Result<Vec<u8>, PublicationError> {
+        self.capture_atomic(namespace, None, Some(max)).map(|view| view.wire_bytes(
+            28 + namespace.len() + view.rows.iter().map(|(key, value)| 17 + key.len() + value.bytes.len()).sum::<usize>()
+        ))
     }
     /// Reserve the entire finite account against actual snapshot and memory
     /// headroom before materializing the complete population. Requests prepared
@@ -374,16 +495,23 @@ impl Store {
         namespace: &str,
         bytes: usize,
     ) -> Result<NamespaceView, PublicationError> {
-        self.capture_atomic(namespace, Some(bytes))
+        self.capture_atomic(namespace, Some(bytes), None)
     }
     fn capture_atomic(
         &self,
         namespace: &str,
         requested: Option<usize>,
+        wire_max: Option<usize>,
     ) -> Result<NamespaceView, PublicationError> {
         valid_namespace(namespace)?;
+        if let Some(max) = wire_max {
+            Self::atomic_wire_size(namespace, &self.committed.read().unwrap(), max)?;
+        }
         let _gate = self.admission_gate.write().unwrap();
         let committed = self.committed.read().unwrap();
+        if let Some(max) = wire_max {
+            Self::atomic_wire_size(namespace, &committed, max)?;
+        }
         if !self.atomic_compatible(namespace, &committed) {
             return Err(PublicationError::Unsupported);
         }
@@ -408,7 +536,7 @@ impl Store {
         // Same coordination as ordinary snapshot reservation: committed->scans->state.
         let scans = self.scans.lock().unwrap();
         let state = self.state.lock().unwrap();
-        if state.read_only || state.warming {
+        if state.read_only || state.warming || (wire_max.is_some() && self.flags.storage_error.load(Ordering::SeqCst)) {
             return Err(PublicationError::Unavailable);
         }
         let total = self
@@ -444,14 +572,36 @@ impl Store {
             budget,
             entries,
             |key, entry| {
-                entry
-                    .read(namespace, key)
+                let value = if wire_max.is_some() {
+                    self.read_entry(namespace, key, entry)
+                } else {
+                    entry.read(namespace, key)
+                };
+                value
                     .map(|v| (*v).clone())
                     .map_err(|_| PublicationError::Uncertain)
             },
         )
     }
-    fn atomic_compatible(&self, ns: &str, committed: &store::Committed) -> bool {
+    fn atomic_wire_size(namespace: &str, committed: &store::Committed, max: usize) -> Result<(), PublicationError> {
+        let mut size = 28 + namespace.len();
+        for (i, ((_, key), entry)) in committed.range((namespace.to_owned(), String::new())..)
+            .take_while(|((ns, _), _)| ns == namespace).filter(|(_, e)| !e.tombstone).enumerate()
+        {
+            if !valid_id(key) || entry.version == 0 || !matches!(entry.ack, 1 | 2) || entry.len > crate::MAX_VALUE {
+                return Err(PublicationError::Uncertain);
+            }
+            size = size.checked_add(17 + key.len() + entry.len).ok_or(PublicationError::Resource(4))?;
+            if i >= MAX_POPULATION || size > max {
+                return Err(PublicationError::Resource(4));
+            }
+        }
+        if size > max {
+            return Err(PublicationError::Resource(4));
+        }
+        Ok(())
+    }
+    pub(crate) fn atomic_compatible(&self, ns: &str, committed: &store::Committed) -> bool {
         // Initial additive capability supports FOREVER only, including all prefix policies.
         self.policies
             .read()
@@ -464,6 +614,61 @@ impl Store {
                 .filter(|(k, _)| k.0 == ns)
                 .all(|(_, e)| e.class == crate::Class::FOREVER)
     }
+    pub(crate) fn publish_atomic_for_wire(
+        &self, ns: &str, op: &str, bytes: &[u8], deadline: u64,
+    ) -> Result<Outcome, PublicationError> {
+        let original = BorrowedOriginal::from_canonical_bytes(bytes)?;
+        if original.namespace() != ns || original.operation_id() != op {
+            return Err(PublicationError::IdentityMismatch);
+        }
+        let id = (ns.to_owned(), op.to_owned());
+        let owned_bytes = original.allocation_bytes()?;
+        // Include the pending admission key vector until publication has its own grants.
+        let ingress_bytes = original.changes().try_fold(owned_bytes, |total, (key, _)| {
+            add(total, 128 + ns.len() + key.len())
+        })?;
+        let fingerprint = original.fingerprint();
+        let _gate = self.admission_gate.write().unwrap();
+        let committed = self.committed.read().unwrap();
+        let state = self.state.lock().unwrap();
+        if let Some(outcome) = self.original_status(
+            &state, &id, &fingerprint, original.epoch(), original.expires_mono(), deadline,
+        )? {
+            return Ok(outcome);
+        }
+        if !self.atomic_compatible(ns, &committed) {
+            return Err(PublicationError::Unsupported);
+        }
+        if !original.matches_current(live_population(ns, &committed)) {
+            return Err(PublicationError::Conflict);
+        }
+        let _backing = self.reserve_read_backing(&state, ingress_bytes, ingress_bytes)
+            .map_err(|_| PublicationError::Resource(7))?;
+        drop(state);
+        drop(committed);
+        let request = original.to_owned(&OriginalBudget::new(owned_bytes))?;
+        self.publish_atomic_under_gate(&request, deadline, fingerprint)
+    }
+
+    fn original_status(
+        &self, state: &store::State, id: &store::Key, fingerprint: &[u8; 32],
+        epoch: u64, expires: u64, deadline: u64,
+    ) -> Result<Option<Outcome>, PublicationError> {
+        let mono = self.clock.mono_ms();
+        if let Some(outcome) = retained_outcome(fingerprint, state.dedup.get(id), state.retired_set.contains(id), mono)? {
+            return Ok(Some(outcome));
+        }
+        if epoch != self.epoch {
+            return Err(PublicationError::RestartUncertain);
+        }
+        if self.clock.utc_ms() >= deadline || mono >= expires {
+            return Err(PublicationError::Expired);
+        }
+        if state.read_only || state.warming || self.flags.storage_error.load(Ordering::SeqCst) {
+            return Err(PublicationError::Unavailable);
+        }
+        Ok(None)
+    }
     pub fn publish_atomic(
         &self,
         r: &AtomicRequest,
@@ -472,36 +677,23 @@ impl Store {
         // Outermost gate: raw writes, whole policy projection, and expiry finish before comparison.
         // No state/index lock is retained while acquiring this gate.
         let _gate = self.admission_gate.write().unwrap();
+        self.publish_atomic_under_gate(r, deadline, r.fingerprint())
+    }
+    fn publish_atomic_under_gate(
+        &self, r: &AtomicRequest, deadline: u64, fp: [u8; 32],
+    ) -> Result<Outcome, PublicationError> {
         let id = (r.data.namespace.clone(), r.data.operation_id.clone());
-        let fp = r.fingerprint();
         let committed = self.committed.read().unwrap();
         let mut state = self.state.lock().unwrap();
-        if let Some(outcome) = retained_outcome(
-            &fp,
-            state.dedup.get(&id),
-            state.retired_set.contains(&id),
-            self.clock.mono_ms(),
+        if let Some(outcome) = self.original_status(
+            &state, &id, &fp, r.data.epoch, r.data.expires_mono, deadline,
         )? {
             return Ok(outcome);
-        }
-        if r.data.epoch != self.epoch {
-            return Err(PublicationError::RestartUncertain);
-        }
-        if self.clock.utc_ms() >= deadline || self.clock.mono_ms() >= r.data.expires_mono {
-            return Err(PublicationError::Expired);
-        }
-        if state.read_only || state.warming || self.flags.storage_error.load(Ordering::SeqCst) {
-            return Err(PublicationError::Unavailable);
         }
         if !self.atomic_compatible(&r.data.namespace, &committed) {
             return Err(PublicationError::Unsupported);
         }
-        let current = committed
-            .range((r.data.namespace.clone(), String::new())..)
-            .take_while(|(k, _)| k.0 == r.data.namespace)
-            .filter(|(_, e)| !e.tombstone)
-            .map(|(k, e)| (k.1.as_str(), e.version));
-        if !r.matches_population(current) {
+        if !r.matches_population(live_population(&r.data.namespace, &committed)) {
             return Err(PublicationError::Conflict);
         }
         let keys: Vec<_> = r

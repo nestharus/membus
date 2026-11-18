@@ -9,6 +9,8 @@ pub use chunks::{Class, ManualClock, POLICY_NS};
 pub mod client;
 pub mod indexed;
 pub mod atomic;
+pub mod atomic_population;
+mod atomic_wire;
 pub mod recovery_image;
 #[cfg(windows)]
 pub mod pipe_io;
@@ -54,10 +56,12 @@ use append_owner::{AppendHandle, AppendOwner};
 #[cfg(test)]
 use codec::mutation_bytes;
 pub use codec::{
+    ATOMIC_CAPTURE, ATOMIC_POPULATION, ATOMIC_PUBLISH,
     crc32, frame, lp, read_frame, read_frame_limit, reply, Cursor, BATCH, CAPTURE_METRICS, CODES,
     CONDITIONAL_PUT, GET, GET_MANY, GET_STATUS, HEALTH, HEALTH2, HELLO, IO_METRICS, MAX_BATCH,
     MAX_FRAME, MAX_ID, MAX_VALUE, POLICY_GET, POLICY_SET, PUT, REMOVE, SCAN_KEYS_PREFIX,
     SCAN_KEYS_RANGE, SCAN_PREFIX, SCAN_RANGE, SIGNAL_USAGE, SNAPSHOT_OPEN, SNAPSHOT_RELEASE,
+    SNAPSHOT_REQUIRE_COMPLETE,
     SUBSCRIBE, SUBSCRIPTION_STATUS, TIMER_CANCEL, TIMER_SET, TIMER_STATUS, UNSUBSCRIBE,
 };
 #[cfg(test)]

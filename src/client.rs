@@ -60,6 +60,7 @@ pub struct Refusal {
 #[derive(Debug)]
 pub enum Error {
     Invalid(&'static str),
+    Atomic(crate::atomic::PublicationError),
     Transport(io::Error),
     Protocol(&'static str),
     Refused(Refusal),
@@ -239,12 +240,12 @@ pub struct Client<T: Transport> {
     io: T,
     request_id: u64,
     negotiated: Negotiated,
-    usable: bool,
+    pub(crate) usable: bool,
     feature_limits: FeatureLimits,
 }
 // Own the bounded reply body through typed decoding. Constructed only after
 // header association and status validation; decoders borrow past that header.
-struct ReplyPayload(Vec<u8>);
+pub(crate) struct ReplyPayload(Vec<u8>);
 impl ReplyPayload {
     // Call only after validating that this value ends at the reply boundary.
     fn into_tail(mut self, len: usize) -> Vec<u8> {
@@ -437,12 +438,12 @@ impl<T: Transport> Client<T> {
     pub fn is_usable(&self) -> bool {
         self.usable
     }
-    fn exchange(&mut self, op: u8, p: &[u8], until: Instant) -> Result<ReplyPayload> {
+    pub(crate) fn exchange(&mut self, op: u8, p: &[u8], until: Instant) -> Result<ReplyPayload> {
         let id = self.begin_exchange(p.len(), until)?;
         let bytes = frame(op, id, p);
         self.exchange_bytes(op, id, &bytes, until)
     }
-    fn begin_exchange(&mut self, payload_len: usize, until: Instant) -> Result<u64> {
+    pub(crate) fn begin_exchange(&mut self, payload_len: usize, until: Instant) -> Result<u64> {
         if !self.usable {
             return Err(Error::Invalid("connection requires reconnect"));
         }
@@ -462,7 +463,7 @@ impl<T: Transport> Client<T> {
             .ok_or(Error::Invalid("request id exhausted"))?;
         Ok(self.request_id)
     }
-    fn exchange_bytes(
+    pub(crate) fn exchange_bytes(
         &mut self,
         op: u8,
         id: u64,
@@ -545,7 +546,7 @@ impl<T: Transport> Client<T> {
         }
         Ok(())
     }
-    fn prefix(&self, operation_id: &str, namespace: &str, d: Deadline) -> Result<Vec<u8>> {
+    pub(crate) fn prefix(&self, operation_id: &str, namespace: &str, d: Deadline) -> Result<Vec<u8>> {
         identifier(operation_id)?;
         identifier(namespace)?;
         let mut p = d.unix_ms.to_le_bytes().to_vec();

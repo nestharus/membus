@@ -122,6 +122,7 @@ impl<T: Transport> Client<T> {
     }
     fn snapshot_frame(
         &self,
+        opcode: u8,
         ns: &str,
         snapshot: Option<&[u8; 16]>,
         op: &str,
@@ -130,11 +131,6 @@ impl<T: Transport> Client<T> {
         // Retain prefix's validation order before reserving the final frame.
         identifier(op)?;
         identifier(ns)?;
-        let opcode = if snapshot.is_some() {
-            crate::SNAPSHOT_RELEASE
-        } else {
-            crate::SNAPSHOT_OPEN
-        };
         let payload_len = 8 + 2 * 4 + op.len() + ns.len()
             + if snapshot.is_some() { 4 + 16 } else { 0 };
         let mut bytes = crate::codec::frame_header(opcode, 0, payload_len);
@@ -181,22 +177,25 @@ impl<T: Transport> Client<T> {
     fn m3_frame_response<R>(
         &mut self,
         op: u8,
-        mut bytes: Vec<u8>,
+        bytes: Vec<u8>,
         until: Instant,
         decode: impl FnOnce(&Self, ReplyPayload) -> Result<R>,
     ) -> Result<R> {
+        let b = self.m3_frame_exchange(op, bytes, until)?;
+        self.m3_decode_response(b, decode)
+    }
+    fn m3_frame_exchange(&mut self, op: u8, mut bytes: Vec<u8>, until: Instant) -> Result<ReplyPayload> {
         // Keep readiness/deadline/frame admission after complete encoding.
         // Refused sends consume no request ID and perform no transport I/O.
         let id = self.begin_exchange(bytes.len() - 17, until)?;
         bytes[9..17].copy_from_slice(&id.to_le_bytes());
-        let b = self.exchange_bytes(op, id, &bytes, until)?;
-        self.m3_decode_response(b, decode)
+        self.exchange_bytes(op, id, &bytes, until)
     }
     pub fn snapshot_open(&mut self, ns: &str, op: &str, d: Deadline) -> Result<[u8; 16]> {
         if !self.negotiated.scans {
             return Err(Error::Invalid("scans unavailable"));
         }
-        let p = self.snapshot_frame(ns, None, op, d)?;
+        let p = self.snapshot_frame(crate::SNAPSHOT_OPEN, ns, None, op, d)?;
         self.m3_frame_response(crate::SNAPSHOT_OPEN, p, d.local, |_, b| {
             let mut c = Cursor::new(&b);
             let t = token(&mut c)?;
@@ -214,10 +213,23 @@ impl<T: Transport> Client<T> {
         if !self.negotiated.scans {
             return Err(Error::Invalid("scans unavailable"));
         }
-        let p = self.snapshot_frame(ns, Some(snapshot), op, d)?;
+        let p = self.snapshot_frame(crate::SNAPSHOT_RELEASE, ns, Some(snapshot), op, d)?;
         self.m3_frame_response(crate::SNAPSHOT_RELEASE, p, d.local, |_, b| {
             if !b.is_empty() {
                 return Err(Error::Protocol("release payload"));
+            }
+            Ok(())
+        })
+    }
+    /// Require complete-query eligibility for the supplied immutable capture.
+    pub fn snapshot_require_complete(&mut self, ns: &str, snapshot: &[u8; 16], op: &str, d: Deadline) -> Result<()> {
+        if !self.negotiated.scans {
+            return Err(Error::Invalid("scans unavailable"));
+        }
+        let p = self.snapshot_frame(crate::SNAPSHOT_REQUIRE_COMPLETE, ns, Some(snapshot), op, d)?;
+        self.m3_frame_response(crate::SNAPSHOT_REQUIRE_COMPLETE, p, d.local, |_, b| {
+            if !b.is_empty() {
+                return Err(Error::Protocol("snapshot completeness payload"));
             }
             Ok(())
         })
@@ -234,6 +246,21 @@ impl<T: Transport> Client<T> {
         op: &str,
         d: Deadline,
     ) -> Result<ScanPage> {
+        self.scan_prefix_inner(ns, prefix, snapshot, cursor, limit, max_bytes, op, d, false)
+    }
+    pub(crate) fn scan_population_page(
+        &mut self, ns: &str, snapshot: &[u8; 16], cursor: &[u8], op: &str, d: Deadline,
+    ) -> Result<ScanPage> {
+        // The bounded owner can release its already authenticated token on an
+        // associated payload error. Framing/transport failures still poison immediately.
+        self.scan_prefix_inner(ns, "", snapshot, cursor, self.negotiated.max_batch as u16,
+            self.negotiated.max_frame, op, d, true)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn scan_prefix_inner(
+        &mut self, ns: &str, prefix: &str, snapshot: &[u8; 16], cursor: &[u8], limit: u16,
+        max_bytes: usize, op: &str, d: Deadline, release_on_payload_error: bool,
+    ) -> Result<ScanPage> {
         if !self.negotiated.scans {
             return Err(Error::Invalid("scans unavailable"));
         }
@@ -246,7 +273,8 @@ impl<T: Transport> Client<T> {
             return Err(Error::Invalid("scan bounds"));
         }
         let p = self.scan_frame(crate::SCAN_PREFIX, ns, snapshot, cursor, limit, max_bytes, &[prefix], op, d)?;
-        self.m3_frame_response(crate::SCAN_PREFIX, p, d.local, |this, b| {
+        let b = self.m3_frame_exchange(crate::SCAN_PREFIX, p, d.local)?;
+        let result = (|| {
             if b.len() > max_bytes {
                 return Err(Error::Protocol("scan page bytes"));
             }
@@ -270,7 +298,7 @@ impl<T: Transport> Client<T> {
             let mut tail = None;
             for index in 0..count {
                 let key = parse(c.text())?;
-                let (version, ack, bytes) = this
+                let (version, ack, bytes) = self
                     .borrowed_value(&mut c)?
                     .ok_or(Error::Protocol("scan tombstone"))?;
                 let bytes = if index + 1 == count {
@@ -301,7 +329,11 @@ impl<T: Transport> Client<T> {
                 done: done == 1,
                 items,
             })
-        })
+        })();
+        if result.is_err() && !release_on_payload_error {
+            self.usable = false;
+        }
+        result
     }
     /// No retry after a lost reply: the remote subscription may already exist.
     pub fn subscribe(

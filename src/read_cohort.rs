@@ -9,7 +9,7 @@ pub(crate) struct ReadUsage {
     pub(crate) bytes: AtomicUsize,
     pub(crate) released: AtomicBool,
 }
-struct Budget {
+pub(crate) struct Budget {
     usage: Arc<ReadUsage>,
     limit: usize,
     used: AtomicUsize,
@@ -23,6 +23,29 @@ impl Drop for Budget {
 enum FrameCharge {
     Cohort { budget: Arc<Budget>, bytes: usize },
     Snapshot { owner: Arc<ScanCharge>, bytes: usize },
+}
+impl FrameCharge {
+    fn grow(&mut self, store: &Store, extra: usize) -> io::Result<()> {
+        match self {
+            Self::Cohort { budget, bytes } => {
+                budget.used.try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                    used.checked_add(extra).filter(|total| *total <= budget.limit)
+                }).map_err(|_| capacity())?;
+                *bytes += extra;
+            }
+            Self::Snapshot { owner, bytes } => {
+                let state = store.state.lock().unwrap();
+                if owner.usage.bytes.load(Ordering::Acquire).checked_add(extra)
+                    .is_none_or(|total| total > store.config.snapshot_bytes) || extra > store.cache_limit(&state) {
+                    return Err(capacity());
+                }
+                owner.usage.bytes.fetch_add(extra, Ordering::AcqRel);
+                *bytes += extra;
+                store.trim_cache(&state);
+            }
+        }
+        Ok(())
+    }
 }
 impl Drop for FrameCharge {
     fn drop(&mut self) {
@@ -96,6 +119,14 @@ pub struct ReadCohort<'a> {
     budget: Arc<Budget>,
 }
 impl Store {
+    pub(crate) fn reserve_read_backing(&self, state: &crate::store::State, bytes: usize, used: usize) -> io::Result<Arc<Budget>> {
+        if bytes > self.cache_limit(state) { return Err(capacity()); }
+        self.read_usage.bytes.fetch_add(bytes, Ordering::AcqRel);
+        self.trim_cache(state);
+        Ok(Arc::new(Budget {
+            usage: self.read_usage.clone(), limit: bytes, used: AtomicUsize::new(used),
+        }))
+    }
     /// Reserve a finite managed-memory allowance before creating the cohort.
     /// Capacity refusal is WouldBlock. Zero and undersized allowances are invalid.
     pub fn read_cohort(&self, byte_budget: usize) -> io::Result<ReadCohort<'_>> {
@@ -103,12 +134,8 @@ impl Store {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "read cohort budget too small"));
         }
         let state = self.state.lock().unwrap();
-        if byte_budget > self.cache_limit(&state) { return Err(capacity()); }
-        self.read_usage.bytes.fetch_add(byte_budget, Ordering::AcqRel);
-        self.trim_cache(&state);
-        Ok(ReadCohort { store: self, frame: Mutex::new(None), budget: Arc::new(Budget {
-            usage: self.read_usage.clone(), limit: byte_budget, used: AtomicUsize::new(OWNER_BYTES),
-        }) })
+        let budget = self.reserve_read_backing(&state, byte_budget, OWNER_BYTES)?;
+        Ok(ReadCohort { store: self, frame: Mutex::new(None), budget })
     }
     /// Reserved cohort bytes, including values still alive after cohort release.
     pub fn read_cohort_bytes(&self) -> usize { self.read_usage.bytes.load(Ordering::Acquire) }
@@ -157,7 +184,7 @@ fn storage_observation<T>(store: &Store, result: &io::Result<T>) {
         store.flags.storage_error.store(true, Ordering::SeqCst);
     }
 }
-fn interpret(store: &Store, location: &Location, charge: FrameCharge) -> io::Result<Arc<InterpretedFrame>> {
+fn interpret(store: &Store, location: &Location, mut charge: FrameCharge) -> io::Result<Arc<InterpretedFrame>> {
     let _reader = store.cold_reader();
     store.cache.cold();
     let encoded = location.whole_payload()?;
@@ -170,8 +197,13 @@ fn interpret(store: &Store, location: &Location, charge: FrameCharge) -> io::Res
         }) });
     };
     if location.subrecord.is_some() {
-        crate::atomic::visit_subrecords(&encoded, |_, record| append(record))
+        let envelope = crate::atomic::decode_envelope(&encoded)
             .map_err(|_| io::Error::other("invalid envelope subrecord"))?;
+        let wide_members = envelope.request.change_count().saturating_sub(crate::atomic::MAX_CHANGES);
+        if wide_members != 0 {
+            charge.grow(store, wide_members * 256)?;
+        }
+        envelope.visit(|_, record| append(record));
     } else {
         append(codec::parse_record_view(&encoded).map_err(|_| io::Error::other("invalid indexed record"))?);
     }

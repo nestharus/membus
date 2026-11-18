@@ -515,6 +515,23 @@ class Client:
         if self.call(13, ns, lp(snapshot), **options):
             raise ValueError('invalid release reply')
 
+    def snapshot_require_complete(self, ns, snapshot, **options):
+        """Require captured complete-query eligibility on this exact token.
+
+        Unsupported providers raise NotAvailable; captured uncertainty and token
+        refusals retain their original codes. This does not inspect live health.
+        """
+        if not isinstance(snapshot, bytes) or len(snapshot) != 16:
+            raise ValueError('explicit 16-byte snapshot token required')
+        try:
+            reply = self.call(31, ns, lp(snapshot), **options)
+        except Refusal as error:
+            if error.code == 2:
+                raise NotAvailable('snapshot_require_complete') from error
+            raise
+        if reply != b'':
+            raise ValueError('invalid snapshot completeness reply')
+
     def _scan(self, opcode, ns, bounds, snapshot, cursor, limit, max_bytes, options):
         if not 1 <= limit <= MAX_BATCH or not 42 <= max_bytes <= MAX_FRAME:
             raise ValueError('scan limit must be 1..128; max_bytes must be 42..MAX_FRAME')
