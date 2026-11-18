@@ -69,7 +69,8 @@ declared fields belongs to the application codec.
   `prepare_append(client, namespace, record, operation, ack)` return a frozen
   `Publication` containing the immutable original request, endpoint, epoch and
   conservative retry horizon. Preparation performs no I/O. It preflights each
-  planned mutation's frame size before any publication effect. A negotiated
+  planned mutation's frame size and checks the serialized declaration head
+  against the negotiated value limit before any publication effect. A negotiated
   zero retry horizon raises `Unsupported` during preparation, before any
   schema, head, row or posting effect. This multi-step binding cannot safely
   complete that configuration; positive horizons remain fixed bounds, not a
@@ -145,6 +146,11 @@ transport loss, malformed mutation reply or wrong achieved Ack raise `Uncertain`
 with the original Publication, MutationRequest, operation ID, epoch and cause.
 The token's `uncertainties` tuple retains every such original observation even
 when a later explicit reconciliation succeeds or refuses.
+
+An interruption during a possibly sent mutation leaves the original interrupt
+in flight and records an `Uncertain` with that cause on the same Publication.
+The binding closes or invalidates the connection during unwind. There is no
+reconnect or resend in that invocation.
 
 An application may explicitly reconnect the same Client/endpoint and revisit
 the SAME Publication with a fresh bounded deadline, within its original epoch

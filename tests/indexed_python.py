@@ -11,7 +11,7 @@ from dataclasses import replace
 from unittest.mock import patch
 
 sys.path.insert(0, os.environ.get('MEMBUS_PYTHON_SDK_ROOT', str(pathlib.Path(__file__).resolve().parents[1] / 'python')))
-from membus import Client, Refusal, EpochChanged, NotAvailable, MAX_FRAME, MAX_VALUE, CODES, lp
+from membus import Client, Decoder, Refusal, EpochChanged, NotAvailable, MAX_FRAME, MAX_VALUE, CODES, lp
 
 
 def no_retry_control():
@@ -89,6 +89,20 @@ class PreparationControls(unittest.TestCase):
     def test_zero_retry_append_refuses_during_pure_preparation(self):
         with self.assertRaises(Unsupported):
             Collection('zero', SCHEMA).prepare_append(self.metadata(), 'fixture', row(1), 'original', Ack.OS)
+
+    def test_declaration_preflights_head_with_only_negotiated_metadata(self):
+        c = self.metadata()
+        c.retry_ms = 60000
+        col = Collection('small', Schema(()))
+        for c.max_value, refusal in ((7, 'declaration'), (8, 'head'), (13, 'head'), (14, None), (15, None)):
+            with self.subTest(max_value=c.max_value):
+                if refusal:
+                    with self.assertRaisesRegex(Unsupported, refusal):
+                        col.prepare_declaration(c, 'fixture', 'original', Ack.OS)
+                else:
+                    p = col.prepare_declaration(c, 'fixture', 'original', Ack.OS)
+                    self.assertEqual(p.uncertainties, ())
+                    self.assertIsNone(p._custody.oldest_first_send)
 
     def test_documented_helper_closes_owned_handle_on_preparation_refusal(self):
         root = pathlib.Path(os.environ['MEMBUS_PYTHON_SDK_ROOT']).parent if 'MEMBUS_PYTHON_SDK_ROOT' in os.environ else pathlib.Path(__file__).resolve().parents[1]
@@ -257,6 +271,33 @@ class PrivateIPC(unittest.TestCase):
         with self.assertRaises(Conflict):
             other.declare(self.c, p, Deadline.after(30))
 
+    def test_declaration_small_provider_values_refuse_before_effects(self):
+        head = b'MBIX1H' + bytes(8)
+        for limit in (7, 8, 13, 14, 15):
+            # Emulate a smaller negotiated cap while using the real private resident for state checks.
+            with self.subTest(max_value=limit), patch.object(self.c, 'max_value', limit):
+                name = 'small_' + uuid.uuid4().hex
+                col = Collection(name, Schema(()))
+                before = self.c.request_id
+                if limit < len(head):
+                    with self.assertRaises(Unsupported):
+                        col.prepare_declaration(self.c, self.namespace, name, Ack.OS)
+                    self.assertEqual(self.c.request_id, before)
+                    self.assertIsNone(self.c.get(self.namespace, col._schema_key))
+                    self.assertIsNone(self.c.get(self.namespace, col._head_key))
+                else:
+                    p = col.prepare_declaration(self.c, self.namespace, name, Ack.OS)
+                    self.assertEqual(self.c.request_id, before)
+                    col.declare(self.c, p, Deadline.after(30))
+                    keys = (col._schema_key, col._head_key)
+                    values = tuple(self.c.get(self.namespace, key) for key in keys)
+                    self.assertEqual(tuple(v['value'] for v in values), (b'MBIX1S\0\0', head))
+                    noop = col.prepare_declaration(self.c, self.namespace, name + ':noop', Ack.OS)
+                    with patch.object(self.c, 'put', wraps=self.c.put) as put:
+                        col.declare(self.c, noop, Deadline.after(30))
+                    put.assert_not_called()
+                    self.assertEqual(tuple(self.c.get(self.namespace, key) for key in keys), values)
+
     def test_missing_declaration_is_corrupt_unavailable(self):
         with self.assertRaises(Corrupt):
             self.query()
@@ -349,7 +390,6 @@ class PrivateIPC(unittest.TestCase):
             sends = 0
             def exchange(inner, opcode, payload, deadline):
                 if opcode == 5:
-                    from membus import Decoder
                     d = Decoder(payload)
                     d.unpack('<Q')
                     op = d.blob().decode()
@@ -363,6 +403,76 @@ class PrivateIPC(unittest.TestCase):
         c = self.client(Loss)
         self.addCleanup(c.close)
         return c
+
+    def test_head_receipt_interruption_preserves_original_and_invalidates_channel(self):
+        record = row(1, payload=b'A\0\xff')
+        for mode in ('healthy', 'interrupted', 'close-failed'):
+            with self.subTest(mode=mode):
+                col = Collection('receipt_' + uuid.uuid4().hex, SCHEMA)
+                c = self.client()
+                self.addCleanup(c.close)
+                channel = c.channel
+                self.addCleanup(channel.close)
+                p = self.prepare(record, client=c, col=col)
+                operation = p.operation + ':commit'
+                interrupt = KeyboardInterrupt('authored receipt interrupt')
+                write_all, read_exact = c.write_all, c.read_exact
+                writes, first_sends = [], {}
+
+                def write(data, deadline):
+                    opcode = data[8]
+                    request = Decoder(data[17:])
+                    request.unpack('<Q')
+                    op = request.blob().decode()
+                    writes.append((opcode, op))
+                    if opcode == 5:
+                        first_sends.setdefault(op, p._mutations[op].first_send)
+                    return write_all(data, deadline)
+
+                def read(count, deadline):
+                    # The response length has arrived and the mutation receipt body is unread.
+                    if mode != 'healthy' and writes[-1] == (5, operation) and count == 24:
+                        raise interrupt
+                    return read_exact(count, deadline)
+
+                close_failure = OSError('authored close failure') if mode == 'close-failed' else None
+                with (patch.object(c, 'write_all', side_effect=write),
+                      patch.object(c, 'read_exact', side_effect=read),
+                      patch.object(c, 'connect', wraps=c.connect) as connect,
+                      patch.object(channel, 'close', wraps=channel.close, side_effect=close_failure) as close):
+                    if mode == 'healthy':
+                        receipt = col.append(c, p, Deadline.after(30))
+                        self.assertEqual((receipt.through, receipt.already_committed), (1, False))
+                        self.assertEqual(p.uncertainties, ())
+                        self.assertIs(c.channel, channel)
+                        close.assert_not_called()
+                        self.assertEqual(c.get(self.namespace, col._head_key)['value'], b'MBIX1H\x01' + bytes(7))
+                    else:
+                        with self.assertRaises(KeyboardInterrupt) as caught:
+                            col.append(c, p, Deadline.after(30))
+                        self.assertIs(caught.exception, interrupt)
+                        self.assertIsNone(c.channel)
+                        close.assert_called_once_with()
+                        self.assertEqual(writes[-1], (5, operation))
+                        self.assertEqual(len(p.uncertainties), 1)
+                        original, = p.uncertainties
+                        self.assertIs(original.publication, p)
+                        self.assertIs(original.request, p._mutations[operation].request)
+                        self.assertEqual((original.operation_id, original.request.namespace, original.request.key,
+                                          original.request.value, original.request.ack, original.epoch),
+                                         (operation, self.namespace, col._head_key,
+                                          b'MBIX1H\x01' + bytes(7), Ack.OS, c.epoch))
+                        self.assertIs(original.cause, interrupt)
+                    connect.assert_not_called()
+                self.assertEqual(writes.count((5, operation)), 1)
+                self.assertIsNotNone(first_sends[operation])
+                self.assertEqual(p._mutations[operation].first_send, first_sends[operation])
+                self.assertEqual(p._custody.oldest_first_send, min(first_sends.values()))
+                with self.c.snapshot(self.namespace) as token:
+                    for q in (All(), Ordinals(1, 1), Equal('reference', b'repeated')):
+                        result = col.query(self.c, self.namespace, token, q, Limits(2, MAX_VALUE),
+                                           'receipt-observer', Deadline.after(30))
+                        self.assertEqual((result.through, result.records), (1, (record,)))
 
     def test_uncertain_original_commit_preserved_on_explicit_reconnect(self):
         c = self.loss_client(':commit')

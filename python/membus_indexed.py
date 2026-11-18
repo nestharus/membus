@@ -310,6 +310,9 @@ class Collection:
         _integer(c.retry_ms, 0, U64_MAX, 'negotiated retry horizon')
         if c.retry_ms == 0:
             raise Unsupported('indexed publication requires a positive retry horizon; no effects prepared')
+        head_size = len(_head(0))
+        if head_size > c.max_value:
+            raise Unsupported('head exceeds negotiated value bound')
         def preflight(key, size, op):
             _identifier(op)
             _identifier(op + ':reconcile')
@@ -318,10 +321,10 @@ class Collection:
                 raise Unsupported('complete publication exceeds a negotiated mutation frame bound')
         base = operation + ':declare' if record is not None else operation
         preflight(self._schema_key, len(self._declaration), base + ':schema')
-        preflight(self._head_key, 14, base + ':head-init')
+        preflight(self._head_key, head_size, base + ':head-init')
         if record is not None:
             preflight(self._row_key(record.ordinal), self.encoded_len(record), operation + ':row')
-            preflight(self._head_key, 14, operation + ':commit')
+            preflight(self._head_key, head_size, operation + ':commit')
             for index, values in enumerate(record.fields):
                 for value in values:
                     bucket = zlib.crc32(value)
@@ -365,13 +368,14 @@ class Collection:
         size = 13 + 8 + sum(4 + len(s.encode('utf8')) for s in (op, key, p.namespace)) + 1 + 8 + 4 + len(body)
         if len(body) > c.max_value or size > c.max_frame:
             raise Unsupported('mutation exceeds negotiated value/frame bound')
+        deadline = _deadline(d)
         if m.first_send is None:
             m.first_send = time.monotonic()
             first = p._custody.oldest_first_send
             p._custody.oldest_first_send = m.first_send if first is None else min(first, m.first_send)
         try:
             result = c.put(p.namespace, key, body, ack=p.ack, expected=expected,
-                           op_id=op, deadline=_deadline(d), retry_transport=False)
+                           op_id=op, deadline=deadline, retry_transport=False)
             if type(result.get('version')) is not int or not 1 <= result['version'] <= U64_MAX or result.get('ack') != p.ack:
                 raise Corrupt('mutation achieved acknowledgment/revision')
             return result
@@ -381,8 +385,19 @@ class Collection:
             cause = e
         except (OSError, ConnectionError, ValueError, struct.error, Corrupt) as e:
             cause = e
+        except BaseException as e:
+            if isinstance(e, Exception):
+                raise
+            p._uncertainties.append(Uncertain(p, m.request, e))
+            try:
+                c.close()
+            except BaseException:
+                # A failed close can leave Client.channel set. Invalidate it
+                # while the original interruption still owns the unwind.
+                c.channel = None
+            raise
         c.close()
-        error = Uncertain(p, request, cause)
+        error = Uncertain(p, m.request, cause)
         p._uncertainties.append(error)
         raise error from cause
 
