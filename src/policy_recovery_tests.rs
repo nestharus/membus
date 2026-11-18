@@ -70,12 +70,30 @@ fn public_builtins_normalize_before_retry_identity_and_durable_routing() {
         assert_eq!(s.policies(), vec![("authored".into(), "builtin/".into(), canonical)]);
         let written = put(&s, "builtin/value");
         assert_eq!((written.code, written.ack), (0, 2));
-        assert!(receiver::read(&f.catalogue()).unwrap().iter().any(|r| matches!(&r.rec,
-            Rec::Open { class, policy, .. } if *class == canonical && policy == "authored/builtin/")));
+        let (placed, catalogue) = s.inspect_durable_placement(
+            "authored", "builtin/value", written.version, b"retained value",
+        ).unwrap();
+        assert_eq!(placed.class, canonical);
+        assert_eq!(placed.stripe, stripe("authored", "builtin/value"));
+        if canonical == Class::FOREVER {
+            assert!(placed.offset > 0);
+            assert!(receiver::decode(&catalogue).unwrap().iter().any(|record| matches!(
+                &record.rec, Rec::Open { seq, policy, .. }
+                    if *seq == placed.sequence && policy == "(built in: policies)"
+            )));
+        }
         drop(s);
         let reopened = Store::open(&f.0, cfg).unwrap();
         assert_eq!(reopened.policies(), vec![("authored".into(), "builtin/".into(), canonical)]);
-        assert_eq!(reopened.get("authored", "builtin/value").unwrap().version, written.version);
+        let retained = reopened.get("authored", "builtin/value").unwrap();
+        assert_eq!((retained.version, retained.ack, retained.bytes.as_slice()),
+            (written.version, 2, b"retained value".as_slice()));
+        let (closed, _) = reopened.inspect_durable_placement(
+            "authored", "builtin/value", written.version, b"retained value",
+        ).unwrap();
+        assert_eq!((closed.sequence, closed.stripe, closed.offset, closed.frame_bytes),
+            (placed.sequence, placed.stripe, placed.offset, placed.frame_bytes));
+        assert_eq!((closed.class, closed.state), (canonical, chunks::ChunkState::Closed));
     }
 }
 
@@ -151,7 +169,9 @@ fn recovery_preserves_acknowledged_policy_and_subsequent_route() {
     }).max().unwrap();
     let routed = put(&reopened, "retained/after");
     assert_eq!((routed.code, routed.ack), (0, 2));
-    assert!(receiver::read(&f.catalogue()).unwrap().iter().any(|r| matches!(&r.rec,
-        Rec::Open { seq, class, policy, .. }
-            if *seq > previous && *class == Class::LATEST && policy == "authored/retained/")));
+    let (placed, _) = reopened.inspect_durable_placement(
+        "authored", "retained/after", routed.version, b"retained value",
+    ).unwrap();
+    assert_eq!(placed.class, Class::LATEST);
+    assert!(placed.sequence > previous);
 }

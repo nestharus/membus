@@ -71,6 +71,60 @@ fn writable(p: &Path) {
     perms.set_readonly(false);
     fs::set_permissions(p, perms).unwrap();
 }
+
+#[test]
+fn frozen_scalar_frames_reopen_canonical_and_refuse_noncanonical_remove() {
+    for (flag, legacy) in [(0, false), (1, false), (255, false), (255, true)] {
+        let f = Fixture::new();
+        let dir = f.0.join("chunks");
+        fs::create_dir(&dir).unwrap();
+        let catalogue = dir.join("catalogue.log");
+        let config = Config { clock: Some(chunks::ManualClock::new(100)), ..Config::default() };
+        let mutation = Mutation {
+            ns: "é".into(), key: "e\u{301}".into(), op_id: "append-identity".into(),
+            deadline: u64::MAX, ack: if flag == 0 { 1 } else { 2 },
+            expected: match flag { 0 => None, 1 => Some(0), _ => Some(37) },
+            bytes: vec![0, 127, 255], remove: flag != 0,
+        };
+        let mut payload = mutation_bytes(&mutation, 29, 17);
+        payload[17] = flag;
+        let frame = chunks::frame(b"MBK1", &payload);
+        let si = stripe(&mutation.ns, &mutation.key);
+        let path = if legacy {
+            fs::write(&catalogue, []).unwrap();
+            f.0.join(format!("stripe-{si}.log"))
+        } else {
+            let mut writer = chunks::Catalogue::open(&catalogue).unwrap();
+            writer.append(&chunks::CatRecord { at_ms: 17, rec: chunks::Rec::Open {
+                seq: 1, stripe: si as u8, class: Class::FOREVER, policy: "(default)".into(), next: 30,
+            }}).unwrap();
+            let path = chunks::chunk_path(&dir, Class::FOREVER, si, 1);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            path
+        };
+        fs::write(&path, &frame).unwrap();
+        let before = fs::read(&catalogue).unwrap();
+        fs::write(f.0.join("epoch"), 1u64.to_le_bytes()).unwrap();
+        if flag == 255 {
+            let refusal = Store::open(&f.0, config).err().unwrap().to_string();
+            assert!(refusal.contains("offset 0") && refusal.contains("payload"), "{refusal}");
+            assert_eq!(fs::read(&path).unwrap(), frame);
+            assert_eq!(fs::read(&catalogue).unwrap(), before);
+            assert_eq!(fs::read(f.0.join("epoch")).unwrap(), 1u64.to_le_bytes());
+        } else {
+            let store = Store::open(&f.0, config).unwrap();
+            let value = store.get(&mutation.ns, &mutation.key);
+            if flag == 0 {
+                let value = value.unwrap();
+                assert_eq!((value.version, value.ack, value.bytes), (29, 1, mutation.bytes.clone()));
+            } else {
+                assert!(value.is_none());
+            }
+            let ack = mutation.ack;
+            assert_eq!(store.mutate(mutation), Outcome { code: 0, version: 29, ack });
+        }
+    }
+}
 impl Drop for Fixture {
     fn drop(&mut self) {
         fn clear(dir: &Path) {

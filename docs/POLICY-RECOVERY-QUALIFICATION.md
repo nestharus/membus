@@ -31,17 +31,26 @@ library wire dispatcher, without an installed server or network transport.
 
 KEY selects neighboring keys beginning with it unless a longer prefix wins. Both commands
 require exactly one policy row in NS: that KEY prefix with Latest. An unrelated row in NS
-refuses even when the requested key still routes Latest. This deliberately scoped helper is
-not a general existing-state policy resolver. Normal startup may advance epoch, append closure
-records or finish resolved replay before a later policy, value or version refusal. Retain
-partial effects and both output streams. Unresolved marker recovery is not supported here.
+refuses even when the requested key still routes Latest. The receiver separately verifies
+that the exact namespace, key and revision have one validated frame in the active Latest
+catalogue placement. A chunk can contain keys from several prefixes or namespaces. Its
+opener label records the policy at chunk creation. Duplicate retained frames, missing
+placement evidence and other physical classes refuse even when policy and readback agree.
+
+Run on an exclusively held private working copy. Normal startup may advance epoch, append
+closure records or finish resolved replay before a later policy, value, version or
+placement refusal. Retain the attempted copy and both output streams for reconciliation.
+An unresolved catalogue append requires separate owner recovery.
 
 Successful stdout is JSON with source/transport, version, ack, input/catalogue hashes, value
 hex and raw acknowledgement/policy/read/reopen replies. Refusals exit nonzero with stderr
 context. `input_sha256` hashes the supplied bytes actually compared. `catalogue_sha256` and
 `decoded_records` describe the same captured bytes at `catalogue_phase: "before_orderly_reopen"`;
-normal reopen may append Close records afterward. `policy_scope: "singleton_namespace_latest_prefix"`
-and `policy_prefix` identify the selection and namespace restriction. The independent decoder
+normal reopen may append Close records afterward. The placement fields identify the
+catalogue class, lifecycle, sequence and stripe, plus the byte offset and length of the
+validated frame. The optional `--catalogue-snapshot NEW_FILE` saves those captured
+catalogue bytes after placement verification. The policy scope and prefix fields identify
+the current policy separately. The independent catalogue decoder
 recognizes multipart retirement kind 10 and expiry resume basis kind 11. Input remains subject
 to the normal value/identifier limits and a 64 MiB receiving catalogue bound.
 

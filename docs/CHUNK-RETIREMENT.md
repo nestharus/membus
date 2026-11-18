@@ -27,7 +27,8 @@ the retry horizon. Retry outcomes remain valid at the exact retry boundary,
 including a zero-length window at the close instant. Longer expire retention
 keeps its existing inclusive retention boundary. Recovered chunks use the UTC
 age without adding to a timestamp, so a close time near the integer limit cannot
-shorten either window. Explicit forced retirement retains its clock override.
+shorten either window. Explicit forced retirement overrides the class clock checks
+and still respects retained retry guards.
 
 HEALTH2 counts latest-class bytes as pinned only after the same UTC and local
 retry bounds have passed. An exact-boundary chunk or a UTC correction alone
@@ -190,8 +191,12 @@ reconstructed outcomes. Automatic retirement and latest-class pinned pressure
 wait strictly past that inclusive cutoff. A backward UTC correction between
 admission and chunk close can otherwise make close-time age pass while the
 record's recovered outcome remains retryable. The extra cutoff is in memory;
-recorded close timestamps are unchanged. Forced retirement
-keeps its explicit override, and already Retiring cleanup is unchanged.
+recorded close timestamps are unchanged. A forced request can return false
+while a recovered ordinary or a live or recovered atomic outcome still guards
+the chunk. The guard is inclusive at its retry cutoff. A live ordinary outcome
+can remain retryable in memory after a forced retirement deletes its durable
+retry evidence. That outcome may be lost on restart. Already Retiring cleanup
+is unchanged.
 
 A failed Resume publication keeps the pause and any explicit `expiry.resume`
 request in place for a later tick. HEALTH2 sets the sticky `storage_error`

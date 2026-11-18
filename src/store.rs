@@ -251,7 +251,8 @@ impl Store {
         self.flags.expiry_degraded.load(Ordering::SeqCst)
     }
     /// Retire one closed chunk by the steps of 5.4 (`retiring` with horizons, holders dropped, delete,
-    /// `retired`) whatever its class's window; a chunk holding a key's latest record, or a pending key, stays.
+    /// `retired`), overriding the class's clock checks. Chunks with a latest record, pending key,
+    /// or a retained retry guard (including recovered ordinary and live or recovered atomic outcomes) stay.
     /// Ok(true) when retired; Ok(false) when kept, held or stopped at the test seam.
     pub fn retire_chunk(&self, id: u64) -> io::Result<bool> {
         Ok(self.maint.retire(Some(id))?.contains(&id))

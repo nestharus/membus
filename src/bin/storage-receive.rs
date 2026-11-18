@@ -8,6 +8,7 @@ use std::{
     process::ExitCode,
 };
 #[path = "../../tools/catalogue_receiver.rs"]
+#[allow(dead_code)] // This binary decodes bytes captured by the owned Store.
 mod receiver;
 const HEAD: &str = match option_env!("MEMBUS_BUILD_HEAD") {
     Some(s) => s,
@@ -156,8 +157,15 @@ fn run() -> io::Result<()> {
     };
     let effective = policy(&s, &a[2], &a[3])?;
     let received = read(&s, &a[2], &a[3], &expected, version)?;
-    let cat = state.join("chunks/catalogue.log");
-    let (catalogue_snapshot, records) = receiver::capture(&cat)?;
+    let (placement, catalogue_snapshot) =
+        s.inspect_durable_placement(&a[2], &a[3], version, &expected)?;
+    if placement.class != Class::LATEST {
+        return Err(fail(format!(
+            "received revision {version} is physically {} in stripe {}, chunk {}; expected latest",
+            placement.class.label(), placement.stripe, placement.sequence,
+        )));
+    }
+    let records = receiver::decode(&catalogue_snapshot)?;
     let mut hash = chunks::Sha256::new();
     hash.update(&catalogue_snapshot);
     let catalogue_sha256 = hash.hex();
@@ -169,12 +177,6 @@ fn run() -> io::Result<()> {
         output.write_all(&catalogue_snapshot)?;
         output.sync_all()?;
     }
-    if !records.iter().any(|r| {
-        matches!(&r.rec,chunks::Rec::Open { class,policy,.. }
-        if *class==Class::LATEST && policy==&format!("{}/{}",a[2],a[3]))
-    }) {
-        return Err(fail("selected receiving chunk representation missing"));
-    }
     drop(s);
     let reopened = Store::open(state, cfg)?;
     let retained = read(&reopened, &a[2], &a[3], &expected, version)?;
@@ -182,10 +184,21 @@ fn run() -> io::Result<()> {
     drop(reopened);
     let mut input_hash = chunks::Sha256::new();
     input_hash.update(&expected);
-    println!("{{\"operation\":{},\"source_head\":{},\"transport\":\"native public library wire dispatcher\",\"namespace\":{},\"key\":{},\"version\":{},\"ack\":2,\"input_sha256\":{},\"catalogue_sha256\":{},\"decoded_records\":{},\"catalogue_phase\":\"before_orderly_reopen\",\"policy_scope\":\"singleton_namespace_latest_prefix\",\"policy_prefix\":{},\"ack_reply_hex\":{},\"policy_reply_hex\":{},\"received_reply_hex\":{},\"reopened_reply_hex\":{},\"value_hex\":{}}}",
-        quote(&a[0]),quote(HEAD),quote(&a[2]),quote(&a[3]),version,quote(&input_hash.hex()),
-        quote(&catalogue_sha256),records.len(),quote(&a[3]),quote(&hex(&ack_reply)),quote(&hex(&effective)),
-        quote(&hex(&received)),quote(&hex(&retained)),quote(&hex(&expected)));
+    println!(concat!(
+        "{{\"operation\":{},\"source_head\":{},\"transport\":\"native public library wire dispatcher\",",
+        "\"namespace\":{},\"key\":{},\"version\":{},\"ack\":2,\"input_sha256\":{},",
+        "\"catalogue_sha256\":{},\"decoded_records\":{},\"catalogue_phase\":\"before_orderly_reopen\",",
+        "\"policy_scope\":\"singleton_namespace_latest_prefix\",\"policy_prefix\":{},",
+        "\"placement_class\":{},\"placement_state\":{},\"placement_sequence\":{},",
+        "\"placement_stripe\":{},\"placement_offset\":{},\"placement_frame_bytes\":{},",
+        "\"ack_reply_hex\":{},\"policy_reply_hex\":{},\"received_reply_hex\":{},",
+        "\"reopened_reply_hex\":{},\"value_hex\":{}}}"
+    ),
+        quote(&a[0]), quote(HEAD), quote(&a[2]), quote(&a[3]), version, quote(&input_hash.hex()),
+        quote(&catalogue_sha256), records.len(), quote(&a[3]), quote(&placement.class.label()),
+        quote(&format!("{:?}", placement.state)), placement.sequence, placement.stripe,
+        placement.offset, placement.frame_bytes, quote(&hex(&ack_reply)), quote(&hex(&effective)),
+        quote(&hex(&received)), quote(&hex(&retained)), quote(&hex(&expected)));
     Ok(())
 }
 fn main() -> ExitCode {

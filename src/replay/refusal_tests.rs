@@ -196,43 +196,55 @@ fn empty_open_retired_append_failure_replaces_the_previous_ready_report() {
 
 #[cfg(windows)]
 #[test]
-fn catalogue_write_open_denial_records_refusal_with_prior_observations() {
+fn late_catalogue_sharing_denial_records_refusal_with_prior_observations() {
     use std::os::windows::fs::OpenOptionsExt;
     let f = Fixture::new();
     let (mut config, data, _) = seed(&f, RecoveryCase::Close);
     let epoch = fs::read(f.0.join("epoch")).unwrap();
     let catalogue = fs::read(f.0.join("chunks/catalogue.log")).unwrap();
+    let original_data = fs::read(&data).unwrap();
+    let orphan = chunks::chunk_path(&f.0.join("chunks"), Class::FOREVER, 0, 1000);
     let cat = f.0.join("chunks/catalogue.log");
     let parent = data.parent().unwrap().to_owned();
-    let holder = Arc::new(Mutex::new(None));
-    let held = holder.clone();
     let expected = Arc::new(Mutex::new(None));
     let observed = expected.clone();
     config.recovery_dir_sync = Some(Arc::new(move |dir| {
         if dir == parent {
-            *held.lock().unwrap() =
-                Some(OpenOptions::new().read(true).share_mode(1 | 4).open(&cat)?);
-            *observed.lock().unwrap() = OpenOptions::new()
+            // The owned writer is already open. This new handle's share flags deny it.
+            let error = OpenOptions::new()
                 .read(true)
-                .write(true)
+                .share_mode(1 | 4)
                 .open(&cat)
-                .unwrap_err()
-                .raw_os_error();
+                .unwrap_err();
+            *observed.lock().unwrap() = error.raw_os_error();
+            return Err(error);
         }
         Ok(())
     }));
     let error = Store::open(&f.0, config.clone())
         .err()
-        .expect("held catalogue must deny write open");
-    assert!(error.raw_os_error().is_some());
+        .expect("owned catalogue must refuse the conflicting reader");
+    assert_eq!(error.raw_os_error(), Some(32));
     assert_eq!(error.raw_os_error(), *expected.lock().unwrap());
     assert_refused(&f, &epoch, &catalogue);
-    holder.lock().unwrap().take();
+    assert_eq!(fs::read(&data).unwrap(), original_data);
+    assert!(fs::read(&orphan).unwrap().is_empty());
+    let report = fs::read_to_string(f.0.join("replay.json")).unwrap();
+    assert!(report.contains("\"epoch\":2"), "{report}");
+    assert!(report.contains("\"records\":1"), "{report}");
     f.unlock();
     config.recovery_dir_sync = None;
     let store = Store::open(&f.0, config).unwrap();
     assert_eq!(store.epoch, 2);
-    assert_eq!(store.get("caller", "key").unwrap().bytes, b"kept");
+    assert_eq!(store.replay_report().stage, "ready");
+    assert!(store.storage_error());
+    assert!(fs::read(orphan).unwrap().is_empty());
+    let value = store.get("caller", "key").unwrap();
+    assert_eq!((value.version, value.ack, value.bytes), (1, 2, b"kept".to_vec()));
+    assert_eq!(store.mutate(Mutation {
+        ns: "caller".into(), key: "key".into(), op_id: "retained".into(),
+        deadline: u64::MAX, ack: 2, expected: None, bytes: b"kept".to_vec(), remove: false,
+    }), crate::Outcome { code: 0, version: 1, ack: 2 });
 }
 
 #[cfg(windows)]

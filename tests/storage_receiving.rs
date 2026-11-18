@@ -1,6 +1,7 @@
 //! Native receiving/staging helper exercised only on explicitly authored private fixture data.
 use std::{
     fs,
+    io::Write,
     path::PathBuf,
     process::{Command, Stdio},
     time::{Duration, Instant},
@@ -46,7 +47,8 @@ fn invoke(args: &[&std::ffi::OsStr], output: &std::path::Path) -> bool {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000);
     }
-    let mut child = command.args(args)
+    let mut child = command
+        .args(args)
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
         .spawn()
@@ -72,12 +74,14 @@ fn invoke(args: &[&std::ffi::OsStr], output: &std::path::Path) -> bool {
 #[test]
 fn native_stage_receive_exact_value_version_reopen_and_refusal() {
     use std::ffi::OsStr;
-    let p = PathBuf::from(std::env::var_os("MEMBUS_TEST_OUTPUT").unwrap_or_else(|| ".test-output".into()))
-        .join(format!(
-            "native-receiving-{}-{}",
-            std::process::id(),
-            membus::now_ms()
-        ));
+    let p = PathBuf::from(
+        std::env::var_os("MEMBUS_TEST_OUTPUT").unwrap_or_else(|| ".test-output".into()),
+    )
+    .join(format!(
+        "native-receiving-{}-{}",
+        std::process::id(),
+        membus::now_ms()
+    ));
     fs::create_dir_all(&p).unwrap();
     let state = p.join("state");
     let input = p.join("input.txt");
@@ -107,6 +111,8 @@ fn native_stage_receive_exact_value_version_reopen_and_refusal() {
     assert_eq!(field(&receipt, "policy_prefix"), "result");
     assert_snapshot(&receipt, &state.join("chunks/catalogue.log"));
     assert_eq!(field(&receipt, "decoded_records"), "2"); // Two Opens; reopen legitimately adds Close.
+    assert_eq!(field(&receipt, "placement_class"), "latest");
+    assert_eq!(field(&receipt, "placement_state"), "Open");
     let read = p.join("receive.json");
     assert!(invoke(
         &[
@@ -123,6 +129,15 @@ fn native_stage_receive_exact_value_version_reopen_and_refusal() {
     let received = fs::read_to_string(&read).unwrap();
     assert_snapshot(&received, &state.join("chunks/catalogue.log"));
     assert_eq!(field(&received, "decoded_records"), "4");
+    assert_eq!(field(&received, "placement_state"), "Closed");
+    for name in [
+        "placement_sequence",
+        "placement_stripe",
+        "placement_offset",
+        "placement_frame_bytes",
+    ] {
+        assert_eq!(field(&received, name), field(&receipt, name));
+    }
     assert_eq!(field(&received, "value_hex"), field(&receipt, "value_hex"));
     assert_eq!(
         field(&received, "input_sha256"),
@@ -237,4 +252,239 @@ fn native_stage_receive_exact_value_version_reopen_and_refusal() {
     println!("prefix neighbor ack={neighbor:?}; unrelated-row refusal={refusal}");
     assert_eq!(fs::read(input).unwrap(), bytes);
     fs::remove_dir_all(&p).unwrap();
+}
+
+#[test]
+fn native_existing_state_checks_the_received_frame_even_with_other_latest_frames() {
+    use membus::{
+        atomic::{AtomicAck, FinalChange},
+        chunks::{self, Rec},
+        Class, Config, Mutation, Store,
+    };
+    use std::ffi::OsStr;
+
+    let root = PathBuf::from(
+        std::env::var_os("MEMBUS_TEST_OUTPUT").unwrap_or_else(|| ".test-output".into()),
+    )
+    .join(format!(
+        "receiving-placement-{}-{}",
+        std::process::id(),
+        membus::now_ms()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let input = root.join("input");
+    let expected = b"selected";
+    fs::write(&input, expected).unwrap();
+    let config = Config {
+        flush_ms: 0,
+        tick_ms: 3_600_000,
+        retire_ms: 3_600_000,
+        ..Config::default()
+    };
+    let ns = "authored";
+    let key = "builtin/value";
+    let stripe = |namespace: &str, key: &str| {
+        membus::crc32(&[namespace.as_bytes(), &[0], key.as_bytes()].concat()) as usize % 4
+    };
+    let selected_stripe = stripe(ns, key);
+    let other = (0..100)
+        .map(|n| format!("other/{n}"))
+        .find(|key| stripe("other", key) == selected_stripe)
+        .unwrap();
+    let put = |store: &Store, ns: &str, key: &str, id: &str, bytes: &[u8]| {
+        let result = store.mutate(Mutation {
+            ns: ns.into(),
+            key: key.into(),
+            op_id: id.into(),
+            deadline: u64::MAX,
+            ack: 2,
+            expected: None,
+            bytes: bytes.to_vec(),
+            remove: false,
+        });
+        assert_eq!((result.code, result.ack), (0, 2));
+        result.version
+    };
+    let latest = |store: &Store, ns: &str, prefix: &str| {
+        let result = store.set_policy(ns, prefix, Some(Class::LATEST), u64::MAX);
+        assert_eq!((result.code, result.ack), (0, 2));
+    };
+    let head = option_env!("MEMBUS_BUILD_HEAD").unwrap_or("unrecorded");
+    for case in [
+        "shared",
+        "before-policy",
+        "duplicate-frame",
+        "duplicate-chunk",
+        "atomic",
+    ] {
+        let state = root.join(case);
+        let store = Store::open(&state, config.clone()).unwrap();
+        let revision = match case {
+            "shared" | "duplicate-frame" | "duplicate-chunk" => {
+                latest(&store, "other", "other/");
+                put(&store, "other", &other, "neighbor", b"other");
+                latest(&store, ns, key);
+                put(&store, ns, key, "target", expected)
+            }
+            "atomic" => {
+                let request = store
+                    .capture_namespace(ns)
+                    .unwrap()
+                    .prepare(
+                        "atomic-target",
+                        AtomicAck::Flush,
+                        vec![
+                            FinalChange::put("earlier", b"other".to_vec()),
+                            FinalChange::put(key, expected.to_vec()),
+                        ],
+                    )
+                    .unwrap();
+                let outcome = store.publish_atomic(&request, u64::MAX).unwrap();
+                assert_eq!((outcome.code, outcome.ack), (0, 2));
+                latest(&store, ns, key);
+                put(&store, ns, &format!("{key}/later"), "later", b"later");
+                outcome.version + 1
+            }
+            _ => {
+                let revision = put(&store, ns, key, "target", expected);
+                latest(&store, ns, key);
+                put(&store, ns, &format!("{key}/later"), "later", b"later");
+                revision
+            }
+        };
+        let value = store.get(ns, key).unwrap();
+        assert_eq!(
+            (value.version, value.ack, value.bytes.as_slice()),
+            (revision, 2, expected.as_slice())
+        );
+        drop(store);
+
+        let dir = state.join("chunks");
+        let catalogue = dir.join("catalogue.log");
+        if case.starts_with("duplicate") {
+            let mut files = chunks::list_chunk_files(&dir)
+                .unwrap()
+                .into_iter()
+                .filter(|(class, _, _, _)| class == "latest");
+            let (_, stripe, _, path) = files.next().unwrap();
+            assert!(files.next().is_none());
+            let bytes = fs::read(&path).unwrap();
+            let first_len = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize + 16;
+            let target_frame = &bytes[first_len..];
+            if case == "duplicate-frame" {
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(path)
+                    .unwrap()
+                    .write_all(target_frame)
+                    .unwrap();
+            } else {
+                // A valid competing copy in Forever must count before any Latest filter.
+                let seq = 100;
+                let mut writer = chunks::Catalogue::open(&catalogue).unwrap();
+                writer
+                    .append(&chunks::CatRecord {
+                        at_ms: membus::now_ms(),
+                        rec: Rec::Open {
+                            seq,
+                            stripe: stripe as u8,
+                            class: Class::FOREVER,
+                            policy: "(default)".into(),
+                            next: revision + 1,
+                        },
+                    })
+                    .unwrap();
+                fs::write(
+                    chunks::chunk_path(&dir, Class::FOREVER, stripe, seq),
+                    target_frame,
+                )
+                .unwrap();
+            }
+        }
+
+        let original_frames: Vec<_> = chunks::list_chunk_files(&dir).unwrap().into_iter()
+            .map(|(_, _, _, path)| {
+                let bytes = fs::read(&path).unwrap();
+                (path, bytes)
+            }).collect();
+        let output = root.join(format!("{case}.json"));
+        let snapshot = root.join(format!("{case}.cat"));
+        let ok = invoke(
+            &[
+                OsStr::new("receive"),
+                state.as_os_str(),
+                OsStr::new(ns),
+                OsStr::new(key),
+                input.as_os_str(),
+                OsStr::new(head),
+                OsStr::new(&revision.to_string()),
+                OsStr::new("--catalogue-snapshot"),
+                snapshot.as_os_str(),
+            ],
+            &output,
+        );
+        let receipt = fs::read_to_string(&output).unwrap();
+        if case == "shared" {
+            assert!(
+                ok,
+                "{}",
+                fs::read_to_string(output.with_extension("stderr")).unwrap()
+            );
+            assert_eq!(field(&receipt, "version"), revision.to_string());
+            assert_eq!(field(&receipt, "placement_class"), "latest");
+            assert_eq!(field(&receipt, "placement_state"), "Closed");
+            assert_eq!(
+                field(&receipt, "received_reply_hex"),
+                field(&receipt, "reopened_reply_hex")
+            );
+            assert_eq!(field(&receipt, "ack_reply_hex"), "");
+            assert_snapshot(&receipt, &snapshot);
+            let seq = field(&receipt, "placement_sequence").parse().unwrap();
+            let offset = field(&receipt, "placement_offset").parse().unwrap();
+            assert!(offset > 0);
+            assert_eq!(
+                field(&receipt, "placement_stripe"),
+                selected_stripe.to_string()
+            );
+            assert!(receiver::read(&snapshot)
+                .unwrap()
+                .iter()
+                .any(|r| matches!(&r.rec,
+                Rec::Open { seq: id, stripe, class, policy, .. }
+                    if *id == seq && usize::from(*stripe) == selected_stripe &&
+                        *class == Class::LATEST && policy == "other/other/")));
+            let path = chunks::chunk_path(&dir, Class::LATEST, selected_stripe, seq);
+            let mut file = fs::File::open(path).unwrap();
+            use std::io::{Seek, SeekFrom};
+            file.seek(SeekFrom::Start(offset)).unwrap();
+            let len = file.metadata().unwrap().len();
+            let chunks::Frame::Whole(payload, bytes) =
+                chunks::read_frame_at(&mut file, b"MBK1", offset, len, "shared data").unwrap()
+            else {
+                panic!("expected the selected frame");
+            };
+            assert_eq!(field(&receipt, "placement_frame_bytes"), bytes.to_string());
+            assert_eq!(
+                chunks::record_key(&payload),
+                Some((ns.into(), key.into(), revision))
+            );
+            println!("{case}: {receipt}");
+        } else {
+            assert!(!ok, "{case}: {receipt}");
+            assert!(receipt.is_empty());
+            assert!(!snapshot.exists());
+            let refusal = fs::read_to_string(output.with_extension("stderr")).unwrap();
+            let reason = if case.starts_with("duplicate") {
+                "multiple durable records".to_owned()
+            } else {
+                format!("received revision {revision} is physically forever")
+            };
+            assert!(refusal.contains(&reason), "{case}: {refusal}");
+            println!("{case}: {refusal}");
+        }
+        for (path, bytes) in original_frames {
+            assert_eq!(fs::read(path).unwrap(), bytes);
+        }
+    }
+    fs::remove_dir_all(root).unwrap();
 }

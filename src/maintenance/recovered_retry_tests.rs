@@ -143,12 +143,32 @@ fn recovered_retry_already_expired_outcomes_do_not_hold_a_chunk() {
 }
 
 #[test]
-fn recovered_retry_explicit_retirement_keeps_its_existing_override() {
+fn recovered_retry_pins_ordinary_chunk_even_during_explicit_retirement() {
     let f = Fixture::new();
-    let Seed { store, config, old_id, old_path, latest, .. } = seed(&f, Class::LATEST, true);
+    let Seed { store, config, original, first, old_id, old_path, latest, .. } =
+        seed(&f, Class::LATEST, true);
     drop(store);
-    let (store, _) = reopen(&f, config, RESTART);
+    let catalogue = f.0.join("chunks/catalogue.log");
+    let (store, _) = reopen(&f, config.clone(), RESTART);
+    let retained_bytes = fs::read(&old_path).unwrap();
+    let retained_catalogue = fs::read(&catalogue).unwrap();
+    assert!(!store.retire_chunk(old_id).unwrap());
+    assert_eq!(fs::read(&old_path).unwrap(), retained_bytes);
+    assert_eq!(fs::read(&catalogue).unwrap(), retained_catalogue);
+    drop(store);
+
+    let (store, clock) = reopen(&f, config.clone(), RESTART);
+    assert_eq!(store.mutate(original.clone()), first);
+    clock.advance(WINDOW);
+    assert_eq!(store.mutate(original.clone()), first);
+    assert!(!store.retire_chunk(old_id).unwrap());
+    assert_eq!(fs::read(&old_path).unwrap(), retained_bytes);
+    assert_eq!(fs::read(&catalogue).unwrap(), retained_catalogue);
+    clock.advance(1);
+    assert_eq!(store.mutate(original).code, 13);
     assert!(store.retire_chunk(old_id).unwrap());
     assert!(!old_path.exists());
+    drop(store);
+    let (store, _) = reopen(&f, config, RESTART + WINDOW + 1);
     assert_eq!(store.get("retire-clock", "key").unwrap().version, latest.version);
 }

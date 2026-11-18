@@ -1862,12 +1862,15 @@ mod catalogue_failure_tests {
         c.fail_recovery_once = true;
         assert!(c.append(&record(2)).unwrap_err().to_string().contains("boundary recovery failed"));
         let path = c.path.clone();
+        let marker = append_pending_path(&path);
+        let pending = fs::read(&marker).unwrap();
         let failed_bytes = fs::read(&path).unwrap();
         assert!(failed_bytes.ends_with(&encode(&record(2))), "witness must leave the complete failed frame");
         drop(c);
         assert!(read_catalogue(&path).unwrap_err().to_string().contains("append unresolved"));
-        assert!(Catalogue::open(&path).err().unwrap().to_string().contains("ownership refused"));
+        assert!(Catalogue::open(&path).err().unwrap().to_string().contains("append unresolved"));
         assert_eq!(fs::read(&path).unwrap(), failed_bytes, "refusal preserves recovery evidence");
+        assert_eq!(fs::read(&marker).unwrap(), pending);
     }
     #[test]
     fn unresolved_complete_append_can_be_replaced_only_with_known_live_state() {

@@ -14,6 +14,8 @@ pub mod atomic;
 pub mod atomic_population;
 mod atomic_wire;
 pub mod recovery_image;
+mod receiving;
+pub use receiving::DurablePlacement;
 #[cfg(windows)]
 pub mod pipe_io;
 use std::{

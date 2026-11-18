@@ -25,7 +25,7 @@ fn image(
 }
 #[test]
 fn durable_record_frozen_layout_and_truncation_remain_strict() {
-    for (ack, remove, expected) in [(1, 0, u64::MAX), (2, 1, 0), (2, 255, 37)] {
+    for (ack, remove, expected) in [(1, 0, u64::MAX), (2, 1, 0)] {
         let bytes = image(
             "é".as_bytes(),
             "e\u{301}".as_bytes(),
@@ -49,6 +49,7 @@ fn durable_record_frozen_layout_and_truncation_remain_strict() {
             }
         );
         assert_eq!(m.bytes, vec![0, 127, 255]);
+        assert_eq!(mutation_bytes(&m, version, at), bytes);
         for end in 0..bytes.len() {
             assert!(
                 parse_record(&bytes[..end]).is_err(),
@@ -59,6 +60,14 @@ fn durable_record_frozen_layout_and_truncation_remain_strict() {
         trailing.push(0);
         assert!(parse_record(&trailing).is_err());
     }
+}
+#[test]
+fn noncanonical_scalar_remove_byte_refuses() {
+    assert_eq!(
+        parse_record(&image("é".as_bytes(), "e\u{301}".as_bytes(),
+            b"append-identity", 2, 255, 37, &[0, 127, 255])).unwrap_err(),
+        3,
+    );
 }
 #[test]
 fn durable_record_identifiers_ack_and_value_bounds_remain_strict() {

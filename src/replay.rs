@@ -236,7 +236,7 @@ impl Replayed {
     }
 }
 /// The legacy stripe logs a folder holds: the state root before the import, legacy-<epoch>/ after it.
-fn legacy_files(dir: &Path) -> Vec<(usize, PathBuf)> {
+pub(super) fn legacy_files(dir: &Path) -> Vec<(usize, PathBuf)> {
     (0..4)
         .map(|i| (i, dir.join(format!("stripe-{i}.log"))))
         .filter(|(_, p)| p.exists())
