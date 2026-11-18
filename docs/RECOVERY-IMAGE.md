@@ -1,5 +1,11 @@
 # Stopped library images and quarantined recovery
 
+The legacy capture/validation calls below are **unfunded compatibility APIs**.
+The selected caller-funded capability is described in [IMAGE-RESOURCES.md](IMAGE-RESOURCES.md):
+`Store::image_budget`, `capture_stopped_funded`, `validate_image_funded` and
+`CaptureCompletion::persist_new_funded` use actual allocation/resource owners.
+Neither the legacy count limits nor a budget integer in a certificate funds them.
+
 `Store::capture_stopped` consumes the actual library Store owner. It captures
 the complete recursive population of ordinary file bytes and directories under
 that Store root, including unknown regular files, empty directories, catalogue

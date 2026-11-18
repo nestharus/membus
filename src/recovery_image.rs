@@ -2,11 +2,7 @@
 //!
 //! An image is evidence of a stopped durable root, never a grant to resume an
 //! old writer. The retained image is never passed to mutable Store recovery.
-use crate::{
-    chunks::{sha256_file, Sha256},
-    client::Ack,
-    Config, Health2, Store, Value,
-};
+use crate::{chunks::Sha256, client::Ack, Config, Health2, Store, Value};
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
@@ -20,6 +16,12 @@ const COMPLETE: &str = "capture.complete";
 const PAYLOAD: &str = "root";
 const MAX_MANIFEST: u64 = 64 * 1024 * 1024;
 const MAX_ENTRIES: usize = 1_000_000;
+mod funding;
+use funding::Context;
+pub use funding::{
+    validate_image_funded, FundedCompletion, FundedImage, ImageBudget, ImageFailure, ImageLimits,
+    ImageOutput, ImageProgress, ImageResource, ImageShortfall, ImageStage,
+};
 #[cfg(test)]
 #[path = "recovery_image_correction_tests.rs"]
 mod correction_tests;
@@ -118,11 +120,6 @@ fn invalid(message: impl Into<String>) -> io::Error {
 fn context(stage: &str, path: &Path, error: io::Error) -> io::Error {
     io::Error::new(error.kind(), format!("{stage} {}: {error}", path.display()))
 }
-fn hash(bytes: &[u8]) -> String {
-    let mut h = Sha256::new();
-    h.update(bytes);
-    h.hex()
-}
 fn blob(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend((bytes.len() as u64).to_le_bytes());
     out.extend(bytes);
@@ -133,23 +130,8 @@ fn text(out: &mut Vec<u8>, value: &str) {
 
 /// Canonical configuration binding. It includes test seams rather than silently
 /// dropping them; callback seams cannot be faithfully captured and are refused.
-fn config_bytes(c: &Config) -> io::Result<Vec<u8>> {
-    #[cfg(test)]
-    if c.sync_test_gate.is_some()
-        || c.sync_test_notice.is_some()
-        || c.flush_covered_count.is_some()
-        || c.recovery_dir_sync.is_some()
-        || c.replay_report_dir_sync.is_some()
-        || c.chunk_dir_sync.is_some()
-        || c.state_dir_sync.is_some()
-        || c.stop_after_replay_truncation
-    {
-        return Err(invalid(
-            "capture configuration contains an unsupported callback seam",
-        ));
-    }
-    let mut out = b"MBCFG1".to_vec();
-    for value in [
+fn config_values(c: &Config) -> impl ExactSizeIterator<Item = u64> {
+    [
         c.cache_bytes as u64,
         c.signal_history as u64,
         c.signal_bytes as u64,
@@ -182,36 +164,109 @@ fn config_bytes(c: &Config) -> io::Result<Vec<u8>> {
         c.retire_stop_after as u64,
         c.import_inject_difference as u64,
         c.clock.is_some() as u64,
-    ] {
-        out.extend(value.to_le_bytes());
+    ]
+    .into_iter()
+}
+fn config_bytes(c: &Config) -> io::Result<Vec<u8>> {
+    config_bytes_in(c, &Context::legacy())
+}
+fn config_bytes_in(c: &Config, ctx: &Context) -> io::Result<Vec<u8>> {
+    #[cfg(test)]
+    if c.sync_test_gate.is_some()
+        || c.sync_test_notice.is_some()
+        || c.flush_covered_count.is_some()
+        || c.recovery_dir_sync.is_some()
+        || c.replay_report_dir_sync.is_some()
+        || c.chunk_dir_sync.is_some()
+        || c.state_dir_sync.is_some()
+        || c.stop_after_replay_truncation
+    {
+        return Err(invalid(
+            "capture configuration contains an unsupported callback seam",
+        ));
     }
-    fn policy(out: &mut Vec<u8>, p: crate::CachePolicy) {
-        out.extend(p.initial_ttl.to_le_bytes());
-        out.extend(p.active_ttl.to_le_bytes());
-        out.extend([p.refresh_on_read as u8, p.never_cache as u8]);
-    }
-    policy(&mut out, c.cache_policy);
-    out.extend((c.cache_rules.len() as u64).to_le_bytes());
+    let values = config_values(c);
+    let mut size = 6usize + values.len() * 8 + 18 + 8 + if c.clock.is_some() { 8 } else { 0 };
     for r in &c.cache_rules {
-        out.push(r.namespace.is_some() as u8);
-        text(&mut out, r.namespace.as_deref().unwrap_or(""));
-        text(&mut out, &r.prefix);
-        out.push(r.class.is_some() as u8);
-        if let Some(class) = r.class {
-            out.push(class.kind);
-            out.extend(class.retention_ms.to_le_bytes());
-        }
-        text(&mut out, &r.label);
-        policy(&mut out, r.policy);
+        size = size
+            .checked_add(
+                1 + 8
+                    + r.namespace.as_ref().map_or(0, String::len)
+                    + 8
+                    + r.prefix.len()
+                    + 1
+                    + if r.class.is_some() { 9 } else { 0 }
+                    + 8
+                    + r.label.len()
+                    + 18,
+            )
+            .ok_or_else(|| invalid("capture configuration size overflow"))?;
     }
-    if let Some(clock) = &c.clock {
-        out.extend(clock.utc_ms().to_le_bytes());
-    }
+    ctx.allocate(size)?;
+    ctx.work(size as u64)?;
+    let mut out = Vec::with_capacity(size);
+    config_parts(c, |part| {
+        out.extend_from_slice(part);
+        Ok(())
+    })?;
     Ok(out)
 }
 
-fn portable(path: &Path) -> io::Result<String> {
-    let mut names = Vec::new();
+fn config_parts(c: &Config, mut emit: impl FnMut(&[u8]) -> io::Result<()>) -> io::Result<()> {
+    fn blob(emit: &mut impl FnMut(&[u8]) -> io::Result<()>, bytes: &[u8]) -> io::Result<()> {
+        emit(&(bytes.len() as u64).to_le_bytes())?;
+        emit(bytes)
+    }
+    fn policy(
+        emit: &mut impl FnMut(&[u8]) -> io::Result<()>,
+        p: crate::CachePolicy,
+    ) -> io::Result<()> {
+        emit(&p.initial_ttl.to_le_bytes())?;
+        emit(&p.active_ttl.to_le_bytes())?;
+        emit(&[p.refresh_on_read as u8, p.never_cache as u8])
+    }
+    emit(b"MBCFG1")?;
+    for value in config_values(c) {
+        emit(&value.to_le_bytes())?;
+    }
+    policy(&mut emit, c.cache_policy)?;
+    emit(&(c.cache_rules.len() as u64).to_le_bytes())?;
+    for r in &c.cache_rules {
+        emit(&[r.namespace.is_some() as u8])?;
+        blob(&mut emit, r.namespace.as_deref().unwrap_or("").as_bytes())?;
+        blob(&mut emit, r.prefix.as_bytes())?;
+        emit(&[r.class.is_some() as u8])?;
+        if let Some(class) = r.class {
+            emit(&[class.kind])?;
+            emit(&class.retention_ms.to_le_bytes())?;
+        }
+        blob(&mut emit, r.label.as_bytes())?;
+        policy(&mut emit, r.policy)?;
+    }
+    if let Some(clock) = &c.clock {
+        emit(&clock.utc_ms().to_le_bytes())?;
+    }
+    Ok(())
+}
+fn config_matches(c: &Config, bytes: &[u8], ctx: &Context) -> io::Result<bool> {
+    let _temporary = ctx.temporary(1024)?;
+    ctx.work(bytes.len() as u64)?;
+    let mut offset = 0usize;
+    let mut same = true;
+    config_parts(c, |part| {
+        let end = offset
+            .checked_add(part.len())
+            .ok_or_else(|| invalid("configuration comparison overflow"))?;
+        same &= bytes.get(offset..end) == Some(part);
+        offset = end;
+        Ok(())
+    })?;
+    Ok(same && offset == bytes.len())
+}
+
+fn portable_in(path: &Path, ctx: &Context) -> io::Result<String> {
+    let mut bytes = 0usize;
+    let mut count = 0usize;
     for component in path.components() {
         let Component::Normal(name) = component else {
             return Err(invalid("non-relative image path"));
@@ -222,16 +277,37 @@ fn portable(path: &Path) -> io::Result<String> {
         if name.is_empty() || name.contains(['\\', '/', ':', '\0']) || name.ends_with(['.', ' ']) {
             return Err(invalid("nonportable image path"));
         }
-        names.push(name);
+        ctx.work(1)?;
+        bytes = bytes
+            .checked_add(name.len() + usize::from(count != 0))
+            .ok_or_else(|| invalid("image path length overflow"))?;
+        count += 1;
     }
-    if names.is_empty() {
+    if count == 0 {
         return Err(invalid("empty image path"));
     }
-    Ok(names.join("/"))
+    ctx.allocate(bytes)?;
+    let mut name = String::with_capacity(bytes);
+    for component in path.components() {
+        let Component::Normal(part) = component else {
+            unreachable!()
+        };
+        if !name.is_empty() {
+            name.push('/');
+        }
+        name.push_str(part.to_str().unwrap());
+    }
+    Ok(name)
 }
-fn relative(text: &str) -> io::Result<PathBuf> {
+fn relative_in(text: &str, ctx: &Context) -> io::Result<PathBuf> {
+    ctx.allocate(
+        text.len()
+            .checked_mul(2)
+            .ok_or_else(|| invalid("image path size overflow"))?
+            + 32,
+    )?;
     let p = PathBuf::from(text);
-    if portable(&p)? != text {
+    if portable_in(&p, ctx)? != text {
         return Err(invalid("noncanonical image path"));
     }
     Ok(p)
@@ -254,10 +330,20 @@ fn normal(meta: &fs::Metadata) -> io::Result<()> {
     Ok(())
 }
 fn root_directory(root: &Path) -> io::Result<PathBuf> {
+    root_directory_in(root, &Context::legacy())
+}
+fn root_directory_in(root: &Path, ctx: &Context) -> io::Result<PathBuf> {
     if !root.is_absolute() {
         return Err(invalid("absolute image selector required"));
     }
-    let mut walked = PathBuf::new();
+    ctx.allocate(
+        root.as_os_str()
+            .len()
+            .checked_mul(4)
+            .ok_or_else(|| invalid("selector size overflow"))?
+            + 64,
+    )?;
+    let mut walked = PathBuf::with_capacity(root.as_os_str().len() * 2 + 32);
     for c in root.components() {
         if matches!(c, Component::ParentDir | Component::CurDir) {
             return Err(invalid("canonical image selector required"));
@@ -269,43 +355,59 @@ fn root_directory(root: &Path) -> io::Result<PathBuf> {
         if matches!(c, Component::Prefix(_)) {
             continue;
         }
+        ctx.work(1)?;
         normal(
             &fs::symlink_metadata(&walked)
                 .map_err(|e| context("selector ancestor metadata", &walked, e))?,
         )?;
     }
+    ctx.work(2)?;
     let meta = fs::symlink_metadata(root).map_err(|e| context("selector metadata", root, e))?;
     if !meta.is_dir() {
         return Err(invalid("image selector is not a directory"));
     }
-    root.canonicalize()
-        .map_err(|e| context("selector canonicalization", root, e))
+    // Windows final-path representation is at most 32768 UTF-16 code units.
+    // This is temporary OS-path workspace, not an image population cutoff.
+    #[cfg(windows)]
+    let maximum = 4 * 32768;
+    #[cfg(not(windows))]
+    let maximum = root.as_os_str().len() * 4 + 64;
+    ctx.allocate(maximum)?;
+    let canonical = root
+        .canonicalize()
+        .map_err(|e| context("selector canonicalization", root, e))?;
+    if canonical.capacity() > maximum {
+        return Err(invalid("canonical path exceeds admitted OS representation"));
+    }
+    ctx.release(maximum - canonical.capacity());
+    Ok(canonical)
 }
 fn new_directory(path: &Path) -> io::Result<PathBuf> {
+    new_directory_in(path, &Context::legacy())
+}
+fn new_directory_in(path: &Path, ctx: &Context) -> io::Result<PathBuf> {
     if !path.is_absolute() {
         return Err(invalid("absolute new output selector required"));
     }
-    let parent = root_directory(
+    let parent = root_directory_in(
         path.parent()
             .ok_or_else(|| invalid("output parent required"))?,
+        ctx,
     )?;
     let name = path
         .file_name()
         .ok_or_else(|| invalid("output name required"))?;
-    portable(Path::new(name))?;
+    portable_in(Path::new(name), ctx)?;
+    ctx.allocate((parent.as_os_str().len() + name.len() + 2) * 4 + 64)?;
     let path = parent.join(name);
+    ctx.work(1)?;
     fs::create_dir(&path).map_err(|e| context("create selected output", &path, e))?;
+    ctx.output(ImageOutput::Incomplete);
     Ok(path)
-}
-fn read_handle(mut file: File) -> io::Result<Vec<u8>> {
-    file.seek(SeekFrom::Start(0))?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    Ok(bytes)
 }
 
 #[cfg(windows)]
-fn regular_streams(file: &File) -> io::Result<()> {
+fn regular_streams_in(file: &File, ctx: &Context) -> io::Result<()> {
     use std::{ffi::c_void, os::windows::io::AsRawHandle};
     #[link(name = "kernel32")]
     extern "system" {
@@ -319,7 +421,9 @@ fn regular_streams(file: &File) -> io::Result<()> {
     // FILE_STREAM_INFO is a linked sequence; refuse oversized inventories
     // rather than omitting alternate streams. Existing locked-owner handles
     // permit inspection without releasing directory ownership.
-    let mut bytes = vec![0u8; 65536];
+    let _workspace = ctx.temporary(65536 + 512)?;
+    ctx.work(1)?;
+    let mut bytes = [0u8; 65536];
     if unsafe {
         GetFileInformationByHandleEx(
             file.as_raw_handle(),
@@ -348,14 +452,7 @@ fn regular_streams(file: &File) -> io::Result<()> {
         let name = bytes
             .get(offset + 24..offset + 24 + length)
             .ok_or_else(|| invalid("oversized filesystem stream name"))?;
-        let name = String::from_utf16(
-            &name
-                .chunks_exact(2)
-                .map(|b| u16::from_le_bytes([b[0], b[1]]))
-                .collect::<Vec<_>>(),
-        )
-        .map_err(|_| invalid("invalid filesystem stream encoding"))?;
-        if name != "::$DATA" {
+        if name != b":\0:\0$\0D\0A\0T\0A\0" {
             return Err(invalid(
                 "alternate filesystem streams are unsupported by the regular-byte image",
             ));
@@ -373,12 +470,12 @@ fn regular_streams(file: &File) -> io::Result<()> {
     Ok(())
 }
 #[cfg(not(windows))]
-fn regular_streams(_: &File) -> io::Result<()> {
+fn regular_streams_in(_: &File, _: &Context) -> io::Result<()> {
     Ok(())
 }
 
 #[cfg(windows)]
-fn directory_streams(path: &Path) -> io::Result<()> {
+fn directory_streams_in(path: &Path, ctx: &Context) -> io::Result<()> {
     use std::{ffi::c_void, os::windows::ffi::OsStrExt};
     #[repr(C)]
     struct Stream {
@@ -395,6 +492,8 @@ fn directory_streams(path: &Path) -> io::Result<()> {
         ) -> *mut c_void;
         fn FindClose(handle: *mut c_void) -> i32;
     }
+    let _workspace = ctx.temporary(path.as_os_str().len() * 4 + 1024)?;
+    ctx.work(1)?;
     let name: Vec<_> = path.as_os_str().encode_wide().chain(Some(0)).collect();
     let mut stream = Stream {
         size: 0,
@@ -418,24 +517,77 @@ fn directory_streams(path: &Path) -> io::Result<()> {
     ))
 }
 #[cfg(not(windows))]
-fn directory_streams(_: &Path) -> io::Result<()> {
+fn directory_streams_in(_: &Path, _: &Context) -> io::Result<()> {
     Ok(())
 }
 
+fn reserve_vec<T>(values: &mut Vec<T>, ctx: &Context) -> io::Result<()> {
+    if values.len() < values.capacity() {
+        return Ok(());
+    }
+    let old = values.capacity();
+    let next = old.checked_mul(2).unwrap_or(usize::MAX).max(4);
+    let bytes = next
+        .checked_mul(std::mem::size_of::<T>())
+        .ok_or_else(|| invalid("image vector size overflow"))?;
+    ctx.allocate(bytes)?;
+    values
+        .try_reserve_exact(next - values.len())
+        .map_err(|_| io::Error::other("image backing allocation failed"))?;
+    ctx.release(old * std::mem::size_of::<T>());
+    Ok(())
+}
+fn hex_in(h: Sha256, ctx: &Context) -> io::Result<String> {
+    ctx.allocate(64)?;
+    let _temporary = ctx.temporary(512)?;
+    let mut text = String::with_capacity(64);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for b in h.finish() {
+        text.push(HEX[(b >> 4) as usize] as char);
+        text.push(HEX[(b & 15) as usize] as char);
+    }
+    Ok(text)
+}
+fn hash_in(bytes: &[u8], ctx: &Context) -> io::Result<String> {
+    let _temporary = ctx.temporary(512)?;
+    ctx.work(bytes.len() as u64)?;
+    let mut h = Sha256::new();
+    h.update(bytes);
+    hex_in(h, ctx)
+}
+fn hash_file_in(mut file: File, size: u64, ctx: &Context) -> io::Result<String> {
+    let _temporary = ctx.temporary(8192 + 1024)?;
+    ctx.io(size
+        .checked_add(1)
+        .ok_or_else(|| invalid("image input size overflow"))?)?;
+    ctx.work(size)?;
+    file.seek(SeekFrom::Start(0))?;
+    let mut h = Sha256::new();
+    let mut buf = [0u8; 8192];
+    let mut remaining = size;
+    while remaining > 0 {
+        let n = remaining.min(buf.len() as u64) as usize;
+        file.read_exact(&mut buf[..n])?;
+        h.update(&buf[..n]);
+        remaining -= n as u64;
+    }
+    if file.read(&mut buf[..1])? != 0 {
+        return Err(invalid("image input grew beyond admitted extent"));
+    }
+    hex_in(h, ctx)
+}
 struct OwnedFile {
-    bytes: Vec<u8>,
     handle: File,
 }
-
-/// File contents held by directory ownership are read through their existing
-/// handles. The source retains every lock for the entire capture.
-fn owned_files(store: &Store) -> io::Result<BTreeMap<String, OwnedFile>> {
+fn owned_files_in(store: &Store, ctx: &Context) -> io::Result<BTreeMap<String, OwnedFile>> {
+    // At most the two existing cooperative ownership handles. Their payloads
+    // stream through those handles; no lock-sized read_to_end buffer is made.
+    ctx.allocate(1024)?;
+    ctx.work(3)?;
     let mut files = BTreeMap::new();
     files.insert(
         "owner.lock".into(),
         OwnedFile {
-            bytes: read_handle(store._owner.try_clone()?)
-                .map_err(|e| context("read owned lock", Path::new("owner.lock"), e))?,
             handle: store._owner.try_clone()?,
         },
     );
@@ -447,87 +599,129 @@ fn owned_files(store: &Store) -> io::Result<BTreeMap<String, OwnedFile>> {
             .ok_or_else(|| invalid("chunk directory name"))?
             .to_str()
             .ok_or_else(|| invalid("chunk directory encoding"))?;
-        let handle = cat.capture_owner()?;
+        ctx.allocate(name.len() + 32)?;
         files.insert(
             format!("{name}.catalogue-owner"),
             OwnedFile {
-                bytes: read_handle(handle.try_clone()?)
-                    .map_err(|e| context("read catalogue ownership", Path::new(name), e))?,
-                handle,
+                handle: cat.capture_owner()?,
             },
         );
     }
     Ok(files)
 }
 fn inventory(root: &Path, owned: &BTreeMap<String, OwnedFile>) -> io::Result<Vec<ImageEntry>> {
-    fn walk(
-        root: &Path,
-        dir: &Path,
-        owned: &BTreeMap<String, OwnedFile>,
-        out: &mut Vec<ImageEntry>,
-    ) -> io::Result<()> {
-        directory_streams(dir).map_err(|e| context("inventory directory streams", dir, e))?;
-        for entry in fs::read_dir(dir)? {
+    inventory_in(root, owned, &Context::legacy())
+}
+fn inventory_in(
+    root: &Path,
+    owned: &BTreeMap<String, OwnedFile>,
+    ctx: &Context,
+) -> io::Result<Vec<ImageEntry>> {
+    let mut entries = Vec::new();
+    let mut dirs = Vec::new();
+    reserve_vec(&mut dirs, ctx)?;
+    ctx.allocate(root.as_os_str().len())?;
+    dirs.push(root.to_owned());
+    // Iterative traversal: directory depth consumes explicitly admitted backing,
+    // not an unbounded recursive call stack.
+    while let Some(dir) = dirs.pop() {
+        directory_streams_in(&dir, ctx)?;
+        let _reader_workspace = ctx.temporary(dir.as_os_str().len() * 4 + 4096)?;
+        ctx.work(1)?;
+        let mut reader = fs::read_dir(&dir)?;
+        loop {
+            // Standard directory-entry/name/path extraction uses bounded OS
+            // component workspace (Windows WIN32_FIND_DATA has 260 UTF-16 units).
+            let _entry = ctx.temporary(dir.as_os_str().len() * 8 + 4 * 260 + 1024)?;
+            ctx.work(1)?;
+            let Some(entry) = reader.next() else { break };
             let entry = entry?;
             let path = entry.path();
+            ctx.work(1)?;
             let meta = fs::symlink_metadata(&path)?;
             normal(&meta)?;
-            if out.len() >= MAX_ENTRIES {
+            if !ctx.funded() && entries.len() >= MAX_ENTRIES {
                 return Err(invalid("capture entry limit exceeded"));
             }
-            let name = portable(
+            let name = portable_in(
                 path.strip_prefix(root)
                     .map_err(|_| invalid("image path escaped root"))?,
+                ctx,
             )?;
             let digest = if meta.is_dir() {
                 String::new()
-            } else if let Some(file) = owned.get(&name) {
-                if meta.len() != file.bytes.len() as u64 {
-                    return Err(invalid("owned lock length changed"));
-                }
-                regular_streams(&file.handle)
-                    .map_err(|e| context("inventory owned-file streams", &path, e))?;
-                hash(&file.bytes)
             } else {
-                regular_streams(&File::open(&path)?)
-                    .map_err(|e| context("inventory regular-file streams", &path, e))?;
-                sha256_file(&path)?
+                ctx.work(1)?;
+                let file = if let Some(owned) = owned.get(&name) {
+                    owned.handle.try_clone()?
+                } else {
+                    File::open(&path)?
+                };
+                regular_streams_in(&file, ctx)?;
+                hash_file_in(file, meta.len(), ctx)?
             };
-            out.push(ImageEntry {
+            reserve_vec(&mut entries, ctx)?;
+            entries.push(ImageEntry {
                 path: name,
                 directory: meta.is_dir(),
                 bytes: if meta.is_dir() { 0 } else { meta.len() },
                 sha256: digest,
             });
             if meta.is_dir() {
-                walk(root, &path, owned, out)?;
+                reserve_vec(&mut dirs, ctx)?;
+                ctx.allocate(path.capacity())?;
+                dirs.push(path);
             }
         }
-        Ok(())
+        ctx.release(dir.capacity());
     }
-    let mut entries = Vec::new();
-    walk(root, root, owned, &mut entries)?;
-    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    ctx.release(dirs.capacity() * std::mem::size_of::<PathBuf>());
+    // Unstable sort needs no auxiliary population allocation. The case-folded
+    // set is a separate, pre-admitted temporary; it never replaces history.
+    ctx.work(entries.len() as u64)?;
+    entries.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+    let folded_bytes = entries.iter().try_fold(0usize, |n, e| {
+        let lower = e
+            .path
+            .chars()
+            .flat_map(char::to_lowercase)
+            .map(char::len_utf8)
+            .sum::<usize>();
+        n.checked_add(512 + lower * 2 + e.path.len())
+            .ok_or_else(|| invalid("image path-set size overflow"))
+    })?;
+    let _folded = ctx.temporary(folded_bytes)?;
     let mut folded = std::collections::BTreeSet::new();
     for e in &entries {
+        ctx.work(e.path.len() as u64 + 1)?;
         if !folded.insert(e.path.to_lowercase()) {
             return Err(invalid("image has case-ambiguous paths"));
         }
     }
     Ok(entries)
 }
-fn entries_bytes(entries: &[ImageEntry]) -> Vec<u8> {
-    let mut out = Vec::new();
+fn entries_hash_in(entries: &[ImageEntry], ctx: &Context) -> io::Result<String> {
+    let _temporary = ctx.temporary(1024)?;
+    let mut h = Sha256::new();
     for e in entries {
-        text(&mut out, &e.path);
-        out.push(e.directory as u8);
-        out.extend(e.bytes.to_le_bytes());
-        text(&mut out, &e.sha256);
+        ctx.work((25 + e.path.len() + e.sha256.len()) as u64)?;
+        h.update(&(e.path.len() as u64).to_le_bytes());
+        h.update(e.path.as_bytes());
+        h.update(&[e.directory as u8]);
+        h.update(&e.bytes.to_le_bytes());
+        h.update(&(e.sha256.len() as u64).to_le_bytes());
+        h.update(e.sha256.as_bytes());
     }
-    out
+    hex_in(h, ctx)
 }
+
 fn sync_output(path: &Path, directory: bool, requested: Ack) -> io::Result<()> {
+    sync_output_in(path, directory, requested, &Context::legacy())
+}
+fn sync_output_in(path: &Path, directory: bool, requested: Ack, ctx: &Context) -> io::Result<()> {
     if requested == Ack::Flush {
+        let _temporary = ctx.temporary(path.as_os_str().len() * 4 + 1024)?;
+        ctx.work(1)?;
         #[cfg(test)]
         barrier_test(path, directory)?;
         if directory {
@@ -536,23 +730,58 @@ fn sync_output(path: &Path, directory: bool, requested: Ack) -> io::Result<()> {
             OpenOptions::new()
                 .write(true)
                 .open(path)
-                .map_err(|e| context("capture barrier open", path, e))?
-                .sync_all()
+                .and_then(|f| f.sync_all())
                 .map_err(|e| context("capture file barrier", path, e))
         }
     } else {
         Ok(())
     }
 }
+fn read_file_in(path: &Path, ctx: &Context) -> io::Result<Vec<u8>> {
+    ctx.work(2)?;
+    let mut file = File::open(path)?;
+    let size = file.metadata()?.len();
+    let n = usize::try_from(size).map_err(|_| invalid("image file cannot be represented"))?;
+    ctx.allocate(n)?;
+    ctx.io(size
+        .checked_add(1)
+        .ok_or_else(|| invalid("image input size overflow"))?)?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(n)
+        .map_err(|_| io::Error::other("image read backing allocation failed"))?;
+    bytes.resize(n, 0);
+    file.read_exact(&mut bytes)?;
+    let mut extra = [0u8; 1];
+    if file.read(&mut extra)? != 0 {
+        return Err(invalid("image file grew beyond admitted extent"));
+    }
+    Ok(bytes)
+}
 fn write_new(path: &Path, bytes: &[u8], ack: Ack) -> io::Result<()> {
+    write_new_in(path, bytes, ack, &Context::legacy())
+}
+fn write_new_in(path: &Path, bytes: &[u8], ack: Ack, ctx: &Context) -> io::Result<()> {
+    let _temporary = ctx.temporary(path.as_os_str().len() * 4 + 1024)?;
+    ctx.backing(bytes.len() as u64)?;
+    ctx.io(bytes.len() as u64)?;
+    ctx.work(1)?;
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path)
         .map_err(|e| context("capture create file", path, e))?;
+    if matches!(
+        ctx.current_stage(),
+        ImageStage::Completion | ImageStage::Custody
+    ) {
+        ctx.output(ImageOutput::CompletionUnknown);
+    }
+    ctx.work(1)?;
     file.write_all(bytes)
         .map_err(|e| context("capture write file", path, e))?;
     if ack == Ack::Flush {
+        ctx.work(1)?;
         #[cfg(test)]
         barrier_test(path, false)?;
         file.sync_all()
@@ -567,33 +796,69 @@ fn copy_entries(
     owned: &BTreeMap<String, OwnedFile>,
     ack: Ack,
 ) -> io::Result<(u64, u64)> {
+    copy_entries_in(source, target, entries, owned, ack, &Context::legacy())
+}
+fn copy_entries_in(
+    source: &Path,
+    target: &Path,
+    entries: &[ImageEntry],
+    owned: &BTreeMap<String, OwnedFile>,
+    ack: Ack,
+    ctx: &Context,
+) -> io::Result<(u64, u64)> {
+    let _scope = ctx.scope();
+    let _buffer = ctx.temporary(8192 + 1024)?;
     let mut file_barriers = 0;
-    let mut dirs = vec![target.to_owned()];
+    let mut dirs = Vec::new();
+    reserve_vec(&mut dirs, ctx)?;
+    ctx.allocate(target.as_os_str().len())?;
+    dirs.push(target.to_owned());
     for e in entries {
-        let relative = relative(&e.path)?;
+        ctx.work(1)?;
+        let relative = relative_in(&e.path, ctx)?;
+        ctx.allocate((target.as_os_str().len() + relative.as_os_str().len() + 2) * 4 + 64)?;
         let destination = target.join(&relative);
         if e.directory {
+            ctx.work(1)?;
             fs::create_dir(&destination)
                 .map_err(|e| context("capture copy directory", &destination, e))?;
+            reserve_vec(&mut dirs, ctx)?;
             dirs.push(destination);
         } else {
+            ctx.backing(e.bytes)?;
+            ctx.io(e
+                .bytes
+                .checked_mul(2)
+                .and_then(|v| v.checked_add(1))
+                .ok_or_else(|| invalid("image copy extent overflow"))?)?;
+            ctx.work(2)?;
             let mut output = OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&destination)
                 .map_err(|e| context("capture copy create", &destination, e))?;
-            if let Some(file) = owned.get(&e.path) {
-                output
-                    .write_all(&file.bytes)
-                    .map_err(|e| context("capture copy owned bytes", &destination, e))?;
+            let mut input = if let Some(file) = owned.get(&e.path) {
+                file.handle.try_clone()?
             } else {
-                let input_path = source.join(relative);
-                let mut input = File::open(&input_path)
-                    .map_err(|e| context("capture copy input open", &input_path, e))?;
-                io::copy(&mut input, &mut output)
-                    .map_err(|e| context("capture byte copy", &destination, e))?;
+                ctx.allocate((source.as_os_str().len() + relative.as_os_str().len() + 2) * 4 + 64)?;
+                File::open(source.join(&relative))?
+            };
+            input.seek(SeekFrom::Start(0))?;
+            let mut buf = [0u8; 8192];
+            let mut remaining = e.bytes;
+            while remaining > 0 {
+                ctx.work(1)?;
+                let n = remaining.min(buf.len() as u64) as usize;
+                input.read_exact(&mut buf[..n])?;
+                output.write_all(&buf[..n])?;
+                ctx.copied(n as u64);
+                remaining -= n as u64;
+            }
+            if input.read(&mut buf[..1])? != 0 {
+                return Err(invalid("copy source grew beyond admitted extent"));
             }
             if ack == Ack::Flush {
+                ctx.work(1)?;
                 output
                     .sync_all()
                     .map_err(|e| context("capture copied-file barrier", &destination, e))?;
@@ -601,10 +866,11 @@ fn copy_entries(
             }
         }
     }
-    dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
+    ctx.work(dirs.len() as u64)?;
+    dirs.sort_unstable_by_key(|d| std::cmp::Reverse(d.components().count()));
     if ack == Ack::Flush {
         for d in &dirs {
-            sync_output(d, true, ack)?;
+            sync_output_in(d, true, ack, ctx)?;
         }
     }
     Ok((
@@ -616,10 +882,33 @@ fn copy_entries(
         },
     ))
 }
-
 impl CaptureManifest {
-    fn encode(&self) -> Vec<u8> {
-        let mut out = b"MBCAP1".to_vec();
+    fn encoded_len(&self) -> io::Result<usize> {
+        let mut size = 8usize
+            + 8
+            + self.source_label.len()
+            + 32
+            + 4
+            + 8
+            + self.config.len()
+            + 8
+            + self.root_sha256.len()
+            + 24;
+        for e in &self.entries {
+            size = size
+                .checked_add(25 + e.path.len() + e.sha256.len())
+                .ok_or_else(|| invalid("image manifest size overflow"))?;
+        }
+        Ok(size)
+    }
+    fn encode_in(&self, ctx: &Context) -> io::Result<Vec<u8>> {
+        let size = self.encoded_len()?;
+        ctx.allocate(size)?;
+        ctx.work(size as u64)?;
+        let mut out = Vec::new();
+        out.try_reserve_exact(size)
+            .map_err(|_| io::Error::other("manifest backing allocation failed"))?;
+        out.extend(b"MBCAP1");
         out.extend(self.version.to_le_bytes());
         text(&mut out, &self.source_label);
         for n in [
@@ -641,11 +930,18 @@ impl CaptureManifest {
         out.extend(self.file_barriers.to_le_bytes());
         out.extend(self.directory_barriers.to_le_bytes());
         out.extend((self.entries.len() as u64).to_le_bytes());
-        out.extend(entries_bytes(&self.entries));
-        out
+        for e in &self.entries {
+            text(&mut out, &e.path);
+            out.push(e.directory as u8);
+            out.extend(e.bytes.to_le_bytes());
+            text(&mut out, &e.sha256);
+        }
+        debug_assert_eq!(out.len(), size);
+        Ok(out)
     }
-    fn decode(bytes: &[u8]) -> io::Result<Self> {
+    fn decode_in(bytes: &[u8], ctx: &Context) -> io::Result<Self> {
         struct Reader<'a> {
+            ctx: &'a Context,
             bytes: &'a [u8],
             pos: usize,
         }
@@ -667,7 +963,9 @@ impl CaptureManifest {
             }
             fn blob(&mut self) -> io::Result<Vec<u8>> {
                 let n = usize::try_from(self.n()?).map_err(|_| invalid("manifest size"))?;
-                Ok(self.take(n)?.to_vec())
+                let bytes = self.take(n)?;
+                self.ctx.allocate(n)?;
+                Ok(bytes.to_vec())
             }
             fn text(&mut self) -> io::Result<String> {
                 String::from_utf8(self.blob()?).map_err(|_| invalid("manifest UTF8"))
@@ -687,7 +985,8 @@ impl CaptureManifest {
                 }
             }
         }
-        let mut r = Reader { bytes, pos: 0 };
+        ctx.work(bytes.len() as u64)?;
+        let mut r = Reader { bytes, pos: 0, ctx };
         if r.take(6)? != b"MBCAP1" {
             return Err(invalid("manifest magic"));
         }
@@ -709,13 +1008,29 @@ impl CaptureManifest {
         let file_barriers = r.n()?;
         let directory_barriers = r.n()?;
         let count = usize::try_from(r.n()?).map_err(|_| invalid("manifest count"))?;
-        if count > MAX_ENTRIES {
+        if !ctx.funded() && count > MAX_ENTRIES {
             return Err(invalid("manifest entry count limit"));
         }
+        // The count must first fit its literal representation, then its real
+        // funded vector. Neither a wire count nor a manifest claims resources.
+        if count > (bytes.len() - r.pos) / 25 {
+            return Err(invalid("manifest count exceeds literal body"));
+        }
+        ctx.allocate(
+            count
+                .checked_mul(std::mem::size_of::<ImageEntry>())
+                .ok_or_else(|| invalid("manifest entries size overflow"))?,
+        )?;
         let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(count)
+            .map_err(|_| io::Error::other("manifest entry backing allocation failed"))?;
         for _ in 0..count {
             let path = r.text()?;
-            relative(&path)?;
+            {
+                let _temporary = ctx.scope();
+                relative_in(&path, ctx)?;
+            }
             entries.push(ImageEntry {
                 path,
                 directory: r.flag()?,
@@ -752,9 +1067,17 @@ impl Store {
     /// therefore cannot provide this owner until it is joined. Weak timer owners
     /// require the separate explicit running check below.
     pub fn capture_stopped(
+        self,
+        destination: &Path,
+        request: CaptureRequest,
+    ) -> io::Result<CaptureManifest> {
+        self.capture_stopped_in(destination, request, &Context::legacy())
+    }
+    fn capture_stopped_in(
         mut self,
         destination: &Path,
         request: CaptureRequest,
+        ctx: &Context,
     ) -> io::Result<CaptureManifest> {
         if crate::timers::capture_owner_running(&self.timers) {
             return Err(invalid("running timer owner must be joined before capture"));
@@ -765,18 +1088,22 @@ impl Store {
         {
             return Err(invalid("capture source label required"));
         }
-        let config = config_bytes(&self.config)?;
-        let source = root_directory(&self.path)?;
-        let parent = root_directory(
+        ctx.allocate(request.source_label.len())?;
+        let source_label = request.source_label.as_str().to_owned();
+        let config = config_bytes_in(&self.config, ctx)?;
+        let source = root_directory_in(&self.path, ctx)?;
+        let parent = root_directory_in(
             destination
                 .parent()
                 .ok_or_else(|| invalid("image parent required"))?,
+            ctx,
         )?;
         if parent.starts_with(&source) {
             return Err(invalid("capture destination is inside source"));
         }
         // Stop every owner and observe every join result. Settlement continues
         // even if one join fails; a panic can never publish a complete image.
+        ctx.stage(ImageStage::Stopping);
         let mut panicked = false;
         if let Some((stop, worker)) = self.scan_reaper.take() {
             let _ = stop.send(());
@@ -802,6 +1129,16 @@ impl Store {
             return Err(invalid("capture owner failed while settling"));
         }
         signal_result?;
+        let health_workspace = self
+            .chunks
+            .lock()
+            .unwrap()
+            .table
+            .len()
+            .checked_mul(256)
+            .and_then(|n| n.checked_add(131072))
+            .ok_or_else(|| invalid("health population size overflow"))?;
+        let health_scope = ctx.temporary(health_workspace)?;
         let health = self.health2();
         if health.storage_error
             || health.read_only
@@ -810,33 +1147,45 @@ impl Store {
         {
             return Err(invalid("capture source health is incomplete"));
         }
-        let owned = owned_files(&self)?;
-        let output = new_directory(destination)?;
+        drop(health);
+        drop(health_scope);
+        ctx.stage(ImageStage::Inventory);
+        let owned = owned_files_in(&self, ctx)?;
+        let output = new_directory_in(destination, ctx)?;
+        // Fixed control/output path joins below are admitted before allocation.
+        ctx.allocate((output.as_os_str().len() + 64) * 32)?;
         // The existence of this file documents incomplete outputs on every
         // later refusal; only capture.complete grants complete-image status.
-        write_new(
+        write_new_in(
             &output.join("capture.started"),
             b"MBCAP1 incomplete unless capture.complete validates\n",
             request.ack,
+            ctx,
         )?;
-        let entries = inventory(&source, &owned)?;
+        let entries = inventory_in(&source, &owned, ctx)?;
         let source_utc_ms = self.clock.utc_ms();
         let source_mono_ms = self.clock.mono_ms();
         let target = output.join(PAYLOAD);
+        ctx.stage(ImageStage::Copy);
+        ctx.work(1)?;
         fs::create_dir(&target)?;
         let (file_barriers, directory_barriers) =
-            copy_entries(&source, &target, &entries, &owned, request.ack)?;
-        if inventory(&source, &owned)? != entries
-            || inventory(&target, &BTreeMap::new())? != entries
-            || config_bytes(&self.config)? != config
-        {
+            copy_entries_in(&source, &target, &entries, &owned, request.ack, ctx)?;
+        let changed = {
+            let _temporary = ctx.scope();
+            inventory_in(&source, &owned, ctx)? != entries
+        } || {
+            let _temporary = ctx.scope();
+            inventory_in(&target, &BTreeMap::new(), ctx)? != entries
+        } || !config_matches(&self.config, &config, ctx)?;
+        if changed {
             return Err(invalid(
                 "capture source/config changed or destination readback differs",
             ));
         }
         let mut manifest = CaptureManifest {
             version: 1,
-            source_label: request.source_label,
+            source_label,
             source_epoch: self.epoch,
             source_utc_ms,
             source_mono_ms,
@@ -845,33 +1194,43 @@ impl Store {
             achieved_ack: request.ack,
             complete: true,
             config,
-            root_sha256: hash(&entries_bytes(&entries)),
+            root_sha256: entries_hash_in(&entries, ctx)?,
             entries,
             file_barriers,
             directory_barriers: directory_barriers + if request.ack == Ack::Flush { 3 } else { 0 },
             readback: true,
             completion: None,
         };
-        let encoded = manifest.encode();
-        if encoded.len() as u64 > MAX_MANIFEST {
+        ctx.stage(ImageStage::Encoding);
+        let encoded = manifest.encode_in(ctx)?;
+        if !ctx.funded() && encoded.len() as u64 > MAX_MANIFEST {
             return Err(invalid("capture manifest limit"));
         }
-        write_new(&output.join(MANIFEST), &encoded, request.ack)?;
-        sync_output(&output, true, request.ack)?;
-        sync_output(output.parent().unwrap(), true, request.ack)?;
-        if fs::read(output.join(MANIFEST))? != encoded {
+        write_new_in(&output.join(MANIFEST), &encoded, request.ack, ctx)?;
+        sync_output_in(&output, true, request.ack, ctx)?;
+        sync_output_in(output.parent().unwrap(), true, request.ack, ctx)?;
+        if {
+            let _temporary = ctx.scope();
+            read_file_in(&output.join(MANIFEST), ctx)? != encoded
+        } {
             return Err(invalid("manifest readback differs"));
         }
         // Completion is last, binds the entire manifest, and is separately
         // covered by the image-directory barrier and readback.
-        write_new(
+        ctx.stage(ImageStage::Completion);
+        let manifest_hash = hash_in(&encoded, ctx)?;
+        write_new_in(
             &output.join(COMPLETE),
-            hash(&encoded).as_bytes(),
+            manifest_hash.as_bytes(),
             request.ack,
+            ctx,
         )?;
-        sync_output(&output, true, request.ack)?;
-        let validated = validate_contents(&output)?;
-        if validated != manifest {
+        sync_output_in(&output, true, request.ack, ctx)?;
+        let differs = {
+            let _temporary = ctx.scope();
+            validate_contents_in(&output, ctx)? != manifest
+        };
+        if differs {
             return Err(invalid("completed image readback differs"));
         }
         // This evidence is issued only AFTER successful completion-file and
@@ -879,9 +1238,11 @@ impl Store {
         // the image: no readable in-image marker can prove its own failed sync.
         if request.ack == Ack::Flush {
             manifest.completion = Some(CaptureCompletion {
-                manifest_sha256: hash(&encoded),
+                manifest_sha256: manifest_hash,
             });
         }
+        ctx.output(ImageOutput::Complete);
+        ctx.achieved_ack(request.ack);
         Ok(manifest)
     }
 }
@@ -898,71 +1259,130 @@ pub fn validate_image_with_completion(
 ) -> io::Result<CaptureManifest> {
     validate_selected(image, Some(completion))
 }
+
 fn validate_selected(
     image: &Path,
     completion: Option<&CaptureCompletion>,
 ) -> io::Result<CaptureManifest> {
-    let mut manifest = validate_contents(image)?;
+    validate_selected_in(image, completion, &Context::legacy())
+}
+fn validate_selected_in(
+    image: &Path,
+    completion: Option<&CaptureCompletion>,
+    ctx: &Context,
+) -> io::Result<CaptureManifest> {
+    let mut manifest = validate_contents_in(image, ctx)?;
     if manifest.requested_ack == Ack::Flush {
-        let evidence = completion.ok_or_else(|| invalid("Flush capture settlement unknown: original post-barrier completion evidence required"))?;
-        if evidence.manifest_sha256 != hash(&manifest.encode()) {
+        let evidence=completion.ok_or_else(||invalid("Flush capture settlement unknown: original post-barrier completion evidence required"))?;
+        let matches = {
+            let _temporary = ctx.scope();
+            evidence.manifest_sha256 == hash_in(&manifest.encode_in(ctx)?, ctx)?
+        };
+        if !matches {
             return Err(invalid(
                 "capture completion evidence does not bind this manifest",
             ));
         }
+        ctx.allocate(64)?;
         manifest.completion = Some(evidence.clone());
     }
     Ok(manifest)
 }
-fn validate_contents(image: &Path) -> io::Result<CaptureManifest> {
-    let image = root_directory(image)?;
-    directory_streams(&image)?;
-    let names: std::collections::BTreeSet<_> = fs::read_dir(&image)?
-        .map(|e| e.map(|x| x.file_name()))
-        .collect::<io::Result<_>>()?;
-    let expected: std::collections::BTreeSet<_> = ["capture.started", MANIFEST, COMPLETE, PAYLOAD]
-        .into_iter()
-        .map(std::ffi::OsString::from)
-        .collect();
-    if names != expected {
+fn validate_contents_in(image: &Path, ctx: &Context) -> io::Result<CaptureManifest> {
+    let image = root_directory_in(image, ctx)?;
+    directory_streams_in(&image, ctx)?;
+    ctx.allocate((image.as_os_str().len() + 64) * 24)?;
+    // Envelope membership is exactly four names. Refuse unexpected members
+    // immediately rather than allocating an arbitrary unmanifested path set.
+    let mut found = 0u8;
+    let _reader_workspace = ctx.temporary(image.as_os_str().len() * 4 + 4096)?;
+    ctx.work(1)?;
+    let mut reader = fs::read_dir(&image)?;
+    loop {
+        let _entry = ctx.temporary(image.as_os_str().len() * 8 + 4 * 260 + 1024)?;
+        ctx.work(1)?;
+        let Some(entry) = reader.next() else { break };
+        let entry = entry?;
+        let name = entry.file_name();
+        let bit = if name == "capture.started" {
+            1
+        } else if name == MANIFEST {
+            2
+        } else if name == COMPLETE {
+            4
+        } else if name == PAYLOAD {
+            8
+        } else {
+            return Err(invalid("image envelope population differs"));
+        };
+        if found & bit != 0 {
+            return Err(invalid("image envelope population differs"));
+        }
+        found |= bit;
+    }
+    if found != 15 {
         return Err(invalid("image envelope population differs"));
     }
     for name in ["capture.started", MANIFEST, COMPLETE] {
         let path = image.join(name);
+        ctx.work(2)?;
         let meta = fs::symlink_metadata(&path)?;
         normal(&meta)?;
         if !meta.is_file() {
             return Err(invalid("image envelope file type"));
         }
-        regular_streams(&File::open(path)?)?;
+        regular_streams_in(&File::open(path)?, ctx)?;
     }
-    if fs::read(image.join("capture.started"))?
-        != b"MBCAP1 incomplete unless capture.complete validates\n"
-    {
-        return Err(invalid("capture-start marker differs"));
-    }
-    if fs::metadata(image.join(MANIFEST))?.len() > MAX_MANIFEST
+    ctx.work(3)?;
+    if fs::metadata(image.join("capture.started"))?.len()
+        != b"MBCAP1 incomplete unless capture.complete validates\n".len() as u64
         || fs::metadata(image.join(COMPLETE))?.len() != 64
     {
         return Err(invalid("manifest/completion size"));
     }
-    let encoded = fs::read(image.join(MANIFEST))?;
-    if fs::read(image.join(COMPLETE))? != hash(&encoded).as_bytes() {
-        return Err(invalid("completion does not bind manifest"));
+    {
+        let _temporary = ctx.scope();
+        if read_file_in(&image.join("capture.started"), ctx)?
+            != b"MBCAP1 incomplete unless capture.complete validates\n"
+        {
+            return Err(invalid("capture-start marker differs"));
+        }
     }
-    let manifest = CaptureManifest::decode(&encoded)?;
+    if !ctx.funded() && fs::metadata(image.join(MANIFEST))?.len() > MAX_MANIFEST {
+        return Err(invalid("manifest/completion size"));
+    }
+    let manifest = {
+        // The encoded file is temporary; decoded metadata has its own separate
+        // charge and lives beyond it. Release only the encoded buffer below.
+        let before = ctx.memory_used();
+        let encoded = read_file_in(&image.join(MANIFEST), ctx)?;
+        let encoded_charge = ctx.memory_used() - before;
+        {
+            let _temporary = ctx.scope();
+            if read_file_in(&image.join(COMPLETE), ctx)? != hash_in(&encoded, ctx)?.as_bytes() {
+                return Err(invalid("completion does not bind manifest"));
+            }
+        }
+        let manifest = CaptureManifest::decode_in(&encoded, ctx)?;
+        drop(encoded);
+        ctx.release(encoded_charge);
+        manifest
+    };
     if !manifest.complete || !manifest.readback || manifest.requested_ack != manifest.achieved_ack {
         return Err(invalid("capture incomplete or requested Ack not achieved"));
     }
-    let payload = root_directory(&image.join(PAYLOAD))?;
-    let actual = inventory(&payload, &BTreeMap::new())?;
-    if actual != manifest.entries || hash(&entries_bytes(&actual)) != manifest.root_sha256 {
-        return Err(invalid(
-            "image contents/population differ from complete manifest",
-        ));
+    let payload = root_directory_in(&image.join(PAYLOAD), ctx)?;
+    {
+        let _temporary = ctx.scope();
+        let actual = inventory_in(&payload, &BTreeMap::new(), ctx)?;
+        if actual != manifest.entries || entries_hash_in(&actual, ctx)? != manifest.root_sha256 {
+            return Err(invalid(
+                "image contents/population differ from complete manifest",
+            ));
+        }
     }
-    let files = actual.iter().filter(|e| !e.directory).count() as u64;
-    let directories = actual.iter().filter(|e| e.directory).count() as u64 + 1;
+    let files = manifest.entries.iter().filter(|e| !e.directory).count() as u64;
+    let directories = manifest.entries.iter().filter(|e| e.directory).count() as u64 + 1;
     if manifest.achieved_ack == Ack::Flush
         && (manifest.file_barriers != files || manifest.directory_barriers != directories + 3)
     {

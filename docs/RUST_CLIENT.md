@@ -272,3 +272,8 @@ one captured population, and quota pressure leaves one batch item committed.
 that its clone can reuse the original epoch and accept an original uncertain
 removal. These are counterexamples to stronger guarantees, not implementations
 of atomic publication, complete capture/restore or independent authority lineage.
+
+## Typed policy projection
+
+See [CLIENT_POLICY.md](CLIENT_POLICY.md) for exact namespace POLICY_GET and
+original-attempt durable POLICY_SET, bounds, readback and operating prerequisites.

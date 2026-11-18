@@ -434,7 +434,8 @@ impl Store {
                 POLICY_GET => {
                     c.end()?;
                     let rows: Vec<_> = self.policies().into_iter().filter(|r| r.0 == ns).collect();
-                    let mut p = (rows.len() as u16).to_le_bytes().to_vec();
+                    let count = u16::try_from(rows.len()).map_err(|_| 4u16)?;
+                    let mut p = count.to_le_bytes().to_vec();
                     for (_, prefix, class) in rows {
                         lp(&mut p, prefix.as_bytes());
                         p.push(class.kind);
@@ -445,7 +446,8 @@ impl Store {
                 HEALTH2 => {
                     c.end()?;
                     let fields = self.health2().fields();
-                    let mut p = (fields.len() as u16).to_le_bytes().to_vec();
+                    let count = u16::try_from(fields.len()).map_err(|_| 4u16)?;
+                    let mut p = count.to_le_bytes().to_vec();
                     for (k, v) in fields {
                         lp(&mut p, format!("{k}={v}").as_bytes());
                     }
@@ -750,3 +752,117 @@ mod read_tests;
 #[cfg(test)]
 #[path = "codec/record_tests.rs"]
 mod record_tests;
+
+#[cfg(test)]
+mod counted_reply_tests {
+    use super::*;
+    use crate::Config;
+    use std::{collections::BTreeMap, path::PathBuf};
+
+    fn fixture(label: &str) -> (PathBuf, Store) {
+        let root = PathBuf::from(
+            std::env::var("MEMBUS_TEST_OUTPUT").unwrap_or_else(|_| ".test-output".into()),
+        )
+        .join(format!("counted-reply-{label}-{}-{}", std::process::id(), crate::now_ms()));
+        let store = Store::open(&root, Config {
+            tick_ms: 3_600_000,
+            retire_ms: 3_600_000,
+            ..Config::default()
+        }).unwrap();
+        (root, store)
+    }
+
+    fn request(op: u8) -> Vec<u8> {
+        let mut payload = u64::MAX.to_le_bytes().to_vec();
+        lp(&mut payload, b"counted-reply");
+        lp(&mut payload, b"ledger");
+        frame(op, 37, &payload)
+    }
+
+    fn response(store: &Store, root: &std::path::Path, op: u8, limit: usize) -> Vec<u8> {
+        let reply = store.dispatch_for_limit(&request(op)[4..], false, limit);
+        // Retain exact wire evidence beside this test's isolated state.
+        std::fs::write(root.join(format!("reply-{limit}.bin")), &reply).unwrap();
+        let mut wire = std::io::Cursor::new(&reply);
+        let body = read_frame_limit(&mut wire, limit).unwrap();
+        assert_eq!(wire.position() as usize, reply.len());
+        let mut decoder = Cursor::new(&body);
+        assert_eq!(decoder.u16(), Ok(1));
+        assert_eq!(decoder.u16(), Ok(0));
+        assert_eq!(decoder.u8(), Ok(op | 0x80));
+        assert_eq!(decoder.u64(), Ok(37));
+        body[13..].to_vec()
+    }
+
+    fn policy(count: usize) {
+        let (root, store) = fixture(&format!("policy-{count}"));
+        // Seed the projection directly: this tests framing, not durable admission or load.
+        {
+            let mut policies = store.policies.write().unwrap();
+            for i in 0..count {
+                policies.set("ledger", &format!("p{i:05}"), Some(Class::LATEST));
+            }
+            // The count applies only to the requested namespace.
+            policies.set("other", "unrelated", Some(Class::FOREVER));
+        }
+        assert_eq!(store.policies().len(), count + 1);
+        let body = response(&store, &root, POLICY_GET, MAX_FRAME);
+        let mut c = Cursor::new(&body);
+        if count > u16::MAX as usize {
+            assert_eq!(c.u16(), Ok(4), "overflow must refuse the whole reply");
+            assert_eq!(c.end(), Ok(()), "refusal has no partial payload");
+        } else {
+            assert_eq!(c.u16(), Ok(0));
+            assert_eq!(c.u16(), Ok(u16::MAX));
+            // The policy CLI uses this counted Cursor/bound/u8/u64/end contract.
+            for i in 0..count {
+                assert_eq!(c.bound(), Ok(format!("p{i:05}")));
+                assert_eq!(c.u8(), Ok(Class::LATEST.kind));
+                assert_eq!(c.u64(), Ok(Class::LATEST.retention_ms));
+            }
+            assert_eq!(c.end(), Ok(()));
+        }
+        assert_eq!(response(&store, &root, POLICY_GET, 1024), 4u16.to_le_bytes());
+    }
+
+    fn health(count: usize) {
+        let (root, store) = fixture(&format!("health-{count}"));
+        let fixed = store.health2().fields().len();
+        {
+            let mut state = store.state.lock().unwrap();
+            for i in 0..count - fixed {
+                state.namespace_counts.insert(format!("n{i:05}"), 1);
+            }
+            state.keys = count - fixed;
+        }
+        let expected: BTreeMap<_, _> = store.health2().fields().into_iter().collect();
+        assert_eq!(expected.len(), count);
+        let body = response(&store, &root, HEALTH2, MAX_FRAME);
+        let mut c = Cursor::new(&body);
+        if count > u16::MAX as usize {
+            assert_eq!(c.u16(), Ok(4), "overflow must refuse the whole reply");
+            assert_eq!(c.end(), Ok(()), "refusal has no partial payload");
+        } else {
+            assert_eq!(c.u16(), Ok(0));
+            assert_eq!(c.u16(), Ok(u16::MAX));
+            let mut decoded = BTreeMap::new();
+            for _ in 0..count {
+                let field = c.bound().unwrap();
+                let (key, value) = field.split_once('=').unwrap();
+                assert!(decoded.insert(key.to_owned(), value.to_owned()).is_none());
+            }
+            assert_eq!(c.end(), Ok(()));
+            assert_eq!(decoded, expected);
+        }
+        assert_eq!(response(&store, &root, HEALTH2, 1024), 4u16.to_le_bytes());
+    }
+
+    #[test]
+    fn policy_65535() { policy(65_535); }
+    #[test]
+    fn policy_65536() { policy(65_536); }
+    #[test]
+    fn health_65535() { health(65_535); }
+    #[test]
+    fn health_65536() { health(65_536); }
+}

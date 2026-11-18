@@ -6,6 +6,7 @@ import socket
 import struct
 import time
 import uuid
+from typing import NamedTuple
 
 MAX_FRAME = 16 * 1024 * 1024
 MAX_VALUE = 4 * 1024 * 1024
@@ -42,6 +43,26 @@ class Refusal(Exception):
         self.code = code
         self.name, self.transient = (codes or CODES).get(code, ('unknown_refusal', False))
         super().__init__(self.name)
+
+class CallOriginal(NamedTuple):
+    """In-memory evidence of one call; retaining it does not authorize a resend."""
+    endpoint: tuple
+    epoch: int
+    opcode: int
+    operation_id: str
+    namespace: str
+    payload: bytes
+    first_send_ns: int
+    retry_ms: int
+
+
+class CallUncertain(ConnectionError):
+    """An earlier send may have taken effect, regardless of the final error."""
+    def __init__(self, original, cause, last_error):
+        self.original, self.cause, self.last_error = original, cause, last_error
+        self.epoch, self.operation_id = original.epoch, original.operation_id
+        super().__init__(f'uncertain operation {self.operation_id}: {last_error}; reconcile original intent before another call')
+
 
 def deadline_ms(seconds=10):
     return int(time.time() * 1000 + seconds * 1000)
@@ -245,23 +266,73 @@ class Client:
             self.close()
             raise ValueError('reply association')
         if code:
-            raise Refusal(code, getattr(self, 'codes', CODES))
+            codes = getattr(self, 'codes', CODES)
+            if code not in codes or len(body) != 15:
+                self.close()
+                raise ValueError('invalid refusal reply')
+            raise Refusal(code, codes)
         return body[15:]
 
-    def call(self, opcode, ns, suffix=b'', op_id=None, deadline=None):
+    def call(self, opcode, ns, suffix=b'', op_id=None, deadline=None, *, retry_transport=True):
+        """At most one resend. See docs/PYTHON_RETRY.md for custody and limits."""
         op_id = op_id or str(uuid.uuid4())
         deadline = deadline or deadline_ms(self.timeout)
         payload = struct.pack('<Q', deadline)+lp(op_id)+lp(ns)+suffix
         creates_snapshot = opcode in (10, 16, 21, 22) or (opcode in (11, 12, 14, 15) and suffix[:4] == b'\x00' * 4)
+        bounded_retry = opcode in (4, 5, 6, 7, 17, 24)
+        original = lost = None
         for attempt in range(2):
             try:
                 if self.channel is None: self.connect(deadline)
-                return self.exchange(opcode, payload, deadline)
-            except (OSError, ConnectionError):
-                self.close()
-                if creates_snapshot or attempt or int(time.time()*1000) >= deadline:
+                if bounded_retry and retry_transport:
+                    if original is None:
+                        original = CallOriginal((self.transport, self.address), self.epoch,
+                                                opcode, op_id, ns, payload,
+                                                time.monotonic_ns(), self.retry_ms)
+                    else:
+                        if (self.transport, self.address) != original.endpoint:
+                            raise ValueError('original retry endpoint changed')
+                        if self.epoch != original.epoch:
+                            raise EpochChanged(original.epoch, self.epoch)
+                        if time.monotonic_ns() - original.first_send_ns >= original.retry_ms * 1_000_000:
+                            raise TimeoutError('original retry horizon elapsed')
+                        if int(time.time()*1000) >= deadline:
+                            raise TimeoutError('original request deadline elapsed')
+                reply = self.exchange(opcode, payload, deadline)
+                # An associated success frame is not yet a typed settlement.
+                # Validate while the original request and first loss are in scope.
+                if opcode in (4, 5, 6):
+                    _, achieved = struct.unpack('<QB', reply)
+                    if achieved > 2:
+                        raise ValueError('invalid mutation acknowledgment')
+                elif opcode == 7:
+                    d = Decoder(reply)
+                    count, = d.unpack('<H')
+                    expected, = struct.unpack('<H', suffix[:2])
+                    if count != expected:
+                        raise ValueError('invalid batch reply count')
+                    for _ in range(count):
+                        code, _, achieved = d.unpack('<HQB')
+                        if (code and code not in self.codes) or achieved > 2:
+                            raise ValueError('invalid batch outcome')
+                    if d.pos != len(reply):
+                        raise ValueError('invalid batch reply length')
+                elif opcode == 17 and reply:
+                    raise ValueError('invalid unsubscribe reply')
+                return reply
+            except Exception as error:
+                transport_error = isinstance(error, (OSError, ConnectionError))
+                if transport_error or lost is not None:
+                    self.close()
+                if original is not None and transport_error and lost is None:
+                    lost = error
+                if (not transport_error or not retry_transport or creates_snapshot or attempt
+                        or int(time.time()*1000) >= deadline
+                        or (original is not None and
+                            time.monotonic_ns() - original.first_send_ns >= original.retry_ms * 1_000_000)):
+                    if lost is not None:
+                        raise CallUncertain(original, lost, error) from error
                     raise
-                self.connect(deadline)
         raise AssertionError('unreachable')
 
     def get(self, ns, key, **options):
@@ -305,13 +376,14 @@ class Client:
         count, = d.unpack('<H')
         return [d.value() for _ in range(count)]
 
-    def put(self, ns, key, value, ack=1, expected=None, op_id=None, deadline=None):
+    def put(self, ns, key, value, ack=1, expected=None, op_id=None, deadline=None, *, retry_transport=True):
         opcode = 4 if expected is None else 5
         suffix = lp(key)+struct.pack('<B',ack)
         if expected is not None:
             suffix += struct.pack('<Q',expected)
         suffix += lp(value)
-        version, achieved = struct.unpack('<QB', self.call(opcode,ns,suffix,op_id,deadline))
+        options = {} if retry_transport else {'retry_transport': False}
+        version, achieved = struct.unpack('<QB', self.call(opcode,ns,suffix,op_id,deadline,**options))
         return {'version':version,'ack':achieved}
 
     def remove(self, ns, key, expected, ack=1, **options):
@@ -331,7 +403,7 @@ class Client:
         d=Decoder(self.call(7,ns,b''.join(parts),**options))
         count,=d.unpack('<H')
         outcomes=[dict(zip(('code','version','ack'),d.unpack('<HQB'))) for _ in range(count)]
-        for outcome in outcomes: outcome['name'],outcome['transient']=CODES.get(outcome['code'],('success',False))
+        for outcome in outcomes: outcome['name'],outcome['transient']=self.codes.get(outcome['code'],('success',False))
         return outcomes
 
     def health(self, ns='ledger'):

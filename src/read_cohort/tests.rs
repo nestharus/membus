@@ -1,13 +1,52 @@
 //! Small retained MBK1 fixtures on production read/capture/decoder boundaries.
 use crate::*;
 use super::*;
-use std::{collections::{BTreeMap, HashSet, VecDeque}, io::{Seek, SeekFrom, Write},
+use std::{cell::RefCell, collections::{BTreeMap, HashSet, VecDeque}, io::{Seek, SeekFrom, Write},
     sync::{atomic::{AtomicUsize, Ordering}, Barrier}};
 
-static WORK: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
-pub(crate) fn work(kind: usize, n: usize) { WORK[kind].fetch_add(n, Ordering::SeqCst); }
-fn reset() { for v in &WORK { v.store(0, Ordering::SeqCst); } }
-fn counts() -> [usize; 4] { std::array::from_fn(|i| WORK[i].load(Ordering::SeqCst)) }
+type Work = [AtomicUsize; 4];
+thread_local! {
+    static WORK: RefCell<Option<Arc<Work>>> = const { RefCell::new(None) };
+}
+pub(crate) fn work(kind: usize, n: usize) {
+    WORK.with_borrow(|work| {
+        if let Some(work) = work {
+            work[kind].fetch_add(n, Ordering::Relaxed);
+        }
+    });
+}
+fn reset() { WORK.set(Some(Arc::new([const { AtomicUsize::new(0) }; 4]))); }
+fn measurement() -> Arc<Work> {
+    WORK.with_borrow(|work| work.as_ref().unwrap().clone())
+}
+fn counts() -> [usize; 4] {
+    let work = measurement();
+    std::array::from_fn(|i| work[i].load(Ordering::Relaxed))
+}
+
+fn fixture_path(label: &str) -> PathBuf {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let root = match std::env::var_os("MEMBUS_COHORT_FIXTURE_ROOT") {
+        Some(path) => {
+            let path = PathBuf::from(path);
+            assert!(path.is_absolute() && path.is_dir());
+            path
+        }
+        None => {
+            let path = PathBuf::from(
+                std::env::var_os("MEMBUS_TEST_OUTPUT").unwrap_or_else(|| ".test-output".into()),
+            );
+            fs::create_dir_all(&path).unwrap();
+            fs::canonicalize(path).unwrap()
+        }
+    };
+    root.join(format!(
+        "{label}-{}-{}-{}",
+        std::process::id(),
+        now_ms(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ))
+}
 fn expected() -> Vec<(&'static str, Option<Vec<u8>>)> {
     vec![("row/a", Some(vec![0, 255, 128, b'\n', b'"', 1])),
         ("id/1", Some(1u64.to_le_bytes().to_vec())),
@@ -44,9 +83,8 @@ fn entries(file: Arc<Mutex<File>>, offset: u64, len: usize, first: u64, ack: u8)
     }).collect()
 }
 fn fixture(label: &str) -> (PathBuf, Arc<Store>, usize) {
-    let root = PathBuf::from(std::env::var_os("MEMBUS_COHORT_FIXTURE_ROOT").expect("explicit retained root"));
-    assert!(root.is_absolute() && root.is_dir());
-    let path = root.join(format!("{label}-{}-{}",std::process::id(),now_ms())); fs::create_dir(&path).unwrap();
+    let path = fixture_path(label);
+    fs::create_dir(&path).unwrap();
     let encoded = chunks::frame(b"MBK1", &payload(10,2));
     let mut file = OpenOptions::new().read(true).write(true).create_new(true).open(path.join("authored.frame")).unwrap();
     file.write_all(&encoded).unwrap(); file.flush().unwrap();
@@ -186,7 +224,14 @@ fn concurrent_cohort_leases_share_one_capture_and_admissions_do_not_overbook() {
     let gate=Barrier::new(9);
     std::thread::scope(|scope| {
         let mut jobs=vec![];
-        for key in live() { let (c,gate)=(&c,&gate);jobs.push(scope.spawn(move || {gate.wait();c.try_get("n",key).unwrap().unwrap()})); }
+        for key in live() {
+            let (c, gate, work) = (&c, &gate, measurement());
+            jobs.push(scope.spawn(move || {
+                WORK.set(Some(work));
+                gate.wait();
+                c.try_get("n", key).unwrap().unwrap()
+            }));
+        }
         gate.wait();for (key,job) in live().zip(jobs) { exact(key,&job.join().unwrap(),10,2); }
     });
     assert_eq!(counts(),[f,f-16,1,9]);drop(c);
@@ -207,8 +252,15 @@ fn concurrent_snapshot_workspaces_refuse_before_capture_and_release_on_last_valu
     let (t1,v1)=s.snapshot_open("n").unwrap();let (t2,v2)=s.snapshot_open("n").unwrap();reset();
     let gate=Barrier::new(3);
     let results=std::thread::scope(|scope| {
-        let jobs:Vec<_>=[&v1,&v2].into_iter().map(|v| {let (s,gate)=(&s,&gate);
-            scope.spawn(move||{gate.wait();let (key,row)=&v.rows[0];row.load(s,"n",key)})}).collect();
+        let jobs: Vec<_> = [&v1, &v2].into_iter().map(|view| {
+            let (s, gate, work) = (&s, &gate, measurement());
+            scope.spawn(move || {
+                WORK.set(Some(work));
+                gate.wait();
+                let (key, row) = &view.rows[0];
+                row.load(s, "n", key)
+            })
+        }).collect();
         gate.wait();jobs.into_iter().map(|j|j.join().unwrap()).collect::<Vec<_>>()
     });
     assert_eq!(results.iter().filter(|r|r.is_ok()).count(),1);
@@ -316,9 +368,7 @@ fn singleton_codec_and_snapshot_cache_share_payload_with_retained_charge() {
 
 #[test]
 fn ordinary_mutation_respects_a_retained_read_cohort() {
-    let root = PathBuf::from(std::env::var_os("MEMBUS_COHORT_FIXTURE_ROOT").unwrap());
-    assert!(root.is_absolute() && root.is_dir());
-    let path = root.join(format!("write-admission-{}-{}", std::process::id(), now_ms()));
+    let path = fixture_path("write-admission");
     let store = Store::open(
         &path,
         Config {

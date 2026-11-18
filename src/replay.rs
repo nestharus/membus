@@ -187,21 +187,21 @@ impl Replayed {
                             || self.chunks.table.get(&chunk).is_none_or(|c|c.class!=Class::FOREVER) {
                             return Err(corrupt(format!("interior-corrupt {name} offset {offset}: atomic route/class")));
                         }
-                        self.next=self.next.max(e.first.checked_add(e.mutations.len() as u64).ok_or_else(||corrupt("atomic revision overflow".into()))?);
-                        for (i,m) in e.mutations.iter().enumerate() {
+                        self.next=self.next.max(e.first.checked_add(e.request.change_count() as u64).ok_or_else(||corrupt("atomic revision overflow".into()))?);
+                        for (i,m) in e.request.mutations().enumerate() {
                             let v=e.first+i as u64;let k=(m.ns.clone(),m.key.clone());self.chunks.register(chunk,&k,v);
                             if horizons.get(&k).is_some_and(|h|v<=*h) {self.report.stripes[si].horizons_applied+=1;}
-                            else {self.apply(m.clone(),v,e.at,chunk,now,config,crate::value_disk::Location {
+                            else {self.apply(m,v,e.at,chunk,now,config,crate::value_disk::Location {
                                 class:Class::FOREVER,file:reader.clone(),offset,record_len:n,subrecord:Some(i as u16),
                             });}
                         }
                         if now.saturating_sub(e.at)<=config.retry_ms {
                             self.dedup.insert((e.request.namespace().into(),e.request.operation_id().into()),Dedup {
                                 fingerprint:e.request.fingerprint(),at:e.at,until_mono:0,replayed_chunk:chunk,
-                                outcome:Some(Outcome {code:0,version:e.first,ack:e.mutations[0].ack}),
+                                outcome:Some(Outcome {code:0,version:e.first,ack:e.request.requested_ack().byte()}),
                             });
                         }
-                        self.report.stripes[si].records+=e.mutations.len() as u64;
+                        self.report.stripes[si].records+=e.request.change_count() as u64;
                         self.report.stripes[si].bytes+=n;
                     } else {
                     let (m, v, at) = parse_record(&b).map_err(|_| {
