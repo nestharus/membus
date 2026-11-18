@@ -172,7 +172,8 @@ impl Store {
         self.cache.cold();
         let value = entry.read(ns, key).inspect_err(|_| { self.flags.storage_error.store(true, Ordering::SeqCst); })?;
         if self.scan_usage.released.swap(false, Ordering::AcqRel)
-            | self.read_usage.released.swap(false, Ordering::AcqRel) {
+            | self.read_usage.released.swap(false, Ordering::AcqRel)
+            | self.signals.take_released() {
             // Recompute from current charges, rather than adding released bytes
             // to a stale limit. New captures and writes serialize on state.
             // Hot hits never take this path or the state lock.
@@ -182,10 +183,14 @@ impl Store {
         Ok(value)
     }
     pub fn cache_stats(&self) -> crate::CacheStats { self.cache.stats() }
-    pub(super) fn cache_limit(&self, state: &State) -> usize {
-        self.config.capacity.saturating_sub(state.committed_bytes + state.dedup_bytes + state.memory_reserved
+    pub(super) fn signal_budget(&self, state: &State) -> crate::signals::Budget<'_> {
+        let used = state.committed_bytes + state.dedup_bytes + state.memory_reserved
             + self.scan_usage.bytes.load(Ordering::Acquire) + self.read_cohort_bytes() + self.config.memory_margin()
-            + self.chunks.lock().unwrap().managed_index_bytes() + self.signals.memory_bytes())
+            + self.chunks.lock().unwrap().managed_index_bytes();
+        crate::signals::Budget { bytes: self.config.capacity.saturating_sub(used), cache: &self.cache }
+    }
+    pub(super) fn cache_limit(&self, state: &State) -> usize {
+        self.signal_budget(state).bytes.saturating_sub(self.signals.memory_bytes())
     }
     pub(super) fn trim_cache(&self, state: &State) {
         self.cache.trim(self.cache_limit(state));
@@ -811,24 +816,20 @@ impl Store {
         };
         // Publication precedes completion on every connection; readers never await log I/O.
         let location = self.router.locations.lock().unwrap().remove(&version);
-        if result.is_ok() && m.ack != 0 {
+        let mut committed = (result.is_ok() && m.ack != 0).then(|| self.committed.write().unwrap());
+        let mut state = self.state.lock().unwrap();
+        let signal = committed.as_mut().and_then(|committed| {
             let value = Arc::new(value);
             let entry = Arc::new(crate::value_disk::Entry::new(&m, version, location.expect("append-complete location")));
-            let mut committed = self.committed.write().unwrap();
             let class = entry.class;
-            let previous = committed.insert(k.clone(), entry.clone());
-            if let Some(old) = &previous {
+            if let Some(old) = committed.insert(k.clone(), entry.clone()) {
                 old.cacheable.store(false, Ordering::Release);
                 self.cache.remove(old.version, false);
             }
             let (label, policy) = crate::cache::Cache::policy(&self.config, &m.ns, &m.key, class);
             self.cache.insert(value.clone(), label, policy, true, self.config.cache_bytes, &entry.cacheable);
-            if m.ns != timers::NS {
-                self.signals.publish(&m.ns, &m.key, value);
-            }
-            drop(committed);
-            drop(previous);
-        }
+            (m.ns != timers::NS).then_some(value)
+        });
         let outcome = if result.is_ok() {
             Outcome {
                 code: 0,
@@ -838,7 +839,6 @@ impl Store {
         } else {
             Outcome::error(16)
         };
-        let mut state = self.state.lock().unwrap();
         state.reserved_bytes -= queue_charge;
         state.memory_reserved -= memory_charge;
         drop(chunk_index);
@@ -882,6 +882,11 @@ impl Store {
         }
         if deduplicate {
             state.dedup.get_mut(&id).unwrap().outcome = Some(outcome.clone());
+        }
+        // Return the write's working charge before funding history and live
+        // delivery, and keep committed publication ordered through the handoff.
+        if let Some(value) = signal {
+            self.signals.publish(&m.ns, &m.key, value, &self.signal_budget(&state));
         }
         self.trim_cache(&state);
         self.done.notify_all();

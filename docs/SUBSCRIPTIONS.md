@@ -98,11 +98,15 @@ horizon or disk change log. Resume before floor, beyond head, malformed, or in
 another epoch refuses resume_gap (23) without registration; a cursor at floor
 is valid.
 
+History and deliveries share the managed memory budget with other resident
+charges, and the value cache yields before signal growth. Existing delivery
+charges include the worker's in-flight value. If a new change cannot fit in
+history, retention advances the floor through that change.
+
 Resume queues retained matching events and registers live changes under the
-same hub mutex. Catch-up exceeding 256 queued items, 8 MiB per registration or
-16 MiB globally refuses busy before registration rather than truncating. Full
-history capacity does not guarantee one subscriber can queue it all. During live
-overflow the subscription becomes dropped/inactive and queued work is cleared;
+same hub mutex. Catch-up exceeding 256 queued items, 8 MiB per registration,
+16 MiB globally or available managed memory refuses busy before registration.
+During live overflow the subscription becomes dropped/inactive and queued work is cleared;
 the KV write still commits. Endpoint failure marks failed/inactive and clears
 queued work. Slow subscribers can delay others through the single worker and
 global pressure; there is no arbitrary-fanout latency guarantee.

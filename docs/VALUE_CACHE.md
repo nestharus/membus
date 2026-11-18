@@ -159,11 +159,11 @@ returns the charge and file handles. Old snapshot revisions survive replacement
 and retirement but cannot repopulate an invalidated cache entry. Their handles
 can delay physical reclamation of retired chunk files.
 
-Returning a snapshot charge marks the live cache allowance for recalculation.
-The next successful cold load recomputes it under state admission before cache
-insertion, including newer reservations. Hot hits add no lock. Cache eviction
-does not return snapshot reservations, and release while a reader retains the
-view does not return capacity yet.
+Returning a snapshot, read cohort or queued delivery charge marks the live
+cache allowance for recalculation. The next successful cold load recomputes it
+under state admission before cache insertion, including newer reservations.
+Hot hits add no lock. A retained view or in-flight delivery keeps its charge
+until its owner releases it.
 
 `Store::cache_stats`, `Health2::cache` and HEALTH2's additive fields report
 `cache_bytes`, `cache_budget`, the current `cache_limit`, entries, hits, misses,

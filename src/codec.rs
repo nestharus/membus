@@ -472,6 +472,7 @@ impl Store {
                     let protocol = c.text()?;
                     let frame_max = c.u32()? as usize;
                     c.end()?;
+                    let state = self.state.lock().unwrap();
                     self.signals.subscribe(
                         ns,
                         prefix,
@@ -480,6 +481,7 @@ impl Store {
                         cursor,
                         &protocol,
                         frame_max,
+                        &self.signal_budget(&state),
                     )
                 }
                 UNSUBSCRIBE | SUBSCRIPTION_STATUS => {

@@ -412,7 +412,7 @@ enum PendingReadCase {
     OrdinarySnapshot,
 }
 
-fn pending_write_reserves_chunk_headroom(case: PendingReadCase) {
+fn pending_write_reserves_chunk_headroom(case: PendingReadCase, signal_history: bool) {
     use crate::atomic::{AtomicAck, FinalChange};
     use std::sync::mpsc;
     use std::time::Duration;
@@ -426,12 +426,16 @@ fn pending_write_reserves_chunk_headroom(case: PendingReadCase) {
     }
 
     let gate = Arc::new((Mutex::new((false, false)), Condvar::new()));
+    let cold_cache = signal_history && matches!(case, PendingReadCase::AtomicCohort);
+    const CAPACITY: usize = 2 * 1024 * 1024;
     let store = Store::open(
         &fixture_path("pending-chunk-charge"),
         Config {
-            capacity: 2 * 1024 * 1024,
-            cache_bytes: 0,
-            signal_bytes: 0,
+            capacity: CAPACITY,
+            cache_bytes: if cold_cache { CAPACITY } else { 0 },
+            signal_bytes: if signal_history { Config::default().signal_bytes } else { 0 },
+            tick_ms: 3_600_000,
+            retire_ms: 3_600_000,
             clock: Some(ManualClock::new(1_000_000)),
             sync_test_gate: Some(gate.clone()),
             ..Config::default()
@@ -449,6 +453,13 @@ fn pending_write_reserves_chunk_headroom(case: PendingReadCase) {
         bytes: vec![0x71; 4096],
         remove: false,
     };
+    if cold_cache {
+        for n in 0..16 {
+            let mut seed = mutation(&format!("seed/{n}"), 1);
+            seed.ns = "other".into();
+            assert_eq!(store.mutate(seed).code, 0);
+        }
+    }
     assert_eq!(store.mutate(mutation("seed", 1)).code, 0);
     let request = matches!(case, PendingReadCase::AtomicCohort).then(|| {
         store.capture_namespace_funded("ledger", 128 * 1024).unwrap()
@@ -464,6 +475,9 @@ fn pending_write_reserves_chunk_headroom(case: PendingReadCase) {
         assert!(!store.pending("ledger", "new"));
         assert!(store.try_get("ledger", "new").unwrap().is_none());
         drop(retained);
+        if cold_cache {
+            store.try_get("ledger", "seed").unwrap().unwrap();
+        }
     }
     if matches!(case, PendingReadCase::OrdinarySnapshot) {
         let seed = store.capture_namespace_funded("frames", 128 * 1024).unwrap()
@@ -471,6 +485,7 @@ fn pending_write_reserves_chunk_headroom(case: PendingReadCase) {
             .unwrap();
         assert_eq!(store.publish_atomic(&seed, deadline).unwrap().code, 0);
     }
+    let retained_request = cold_cache.then(|| request.as_ref().unwrap().clone());
 
     std::thread::scope(|scope| {
         let release_sync = ReleaseSync(&gate);
@@ -519,7 +534,43 @@ fn pending_write_reserves_chunk_headroom(case: PendingReadCase) {
         if let Some(row) = &loaded {
             assert_eq!(row.bytes, vec![0x42; 4096]);
         }
-        drop(release_sync);
+        let signal_before = store.signals.memory_bytes();
+        let handoff = if signal_history && !cold_cache {
+            // Park public health after it takes State. The completed append
+            // must not publish a signal while this sampler holds State.
+            let chunks = store.chunks.lock().unwrap();
+            let sampler = scope.spawn(move || store.health2());
+            let (state_locked, publication_reached, signal_at_handoff) = {
+                let start = std::time::Instant::now();
+                while store.state.try_lock().is_ok() && start.elapsed() < timeout {
+                    std::thread::yield_now();
+                }
+                let state_locked = store.state.try_lock().is_err();
+                drop(release_sync);
+                let start = std::time::Instant::now();
+                while store.committed.try_read().is_ok() && store.signals.memory_bytes() == signal_before
+                    && start.elapsed() < timeout {
+                    std::thread::yield_now();
+                }
+                let publication_reached = start.elapsed() < timeout;
+                // Give publication a chance to finish if it can bypass State.
+                let start = std::time::Instant::now();
+                while store.signals.memory_bytes() == signal_before && start.elapsed() < Duration::from_millis(100) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                (state_locked, publication_reached, store.signals.memory_bytes())
+            };
+            drop(chunks);
+            let health = sampler.join().unwrap();
+            assert!(state_locked && publication_reached);
+            eprintln!("ordinary handoff={} history growth={}", health.memory_bytes, signal_at_handoff - signal_before);
+            assert_eq!(health.memory_bytes, pending.memory_bytes, "signal grew before State settlement");
+            assert_eq!(signal_at_handoff, signal_before);
+            Some(health.memory_bytes)
+        } else {
+            drop(release_sync);
+            None
+        };
         let outcome = writer.join().unwrap();
         let settled = store.health2();
         eprintln!(
@@ -532,9 +583,32 @@ fn pending_write_reserves_chunk_headroom(case: PendingReadCase) {
         assert_eq!(pending.memory_bytes, before.memory_bytes);
         assert!(settled.memory_bytes < settled.memory_budget);
         assert!(!pending.storage_error && !settled.storage_error);
+        if signal_history {
+            assert_eq!(store.signals.memory_bytes() - signal_before, 256 + "ledger".len() + "new".len() + 4096);
+        }
+        if cold_cache {
+            let available = store.cache_limit(&store.state.lock().unwrap());
+            assert!(available < store.config.cache_bytes);
+            let mut after_reads = settled.memory_bytes;
+            for n in 0..16 {
+                assert_eq!(store.try_get("other", &format!("seed/{n}")).unwrap().unwrap().bytes.len(), 4096);
+                let health = store.health2();
+                after_reads = after_reads.max(health.memory_bytes);
+            }
+            let cache = store.cache_stats();
+            assert_eq!(cache.cold_reads - settled.cache.cold_reads, 16);
+            assert!(cache.bytes > settled.cache.bytes);
+            eprintln!("atomic history={} installed allowance={} available={available} peak managed after cold reads={after_reads}",
+                store.signals.memory_bytes(), settled.cache.limit);
+            assert!(after_reads <= settled.memory_budget);
+            assert_eq!(settled.cache.limit, available);
+        } else if let Some(handoff) = handoff {
+            eprintln!("ordinary handoff={handoff} history growth={}", store.signals.memory_bytes() - signal_before);
+        }
         assert_eq!(store.try_get("ledger", "new").unwrap().unwrap().version, outcome.version);
         drop(retained);
         drop(loaded);
+        drop(retained_request);
         assert_eq!(store.read_cohort_bytes(), 0);
         assert_eq!(scan_usage(store), (0, 0));
     });
@@ -542,17 +616,32 @@ fn pending_write_reserves_chunk_headroom(case: PendingReadCase) {
 
 #[test]
 fn pending_ordinary_flush_leaves_only_available_cohort_headroom() {
-    pending_write_reserves_chunk_headroom(PendingReadCase::OrdinaryCohort);
+    pending_write_reserves_chunk_headroom(PendingReadCase::OrdinaryCohort, false);
 }
 
 #[test]
 fn pending_atomic_flush_leaves_only_available_cohort_headroom() {
-    pending_write_reserves_chunk_headroom(PendingReadCase::AtomicCohort);
+    pending_write_reserves_chunk_headroom(PendingReadCase::AtomicCohort, false);
 }
 
 #[test]
 fn pending_ordinary_flush_leaves_only_available_snapshot_workspace() {
-    pending_write_reserves_chunk_headroom(PendingReadCase::OrdinarySnapshot);
+    pending_write_reserves_chunk_headroom(PendingReadCase::OrdinarySnapshot, false);
+}
+
+#[test]
+fn ordinary_flush_funds_signal_history_with_a_retained_cohort() {
+    pending_write_reserves_chunk_headroom(PendingReadCase::OrdinaryCohort, true);
+}
+
+#[test]
+fn ordinary_flush_funds_signal_history_with_a_retained_snapshot_row() {
+    pending_write_reserves_chunk_headroom(PendingReadCase::OrdinarySnapshot, true);
+}
+
+#[test]
+fn atomic_flush_limits_cold_cache_with_signal_history_and_retained_reads() {
+    pending_write_reserves_chunk_headroom(PendingReadCase::AtomicCohort, true);
 }
 
 fn settled_chunk_index(store: &Store) -> usize {

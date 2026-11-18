@@ -449,6 +449,13 @@ impl Cache {
         }
         self.evict_to(limit, 0);
     }
+    /// Store holds State while adjusting the shared allowance. Cold admissions
+    /// still serialize with a reduction through the cache admission lock.
+    pub(super) fn shrink(&self, limit: usize) {
+        if self.limit.load(Ordering::Acquire) > limit {
+            self.trim(limit);
+        }
+    }
     /// Called with admission held; independent removals can only reduce usage.
     fn evict_to(&self, limit: usize, first: usize) {
         for offset in 0..SHARDS {

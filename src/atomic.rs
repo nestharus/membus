@@ -676,6 +676,7 @@ impl Store {
         let chunk = result.as_ref().copied().ok();
         let mut committed = self.committed.write().unwrap();
         let mut state = self.state.lock().unwrap();
+        let mut remaining_memory = memory;
         let success = result.is_ok() && locations.iter().all(Option::is_some);
         if success {
             // One index publication. Readers observe the previous or the complete final population.
@@ -687,8 +688,12 @@ impl Store {
                     self.cache.remove(old.version, false);
                 }
                 if !state.metadata.contains_key(k) {
+                    let charge = store::index_charge(k);
                     state.keys += 1;
-                    state.committed_bytes += store::index_charge(k);
+                    // Move the latest-key charge out of the pending allocation.
+                    state.memory_reserved -= charge;
+                    remaining_memory -= charge;
+                    state.committed_bytes += charge;
                 }
                 state.metadata.insert(
                     k.clone(),
@@ -718,7 +723,7 @@ impl Store {
             state.pending.remove(k);
         }
         state.reserved_bytes -= queue;
-        state.memory_reserved -= memory;
+        state.memory_reserved -= remaining_memory;
         drop(chunk_index);
         state.pending_disk -= disk;
         state.stripe_reserved[log_index] -= queue;
@@ -736,10 +741,8 @@ impl Store {
         let d = state.dedup.get_mut(&id).unwrap();
         d.outcome = Some(outcome.clone());
         d.replayed_chunk = chunk.unwrap_or(0);
-        self.trim_cache(&state);
-        self.done.notify_all();
-        drop(state);
         if success {
+            let budget = self.signal_budget(&state);
             for (i, m) in mutations.iter().enumerate() {
                 self.signals.publish(
                     &m.ns,
@@ -750,9 +753,13 @@ impl Store {
                         bytes: m.bytes.clone(),
                         tombstone: m.remove,
                     }),
+                    &budget,
                 );
             }
         }
+        self.trim_cache(&state);
+        self.done.notify_all();
+        drop(state);
         drop(committed);
         if success {
             Ok(outcome)

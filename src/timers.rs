@@ -236,8 +236,12 @@ fn run(weak:Weak<Store>,shared:Shared) {
 
 fn publish_and_checkpoint(store:&Store,t:&Timer,progress:Progress,persist:impl FnOnce(Mutation)->crate::Outcome)->crate::Outcome {
     // Generic ephemeral wake. The injected refusal unit seam uses this same production ordering.
-    store.signals.publish(&t.schedule.ns,&t.schedule.key,Arc::new(Value {version:t.generation,ack:1,
-        bytes:progress.signal(&t.schedule),tombstone:false}));
+    {
+        let state = store.state.lock().unwrap();
+        store.signals.publish(&t.schedule.ns,&t.schedule.key,Arc::new(Value {version:t.generation,ack:1,
+            bytes:progress.signal(&t.schedule),tombstone:false}), &store.signal_budget(&state));
+        store.trim_cache(&state);
+    }
     let id=identity(&t.schedule.ns,&t.schedule.id).unwrap();
     let op_id=format!("tf-{}-{}-{}",store.epoch,t.generation,progress.index);
     persist(Mutation {ns:NS.into(),key:format!("p/{id}"),op_id,deadline:store.clock.utc_ms().saturating_add(10000),
