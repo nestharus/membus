@@ -229,12 +229,23 @@ class Pipe:
                     raise ctypes.WinError(error)
                 wait = max(0, deadline-int(time.time()*1000))
                 result = self.k.WaitForSingleObject(event, min(wait, 0xfffffffe))
+                timed_out = result == 258  # WAIT_TIMEOUT
+                wait_error = None
                 if result != 0:
+                    if not timed_out:
+                        wait_error = ctypes.get_last_error()
+                    # Completion can win the race with cancellation. The final
+                    # I/O result owns the byte count, including on a zero poll.
                     self.k.CancelIoEx(self.handle, ctypes.byref(operation))
-                    self.k.GetOverlappedResult(self.handle, ctypes.byref(operation), ctypes.byref(done), True)
-                    raise TimeoutError('pipe I/O deadline; outcome uncertain after send')
-                if not self.k.GetOverlappedResult(self.handle, ctypes.byref(operation), ctypes.byref(done), False):
-                    raise ctypes.WinError(ctypes.get_last_error())
+                completed = self.k.GetOverlappedResult(self.handle, ctypes.byref(operation),
+                                                       ctypes.byref(done), result != 0)
+                if wait_error is not None:
+                    raise ctypes.WinError(wait_error)
+                if not completed:
+                    error = ctypes.get_last_error()
+                    if timed_out and error == 995:  # ERROR_OPERATION_ABORTED
+                        raise TimeoutError('pipe I/O deadline; outcome uncertain after send')
+                    raise ctypes.WinError(error)
             return done.value if write else buffer.raw[:done.value]
         finally:
             self.k.CloseHandle(event)
