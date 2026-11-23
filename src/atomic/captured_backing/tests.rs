@@ -81,6 +81,29 @@ fn layout_overflow_and_single_allocation_bound_refuse_without_wrapping() {
 }
 
 #[test]
+fn additional_backing_uses_the_retained_account_after_the_view_drops() {
+    let budget = OriginalBudget::new(8192);
+    let view = captured(budget.clone());
+    let bytes = |n| BackingLayout::empty().array::<u8>(n).unwrap();
+    let retained = view.reserve_backing(bytes(256)).unwrap();
+    drop(view);
+    assert_eq!(budget.used(), 256);
+
+    assert!(matches!(
+        retained.reserve_additional(bytes(7937)),
+        Err(PublicationError::Resource(7))
+    ));
+    assert_eq!(budget.used(), 256);
+
+    let later = retained.reserve_additional(bytes(7936)).unwrap();
+    assert_eq!(budget.used(), 8192);
+    drop(retained);
+    assert_eq!(budget.used(), 7936);
+    drop(later);
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
 fn side_backing_competes_with_original_preparation_on_the_same_pool() {
     let budget = OriginalBudget::new(8192);
     let view = captured(budget.clone());

@@ -79,6 +79,17 @@ impl BackingCharge {
     pub fn bytes(&self) -> usize {
         self.reservation.bytes
     }
+
+    /// Acquire a separate, temporary debit on this charge's captured account.
+    ///
+    /// A later operation can fund its own backing after the original view
+    /// drops. Both debits compete with the existing account's finite allowance
+    /// and return independently when their owners drop.
+    pub fn reserve_additional(&self, layout: BackingLayout) -> Result<Self, PublicationError> {
+        Ok(Self {
+            reservation: self.reservation.budget.reserve(layout.bytes())?,
+        })
+    }
 }
 
 impl NamespaceView {
