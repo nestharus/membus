@@ -6,9 +6,7 @@ use crate::{
     Mutation, Outcome, Store, Value,
 };
 use std::{
-    fs::OpenOptions,
-    io::{self, Write},
-    path::Path,
+    io,
     sync::{atomic::Ordering, mpsc, Arc},
 };
 
@@ -18,6 +16,9 @@ pub const MAX_CHANGES: usize = 128;
 include!("atomic_resources.rs");
 mod captured_backing;
 pub use captured_backing::{BackingCharge, BackingLayout};
+mod custody;
+#[cfg(windows)]
+pub use custody::HeldOriginalFile;
 #[cfg(test)]
 #[path = "atomic_funding_tests.rs"]
 mod funding_tests;
@@ -348,16 +349,6 @@ impl AtomicRequest {
         budget: &OriginalBudget,
     ) -> Result<Self, PublicationError> {
         BorrowedOriginal::from_canonical_bytes(bytes)?.to_owned(budget)
-    }
-    /// New-only caller-owned custody file. Never replaces a possibly sent original.
-    pub fn persist_new(&self, path: &Path) -> io::Result<()> {
-        let mut f = OpenOptions::new().write(true).create_new(true).open(path)?;
-        f.write_all(&self.to_bytes())?;
-        crate::log_io::sync_file(&f)?;
-        crate::log_io::sync_dir(
-            path.parent()
-                .ok_or_else(|| io::Error::other("custody requires parent"))?,
-        )
     }
     pub(crate) fn fingerprint(&self) -> [u8; 32] {
         let mut h = Sha256::new();

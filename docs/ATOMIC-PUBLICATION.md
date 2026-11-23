@@ -40,11 +40,31 @@ bounded by the lesser of snapshot TTL and retry lifetime. AtomicRequest owns the
 immutable namespace, operation ID, capture epoch/horizon, population, requested
 Ack and unique final targets. Its versioned bytes and new-only, file+directory
 synced custody writer let a caller retain the original before transmission.
-Custody creation failure must not be followed by a send. A lost custody-writing
-reply is resolved by reading/validating that same path, never overwriting it.
+If the save fails or its reply is lost, keep the original and preserve the
+selected path. Reading the file can verify its contents. Sending requires
+evidence that both custody barriers completed.
 The provider's admitted envelope independently retains the original bytes and
 whole-set outcome. This is an in-process Rust API; no new wire opcode, Python
 binding or resident service protocol is claimed.
+
+On Windows a custody owner can use `let held = original.persist_new_held(path)?;`
+and bind `held.file_id()` into its own confirmation while retaining `held`.
+The 24 bytes contain the volume serial in little-endian order followed by the
+128-bit Windows file ID. Membus queries the original writer handle after both
+barriers. It keeps that handle open with read sharing only until the holder
+drops. A separate reader opened during that interval must share write access
+with the existing writer. The caller supplies a new file name in a directory
+whose path, including its ancestors, it keeps stable throughout the save.
+Named data streams are refused because their IDs identify the containing file.
+
+Allow `HeldOriginalFile::SAVE_BYTES` of headroom on the account that funded
+the original. The save reserves its fixed encoding buffer and holder before
+creation. Only the holder's charge survives success. A refusal for insufficient
+headroom returns `OutOfMemory` before touching the path. After an I/O error,
+keep the same prepared request and any file the writer created. Matching bytes
+alone cannot establish which barriers completed. The returned ID identifies
+the file object. The domain owner supplies its own signing authority and binds
+the ID to its authenticated original.
 
 Before any target effect, publication checks complete population, supported
 classes/policies, final net quota, new index slots, aggregate queue/stripe slots,
