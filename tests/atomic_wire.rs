@@ -227,6 +227,7 @@ fn malformed_unknown_truncated_and_wrong_ack_replies_are_uncertain() {
         let mut c = client(&s, Arc::new(Mutex::new(damage)), membus::MAX_FRAME);
         let r = request(&mut c, "original", vec![FinalChange::put("a", vec![7])]);
         let bytes = r.to_bytes();
+        assert_eq!(r.encoded_len(), bytes.len());
         assert!(matches!(
             c.publish_atomic(&r, d()),
             Err(Error::Uncertain { .. })

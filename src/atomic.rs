@@ -319,7 +319,10 @@ impl AtomicRequest {
         self.encoding().write(|bytes| b.extend_from_slice(bytes));
         b
     }
-    pub(crate) fn encoded_len(&self) -> usize {
+    /// Number of canonical bytes returned by [Self::to_bytes], without allocating a copy.
+    ///
+    /// Callers can use this length to reserve backing before obtaining those bytes.
+    pub fn encoded_len(&self) -> usize {
         35 + self.data.namespace.len()
             + self.data.operation_id.len()
             + if self.data.population.guard.is_some() { 50 } else { self
