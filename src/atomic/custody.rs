@@ -24,10 +24,13 @@ impl AtomicRequest {
         let mut file = options.write(true).create_new(true).open(path)?;
         self.write_original(&mut file)?;
         sync_file(&file)?;
-        log_io::sync_dir(
-            path.parent()
-                .ok_or_else(|| io::Error::other("custody requires parent"))?,
-        )?;
+        let parent = match path.parent() {
+            // A bare file name has an empty lexical parent in the selected CWD.
+            Some(parent) if parent.as_os_str().is_empty() => Path::new("."),
+            Some(parent) => parent,
+            None => return Err(io::Error::other("custody requires parent")),
+        };
+        log_io::sync_dir(parent)?;
         Ok(file)
     }
 

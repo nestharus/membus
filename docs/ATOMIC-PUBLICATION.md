@@ -40,6 +40,10 @@ bounded by the lesser of snapshot TTL and retry lifetime. AtomicRequest owns the
 immutable namespace, operation ID, capture epoch/horizon, population, requested
 Ack and unique final targets. Its versioned bytes and new-only, file+directory
 synced custody writer let a caller retain the original before transmission.
+Both `persist_new` and `persist_new_held` flush the current directory for a
+bare file name or an explicit `./` parent. When using a relative path, keep
+the process working directory and the selected directory path stable through
+the save.
 If the save fails or its reply is lost, keep the original and preserve the
 selected path. Reading the file can verify its contents. Sending requires
 evidence that both custody barriers completed.

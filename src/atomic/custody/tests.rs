@@ -122,6 +122,121 @@ fn insufficient_headroom_refuses_before_creation_and_legacy_needs_no_headroom() 
 }
 
 #[test]
+fn relative_saves_acknowledge_the_selected_current_directory() {
+    use std::{env, os::windows::process::CommandExt, process::Command};
+
+    const CHILD_DIR: &str = "MEMBUS_RELATIVE_CUSTODY_TEST_DIR";
+    if let Some(selected) = env::var_os(CHILD_DIR) {
+        let selected = Path::new(&selected);
+        assert_eq!(env::current_dir().unwrap(), selected);
+        for (ordinary, held) in [
+            ("ordinary.mar", "held.mar"),
+            (r".\dot-ordinary.mar", r".\dot-held.mar"),
+        ] {
+            check_relative_saves(selected, Path::new(ordinary), Path::new(held));
+        }
+        return;
+    }
+
+    // Give just this child the selected CWD. Parallel tests keep their own CWD.
+    let fixture = Fixture::new();
+    let test = std::thread::current();
+    let result = Command::new(env::current_exe().unwrap())
+        .args(["--exact", test.name().unwrap(), "--nocapture"])
+        .current_dir(&fixture.0)
+        .env(CHILD_DIR, &fixture.0)
+        .creation_flags(0x08000000) // CREATE_NO_WINDOW
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    for name in [
+        "ordinary.mar",
+        "held.mar",
+        "dot-ordinary.mar",
+        "dot-held.mar",
+    ] {
+        assert_eq!(fs::read(fixture.0.join(name)).unwrap(), original(false));
+    }
+}
+
+fn check_relative_saves(selected: &Path, ordinary: &Path, held: &Path) {
+    let bytes = original(false);
+    let (legacy, legacy_budget) = funded(&bytes, 0);
+    let legacy_charge = legacy_budget.used();
+    assert_eq!(
+        legacy.persist_new_held(held).err().unwrap().kind(),
+        io::ErrorKind::OutOfMemory
+    );
+    assert!(!held.try_exists().unwrap());
+    let (): () = legacy.persist_new(ordinary).unwrap();
+
+    let (request, budget) = funded(&bytes, HeldOriginalFile::SAVE_BYTES);
+    let original_charge = budget.used();
+    let stream = held.with_extension("mar:other");
+    assert_eq!(
+        request.persist_new_held(&stream).err().unwrap().kind(),
+        io::ErrorKind::InvalidInput
+    );
+    assert!(!held.try_exists().unwrap());
+    let guard = request.persist_new_held(held).unwrap();
+    assert_eq!(
+        guard.file_id(),
+        &file_id(&File::open(held).unwrap()).unwrap()
+    );
+    assert_eq!(
+        File::options()
+            .write(true)
+            .open(held)
+            .unwrap_err()
+            .raw_os_error(),
+        Some(32)
+    );
+    drop(guard);
+    File::options().write(true).open(held).unwrap();
+
+    check_relative_directory_failure(selected, &ordinary.with_extension("failed"), &bytes, |p| {
+        legacy.persist_new(p)
+    });
+    check_relative_directory_failure(selected, &held.with_extension("failed"), &bytes, |p| {
+        request.persist_new_held(p)
+    });
+    assert_eq!(legacy.to_bytes(), bytes);
+    assert_eq!(request.to_bytes(), bytes);
+    assert_eq!(legacy_budget.used(), legacy_charge);
+    assert_eq!(budget.used(), original_charge);
+}
+
+fn check_relative_directory_failure<T>(
+    selected: &Path,
+    path: &Path,
+    bytes: &[u8],
+    save: impl Fn(&Path) -> io::Result<T>,
+) {
+    // Deny the directory writer on the absolute fixture path. Both relative
+    // spellings must reach this directory's barrier before acknowledging.
+    let directory = File::options()
+        .read(true)
+        .share_mode(1)
+        .custom_flags(0x02000000)
+        .open(selected)
+        .unwrap();
+    assert_eq!(save(path).err().unwrap().raw_os_error(), Some(32));
+    drop(directory);
+    let id = file_id(&File::options().read(true).write(true).open(path).unwrap()).unwrap();
+    assert_eq!(fs::read(path).unwrap(), bytes);
+    assert_eq!(
+        save(path).err().unwrap().kind(),
+        io::ErrorKind::AlreadyExists
+    );
+    assert_eq!(file_id(&File::open(path).unwrap()).unwrap(), id);
+    assert_eq!(fs::read(path).unwrap(), bytes);
+}
+
+#[test]
 fn prepared_store_original_lends_identity_before_any_publication() {
     use crate::atomic::{AtomicAck, FinalChange};
     let fixture = Fixture::new();
