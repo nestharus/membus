@@ -140,6 +140,101 @@ fn copy(source: &Path, target: &Path) {
 }
 
 #[test]
+fn resident_workers_settle_before_capture_of_the_original_store() {
+    use std::{
+        io,
+        sync::Arc,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    let p = root("resident-workers");
+    let source = p.join("source");
+    let store = Arc::new(Store::open(&source, config()).unwrap());
+    let epoch = store.epoch;
+    let workers: membus::ResidentWorkers = store.start_resident_workers(60_000).unwrap();
+    assert!(store.start_timers().is_err());
+    let until = Instant::now() + Duration::from_secs(10);
+    let wall = SystemTime::now() + Duration::from_secs(10);
+    let check_refused = || Err(io::Error::other("owner refused before stop"));
+    assert_eq!(
+        workers
+            .poll_stop(&store, until, wall, check_refused)
+            .unwrap_err()
+            .to_string(),
+        "owner refused before stop"
+    );
+    while !source.join("heartbeat.json").exists() {
+        assert!(Instant::now() < until && SystemTime::now() < wall);
+        thread::sleep(Duration::from_millis(2));
+    }
+    let mut receipts = Vec::new();
+    for (key, ack) in [("first", Ack::Os), ("second", Ack::Flush)] {
+        let receipt = store.mutate(Mutation {
+            ns: "resident".into(),
+            key: key.into(),
+            op_id: format!("original-{key}"),
+            deadline: u64::MAX,
+            ack: ack as u8,
+            expected: None,
+            bytes: key.as_bytes().to_vec(),
+            remove: false,
+        });
+        assert_eq!((receipt.code, receipt.ack), (0, ack as u8));
+        receipts.push((key, receipt));
+    }
+    let budget = store.image_budget(8 * 1024 * 1024, limits()).unwrap();
+    let remaining_reader = Arc::clone(&store);
+    while !workers.poll_stop(&store, until, wall, || Ok(())).unwrap() {
+        thread::yield_now();
+    }
+    workers.join().unwrap();
+    let store = Arc::try_unwrap(store)
+        .err()
+        .expect("reader still holds original Store");
+    drop(remaining_reader);
+    let store = Arc::try_unwrap(store)
+        .ok()
+        .expect("original Store after settlement");
+    let image = p.join("image");
+    let captured = store
+        .capture_stopped_funded(&image, request(Ack::Flush), &budget, 2 * 1024 * 1024)
+        .unwrap();
+    assert_eq!(captured.manifest().source_epoch, epoch);
+    assert_eq!(
+        fs::read(image.join("root/heartbeat.json")).unwrap(),
+        fs::read(source.join("heartbeat.json")).unwrap()
+    );
+    let completion = captured
+        .completion()
+        .unwrap()
+        .persist_new_funded(&p.join("independent.custody"), &budget, 512 * 1024)
+        .unwrap();
+    assert!(validate_image_funded(&image, None, &budget, 2 * 1024 * 1024).is_err());
+    let checked = validate_image_funded(
+        &image,
+        Some(completion.completion()),
+        &budget,
+        2 * 1024 * 1024,
+    )
+    .unwrap();
+    assert_eq!(checked.manifest(), captured.manifest());
+    let recovered = recover_quarantined_with_completion(
+        &image,
+        &p.join("working"),
+        config(),
+        completion.completion(),
+    )
+    .unwrap();
+    assert!(recovered.health2().read_only);
+    for (key, receipt) in receipts {
+        let value = recovered.try_get("resident", key).unwrap().unwrap();
+        assert_eq!((value.version, value.ack), (receipt.version, receipt.ack));
+        assert_eq!(value.bytes, key.as_bytes());
+    }
+}
+
+#[test]
 fn complete_raw_population_and_separate_os_flush_meanings() {
     for ack in [Ack::Os, Ack::Flush] {
         let p = root("population");

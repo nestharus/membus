@@ -358,10 +358,7 @@ fn main() -> io::Result<()> {
     let store = Arc::new(Store::open(&path, config)?);
     // membus.log's one-line replay summary; state/replay.json holds the whole record (CHUNK-RETIREMENT.md 6).
     eprintln!("{}", store.replay_report().summary());
-    let _timers = store.start_timers()?;
-    if heartbeat_ms != 0 {
-        start_heartbeat(path.clone(), store.clone(), heartbeat_ms);
-    }
+    let workers = store.start_resident_workers(heartbeat_ms)?;
     eprintln!(
         "ready epoch={} pid={} state={}",
         store.epoch,
@@ -369,13 +366,22 @@ fn main() -> io::Result<()> {
         path.display()
     );
     let result = match args[2].as_str() {
-        "tcp" => tcp(&args[3], store, idle_ms),
+        "tcp" => tcp(&args[3], store.clone(), idle_ms),
         #[cfg(windows)]
-        "pipe" => pipes(&args[3], store, idle_ms),
+        "pipe" => pipes(&args[3], store.clone(), idle_ms),
         _ => Err(io::Error::other("unsupported transport")),
     };
-    let _ = fs::remove_file(path.join("owner.lock"));
-    result
+    let settlement = workers.join();
+    if let Err(error) = &settlement {
+        eprintln!("resident worker settlement: {error}");
+    }
+    // Keep the original transport result when worker settlement also failed.
+    // A remaining connection or failed join leaves the lock artifact in custody.
+    #[cfg(not(windows))]
+    if settlement.is_ok() && Arc::try_unwrap(store).is_ok() {
+        let _ = fs::remove_file(path.join("owner.lock"));
+    }
+    result.and(settlement)
 }
 
 #[cfg(windows)]
@@ -614,58 +620,4 @@ fn heartbeat_number(text: &str, key: &str) -> io::Result<u64> {
         .1;
     let digits: String = tail.chars().take_while(char::is_ascii_digit).collect();
     digits.parse().map_err(io::Error::other)
-}
-
-fn start_heartbeat(path: PathBuf, store: Arc<Store>, interval_ms: u64) {
-    thread::spawn(move || {
-        let mut writes = 0u64;
-        let mut bytes = 0u64;
-        let mut attempts = 0u64;
-        let mut attempted_bytes = 0u64;
-        let mut failures = 0u64;
-        loop {
-            let now = store.clock().utc_ms() as u128;
-            attempts += 1;
-            let health = store.health2();
-            let format = |successful_bytes, tried_bytes| {
-                membus::heartbeat_json(
-                    std::process::id(),
-                    store.epoch,
-                    now,
-                    writes + 1,
-                    successful_bytes,
-                    attempts,
-                    tried_bytes,
-                    failures,
-                    &health,
-                )
-            };
-            let mut content = format(0, 0);
-            // Byte counter includes the current object; converge across decimal widths.
-            loop {
-                let next = format(
-                    bytes + content.len() as u64,
-                    attempted_bytes + content.len() as u64,
-                );
-                if next.len() == content.len() {
-                    content = next;
-                    break;
-                }
-                content = next;
-            }
-            let temporary = path.join("heartbeat.tmp");
-            // Count write attempts too: failed replacements can still write a temp.
-            // Attempted bytes are a bound, not a claim of successful/physical I/O.
-            attempted_bytes += content.len() as u64;
-            let result = fs::write(&temporary, content.as_bytes())
-                .and_then(|_| fs::rename(&temporary, path.join("heartbeat.json")));
-            if result.is_ok() {
-                writes += 1;
-                bytes += content.len() as u64;
-            } else {
-                failures += 1;
-            }
-            thread::sleep(std::time::Duration::from_millis(interval_ms));
-        }
-    });
 }

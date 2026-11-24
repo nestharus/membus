@@ -41,10 +41,29 @@ fn inspect_stopped(source: &Path, image: &Path, private_working: &Path) -> std::
 }
 ```
 
-The source owner is consumed, never inferred from an Arc count. The executable's
-continuing heartbeat holds an Arc and cannot provide that owned value until its
-owner is joined. A timer service instead holds a Weak reference, so capture
-separately checks its actual running state and refuses an unjoined timer owner.
+The native resident starts its timer and heartbeat with
+`Store::start_resident_workers(heartbeat_ms)`. An in-process host keeps the
+returned `ResidentWorkers` guard and its original `Arc<Store>`. The host fences
+launch and write admission, settles accepted connections and subscription delivery,
+and retains every unconfirmed effect. It calls
+`guard.poll_stop(&store, deadline, wall_deadline, check_owner)` with the selected
+Store, original absolute clocks and ownership/cancellation check. A guard from
+another Store refuses before either worker receives a stop signal. A pending
+poll or a late error can follow an effective stop request. Retain that guard and
+operation. Once ready,
+`guard.join()` observes both thread results. Dropping the guard also waits.
+The heartbeat wakes on a stop request even during a long interval. A failed
+join prevents worker restart and stopped capture on that Store.
+
+Only after worker settlement and the release of all serving references can
+`Arc::try_unwrap` transfer the original Store for capture. On refusal it returns
+the same Arc to the host. Timer-only callers keep their existing Weak ownership
+and must also join. Use the Store's image budget and retain the funded Flush
+completion outside the rollback domain as described in IMAGE-RESOURCES.md.
+The CLI runs its transport inside the resident. The listener, its connections
+and the host's independent admission, resource, clock and serving duties remain
+with their original owners.
+
 Capture joins the snapshot reaper, maintenance ticker, append owners and flush
 owner; it observes their join failures. Signal delivery must have no active
 subscription or delivery bytes in flight, then its worker is stopped and joined.

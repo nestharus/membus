@@ -68,7 +68,7 @@ impl Health2 {
         f
     }
 }
-/// The resident heartbeat line (src/main.rs writes it every beat): the fields fleet's check reads, then the chunk
+/// The resident heartbeat line (the resident writes it every beat): the fields fleet's check reads, then the chunk
 /// retirement flags `heartbeat_warn` may name and three counts (CHUNK-RETIREMENT.md section 6). The new flags are
 /// written 0 or 1, which fleet reads as a count (above 0 flags), so a beat stays under 512 B.
 #[allow(clippy::too_many_arguments)]
@@ -99,4 +99,64 @@ pub fn heartbeat_json(
         h.retained_total,
         h.retired_bytes
     )
+}
+
+pub(super) fn run(
+    store: std::sync::Arc<super::Store>,
+    interval: std::time::Duration,
+    stop: std::sync::mpsc::Receiver<()>,
+) {
+    use std::fs;
+    let mut writes = 0u64;
+    let mut bytes = 0u64;
+    let mut attempts = 0u64;
+    let mut attempted_bytes = 0u64;
+    let mut failures = 0u64;
+    loop {
+        let now = store.clock().utc_ms() as u128;
+        attempts += 1;
+        let health = store.health2();
+        let format = |successful_bytes, tried_bytes| {
+            heartbeat_json(
+                std::process::id(),
+                store.epoch,
+                now,
+                writes + 1,
+                successful_bytes,
+                attempts,
+                tried_bytes,
+                failures,
+                &health,
+            )
+        };
+        let mut content = format(0, 0);
+        // Byte counter includes the current object; converge across decimal widths.
+        loop {
+            let next = format(
+                bytes + content.len() as u64,
+                attempted_bytes + content.len() as u64,
+            );
+            if next.len() == content.len() {
+                content = next;
+                break;
+            }
+            content = next;
+        }
+        let temporary = store.path.join("heartbeat.tmp");
+        // Count write attempts too: failed replacements can still write a temp.
+        // Attempted bytes are a bound, not a claim of successful/physical I/O.
+        attempted_bytes += content.len() as u64;
+        let result = fs::write(&temporary, content.as_bytes())
+            .and_then(|_| fs::rename(&temporary, store.path.join("heartbeat.json")));
+        if result.is_ok() {
+            writes += 1;
+            bytes += content.len() as u64;
+        } else {
+            failures += 1;
+        }
+        match stop.recv_timeout(interval) {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            _ => return,
+        }
+    }
 }

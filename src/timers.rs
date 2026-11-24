@@ -3,6 +3,8 @@ use crate::{lp, Cursor, Mutation, Store, Value, MAX_ID};
 #[cfg(test)]
 use crate::now_ms;
 use std::{collections::{BTreeSet, HashMap, HashSet}, io, sync::{Arc, Condvar, Mutex, Weak}, thread, time::Duration};
+use std::sync::{mpsc, TryLockError};
+use std::time::{Instant, SystemTime};
 
 pub(crate) const NS: &str = "__membus_timers_v1";
 pub(crate) fn is_progress(ns:&str,key:&str)->bool {ns==NS && key.starts_with("p/")}
@@ -22,14 +24,27 @@ struct Progress { generation: u64, index: u64, nominal: u64, due: u64, draw: i64
 struct Timer { schedule: Schedule, generation: u64, next: u64, last: Option<Progress>, active: bool, error: u16 }
 pub(crate) struct State {
     identities: HashSet<String>, timers: HashMap<String, Timer>,
-    deadlines: BTreeSet<(u64, String)>, bytes: usize, stop: bool, running: bool,
+    deadlines: BTreeSet<(u64, String)>, bytes: usize, stop: bool, running: bool, join_failed: bool,
 }
 pub(crate) type Shared = Arc<(Mutex<State>, Condvar)>;
 
-/// Weak Store ownership lets a timer owner outlive the last strong reference;
-/// capture must inspect the actual owner state rather than an Arc count.
-pub(crate) fn capture_owner_running(shared: &Shared) -> bool {
-    shared.0.lock().unwrap().running
+/// A timer-only owner can outlive the last strong Store reference. Capture
+/// also needs the outcome of any previous resident worker join.
+pub(crate) fn require_joined(shared: &Shared) -> io::Result<()> {
+    let state = shared
+        .0
+        .lock()
+        .map_err(|_| io::Error::other("timer state poisoned"))?;
+    if state.join_failed {
+        return Err(io::Error::other("resident worker join previously failed"));
+    }
+    if state.running {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "running timer owner must be joined before capture",
+        ));
+    }
+    Ok(())
 }
 
 fn identity(ns: &str, id: &str) -> Result<String, u16> {
@@ -113,7 +128,7 @@ impl Progress {
 }
 impl State {
     pub(crate) fn restore(values: &HashMap<(String,String),Arc<Value>>) -> io::Result<Shared> {
-        let mut s=Self {identities:HashSet::new(),timers:HashMap::new(),deadlines:BTreeSet::new(),bytes:0,stop:false,running:false};
+        let mut s=Self {identities:HashSet::new(),timers:HashMap::new(),deadlines:BTreeSet::new(),bytes:0,stop:false,running:false,join_failed:false};
         for ((ns,key),v) in values {
             if ns != NS || !key.starts_with("s/") { continue; }
             let id=key[2..].to_owned();s.bytes+=256+id.len();s.identities.insert(id.clone());
@@ -189,23 +204,146 @@ impl Store {
         state.timers.insert(id,Timer {schedule,generation:outcome.version,next:0,last:None,active:true,error:0});
         self.timers.1.notify_one();Ok(outcome.version.to_le_bytes().to_vec())
     }
-    pub fn start_timers(self:&Arc<Self>) -> io::Result<Owner> {
-        {
-            let mut state=self.timers.0.lock().unwrap();
-            if state.running {return Err(io::Error::other("timer owner already running"));}
-            state.running=true;state.stop=false;
+    pub fn start_timers(self: &Arc<Self>) -> io::Result<Owner> {
+        self.start_resident_workers(0)
+    }
+
+    /// Start the resident's timer and optional heartbeat on this same Store.
+    /// Zero disables the heartbeat. The executable uses this guard too.
+    pub fn start_resident_workers(self: &Arc<Self>, heartbeat_ms: u64) -> io::Result<Owner> {
+        if heartbeat_ms != 0 && heartbeat_ms < 100 {
+            return Err(io::Error::other("heartbeat-ms must be zero or >=100"));
         }
-        let weak=Arc::downgrade(self);let shared=self.timers.clone();let owner_shared=shared.clone();
-        let thread=thread::spawn(move||run(weak,shared));Ok(Owner {shared:owner_shared,thread:Some(thread)})
+        let mut state = self
+            .timers
+            .0
+            .lock()
+            .map_err(|_| io::Error::other("timer state poisoned"))?;
+        if state.join_failed {
+            return Err(io::Error::other("resident worker join previously failed"));
+        }
+        if state.running {
+            return Err(io::Error::other("timer owner already running"));
+        }
+        let weak = Arc::downgrade(self);
+        let shared = self.timers.clone();
+        let timer = thread::Builder::new().spawn(move || run(weak, shared))?;
+        state.running = true;
+        state.stop = false;
+        let mut owner = Owner {
+            shared: self.timers.clone(),
+            timer: Some(timer),
+            heartbeat: None,
+        };
+        if heartbeat_ms != 0 {
+            let (stop, monitor) = mpsc::sync_channel(1);
+            let store = self.clone();
+            match thread::Builder::new().spawn(move || {
+                crate::heartbeat::run(store, Duration::from_millis(heartbeat_ms), monitor)
+            }) {
+                Ok(worker) => owner.heartbeat = Some((stop, worker)),
+                Err(error) => {
+                    // The timer has not passed its first lock. Settle this start.
+                    state.stop = true;
+                    drop(state);
+                    drop(owner);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(owner)
     }
 }
-/// Caller owns this guard and must drop it before dropping its Store. It never owns a Store Arc.
-pub struct Owner {shared:Shared,thread:Option<thread::JoinHandle<()>>}
+
+/// The original timer guard also retains the resident heartbeat when enabled.
+/// Timer-only startup retains a Weak Store. A heartbeat retains a strong borrow
+/// until its actual thread exits.
+pub struct Owner {
+    shared: Shared,
+    timer: Option<thread::JoinHandle<()>>,
+    heartbeat: Option<(mpsc::SyncSender<()>, thread::JoinHandle<()>)>,
+}
+impl Owner {
+    fn signal_heartbeat(&self) {
+        if let Some((stop, _)) = &self.heartbeat {
+            let _ = stop.try_send(());
+        }
+    }
+
+    /// Bind the Store to this guard. Check the original control and clocks before signalling
+    /// and after sampling. A late refusal can follow an effective stop request.
+    /// Retain the guard in that case. A true return means both threads can be
+    /// joined; the join itself observes their results.
+    pub fn poll_stop(
+        &self,
+        store: &Store,
+        deadline: Instant,
+        wall_deadline: SystemTime,
+        mut check_owner: impl FnMut() -> io::Result<()>,
+    ) -> io::Result<bool> {
+        let mut check = || {
+            check_owner()?;
+            if Instant::now() >= deadline || SystemTime::now() >= wall_deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "original resident settlement deadline expired",
+                ));
+            }
+            Ok(())
+        };
+        check()?;
+        if !Arc::ptr_eq(&self.shared, &store.timers) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "resident workers belong to another Store",
+            ));
+        }
+        self.signal_heartbeat();
+        let ready = match self.shared.0.try_lock() {
+            Ok(mut state) => {
+                state.stop = true;
+                self.shared.1.notify_all();
+                self.timer.as_ref().is_none_or(|t| t.is_finished())
+                    && self.heartbeat.as_ref().is_none_or(|(_, t)| t.is_finished())
+            }
+            Err(TryLockError::WouldBlock) => false,
+            Err(TryLockError::Poisoned(_)) => return Err(io::Error::other("timer state poisoned")),
+        };
+        check()?;
+        Ok(ready)
+    }
+
+    /// Signal both workers and observe both joins, even after a worker failure.
+    pub fn join(mut self) -> io::Result<()> {
+        self.stop_and_join()
+    }
+    fn stop_and_join(&mut self) -> io::Result<()> {
+        let Some(timer) = self.timer.take() else {
+            return Ok(());
+        };
+        self.signal_heartbeat();
+        self.shared.0.lock().unwrap_or_else(|e| e.into_inner()).stop = true;
+        self.shared.1.notify_all();
+        let timer_failed = timer.join().is_err();
+        let heartbeat_failed = self
+            .heartbeat
+            .take()
+            .is_some_and(|(_, t)| t.join().is_err());
+        let mut state = self.shared.0.lock().unwrap_or_else(|e| e.into_inner());
+        state.running = false;
+        state.join_failed = timer_failed || heartbeat_failed || self.shared.0.is_poisoned();
+        if state.join_failed {
+            return Err(io::Error::other(format!(
+                "resident workers failed to settle cleanly: timer panic={timer_failed}, heartbeat panic={heartbeat_failed}, timer state poisoned={}",
+                self.shared.0.is_poisoned()
+            )));
+        }
+        Ok(())
+    }
+}
 impl Drop for Owner {
     fn drop(&mut self) {
-        self.shared.0.lock().unwrap().stop=true;self.shared.1.notify_all();
-        if let Some(thread)=self.thread.take() {let _=thread.join();}
-        self.shared.0.lock().unwrap().running=false;
+        let _ = self.stop_and_join();
     }
 }
 fn run(weak:Weak<Store>,shared:Shared) {
@@ -348,6 +486,78 @@ mod tests {
         Arc::make_mut(values.get_mut(&(NS.into(),format!("s/{id}"))).unwrap()).tombstone=true;
         let state=State::restore(&values).unwrap();let state=state.0.lock().unwrap();assert!(state.timers.is_empty());assert_eq!(state.bytes,256+id.len());
     }
+    #[test]
+    fn original_clocks_refuse_before_worker_signals_and_a_late_refusal_retains_the_guard() {
+        let store = Arc::new(Store::open(&path("worker-cutoffs"), Default::default()).unwrap());
+        let guard = store.start_resident_workers(60_000).unwrap();
+        let local = Instant::now();
+        let wall = SystemTime::now();
+        let later = Duration::from_secs(60);
+        let unrelated = Store::open(&path("other-worker-guard"), Default::default()).unwrap();
+        let error = guard
+            .poll_stop(&unrelated, local + later, wall + later, || Ok(()))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(!store.timers.0.lock().unwrap().stop);
+        for (deadline, wall_deadline) in [(local, wall + later), (local + later, wall)] {
+            let error = guard
+                .poll_stop(&store, deadline, wall_deadline, || Ok(()))
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            assert!(!store.timers.0.lock().unwrap().stop);
+        }
+        let mut checks = 0;
+        let error = guard
+            .poll_stop(&store, local + later, wall + later, || {
+                checks += 1;
+                if checks == 2 {
+                    Err(io::Error::other("original control revoked"))
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+        assert_eq!(error.to_string(), "original control revoked");
+        assert!(store.start_timers().is_err());
+        guard.join().unwrap();
+        assert!(require_joined(&store.timers).is_ok());
+    }
+
+    #[test]
+    fn failed_worker_join_latches_capture_and_restart_refusal() {
+        let path = path("failed-worker");
+        let store = Arc::new(Store::open(&path, Default::default()).unwrap());
+        let mut guard = store.start_timers().unwrap();
+        let (stop, monitor) = mpsc::sync_channel(1);
+        guard.heartbeat = Some((
+            stop,
+            thread::spawn(move || {
+                monitor.recv().unwrap();
+                panic!("injected resident heartbeat failure");
+            }),
+        ));
+        assert!(guard
+            .join()
+            .unwrap_err()
+            .to_string()
+            .contains("heartbeat panic=true"));
+        assert!(store.start_timers().is_err());
+        let image = path.with_extension("refused-image");
+        let store = Arc::try_unwrap(store).ok().unwrap();
+        let result = store.capture_stopped(
+            &image,
+            crate::recovery_image::CaptureRequest {
+                source_label: "after-join-failure".into(),
+                ack: crate::client::Ack::Flush,
+            },
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("join previously failed"));
+        assert!(!image.exists());
+    }
+
     #[test] fn only_one_service_timer_owner_can_run() {
         let store=Arc::new(Store::open(&path("owner"),Default::default()).unwrap());
         let owner=store.start_timers().unwrap();assert!(store.start_timers().is_err());drop(owner);

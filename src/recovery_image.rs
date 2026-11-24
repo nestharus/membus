@@ -1079,9 +1079,7 @@ impl Store {
         request: CaptureRequest,
         ctx: &Context,
     ) -> io::Result<CaptureManifest> {
-        if crate::timers::capture_owner_running(&self.timers) {
-            return Err(invalid("running timer owner must be joined before capture"));
-        }
+        crate::timers::require_joined(&self.timers)?;
         if request.source_label.is_empty()
             || request.source_label.len() > 4096
             || request.source_label.contains(['\0', '\n', '\r'])
