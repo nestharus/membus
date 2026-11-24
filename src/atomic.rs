@@ -8,6 +8,7 @@ use crate::{
 use std::{
     io,
     sync::{atomic::Ordering, mpsc, Arc},
+    time::Instant,
 };
 
 /// Legacy wire and default capture ceiling. Native funded capture uses its account.
@@ -662,7 +663,7 @@ impl Store {
         drop(state);
         drop(committed);
         let request = original.to_owned(&OriginalBudget::new(owned_bytes))?;
-        self.publish_atomic_under_gate(&request, deadline, fingerprint)
+        self.publish_atomic_under_gate(&request, deadline, None, fingerprint)
     }
 
     fn original_status(
@@ -689,13 +690,30 @@ impl Store {
         r: &AtomicRequest,
         deadline: u64,
     ) -> Result<Outcome, PublicationError> {
+        self.publish_atomic_with_cutoff(r, deadline, None)
+    }
+
+    /// Apply an additional in-process monotonic deadline to new publication.
+    /// The request's own expiry, Unix deadline and retained outcomes still govern.
+    pub fn publish_atomic_before(
+        &self,
+        r: &AtomicRequest,
+        deadline: u64,
+        cutoff: Instant,
+    ) -> Result<Outcome, PublicationError> {
+        self.publish_atomic_with_cutoff(r, deadline, Some(cutoff))
+    }
+
+    fn publish_atomic_with_cutoff(
+        &self, r: &AtomicRequest, deadline: u64, cutoff: Option<Instant>,
+    ) -> Result<Outcome, PublicationError> {
         // Outermost gate: raw writes, whole policy projection, and expiry finish before comparison.
         // No state/index lock is retained while acquiring this gate.
         let _gate = self.admission_gate.write().unwrap();
-        self.publish_atomic_under_gate(r, deadline, r.fingerprint())
+        self.publish_atomic_under_gate(r, deadline, cutoff, r.fingerprint())
     }
     fn publish_atomic_under_gate(
-        &self, r: &AtomicRequest, deadline: u64, fp: [u8; 32],
+        &self, r: &AtomicRequest, deadline: u64, cutoff: Option<Instant>, fp: [u8; 32],
     ) -> Result<Outcome, PublicationError> {
         let id = (r.data.namespace.clone(), r.data.operation_id.clone());
         let committed = self.committed.read().unwrap();
@@ -704,6 +722,9 @@ impl Store {
             &state, &id, &fp, r.data.epoch, r.data.expires_mono, deadline,
         )? {
             return Ok(outcome);
+        }
+        if cutoff.is_some_and(|cutoff| Instant::now() >= cutoff) {
+            return Err(PublicationError::Expired);
         }
         if !self.atomic_compatible(&r.data.namespace, &committed) {
             return Err(PublicationError::Unsupported);
@@ -806,7 +827,10 @@ impl Store {
         {
             return Err(PublicationError::Resource(7));
         }
-        if self.clock.utc_ms() >= deadline || self.clock.mono_ms() >= r.data.expires_mono {
+        if self.clock.utc_ms() >= deadline
+            || self.clock.mono_ms() >= r.data.expires_mono
+            || cutoff.is_some_and(|cutoff| Instant::now() >= cutoff)
+        {
             return Err(PublicationError::Expired);
         }
         // Admission: every remaining failure is uncertainty, with original identity retained.

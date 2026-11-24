@@ -27,7 +27,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 mod borrowed_keys;
 pub(super) use borrowed_keys::get as committed_get;
@@ -549,7 +549,7 @@ impl Store {
             .unwrap()
             .policy_publishing
             .insert(id.clone());
-        let outcome = self.mutate_mode_ungated(m, true);
+        let outcome = self.mutate_mode_ungated(m, true, None);
         if outcome.code == 0 {
             #[cfg(test)]
             {
@@ -611,9 +611,17 @@ impl Store {
     }
     pub(super) fn mutate_mode(&self, m: Mutation, deduplicate: bool) -> Outcome {
         let _publication = self.admission_gate.read().unwrap();
-        self.mutate_mode_ungated(m, deduplicate)
+        self.mutate_mode_ungated(m, deduplicate, None)
     }
-    fn mutate_mode_ungated(&self, m: Mutation, deduplicate: bool) -> Outcome {
+
+    /// Bound new admission with the caller's local monotonic deadline.
+    /// The Store still completes an already admitted write and reports its outcome.
+    pub fn mutate_before(&self, m: Mutation, cutoff: Instant) -> Outcome {
+        let _publication = self.admission_gate.read().unwrap();
+        self.mutate_mode_ungated(m, true, Some(cutoff))
+    }
+
+    fn mutate_mode_ungated(&self, m: Mutation, deduplicate: bool, cutoff: Option<Instant>) -> Outcome {
         if m.ns.is_empty() || m.key.is_empty() || m.op_id.is_empty() {
             return Outcome::error(3);
         }
@@ -658,13 +666,12 @@ impl Store {
                 if let Some(o) = state.dedup.get(&id).and_then(|d| d.outcome.clone()) {
                     return o;
                 }
-                let wait = m.deadline.saturating_sub(self.clock.utc_ms());
-                if wait == 0 {
+                let wall = Duration::from_millis(m.deadline.saturating_sub(self.clock.utc_ms()));
+                let wait = cutoff.map_or(wall, |end| wall.min(end.saturating_duration_since(Instant::now())));
+                if wait.is_zero() {
                     return Outcome::error(17);
                 }
-                let (s, _) = self
-                    .done
-                    .wait_timeout(state, Duration::from_millis(wait))
+                let (s, _) = self.done.wait_timeout(state, wait)
                     .unwrap();
                 state = s;
             }
@@ -672,7 +679,7 @@ impl Store {
         if deduplicate && state.retired_set.contains(&id) {
             return Outcome::error(13);
         }
-        if self.clock.utc_ms() >= m.deadline {
+        if self.clock.utc_ms() >= m.deadline || cutoff.is_some_and(|end| Instant::now() >= end) {
             return Outcome::error(5);
         }
         if state.warming {
@@ -758,7 +765,7 @@ impl Store {
         }
         // The clock check immediately precedes insertion: this is the admission point.
         let at = self.clock.utc_ms();
-        if at >= m.deadline {
+        if at >= m.deadline || cutoff.is_some_and(|end| Instant::now() >= end) {
             return Outcome::error(5);
         }
         let version = state.next;

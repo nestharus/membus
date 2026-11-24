@@ -64,6 +64,58 @@ fn request(s: &Store, id: &str, ack: AtomicAck) -> AtomicRequest {
 fn publish(s: &Store, r: &AtomicRequest) -> Result<Outcome, PublicationError> {
     s.publish_atomic(r, s.clock.utc_ms() + 30_000)
 }
+#[test]
+fn expired_local_publication_cutoff_keeps_store_unchanged() {
+    let fixture = Fixture::new("atomic-local-cutoff");
+    let clock = ManualClock::new(1000);
+    let store = Store::open(&fixture.state(), config(&clock)).unwrap();
+    let original = request(&store, "local-cutoff", AtomicAck::Flush);
+    let deadline = clock.utc_ms() + 30_000;
+    let cutoff = Instant::now();
+    let next_before = store.next_issued.load(Ordering::SeqCst);
+
+    assert!(matches!(
+        store.publish_atomic_before(&original, deadline, cutoff),
+        Err(PublicationError::Expired)
+    ));
+    assert!(store.try_get("authored", "a").unwrap().is_none());
+    assert!(store.try_get("authored", "b").unwrap().is_none());
+    assert_eq!(store.next_issued.load(Ordering::SeqCst), next_before);
+
+    let outcome = store.publish_atomic(&original, deadline).unwrap();
+    assert_eq!(
+        store.publish_atomic_before(&original, deadline, cutoff).unwrap(),
+        outcome
+    );
+}
+
+#[test]
+fn expired_local_mutation_cutoff_keeps_store_unchanged() {
+    let fixture = Fixture::new("mutation-local-cutoff");
+    let clock = ManualClock::new(1000);
+    let store = Store::open(&fixture.state(), config(&clock)).unwrap();
+    let original = Mutation {
+        ns: "authored".into(),
+        key: "custody".into(),
+        op_id: "mutation-cutoff".into(),
+        deadline: clock.utc_ms() + 30_000,
+        ack: 2,
+        expected: Some(0),
+        bytes: vec![1],
+        remove: false,
+    };
+    let cutoff = Instant::now();
+    let next_before = store.next_issued.load(Ordering::SeqCst);
+
+    assert_eq!(store.mutate_before(original.clone(), cutoff), Outcome::error(5));
+    assert!(store.try_get("authored", "custody").unwrap().is_none());
+    assert_eq!(store.next_issued.load(Ordering::SeqCst), next_before);
+
+    let result = store.mutate(original.clone());
+    assert_eq!(result.code, 0);
+    assert_eq!(store.mutate_before(original, cutoff), result);
+}
+
 fn inspect(s: &Store, r: &AtomicRequest) -> AtomicResultInspection {
     inspect_input(s, OriginalRef::Request(r))
 }
