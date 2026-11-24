@@ -152,7 +152,7 @@ fn resident_workers_settle_before_capture_of_the_original_store() {
     let source = p.join("source");
     let store = Arc::new(Store::open(&source, config()).unwrap());
     let epoch = store.epoch;
-    let workers: membus::ResidentWorkers = store.start_resident_workers(60_000).unwrap();
+    let mut workers: membus::ResidentWorkers = store.start_resident_workers(60_000).unwrap();
     assert!(store.start_timers().is_err());
     let until = Instant::now() + Duration::from_secs(10);
     let wall = SystemTime::now() + Duration::from_secs(10);

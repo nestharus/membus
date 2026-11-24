@@ -47,7 +47,8 @@ returned `ResidentWorkers` guard and its original `Arc<Store>`. The host fences
 launch and write admission, settles accepted connections and subscription delivery,
 and retains every unconfirmed effect. It calls
 `guard.poll_stop(&store, deadline, wall_deadline, check_owner)` with the selected
-Store, original absolute clocks and ownership/cancellation check. A guard from
+Store, original absolute clocks and ownership/cancellation check. The guard
+retains the first authorized pair of deadlines for subsequent polls. A guard from
 another Store refuses before either worker receives a stop signal. A pending
 poll or a late error can follow an effective stop request. Retain that guard and
 operation. Once ready,

@@ -234,6 +234,7 @@ impl Store {
             shared: self.timers.clone(),
             timer: Some(timer),
             heartbeat: None,
+            stop_deadlines: None,
         };
         if heartbeat_ms != 0 {
             let (stop, monitor) = mpsc::sync_channel(1);
@@ -262,6 +263,7 @@ pub struct Owner {
     shared: Shared,
     timer: Option<thread::JoinHandle<()>>,
     heartbeat: Option<(mpsc::SyncSender<()>, thread::JoinHandle<()>)>,
+    stop_deadlines: Option<(Instant, SystemTime)>,
 }
 impl Owner {
     fn signal_heartbeat(&self) {
@@ -275,14 +277,27 @@ impl Owner {
     /// Retain the guard in that case. A true return means both threads can be
     /// joined; the join itself observes their results.
     pub fn poll_stop(
-        &self,
+        &mut self,
         store: &Store,
         deadline: Instant,
         wall_deadline: SystemTime,
         mut check_owner: impl FnMut() -> io::Result<()>,
     ) -> io::Result<bool> {
-        let mut check = || {
-            check_owner()?;
+        check_owner()?;
+        if !Arc::ptr_eq(&self.shared, &store.timers) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "resident workers belong to another Store",
+            ));
+        }
+        let selected = (deadline, wall_deadline);
+        if *self.stop_deadlines.get_or_insert(selected) != selected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "original resident settlement deadlines changed",
+            ));
+        }
+        let check_clocks = || {
             if Instant::now() >= deadline || SystemTime::now() >= wall_deadline {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
@@ -291,13 +306,7 @@ impl Owner {
             }
             Ok(())
         };
-        check()?;
-        if !Arc::ptr_eq(&self.shared, &store.timers) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "resident workers belong to another Store",
-            ));
-        }
+        check_clocks()?;
         self.signal_heartbeat();
         let ready = match self.shared.0.try_lock() {
             Ok(mut state) => {
@@ -309,7 +318,8 @@ impl Owner {
             Err(TryLockError::WouldBlock) => false,
             Err(TryLockError::Poisoned(_)) => return Err(io::Error::other("timer state poisoned")),
         };
-        check()?;
+        check_owner()?;
+        check_clocks()?;
         Ok(ready)
     }
 
@@ -489,23 +499,32 @@ mod tests {
     #[test]
     fn original_clocks_refuse_before_worker_signals_and_a_late_refusal_retains_the_guard() {
         let store = Arc::new(Store::open(&path("worker-cutoffs"), Default::default()).unwrap());
-        let guard = store.start_resident_workers(60_000).unwrap();
         let local = Instant::now();
         let wall = SystemTime::now();
         let later = Duration::from_secs(60);
+        for (deadline, wall_deadline) in [(local, wall + later), (local + later, wall)] {
+            let mut guard = store.start_resident_workers(60_000).unwrap();
+            let error = guard
+                .poll_stop(&store, deadline, wall_deadline, || Ok(()))
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            let error = guard
+                .poll_stop(&store, local + later, wall + later, || Ok(()))
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "original resident settlement deadlines changed"
+            );
+            assert!(!store.timers.0.lock().unwrap().stop);
+            guard.join().unwrap();
+        }
+        let mut guard = store.start_resident_workers(60_000).unwrap();
         let unrelated = Store::open(&path("other-worker-guard"), Default::default()).unwrap();
         let error = guard
             .poll_stop(&unrelated, local + later, wall + later, || Ok(()))
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(!store.timers.0.lock().unwrap().stop);
-        for (deadline, wall_deadline) in [(local, wall + later), (local + later, wall)] {
-            let error = guard
-                .poll_stop(&store, deadline, wall_deadline, || Ok(()))
-                .unwrap_err();
-            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-            assert!(!store.timers.0.lock().unwrap().stop);
-        }
         let mut checks = 0;
         let error = guard
             .poll_stop(&store, local + later, wall + later, || {
@@ -518,6 +537,8 @@ mod tests {
             })
             .unwrap_err();
         assert_eq!(error.to_string(), "original control revoked");
+        let changed = guard.poll_stop(&store, local + later, wall + later + later, || Ok(()));
+        assert_eq!(changed.unwrap_err().kind(), io::ErrorKind::InvalidInput);
         assert!(store.start_timers().is_err());
         guard.join().unwrap();
         assert!(require_joined(&store.timers).is_ok());
