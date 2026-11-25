@@ -172,10 +172,20 @@ impl Store {
         let expected=c.u64()?;
         if op==crate::TIMER_CANCEL {
             c.end()?;
+            let mutation = Mutation { ns:NS.into(),key:format!("s/{id}"),op_id,deadline,ack:1,
+                expected:Some(expected),bytes:Vec::new(),remove:true };
+            {
+                let store_state = self.state.lock().unwrap();
+                let dedup_id = crate::store::dedup_identity(&mutation);
+                if let Some(d) = store_state.dedup.get(&dedup_id) {
+                    if d.fingerprint != crate::store::fingerprint(&mutation) {
+                        return Err(14);
+                    }
+                }
+            }
             let t=state.timers.get(&id).ok_or(25u16)?;
             if t.generation!=expected {return Err(12);}
-            let outcome=self.mutate(Mutation { ns:NS.into(),key:format!("s/{id}"),op_id,deadline,ack:1,
-                expected:Some(expected),bytes:Vec::new(),remove:true });
+            let outcome=self.mutate(mutation);
             if outcome.code!=0 {return Err(outcome.code);}
             let old=state.timers.remove(&id).unwrap();state.bytes-=old.schedule.charge();
             if let Some((_,due,_))=old.schedule.time(old.next) {state.deadlines.remove(&(due,id));}
@@ -194,8 +204,14 @@ impl Store {
             expected:if expected==u64::MAX {None}else{Some(expected)},bytes:schedule.encode(),remove:false});
         if outcome.code!=0 {return Err(outcome.code);}
         // A retry of an older op cannot replace newer runtime state or rewind completed progress.
-        let value=self.get_handle(NS,&format!("s/{id}")).ok_or(12u16)?;
-        if value.version!=outcome.version {return Err(12);}
+        let latest = self
+            .committed
+            .read()
+            .unwrap()
+            .get(&(NS.into(), format!("s/{id}")))
+            .filter(|e| !e.tombstone)
+            .map(|e| e.version);
+        if latest != Some(outcome.version) {return Err(12);}
         if state.timers.get(&id).is_some_and(|t|t.generation==outcome.version) {return Ok(outcome.version.to_le_bytes().to_vec());}
         if let Some(t)=state.timers.get(&id) {
             if let Some((_,due,_))=t.schedule.time(t.next) {state.deadlines.remove(&(due,id.clone()));}
@@ -631,5 +647,82 @@ mod tests {
         s.period=99;s.low=0;s.high=0;assert!(s.validate().is_err());
         s.period=100;s.anchor=u64::MAX;s.high=1;assert!(s.validate().is_err());
         s.anchor=1;s.low=-2;s.high=0;assert!(s.validate().is_err());
+    }
+    fn timer_set_payload(name: &str, expected: u64, signal_key: &str, anchor: u64, ack: u8) -> Vec<u8> {
+        let mut p = Vec::new();
+        lp(&mut p, name.as_bytes());
+        p.extend(expected.to_le_bytes());
+        lp(&mut p, signal_key.as_bytes());
+        p.extend(anchor.to_le_bytes());
+        p.extend(60_000u64.to_le_bytes());
+        p.extend((-1000i64 as u64).to_le_bytes());
+        p.extend((1000i64 as u64).to_le_bytes());
+        lp(&mut p, b"wake");
+        p.push(ack);
+        p
+    }
+    fn timer_cancel_payload(name: &str, expected: u64) -> Vec<u8> {
+        let mut p = Vec::new();
+        lp(&mut p, name.as_bytes());
+        p.extend(expected.to_le_bytes());
+        p
+    }
+    #[test]
+    fn timer_set_retry_with_zero_cache_reads_in_memory_without_cold_io() {
+        let dir = path("zero-cache-retry");
+        let cfg = crate::Config { cache_bytes: 0, flush_ms: 0, ..crate::Config::default() };
+        let store = Store::open(&dir, cfg).unwrap();
+        let dl = crate::now_ms() + 30_000;
+        let anchor = crate::now_ms() + 60_000;
+        let p1 = timer_set_payload("t1", 0, "wake/1", anchor, 1);
+        let first = store.timer_call(crate::TIMER_SET, "app".into(), "op-1".into(), dl, &mut Cursor::new(&p1)).unwrap();
+        let gen1 = u64::from_le_bytes(first.try_into().unwrap());
+        // Exact retry with cache_bytes=0 must succeed via in-memory committed state without cold disk I/O.
+        let retry = store.timer_call(crate::TIMER_SET, "app".into(), "op-1".into(), dl, &mut Cursor::new(&p1)).unwrap();
+        assert_eq!(u64::from_le_bytes(retry.try_into().unwrap()), gen1);
+        // Replacing the timer causes an old retry to return Conflict (12).
+        let p2 = timer_set_payload("t1", gen1, "wake/2", anchor, 1);
+        let second = store.timer_call(crate::TIMER_SET, "app".into(), "op-2".into(), dl, &mut Cursor::new(&p2)).unwrap();
+        let gen2 = u64::from_le_bytes(second.try_into().unwrap());
+        assert!(gen2 > gen1);
+        let old_retry = store.timer_call(crate::TIMER_SET, "app".into(), "op-1".into(), dl, &mut Cursor::new(&p1));
+        assert_eq!(old_retry, Err(12));
+    }
+    #[test]
+    fn timer_cancel_reused_op_id_returns_mismatch_before_missing_or_conflict() {
+        let dir = path("cancel-dedup-precedence");
+        let store = Store::open(&dir, crate::Config { flush_ms: 0, ..crate::Config::default() }).unwrap();
+        let dl = crate::now_ms() + 30_000;
+        let anchor = crate::now_ms() + 60_000;
+        let p1 = timer_set_payload("live", 0, "wake/live", anchor, 1);
+        let gen1 = u64::from_le_bytes(
+            store.timer_call(crate::TIMER_SET, "app".into(), "op-shared".into(), dl, &mut Cursor::new(&p1))
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        );
+        // Reusing op-shared on an absent timer must return op_id_mismatch (14), not timer_missing (25).
+        let cancel_absent = timer_cancel_payload("absent", 1);
+        assert_eq!(
+            store.timer_call(crate::TIMER_CANCEL, "app".into(), "op-shared".into(), dl, &mut Cursor::new(&cancel_absent)),
+            Err(14)
+        );
+        // Reusing op-shared on a live timer with a stale generation must also return 14, not 12.
+        let cancel_stale = timer_cancel_payload("live", gen1 + 99);
+        assert_eq!(
+            store.timer_call(crate::TIMER_CANCEL, "app".into(), "op-shared".into(), dl, &mut Cursor::new(&cancel_stale)),
+            Err(14)
+        );
+        // Fresh cancel succeeds, exact same-attempt retry preserves 25, mismatched reuse returns 14.
+        let cancel_live = timer_cancel_payload("live", gen1);
+        store.timer_call(crate::TIMER_CANCEL, "app".into(), "op-cancel".into(), dl, &mut Cursor::new(&cancel_live)).unwrap();
+        assert_eq!(
+            store.timer_call(crate::TIMER_CANCEL, "app".into(), "op-cancel".into(), dl, &mut Cursor::new(&cancel_live)),
+            Err(25)
+        );
+        assert_eq!(
+            store.timer_call(crate::TIMER_CANCEL, "app".into(), "op-cancel".into(), dl, &mut Cursor::new(&cancel_absent)),
+            Err(14)
+        );
     }
 }

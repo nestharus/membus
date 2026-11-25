@@ -403,3 +403,29 @@
         assert_eq!(reopened.chunks.lock().unwrap().summaries.keys.keys().cloned().collect::<HashSet<_>>(),expected);
         assert!(expected.iter().all(|(ns,key)|reopened.get_status(ns,key)==(1,0)));
     }
+    #[test]
+    fn drop_tombstones_preserves_unpublished_policy_clear() {
+        let (path, _, config) = fixture("policy-clear-tombstone");
+        let s = Arc::new(Store::open(&path, config.clone()).unwrap());
+        assert_eq!(s.set_policy("clear-race", "p/", Some(Class::expire(DAY)), now_ms() + 10_000).code, 0);
+        let (reached, committed) = mpsc::channel();
+        let (resume, resumed) = mpsc::channel();
+        *s.policy_after_commit.lock().unwrap() = Some((reached, resumed));
+        let a = s.clone();
+        let clearing = std::thread::spawn(move || a.set_policy("clear-race", "p/", None, now_ms() + 10_000));
+        committed.recv_timeout(Duration::from_secs(5)).unwrap();
+        // Run tombstone reclamation while the policy clear is committed but unpublished.
+        s.maint.drop_tombstones();
+        resume.send(()).unwrap();
+        assert_eq!(clearing.join().unwrap().code, 0);
+        assert!(s.policies().into_iter().all(|r| !(r.0 == "clear-race" && r.1 == "p/")));
+        assert_eq!(s.mutate(put("clear-race", "p/k", "after-clear")).code, 0);
+        let chunks = s.chunks.lock().unwrap();
+        assert!(chunks.table.values()
+            .filter(|c| c.keys.contains_key(&("clear-race".into(), "p/k".into())))
+            .all(|c| c.class == Class::FOREVER));
+        drop(chunks);
+        drop(s);
+        let reopened = Store::open(&path, config).unwrap();
+        assert!(reopened.policies().into_iter().all(|r| !(r.0 == "clear-race" && r.1 == "p/")));
+    }

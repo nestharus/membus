@@ -26,7 +26,7 @@ pub mod selected_view;
 pub mod pipe_io;
 use std::{
     collections::HashMap,
-    fs::{self, File, OpenOptions},
+    fs::{File, OpenOptions},
     io,
     path::{Path, PathBuf},
     sync::{
@@ -38,6 +38,7 @@ use std::{
 #[cfg(test)]
 use std::{
     collections::HashSet,
+    fs,
     io::Write,
     sync::atomic::{AtomicUsize, Ordering},
     time::{Duration, Instant},
@@ -429,6 +430,7 @@ impl Store {
         Self::open_owned_mode(path, config, owner, quarantine)
     }
     #[cfg(test)]
+    #[allow(dead_code)]
     fn open_owned(path: &Path, config: Config, owner: File) -> io::Result<Self> {
         Self::open_owned_mode(path, config, owner, false)
     }

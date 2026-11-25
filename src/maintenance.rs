@@ -309,7 +309,9 @@ impl Maint {
             state.keys -= freed;
             let candidates: Vec<Key> = state.tomb_candidates.drain().collect();
             for k in candidates {
-                if state.pending.contains_key(&k) {
+                if state.pending.contains_key(&k)
+                    || (k.0 == chunks::POLICY_NS && !state.policy_publishing.is_empty())
+                {
                     state.tomb_candidates.insert(k);
                     continue;
                 }

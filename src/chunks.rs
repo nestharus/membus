@@ -870,8 +870,9 @@ impl Catalogue {
     }
     pub fn recovery_evidence(&self) -> Option<&Path> { self.recovery_evidence.as_deref() }
     fn preserve_uncertain(&self) -> io::Result<PathBuf> {
+        let stamp = Clock::new(None).utc_ms();
         for n in 0..32 {
-            let dir = self.path.parent().unwrap().join(format!("catalogue-recovery-{}-{n}", crate::now_ms()));
+            let dir = self.path.parent().unwrap().join(format!("catalogue-recovery-{stamp}-{n}"));
             match fs::create_dir(&dir) {
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(e),
@@ -1417,6 +1418,8 @@ pub struct ChunkStore {
     pub rewrite_error: Option<String>,
     /// A partial retirement prefix needs discharge by a known-live rewrite before retry.
     pub incomplete_retiring: bool,
+    /// Durable Rec::Open entries whose file/dir sync failed before insertion into `table`.
+    pub unrouted_opens: BTreeMap<u64, CatRecord>,
 }
 impl ChunkStore {
     pub fn new(dir: PathBuf) -> Self {
@@ -1440,6 +1443,7 @@ impl ChunkStore {
             last_resume: None,
             rewrite_error: None,
             incomplete_retiring: false,
+            unrouted_opens: BTreeMap::new(),
         }
     }
     pub(super) fn managed_index_bytes(&self) -> usize {
@@ -1529,6 +1533,9 @@ impl ChunkStore {
             if c.state == ChunkState::Retiring {
                 out.extend(retiring_records(c.retired_ms.unwrap_or(now), c.id, next, &c.horizons, &c.expired));
             }
+        }
+        for open in self.unrouted_opens.values() {
+            out.push(open.clone());
         }
         // Payload: kind + at_ms + count, then length-prefixed UTF-8 pairs and versions.
         let mut part = Vec::new();

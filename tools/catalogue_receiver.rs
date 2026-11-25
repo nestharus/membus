@@ -170,6 +170,9 @@ pub fn decode(bytes: &[u8]) -> io::Result<Vec<CatRecord>> {
         if input.word()? != !len {
             return Err(io::Error::other("receiving length complement"));
         }
+        if len as usize > 16 * 1024 * 1024 {
+            return Err(io::Error::other("receiving frame limit"));
+        }
         let crc = input.word()?;
         let payload = input.take(len as usize)?;
         if checksum(payload) != crc {
@@ -179,10 +182,12 @@ pub fn decode(bytes: &[u8]) -> io::Result<Vec<CatRecord>> {
     }
     Ok(out)
 }
+#[allow(dead_code)]
 pub fn read(path: &Path) -> io::Result<Vec<CatRecord>> {
     capture(path).map(|(_, records)| records)
 }
 /// Return the exact bytes the receiving decoder observed with their decoded records.
+#[allow(dead_code)]
 pub fn capture(path: &Path) -> io::Result<(Vec<u8>, Vec<CatRecord>)> {
     if fs::metadata(path)?.len() > 64 * 1024 * 1024 {
         return Err(io::Error::other("receiving catalogue limit"));

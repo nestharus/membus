@@ -276,7 +276,7 @@ impl<T: Transport> Client<T> {
         let p = self.scan_frame(crate::SCAN_PREFIX, ns, snapshot, cursor, limit, max_bytes, &[prefix], op, d)?;
         let b = self.m3_frame_exchange(crate::SCAN_PREFIX, p, d.local)?;
         let result = (|| {
-            if b.len() > max_bytes {
+            if b.len() + 15 > max_bytes {
                 return Err(Error::Protocol("scan page bytes"));
             }
             let mut c = Cursor::new(&b);
@@ -425,7 +425,7 @@ impl<T: Transport> Client<T> {
         }
         let p = self.scan_frame(crate::SCAN_RANGE, ns, snapshot, cursor, limit, max_bytes, &[lower, upper], op, d)?;
         self.m3_frame_response(crate::SCAN_RANGE, p, d.local, |this, b| {
-            if b.len() > max_bytes {
+            if b.len() + 15 > max_bytes {
                 return Err(Error::Protocol("scan page bytes"));
             }
             let mut c = Cursor::new(&b);

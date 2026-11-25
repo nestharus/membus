@@ -123,12 +123,12 @@ fn parse(args: &[String]) -> io::Result<Command<'_>> {
             }
             "--flush-ms" => config.flush_ms = n,
             "--retry-ms" => config.retry_ms = n,
-            "--quota" => config.quota = n as usize,
-            "--index-cap" => config.index_cap = n as usize,
-            "--capacity" => config.capacity = n as usize,
+            "--quota" => config.quota = usize::try_from(n).map_err(io::Error::other)?,
+            "--index-cap" => config.index_cap = usize::try_from(n).map_err(io::Error::other)?,
+            "--capacity" => config.capacity = usize::try_from(n).map_err(io::Error::other)?,
             "--cache-bytes" => config.cache_bytes = usize::try_from(n).map_err(io::Error::other)?,
-            "--queue-bytes" => config.queue_bytes = n as usize,
-            "--dedup-cap" => config.dedup_cap = n as usize,
+            "--queue-bytes" => config.queue_bytes = usize::try_from(n).map_err(io::Error::other)?,
+            "--dedup-cap" => config.dedup_cap = usize::try_from(n).map_err(io::Error::other)?,
             "--delay-ms" => config.write_delay_ms = n,
             "--snapshot-bytes" => {
                 config.snapshot_bytes = usize::try_from(n).map_err(io::Error::other)?

@@ -787,8 +787,8 @@ impl Store {
                     p.extend((namespace_keys as u64).to_le_bytes());
                     p.extend((self.config.quota as u64).to_le_bytes());
                     p.extend((self.config.index_cap as u64).to_le_bytes());
-                    p.push((k * 100 >= self.config.index_cap * 70) as u8);
-                    p.push((namespace_keys * 100 >= self.config.quota * 70) as u8);
+                    p.push(((k as u128) * 100 >= (self.config.index_cap as u128) * 70) as u8);
+                    p.push(((namespace_keys as u128) * 100 >= (self.config.quota as u128) * 70) as u8);
                     Ok(p)
                 }
                 _ => Err(2),

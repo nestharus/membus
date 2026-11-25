@@ -214,6 +214,21 @@ impl Hub {
         }
         let mut demand = row_demand(ns.len(), prefix.capacity(), endpoint.capacity(), frame_max)?;
         if !values { demand.encoding = encoding_demand(frame_max, false)?; }
+        if s.subs.len() == SUB_MAX {
+            let mut removed = false;
+            for _ in 0..s.subs.len() {
+                let old = s.subs.pop_front().unwrap();
+                if !removed && !old.active && old.bytes == 0 {
+                    drop(old);
+                    removed = true;
+                } else {
+                    s.subs.push_back(old);
+                }
+            }
+            if !removed {
+                return Err(6);
+            }
+        }
         let mut allocation = budget.reserve(demand, true).map_err(|_| 7u16)?;
         let child = allocation.split(SubscriptionResources {
             in_flight: demand.in_flight, encoding: demand.encoding, ..Default::default()
@@ -226,11 +241,6 @@ impl Hub {
             status: WRITTEN, queue: LinkedList::new(), bytes: 0, written: 0, failed: 0,
             dropped: 0, last: 0, allocation: Some(allocation),
         };
-        if s.subs.len()==SUB_MAX {
-            let mut removed=false;
-            for _ in 0..s.subs.len(){let old=s.subs.pop_front().unwrap();if !removed && !old.active && old.bytes==0 {drop(old);removed=true;}else{s.subs.push_back(old);}}
-            if !removed{return Err(6);}
-        }
         row.id=s.next;s.next=row.id.checked_add(1).ok_or(7u16)?;
         row.last=start;row.bytes=bytes;
         row.queue.extend(s.ring.iter().filter(|c|c.seq>start && c.ns==ns && c.key.starts_with(&row.prefix)).map(|history| history.change.clone()));

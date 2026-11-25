@@ -133,16 +133,16 @@ impl ChunkRouter {
         let path = chunks::chunk_path(&cs.dir, class, stripe, id);
         let now = self.clock.utc_ms();
         // The open record is flushed before the file exists, so a crash leaves at most a record with no file.
-        cs.log(
-            now,
-            chunks::Rec::Open {
-                seq: id,
-                stripe: stripe as u8,
-                class,
-                policy: policy.clone(),
-                next: self.next.load(Ordering::SeqCst),
-            },
-        )?;
+        let open_rec = chunks::Rec::Open {
+            seq: id,
+            stripe: stripe as u8,
+            class,
+            policy: policy.clone(),
+            next: self.next.load(Ordering::SeqCst),
+        };
+        cs.log(now, open_rec.clone())?;
+        cs.unrouted_opens
+            .insert(id, chunks::CatRecord { at_ms: now, rec: open_rec });
         cs.next_id = next_id;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -154,6 +154,7 @@ impl ChunkRouter {
         // retain the durable Open and empty file for the ordinary replay path.
         sync_chunk_directory(path.parent().unwrap(), config)?;
         sync_chunk_directory(&cs.dir, config)?;
+        cs.unrouted_opens.remove(&id);
         cs.table.insert(
             id,
             chunks::ChunkInfo {

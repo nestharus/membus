@@ -118,7 +118,8 @@ impl Store {
         metadata_bytes: usize,
         limits: ImageLimits,
     ) -> Result<ImageBudget, PublicationError> {
-        let scans = self.scans.lock().unwrap();
+        let mut scans = self.scans.lock().unwrap();
+        self.purge_scans(&mut scans);
         let state = self.state.lock().unwrap();
         if state.read_only || state.warming {
             return Err(PublicationError::Unavailable);

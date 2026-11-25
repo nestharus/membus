@@ -189,3 +189,33 @@ fn rotation_directory_failure_preserves_the_previously_flushed_value() {
         assert_eq!(store.get("caller", "key").unwrap().bytes, b"two");
     }
 }
+
+#[test]
+fn catalogue_rewrite_after_failed_rotation_open_preserves_unrouted_open() {
+    let f = Fixture::new();
+    let count = Arc::new(AtomicUsize::new(0));
+    let observed = count.clone();
+    let mut cfg = Config { chunk_bytes: 1, catalogue_rewrite_bytes: 1, ..config() };
+    cfg.chunk_dir_sync = Some(Arc::new(move |_| {
+        if observed.fetch_add(1, Ordering::SeqCst) + 1 == 3 {
+            Err(io::Error::from_raw_os_error(5))
+        } else { Ok(()) }
+    }));
+    let store = Store::open(&f.0, cfg.clone()).unwrap();
+    let prior = store.mutate(mutation("one", b"one"));
+    assert_eq!((prior.code, prior.ack), (0, 2));
+    assert_eq!(store.mutate(mutation("two", b"two")).code, 16);
+    assert_eq!(count.load(Ordering::SeqCst), 3);
+    assert!(store.health2().read_only);
+    // Force catalogue rewrite while the unrouted Open record exists on disk.
+    store.maint.rewrite_catalogue();
+    drop(store);
+    f.unlock();
+    cfg.chunk_dir_sync = None;
+    let store = Store::open(&f.0, cfg).unwrap();
+    assert!(!store.storage_error(), "rewrite must preserve unrouted Open so restart does not see an orphan");
+    assert!(!store.health2().read_only);
+    assert_eq!(store.get("caller", "key").unwrap().bytes, b"one");
+    assert_eq!(store.mutate(mutation("two", b"two")).code, 0);
+    assert_eq!(store.get("caller", "key").unwrap().bytes, b"two");
+}

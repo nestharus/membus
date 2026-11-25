@@ -518,11 +518,21 @@ fn move_legacy(path: &Path, import: &chunks::Import, config: &Config) -> io::Res
 /// The one-time import (CHUNK-RETIREMENT.md 5.6): each key's latest legacy record, at its version and time, into
 /// chunks by class under chunks.import/, checked against the legacy replay before the switch. None when there is
 /// nothing to import; Err (legacy logs untouched, chunks.import/ removed) on any difference.
+#[cfg(test)]
 fn import_legacy(
     path: &Path,
     config: &Config,
     clock: &chunks::Clock,
     epoch: u64,
+) -> io::Result<Option<(chunks::Import, String)>> {
+    import_legacy_with_catalogue(path, config, clock, epoch, &mut None)
+}
+fn import_legacy_with_catalogue(
+    path: &Path,
+    config: &Config,
+    clock: &chunks::Clock,
+    epoch: u64,
+    previous_catalogue: &mut Option<File>,
 ) -> io::Result<Option<(chunks::Import, String)>> {
     use chunks::Rec;
     let files = legacy_files(path);
@@ -825,6 +835,17 @@ fn import_legacy(
     };
     // The switch: chunks.import/ becomes chunks/; then the legacy logs move, unmodified and read-only.
     if chunks_dir.exists() {
+        if let Some(prev) = previous_catalogue.take() {
+            if prev.metadata()?.len() != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "legacy import refused: existing catalogue is non-empty",
+                ));
+            }
+            // Drop the 0-byte catalogue handle before renaming its parent chunks/
+            // directory on Windows NTFS; chunks.catalogue-owner remains held.
+            drop(prev);
+        }
         fs::rename(&chunks_dir, path.join(format!("chunks.pre-import-{epoch}")))?;
         recovery_sync_dir(path, config)?;
     }
@@ -1268,12 +1289,12 @@ pub(super) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
         .map_err(|e| refuse(e, chunks::ReplayReport::default()))?;
     // Hold the old file too: a writable hardlink in another directory must not
     // race the import switch. Delete sharing permits the owned directory rename.
-    let previous_catalogue = match chunks::Catalogue::writer_file(&cat_path, false) {
+    let mut previous_catalogue = match chunks::Catalogue::writer_file(&cat_path, false) {
         Ok(file) => Some(file),
         Err(e) if e.kind() == io::ErrorKind::NotFound => None,
         Err(e) => return Err(refuse(e, chunks::ReplayReport::default())),
     };
-    let imported = match import_legacy(path, config, &clock, epoch) {
+    let imported = match import_legacy_with_catalogue(path, config, &clock, epoch, &mut previous_catalogue) {
         Ok(x) => x,
         Err(e) => {
             let report = chunks::ReplayReport {

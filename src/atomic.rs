@@ -564,7 +564,8 @@ impl Store {
             return Err(PublicationError::Resource(7));
         }
         // Same coordination as ordinary snapshot reservation: committed->scans->state.
-        let scans = self.scans.lock().unwrap();
+        let mut scans = self.scans.lock().unwrap();
+        self.purge_scans(&mut scans);
         let state = self.state.lock().unwrap();
         if state.read_only || state.warming || (wire_max.is_some() && self.flags.storage_error.load(Ordering::SeqCst)) {
             return Err(PublicationError::Unavailable);
@@ -1029,3 +1030,64 @@ impl Store {
 #[cfg(test)]
 #[path = "atomic_original_tests.rs"]
 mod original_tests;
+
+#[cfg(test)]
+mod expired_scan_tests {
+    use super::*;
+    use crate::recovery_image::ImageLimits;
+    #[test]
+    fn expired_scans_are_purged_before_atomic_capture_and_image_budget() {
+        let dir = std::path::PathBuf::from(
+            std::env::var("MEMBUS_TEST_OUTPUT").unwrap_or_else(|_| ".test-output".into()),
+        )
+        .join(format!(
+            "atomic-expired-scans-{}-{}",
+            std::process::id(),
+            crate::now_ms()
+        ));
+        let clock = crate::chunks::ManualClock::new(crate::now_ms());
+        let cfg = crate::Config {
+            clock: Some(clock.clone()),
+            snapshot_max: 2,
+            snapshot_ttl_ms: 100,
+            flush_ms: 0,
+            tick_ms: 3_600_000,
+            retire_ms: 3_600_000,
+            ..crate::Config::default()
+        };
+        let store = Store::open(&dir, cfg).unwrap();
+        let limits = ImageLimits {
+            backing_bytes: 1024 * 1024,
+            io_bytes: 1024 * 1024,
+            operations: 100,
+        };
+        // Fill snapshot_max (2) scan slots.
+        store.snapshot_open("ns").unwrap();
+        store.snapshot_open("ns").unwrap();
+        // While snapshots are live, both capture_atomic and image_budget are refused with Resource(7).
+        assert!(matches!(
+            store.capture_atomic("ns", None, None),
+            Err(PublicationError::Resource(7))
+        ));
+        assert!(matches!(
+            store.image_budget(1024, limits),
+            Err(PublicationError::Resource(7))
+        ));
+        // Advance clock past snapshot_ttl_ms without issuing another snapshot RPC.
+        clock.advance(200);
+        let view = store.capture_atomic("ns", None, None).unwrap();
+        drop(view);
+        // Re-fill snapshot_max and verify image_budget also purges expired scans on its own.
+        store.snapshot_open("ns").unwrap();
+        store.snapshot_open("ns").unwrap();
+        assert!(matches!(
+            store.image_budget(1024, limits),
+            Err(PublicationError::Resource(7))
+        ));
+        clock.advance(200);
+        let budget = store.image_budget(1024, limits).unwrap();
+        drop(budget);
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

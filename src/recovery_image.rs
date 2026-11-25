@@ -179,6 +179,7 @@ fn config_bytes_in(c: &Config, ctx: &Context) -> io::Result<Vec<u8>> {
         || c.replay_report_dir_sync.is_some()
         || c.chunk_dir_sync.is_some()
         || c.state_dir_sync.is_some()
+        || c.retirement_started.is_some()
         || c.stop_after_replay_truncation
     {
         return Err(invalid(
@@ -423,7 +424,9 @@ fn regular_streams_in(file: &File, ctx: &Context) -> io::Result<()> {
     // permit inspection without releasing directory ownership.
     let _workspace = ctx.temporary(65536 + 512)?;
     ctx.work(1)?;
-    let mut bytes = [0u8; 65536];
+    let mut words = vec![0u64; 8192];
+    let bytes: &mut [u8] =
+        unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), words.len() * 8) };
     if unsafe {
         GetFileInformationByHandleEx(
             file.as_raw_handle(),
@@ -1187,7 +1190,7 @@ impl Store {
             source_epoch: self.epoch,
             source_utc_ms,
             source_mono_ms,
-            completed_utc_ms: crate::now_ms(),
+            completed_utc_ms: self.clock.utc_ms(),
             requested_ack: request.ack,
             achieved_ack: request.ack,
             complete: true,

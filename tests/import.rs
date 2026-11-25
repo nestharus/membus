@@ -608,3 +608,30 @@ fn import_places_each_key_in_its_expected_physical_class_before_and_after_restar
         assert_eq!(fs::read(p.join("legacy-8/import-policies.txt")).unwrap(), policy_bytes);
     }
 }
+
+#[test]
+fn legacy_import_succeeds_with_preexisting_empty_catalogue() {
+    let dir = path("import-empty-catalogue");
+    let at = now_ms();
+    let records = [Rec {
+        ns: "ledger",
+        key: "k1".into(),
+        op_id: "op1".into(),
+        at,
+        version: 1,
+        ack: 2,
+        remove: false,
+        expected: None,
+        bytes: b"hello".to_vec(),
+    }];
+    let model = write_legacy(&dir, &records);
+    fs::create_dir_all(dir.join("chunks")).unwrap();
+    fs::write(dir.join("chunks/catalogue.log"), b"").unwrap();
+    let store = Store::open(&dir, Config::default()).unwrap();
+    assert_eq!(store.epoch, 8);
+    assert!(dir.join("chunks.pre-import-8").is_dir());
+    check_model(&store, &model);
+    drop(store);
+    let reopened = reopen(&dir, Config::default());
+    check_model(&reopened, &model);
+}

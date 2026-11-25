@@ -324,7 +324,7 @@ impl Store {
             expiry_degraded: self.flags.expiry_degraded.load(Ordering::SeqCst),
             dedup_entries: state.dedup.len(),
             dedup_cap: c.dedup_cap,
-            dedup_high_water: state.dedup.len() * 100 >= c.dedup_cap * 70,
+            dedup_high_water: (state.dedup.len() as u128) * 100 >= (c.dedup_cap as u128) * 70,
             keys: state.keys,
             index_cap: c.index_cap,
             quota: c.quota,
@@ -343,7 +343,9 @@ impl Store {
             .map(|(k, n)| (k.clone(), *n))
             .collect();
         namespaces.sort();
-        h.namespace_high_water = namespaces.iter().any(|(_, n)| n * 100 >= c.quota * 70);
+        h.namespace_high_water = namespaces
+            .iter()
+            .any(|(_, n)| (*n as u128) * 100 >= (c.quota as u128) * 70);
         h.namespaces = namespaces;
         let mut by_class: std::collections::BTreeMap<String, u64> =
             std::collections::BTreeMap::new();

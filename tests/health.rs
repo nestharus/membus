@@ -184,3 +184,25 @@ fn t9_health2_alongside_writers_that_open_chunks() {
     assert!(s.health2().chunks_closed > 100);
     println!("T9 concurrent: 1,200 puts over {} closed chunks beside {reads} HEALTH2 reads", s.health2().chunks_closed);
 }
+
+#[test]
+fn health2_handles_usize_max_caps_without_overflow() {
+    let dir = path("health-usize-max");
+    let cfg = Config {
+        dedup_cap: usize::MAX,
+        index_cap: usize::MAX,
+        quota: usize::MAX,
+        ..Default::default()
+    };
+    let s = Store::open(&dir, cfg).unwrap();
+    let h = s.health2();
+    assert!(!h.dedup_high_water);
+    assert!(!h.namespace_high_water);
+    let mut p = (now_ms() + 10000).to_le_bytes().to_vec();
+    lp(&mut p, b"health-op");
+    lp(&mut p, b"ledger");
+    let reply = s.dispatch(&frame(HEALTH, 99, &p)[4..]);
+    assert_eq!(u16::from_le_bytes(reply[17..19].try_into().unwrap()), 0);
+    drop(s);
+    let _ = std::fs::remove_dir_all(dir);
+}

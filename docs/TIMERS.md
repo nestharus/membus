@@ -55,6 +55,9 @@ globally unique within the store and bind them to the intended timer. Changed
 namespace/id/content under the same ID is compared through the scalar store's
 [retained retry comparator](RETRY_RETENTION.md); a mismatch refuses
 op_id_mismatch (14), subject to its encoding and collision-resistance limits.
+On `TIMER_CANCEL`, retained dedup mismatch (`14`) takes precedence over
+`timer_missing (25)` and `conflict (12)`, while an exact same-attempt retry of
+an already-completed cancel still returns `25`.
 
 `prepare_timer_set` and `prepare_timer_cancel` retain immutable typed requests,
 original epoch and conservative retry horizon. Explicit `timer_set`/`timer_cancel`

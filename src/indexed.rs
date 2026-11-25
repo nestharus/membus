@@ -423,6 +423,9 @@ impl Collection {
             if v.bytes != body || v.ack != ack {
                 return Err(Error::Conflict("committed row differs"));
             }
+            if ack == Ack::Flush && row.ordinal == through && h.ack != Ack::Flush {
+                return Err(Error::Conflict("head acknowledgment differs"));
+            }
             return Ok(AppendReceipt {
                 through,
                 already_committed: true,
@@ -486,6 +489,9 @@ impl Collection {
                 let n = count(&current.bytes)?;
                 if n < row.ordinal {
                     return Err(Error::Conflict("boundary changed"));
+                }
+                if ack == Ack::Flush && n == row.ordinal && current.ack != Ack::Flush {
+                    return Err(Error::Conflict("head acknowledgment differs"));
                 }
                 Ok(AppendReceipt {
                     through: n,

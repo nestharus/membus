@@ -43,7 +43,7 @@ fn serve<S: Read + Write>(
             return Ok(());
         }
         if ingress
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(n)
                     .filter(|total| *total <= 64 * 1024 * 1024)
             })

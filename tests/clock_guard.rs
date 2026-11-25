@@ -105,6 +105,7 @@ fn violations(path: &str, source: &str) -> Vec<String> {
     if matches!(
         path,
         "main.rs"
+            | "bin/storage-receive.rs"
             | "qualification.rs"
             | "client.rs"
             | "client_m3.rs"

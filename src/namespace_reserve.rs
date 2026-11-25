@@ -90,8 +90,9 @@ struct Token<'a> {
 impl Token<'_> {
     fn remove(&self) -> Result<ReserveStatus, ReserveError> {
         let mut state = self.store.state.lock().unwrap();
-        expire(&mut state, self.store.clock.mono_ms());
-        if self.store.clock.mono_ms() >= self.expires {
+        let now = self.store.clock.mono_ms();
+        expire(&mut state, now);
+        if now >= self.expires {
             return Err(ReserveError::Expired);
         }
         let account = state

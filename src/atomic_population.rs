@@ -404,7 +404,7 @@ impl<T: Transport> Client<T> {
         })();
         // Cleanup is explicit, bounded and uses a fresh read-only deadline; preserve primary error.
         let cleanup = Deadline {
-            unix_ms: crate::now_ms() + 1000,
+            unix_ms: crate::chunks::Clock::new(None).utc_ms() + 1000,
             local: std::time::Instant::now() + std::time::Duration::from_secs(1),
         };
         let released = self.snapshot_release(ns, &header.token, operation, cleanup);

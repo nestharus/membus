@@ -559,3 +559,28 @@ fn crc_collision_is_only_a_candidate_bucket_and_exact_values_decide() {
     );
     c.snapshot_release("fixture", &t, "release", d()).unwrap();
 }
+
+#[test]
+fn append_flush_conflicts_when_competing_head_uses_ack_os() {
+    let f = Fixture::new();
+    let mut c = f.client("indexed-ack-conflict");
+    let col = Collection::new("ackcheck", schema()).unwrap();
+    let a = row(1, "one", "source", &[]);
+    // Establish flushed declaration and row 1, then simulate a competing Ack::Os head commit.
+    col.append(&mut c, "fixture", &a, "first-flush", Ack::Flush, d())
+        .unwrap();
+    let head_bytes = c
+        .get("fixture", "x/ackcheck/head", "read-head", d())
+        .unwrap()
+        .unwrap()
+        .bytes;
+    write(&mut c, "x/ackcheck/head", head_bytes, "competing-os-head");
+    // Caller requesting Ack::Flush for ordinal 1 must not receive an ok flushed receipt.
+    let err = col
+        .append(&mut c, "fixture", &a, "strict-flush", Ack::Flush, d())
+        .unwrap_err();
+    assert!(
+        matches!(err, IndexError::Conflict("head acknowledgment differs")),
+        "expected Conflict(head acknowledgment differs), got {err:?}"
+    );
+}

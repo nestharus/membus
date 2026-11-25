@@ -952,8 +952,21 @@ impl Client<crate::pipe_io::Pipe> {
         additional: AdditionalFeatures,
         until: Instant,
     ) -> Result<Self> {
-        use std::os::windows::fs::OpenOptionsExt;
-        if !path.to_string_lossy().starts_with(r"\\.\pipe\") {
+        use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetFileType(handle: *mut std::ffi::c_void) -> u32;
+        }
+        let raw = path.to_string_lossy();
+        let low = raw.to_ascii_lowercase();
+        if !low.starts_with(r"\\.\pipe\")
+            || raw.len() <= 9
+            || raw.contains('\0')
+            || raw[9..].contains(['/', ':'])
+            || raw[9..]
+                .split('\\')
+                .any(|p| p.is_empty() || p == "." || p == ".." || p.ends_with(['.', ' ']))
+        {
             return Err(Error::Invalid("explicit local named pipe required"));
         }
         let file = loop {
@@ -977,6 +990,9 @@ impl Client<crate::pipe_io::Pipe> {
                 Err(e) => return Err(Error::Transport(e)),
             }
         };
+        if unsafe { GetFileType(file.as_raw_handle()) } != 3 {
+            return Err(Error::Invalid("explicit local named pipe required"));
+        }
         Self::handshake_with_features(
             crate::pipe_io::Pipe::new(file, 1),
             options,
@@ -989,3 +1005,102 @@ impl Client<crate::pipe_io::Pipe> {
 #[path="client_finite.rs"]
 mod finite_client;
 pub use finite_client::{HintAttempt,HintCreationState};
+
+#[cfg(test)]
+mod client_validation_tests {
+    use super::*;
+    #[cfg(windows)]
+    #[test]
+    fn connect_pipe_rejects_traversal_and_invalid_local_pipe_names() {
+        let until = Instant::now() + std::time::Duration::from_millis(50);
+        for bad in [
+            r"\\.\pipe\",
+            r"\\.\pipe\..\other",
+            r"\\.\pipe\.",
+            r"\\.\pipe\a/b",
+            r"\\.\pipe\a:b",
+            r"\\.\pipe\trailing.",
+            r"\\.\pipe\trailing ",
+            r"\\server\pipe\name",
+            "\\\\.\\pipe\\nul\0byte",
+        ] {
+            let err = Client::connect_pipe(std::path::Path::new(bad), Options::new("test", 4096), until)
+                .err()
+                .unwrap_or_else(|| panic!("should reject {bad:?}"));
+            assert!(
+                matches!(err, Error::Invalid("explicit local named pipe required")),
+                "unexpected error for {bad:?}: {err:?}"
+            );
+        }
+    }
+    #[test]
+    fn scan_replies_enforce_header_inclusive_max_bytes() {
+        struct MockReply {
+            reply: io::Cursor<Vec<u8>>,
+        }
+        impl Read for MockReply {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                self.reply.read(buf)
+            }
+        }
+        impl Write for MockReply {
+            fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl Transport for MockReply {
+            fn deadline(&mut self, _: Instant) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let make_client = |opcode: u8, payload_len: usize| {
+            let body = vec![0u8; payload_len];
+            let wire = crate::reply(opcode, 1, 0, &body);
+            Client {
+                io: Some(MockReply {
+                    reply: io::Cursor::new(wire),
+                }),
+                request_id: 0,
+                negotiated: Negotiated {
+                    epoch: 1,
+                    max_frame: 1024,
+                    max_value: 1024,
+                    max_batch: 8,
+                    server_mem_enabled: false,
+                    retry_window_ms: 1000,
+                    scans: true,
+                    subscriptions: false,
+                    refusals: BTreeMap::new(),
+                },
+                usable: true,
+                feature_limits: FeatureLimits::default(),
+                finite_hints: false,
+            }
+        };
+        let d = Deadline {
+            unix_ms: crate::now_ms() + 10_000,
+            local: Instant::now() + std::time::Duration::from_secs(10),
+        };
+        let snap = [7u8; 16];
+        // payload_len = 55 <= max_bytes (64), but 55 + 15 = 70 > 64.
+        let mut c1 = make_client(crate::SCAN_PREFIX, 55);
+        let err1 = c1
+            .scan_prefix("n", "", &snap, &[], 1, 64, "op1", d)
+            .unwrap_err();
+        assert!(
+            matches!(err1, Error::Protocol("scan page bytes")),
+            "expected Protocol(scan page bytes), got {err1:?}"
+        );
+        let mut c2 = make_client(crate::SCAN_RANGE, 55);
+        let err2 = c2
+            .scan_range("n", "a", "z", &snap, &[], 1, 64, "op2", d)
+            .unwrap_err();
+        assert!(
+            matches!(err2, Error::Protocol("scan page bytes")),
+            "expected Protocol(scan page bytes), got {err2:?}"
+        );
+    }
+}

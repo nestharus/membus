@@ -488,3 +488,19 @@ fn native_existing_state_checks_the_received_frame_even_with_other_latest_frames
     }
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn catalogue_receiver_rejects_frame_over_16_mib() {
+    let len = (16 * 1024 * 1024 + 1) as u32;
+    let mut frame = Vec::with_capacity(16 + len as usize);
+    frame.extend_from_slice(b"MBC1");
+    frame.extend_from_slice(&len.to_le_bytes());
+    frame.extend_from_slice(&(!len).to_le_bytes());
+    frame.extend_from_slice(&0u32.to_le_bytes());
+    frame.resize(16 + len as usize, 0);
+    let err = receiver::decode(&frame).unwrap_err();
+    assert!(
+        err.to_string().contains("receiving frame limit"),
+        "unexpected error: {err}"
+    );
+}
