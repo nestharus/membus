@@ -194,3 +194,87 @@ impl Write for Pipe {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::OpenOptions;
+    use std::os::windows::{ffi::OsStrExt, fs::OpenOptionsExt, io::FromRawHandle};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateNamedPipeW(
+            name: *const u16,
+            open: u32,
+            mode: u32,
+            instances: u32,
+            out: u32,
+            input: u32,
+            timeout: u32,
+            security: Handle,
+        ) -> Handle;
+    }
+
+    fn pipe_pair(label: &str) -> (Pipe, Pipe) {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let name = format!(r"\\.\pipe\membus-pipeio-{label}-{}-{stamp}", std::process::id());
+        let wide: Vec<u16> = std::ffi::OsStr::new(&name)
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let handle = unsafe {
+            CreateNamedPipeW(
+                wide.as_ptr(),
+                3 | 0x40000000 | 0x00080000,
+                8,
+                1,
+                4096,
+                4096,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(handle as isize, -1);
+        let mut server = Pipe::new(unsafe { File::from_raw_handle(handle) }, 50);
+        let client_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(0x40000000)
+            .open(&name)
+            .unwrap();
+        server
+            .connect_until(Instant::now() + Duration::from_secs(5))
+            .unwrap();
+        (server, Pipe::new(client_file, 50))
+    }
+
+    #[test]
+    fn quiet_timeout_keeps_subsequent_pipe_bytes_readable() {
+        let (mut server, mut client) = pipe_pair("timeout");
+        let mut buf = [0u8; 16];
+        let err = server.read(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+
+        client
+            .write_until(b"hello-pipe", Instant::now() + Duration::from_secs(5))
+            .unwrap();
+        server
+            .set_deadline(Instant::now() + Duration::from_secs(5))
+            .unwrap();
+        let n = server.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"hello-pipe");
+    }
+
+    #[test]
+    fn broken_pipe_reports_error_after_peer_close() {
+        let (mut server, client) = pipe_pair("close");
+        drop(client);
+        let mut buf = [0u8; 8];
+        let err = server.read(&mut buf).unwrap_err();
+        assert_ne!(err.kind(), io::ErrorKind::TimedOut);
+    }
+}

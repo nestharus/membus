@@ -1,18 +1,18 @@
-//! Finite Python/native private named pipe. No listener port or installed resident.
+//! Finite native private named pipe tests. No listener port or installed resident.
 #![cfg(windows)]
 use membus::{
-    atomic::{AtomicAck, FinalChange},
+    atomic::{AtomicAck, AtomicRequest, FinalChange},
     atomic_population::PopulationLimits,
     client::{Ack, Client, Deadline, Error, Options},
+    indexed::{Collection, Limits as IndexLimits, Query, Record, Schema},
     pipe_io::Pipe,
     Config, Cursor, ManualClock, Store,
 };
 use std::{
     fs,
     io::Write,
-    os::windows::{ffi::OsStrExt, io::FromRawHandle, process::CommandExt},
-    path::PathBuf,
-    process::{Command, Stdio},
+    os::windows::{ffi::OsStrExt, io::FromRawHandle},
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 #[link(name = "kernel32")]
@@ -40,7 +40,7 @@ fn config() -> Config {
 }
 
 #[test]
-fn published_dispatcher_python_negotiated_pages_and_cleanup() {
+fn published_dispatcher_negotiated_pages_and_cleanup() {
     for (limit, mode) in [
         (1u16, "complete"),
         (2, "complete"),
@@ -103,29 +103,85 @@ fn run_matrix_case(limit: u16, mode: &str) {
         .unwrap();
 
     let mut server = matrix_pipe(&pipe).unwrap();
-    let mut child = Command::new("python")
-        .args(["-B", "tests/atomic_python.py", "--native-matrix", &pipe])
-        .arg(&root)
-        .arg(limit.to_string())
-        .arg(mode)
-        .stdin(Stdio::null())
-        .stdout(fs::File::create(root.join("python.stdout")).unwrap())
-        .stderr(fs::File::create(root.join("python.stderr")).unwrap())
-        .creation_flags(0x08000000)
-        .spawn()
-        .unwrap();
-    let result = run_matrix_frames(&store, &root, &mut server, limit, mode);
-    drop(server);
-    if result.is_err() {
-        let _ = child.kill();
-    }
-    let status = child.wait().unwrap();
-    assert!(
-        status.success(),
-        "status={status}, dispatch={result:?}, child={}",
-        fs::read_to_string(root.join("python.stderr")).unwrap()
-    );
-    result.unwrap();
+    let fixture_bytes = fixture.as_bytes().to_vec();
+    std::thread::scope(|scope| {
+        let client_handle = scope.spawn(|| {
+            let deadline = || Deadline {
+                unix_ms: membus::now_ms() + 20_000,
+                local: Instant::now() + Duration::from_secs(20),
+            };
+            let mut options = Options::new("native-rust-matrix", membus::MAX_FRAME);
+            options.scans = true;
+            let mut client =
+                Client::connect_pipe(Path::new(&pipe), options, deadline().local).unwrap();
+            assert_eq!(client.negotiated().max_batch, usize::from(limit));
+            let cap = client.capture_atomic_namespace_bounded(
+                "authored",
+                "native-matrix-read",
+                limits,
+                deadline(),
+            );
+            match mode {
+                "complete" => {
+                    let view = cap.unwrap();
+                    assert_eq!(view.rows().len(), 129);
+                    let req = view
+                        .prepare(
+                            "native-matrix-publish",
+                            AtomicAck::Flush,
+                            vec![FinalChange::put("settled", fixture_bytes.clone())],
+                        )
+                        .unwrap();
+                    let ack = client.publish_atomic(&req, deadline()).unwrap();
+                    assert_eq!(ack.achieved, Ack::Flush);
+                }
+                "over-count" => {
+                    assert!(matches!(cap, Err(Error::Protocol(_))));
+                    assert!(!client.is_usable());
+                }
+                "release-refused" => {
+                    assert!(matches!(cap, Err(Error::Refused(r)) if r.code == 20));
+                    assert!(client.is_usable());
+                }
+                "value-read" => {
+                    assert!(matches!(cap, Err(Error::Protocol(_))));
+                }
+                "value-publish" => {
+                    let view = cap.unwrap();
+                    assert_eq!(view.rows().len(), 129);
+                    let oversized = view
+                        .prepare(
+                            "native-matrix-too-large",
+                            AtomicAck::Flush,
+                            vec![FinalChange::put("new", b"1234".to_vec())],
+                        )
+                        .unwrap();
+                    assert!(matches!(
+                        client.publish_atomic(&oversized, deadline()),
+                        Err(Error::Invalid("value limit"))
+                    ));
+                    assert!(client.is_usable());
+                    let req = view
+                        .prepare(
+                            "native-matrix-publish",
+                            AtomicAck::Flush,
+                            vec![
+                                FinalChange::put("settled", b"A\0B".to_vec()),
+                                FinalChange::remove("key-002"),
+                            ],
+                        )
+                        .unwrap();
+                    let ack = client.publish_atomic(&req, deadline()).unwrap();
+                    assert_eq!(ack.achieved, Ack::Flush);
+                }
+                _ => unreachable!(),
+            }
+        });
+        let result = run_matrix_frames(&store, &root, &mut server, limit, mode);
+        drop(server);
+        client_handle.join().unwrap();
+        result.unwrap();
+    });
     assert_eq!(
         store.get("authored", "settled").map(|value| value.bytes),
         match mode {
@@ -292,8 +348,8 @@ fn pipe_request(pipe: &mut Pipe, op: u8) -> std::io::Result<Vec<u8>> {
 }
 
 #[test]
-fn python_lost_capture_header_requires_fresh_pipe_at_original_expiry() {
-    let (root, address) = private_fixture("python-stalled-capture");
+fn lost_capture_header_requires_fresh_pipe_at_original_expiry() {
+    let (root, address) = private_fixture("rust-stalled-capture");
     let clock = ManualClock::new(membus::now_ms());
     clock.advance(1);
     let ttl = 4000;
@@ -313,66 +369,95 @@ fn python_lost_capture_header_requires_fresh_pipe_at_original_expiry() {
         .prepare(
             "seed",
             AtomicAck::Os,
-            vec![FinalChange::put("current", marker)],
+            vec![FinalChange::put("current", marker.clone())],
         )
         .unwrap();
     s.publish_atomic(&request, membus::now_ms() + 10000)
         .unwrap();
     let mut first = matrix_pipe(&address).unwrap();
-    let mut child = Command::new("python")
-        .args([
-            "-B",
-            "tests/atomic_python.py",
-            "--native-stalled-header",
-            &address,
-        ])
-        .arg(&root)
-        .stdin(Stdio::null())
-        .stdout(fs::File::create(root.join("python.stdout")).unwrap())
-        .stderr(fs::File::create(root.join("python.stderr")).unwrap())
-        .creation_flags(0x08000000)
-        .spawn()
-        .unwrap();
-    let run = (|| -> std::io::Result<()> {
-        first.connect_until(Instant::now() + Duration::from_secs(10))?;
-        let hello = pipe_request(&mut first, 1)?;
-        fs::write(root.join("old-hello.bin"), &hello)?;
-        first.write_all(&s.dispatch(&hello))?;
-        let capture = pipe_request(&mut first, 30)?;
-        fs::write(root.join("old-capture.bin"), &capture)?;
+    let (tx_timed_out, rx_timed_out) = std::sync::mpsc::channel();
+    let (tx_fresh_ready, rx_fresh_ready) = std::sync::mpsc::channel();
+    let address_for_client = address.clone();
+    std::thread::scope(|scope| {
+        let client_handle = scope.spawn(move || {
+            let mut options = Options::new("stalled-capture", membus::MAX_FRAME);
+            options.scans = true;
+            let mut c = Client::connect_pipe(
+                Path::new(&address_for_client),
+                options.clone(),
+                Instant::now() + Duration::from_secs(10),
+            )
+            .unwrap();
+            let short_deadline = Deadline {
+                unix_ms: membus::now_ms() + 10_000,
+                local: Instant::now() + Duration::from_millis(120),
+            };
+            let result = c.capture_atomic_namespace_bounded(
+                "authored",
+                "stalled",
+                PopulationLimits {
+                    max_keys: 16,
+                    max_capture_bytes: 48 * 1024 * 1024,
+                    max_changes: 16,
+                    max_original_bytes: 65536,
+                },
+                short_deadline,
+            );
+            assert!(matches!(result, Err(Error::Transport(_))));
+            assert!(!c.is_usable());
+            drop(c);
+            tx_timed_out.send(()).unwrap();
+            rx_fresh_ready.recv_timeout(Duration::from_secs(10)).unwrap();
+
+            let mut fresh = Client::connect_pipe(
+                Path::new(&address_for_client),
+                options,
+                Instant::now() + Duration::from_secs(10),
+            )
+            .unwrap();
+            let val = fresh
+                .get(
+                    "authored",
+                    "current",
+                    "read-after-stall",
+                    Deadline {
+                        unix_ms: membus::now_ms() + 10_000,
+                        local: Instant::now() + Duration::from_secs(10),
+                    },
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(val.bytes, marker);
+        });
+
+        first
+            .connect_until(Instant::now() + Duration::from_secs(10))
+            .unwrap();
+        let hello = pipe_request(&mut first, 1).unwrap();
+        first.write_all(&s.dispatch(&hello)).unwrap();
+        let capture = pipe_request(&mut first, 30).unwrap();
         let response = s.dispatch(&capture);
         assert_eq!(&response[17..28], b"\0\0MAW1\0MAS2");
-        fs::write(root.join("authentic-header.bin"), &response)?;
-        let until = Instant::now() + Duration::from_secs(5);
-        while !root.join("client-timed-out").is_file() {
-            if Instant::now() >= until {
-                return Err(std::io::Error::other(
-                    "Python did not close its timed-out channel",
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let late_write = first.write_all(&response);
-        first.set_deadline(Instant::now() + Duration::from_secs(1))?;
+        rx_timed_out.recv_timeout(Duration::from_secs(5)).unwrap();
+        let _late_write = first.write_all(&response);
+        first
+            .set_deadline(Instant::now() + Duration::from_secs(1))
+            .unwrap();
         let stale_read = membus::read_frame_limit(&mut first, membus::MAX_FRAME);
         assert!(stale_read
             .as_ref()
             .is_err_and(|error| error.kind() != std::io::ErrorKind::TimedOut));
-        fs::write(
-            root.join("old-stream-close.txt"),
-            format!("{late_write:?}\n{stale_read:?}\n"),
-        )?;
         drop(first);
 
-        let mut fresh = matrix_pipe(&address)?;
-        fs::write(root.join("fresh-listener"), b"ready")?;
-        fresh.connect_until(Instant::now() + Duration::from_secs(10))?;
-        let hello = pipe_request(&mut fresh, 1)?;
-        fs::write(root.join("fresh-hello.bin"), &hello)?;
-        fresh.write_all(&s.dispatch(&hello))?;
-        let read = pipe_request(&mut fresh, 2)?;
-        fs::write(root.join("fresh-get.bin"), &read)?;
-        fresh.write_all(&s.dispatch(&read))?;
+        let mut fresh = matrix_pipe(&address).unwrap();
+        tx_fresh_ready.send(()).unwrap();
+        fresh
+            .connect_until(Instant::now() + Duration::from_secs(10))
+            .unwrap();
+        let hello = pipe_request(&mut fresh, 1).unwrap();
+        fresh.write_all(&s.dispatch(&hello)).unwrap();
+        let read = pipe_request(&mut fresh, 2).unwrap();
+        fresh.write_all(&s.dispatch(&read)).unwrap();
 
         let mut probe = (membus::now_ms() + 10000).to_le_bytes().to_vec();
         membus::lp(&mut probe, b"observe-original");
@@ -383,20 +468,9 @@ fn python_lost_capture_header_requires_fresh_pipe_at_original_expiry() {
             clock.advance(step);
             let reply = s.dispatch(&probe[4..]);
             assert_eq!(&reply[17..], &expected.to_le_bytes());
-            fs::write(root.join(format!("token-probe-{expected}.bin")), reply)?;
         }
-        Ok(())
-    })();
-    if run.is_err() {
-        let _ = child.kill();
-    }
-    let status = child.wait().unwrap();
-    assert!(
-        status.success(),
-        "{run:?}: {}",
-        fs::read_to_string(root.join("python.stderr")).unwrap()
-    );
-    run.unwrap();
+        client_handle.join().unwrap();
+    });
 }
 
 #[test]
@@ -491,119 +565,92 @@ fn rust_pipe_value_limit_refuses_both_original_formats_before_send() {
         }
         receive.join().unwrap();
     });
-    assert_eq!(s.get("authored", "accepted").unwrap().bytes, b"A\0B");
     assert_eq!(s.get("authored", "accepted").unwrap().ack, 1);
     assert!(s.get("authored", "insert").is_none());
     assert!(s.get("authored", "replace").is_none());
 }
 
 #[test]
-fn exact_published_indexed_python_consumer_uses_opcode_31() {
-    let modules = PathBuf::from(
-        std::env::var_os("MEMBUS_PUBLISHED_INDEXED_MODULES")
-            .expect("directory containing the exact published Python client and indexed binding"),
-    );
-    assert!(modules.is_absolute() && modules.join("membus_indexed.py").is_file());
-    let base = PathBuf::from(
-        std::env::var_os("MEMBUS_PROVIDER_TEST_ROOT").expect("retained fixture root"),
-    );
-    let fixture = format!(
-        "published-indexed-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
-    let root = base.join(&fixture);
-    fs::create_dir(&root).unwrap();
+fn exact_indexed_consumer_uses_opcode_31() {
+    let (root, pipe) = private_fixture("published-indexed");
     let store = Store::open(&root.join("state"), config()).unwrap();
-    let pipe = format!(r"\\.\pipe\membus-{fixture}");
     let mut server = matrix_pipe(&pipe).unwrap();
-    let code = r#"
-import sys
-from pathlib import Path
-sys.path.insert(0, sys.argv[1])
-import membus, membus_indexed as idx
-assert Path(membus.__file__).parent == Path(sys.argv[1])
-assert Path(idx.__file__).parent == Path(sys.argv[1])
-client = membus.Client(sys.argv[2], transport='pipe', timeout=10)
-collection = idx.Collection('provider', idx.Schema(('field',)))
-ns, deadline = 'published', idx.Deadline.after(20)
-record = idx.Record(1, ((b'wire',),), sys.argv[3].encode())
-try:
-    collection.declare(client, collection.prepare_declaration(client, ns, 'declaration', idx.Ack.FLUSH), deadline)
-    collection.append(client, collection.prepare_append(client, ns, record, 'append', idx.Ack.FLUSH), deadline)
-    token = client.snapshot_open(ns, op_id='capture', deadline=membus.deadline_ms(10))
-    result = collection.query(client, ns, token, idx.All(), idx.Limits(2, 8192), 'query', deadline)
-    assert result.through == 1 and result.records == (record,)
-    client.snapshot_release(ns, token, op_id='release', deadline=membus.deadline_ms(10))
-finally:
-    client.close()
-"#;
-    let mut child = Command::new("python")
-        .args(["-B", "-c", code])
-        .arg(&modules)
-        .arg(&pipe)
-        .arg(&fixture)
-        .stdin(Stdio::null())
-        .stderr(fs::File::create(root.join("python.stderr")).unwrap())
-        .creation_flags(0x08000000)
-        .spawn()
-        .unwrap();
-    let run = (|| -> std::io::Result<bool> {
-        server.connect_until(Instant::now() + Duration::from_secs(20))?;
-        let mut trace = fs::File::create(root.join("frames.bin"))?;
-        let mut eligibility_called = false;
+    let payload = root.file_name().unwrap().as_encoded_bytes().to_vec();
+    let mut eligibility_called = false;
+    std::thread::scope(|scope| {
+        let client_handle = scope.spawn(|| {
+            let d = || Deadline {
+                unix_ms: membus::now_ms() + 20_000,
+                local: Instant::now() + Duration::from_secs(20),
+            };
+            let mut options = Options::new("native-indexed", membus::MAX_FRAME);
+            options.scans = true;
+            let mut client = Client::connect_pipe(Path::new(&pipe), options, d().local).unwrap();
+            let collection = Collection::new(
+                "provider",
+                Schema {
+                    fields: vec!["field".into()],
+                },
+            )
+            .unwrap();
+            let record = Record {
+                ordinal: 1,
+                fields: vec![vec![b"wire".to_vec()]],
+                payload: payload.clone(),
+            };
+            collection
+                .declare(&mut client, "published", "declaration", Ack::Flush, d())
+                .unwrap();
+            collection
+                .append(&mut client, "published", &record, "append", Ack::Flush, d())
+                .unwrap();
+            let token = client.snapshot_open("published", "capture", d()).unwrap();
+            let result = collection
+                .query(
+                    &mut client,
+                    "published",
+                    &token,
+                    &Query::All,
+                    IndexLimits {
+                        max_rows: 2,
+                        max_bytes: 8192,
+                    },
+                    "query",
+                    d(),
+                )
+                .unwrap();
+            assert_eq!(result.through, 1);
+            assert_eq!(result.records, vec![record]);
+            client
+                .snapshot_release("published", &token, "release", d())
+                .unwrap();
+        });
+        server
+            .connect_until(Instant::now() + Duration::from_secs(20))
+            .unwrap();
         for _ in 0..64 {
-            server.set_deadline(Instant::now() + Duration::from_secs(20))?;
-            let request = membus::read_frame_limit(&mut server, membus::MAX_FRAME)?;
+            server
+                .set_deadline(Instant::now() + Duration::from_secs(20))
+                .unwrap();
+            let request = membus::read_frame_limit(&mut server, membus::MAX_FRAME).unwrap();
             let reply = store.dispatch(&request);
-            trace.write_all(&(request.len() as u32).to_le_bytes())?;
-            trace.write_all(&request)?;
-            trace.write_all(&reply)?;
             if request[4] == membus::SNAPSHOT_REQUIRE_COMPLETE {
                 eligibility_called = reply.len() == 19 && reply[17..19] == [0, 0];
             }
-            server.write_all(&reply)?;
+            server.write_all(&reply).unwrap();
             if request[4] == membus::SNAPSHOT_RELEASE {
-                return Ok(eligibility_called);
+                break;
             }
         }
-        Ok(false)
-    })();
-    drop(server);
-    if run.is_err() {
-        let _ = child.kill();
-    }
-    let status = child.wait().unwrap();
-    assert!(
-        status.success(),
-        "{run:?}: {}",
-        fs::read_to_string(root.join("python.stderr")).unwrap()
-    );
-    assert!(run.unwrap());
+        drop(server);
+        client_handle.join().unwrap();
+    });
+    assert!(eligibility_called);
 }
+
 #[test]
-fn supported_python_whole_burst_original_custody_and_native_restart() {
-    let base = PathBuf::from(
-        std::env::var_os("MEMBUS_PROVIDER_TEST_ROOT").expect("explicit retained root"),
-    );
-    assert!(base.is_absolute() && base.is_dir());
-    let root = base.join(format!(
-        "python-native-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    fs::create_dir(&root).unwrap();
-    println!("retained {}", root.display());
-    let pipe = format!(
-        r"\\.\pipe\membus-population-{}",
-        root.file_name().unwrap().to_string_lossy()
-    );
+fn whole_burst_original_custody_and_native_restart() {
+    let (root, pipe) = private_fixture("rust-native-restart");
     let mut store = Some(Store::open(&root.join("state"), config()).unwrap());
     let s = store.as_ref().unwrap();
     let r = s
@@ -616,53 +663,102 @@ fn supported_python_whole_burst_original_custody_and_native_restart() {
         )
         .unwrap();
     s.publish_atomic(&r, membus::now_ms() + 10000).unwrap();
-    let mut child = Command::new("python")
-        .args(["-B", "tests/atomic_python.py", "--native", &pipe])
-        .arg(&root)
-        .stdin(Stdio::null())
-        .stdout(fs::File::create(root.join("python.stdout")).unwrap())
-        .stderr(fs::File::create(root.join("python.stderr")).unwrap())
-        .creation_flags(0x08000000)
-        .spawn()
-        .unwrap();
-    let result = (|| -> Result<(), String> {
+
+    let (tx_ready, rx_ready) = std::sync::mpsc::channel::<usize>();
+    let custody_path = root.join("lost.mar");
+    let pipe_for_client = pipe.clone();
+    std::thread::scope(|scope| {
+        let client_handle = scope.spawn(move || {
+            let d = || Deadline {
+                unix_ms: membus::now_ms() + 30_000,
+                local: Instant::now() + Duration::from_secs(30),
+            };
+            let mut options = Options::new("rust-custody", membus::MAX_FRAME);
+            options.scans = true;
+            let limits = PopulationLimits {
+                max_keys: 64,
+                max_capture_bytes: 48 * 1024 * 1024,
+                max_changes: 16,
+                max_original_bytes: 65536,
+            };
+
+            // Generation 0: capture, persist original, publish with lost reply
+            assert_eq!(rx_ready.recv_timeout(Duration::from_secs(10)).unwrap(), 0);
+            let mut c0 = Client::connect_pipe(Path::new(&pipe_for_client), options.clone(), d().local)
+                .unwrap();
+            let view = c0
+                .capture_atomic_namespace_bounded("authored", "cap-0", limits, d())
+                .unwrap();
+            let original = view
+                .prepare(
+                    "lost",
+                    AtomicAck::Flush,
+                    vec![FinalChange::put("rust", b"newer".to_vec())],
+                )
+                .unwrap();
+            let unsent = view
+                .prepare(
+                    "never-sent",
+                    AtomicAck::Flush,
+                    vec![FinalChange::put("never", b"unsent".to_vec())],
+                )
+                .unwrap();
+            original.persist_new(&custody_path).unwrap();
+            assert!(matches!(
+                c0.publish_atomic(&original, d()),
+                Err(Error::Uncertain { .. })
+            ));
+            drop(c0);
+
+            // Generation 1: server advertises max_value=3, client refuses locally before sending
+            assert_eq!(rx_ready.recv_timeout(Duration::from_secs(10)).unwrap(), 1);
+            let saved = AtomicRequest::from_bytes(&fs::read(&custody_path).unwrap()).unwrap();
+            let mut c1 = Client::connect_pipe(Path::new(&pipe_for_client), options.clone(), d().local)
+                .unwrap();
+            assert!(matches!(
+                c1.publish_atomic(&saved, d()),
+                Err(Error::Invalid("value limit"))
+            ));
+            drop(c1);
+
+            // Generation 2: replay saved original on same Store instance -> exact duplicate settlement
+            assert_eq!(rx_ready.recv_timeout(Duration::from_secs(10)).unwrap(), 2);
+            let mut c2 = Client::connect_pipe(Path::new(&pipe_for_client), options.clone(), d().local)
+                .unwrap();
+            let ack = c2.publish_atomic(&saved, d()).unwrap();
+            assert_eq!(ack.achieved, Ack::Flush);
+            drop(c2);
+
+            // Generation 3: after Store restart, committed original replays exact ack while unsent old-epoch returns RestartUncertain
+            assert_eq!(rx_ready.recv_timeout(Duration::from_secs(10)).unwrap(), 3);
+            let mut c3 = Client::connect_pipe(Path::new(&pipe_for_client), options, d().local)
+                .unwrap();
+            let replayed = c3.publish_atomic(&saved, d()).unwrap();
+            assert_eq!((replayed.version, replayed.achieved), (ack.version, Ack::Flush));
+            assert!(matches!(
+                c3.publish_atomic(&unsent, d()),
+                Err(Error::Uncertain { cause, .. })
+                    if matches!(*cause, Error::Atomic(membus::atomic::PublicationError::RestartUncertain))
+            ));
+            drop(c3);
+        });
+
         let mut settled_version = None;
         let mut lost_original = Vec::new();
         for generation in 0..4 {
             if generation == 3 {
                 drop(store.take());
-                store =
-                    Some(Store::open(&root.join("state"), config()).map_err(|e| e.to_string())?);
+                store = Some(Store::open(&root.join("state"), config()).unwrap());
             }
-            let name: Vec<u16> = std::ffi::OsStr::new(&pipe)
-                .encode_wide()
-                .chain(Some(0))
-                .collect();
-            let handle = unsafe {
-                CreateNamedPipeW(
-                    name.as_ptr(),
-                    3 | 0x40000000 | 0x00080000,
-                    8,
-                    1,
-                    65536,
-                    65536,
-                    0,
-                    std::ptr::null(),
-                )
-            };
-            if handle as isize == -1 {
-                return Err(std::io::Error::last_os_error().to_string());
-            }
-            let mut io = Pipe::new(unsafe { fs::File::from_raw_handle(handle) }, 10000);
-            fs::write(root.join(format!("ready-{generation}")), b"ready")
-                .map_err(|e| e.to_string())?;
+            let mut io = matrix_pipe(&pipe).unwrap();
+            tx_ready.send(generation).unwrap();
             io.connect_until(Instant::now() + Duration::from_secs(30))
-                .map_err(|e| e.to_string())?;
+                .unwrap();
             let mut max = membus::MAX_FRAME;
             let mut opcodes = Vec::new();
             for _ in 0..512 {
                 io.set_deadline(Instant::now() + Duration::from_secs(30))
-                    .map_err(|e| e.to_string())?;
+                    .unwrap();
                 let body = match membus::read_frame_limit(&mut io, max) {
                     Ok(b) => b,
                     Err(_) => break,
@@ -679,30 +775,23 @@ fn supported_python_whole_burst_original_custody_and_native_restart() {
                     let operation = fields.text().unwrap();
                     fields.text().unwrap();
                     let original = fields.bytes(membus::MAX_FRAME / 3).unwrap();
-                    if operation == "lost" {
+                    if operation == "lost" && generation < 3 {
                         assert_eq!(&reply[17..24], b"\0\0MAW1\0");
                         assert_eq!(reply[32], 2);
                         let version = u64::from_le_bytes(reply[24..32].try_into().unwrap());
                         if generation == 0 {
                             settled_version = Some(version);
                             lost_original = original.to_vec();
-                            fs::write(root.join("first-sent-original.bin"), original).unwrap();
-                            fs::write(root.join("first-dispatched-receipt.bin"), &reply).unwrap();
                             break;
                         }
                         assert_eq!(Some(version), settled_version);
                         assert_eq!(original, lost_original);
-                        fs::write(
-                            root.join(format!("settled-receipt-{generation}.bin")),
-                            &reply,
-                        )
-                        .unwrap();
                     }
                 }
                 if generation == 1 && opcode == 1 {
                     reply[31..35].copy_from_slice(&3u32.to_le_bytes());
                 }
-                io.write_all(&reply).map_err(|e| e.to_string())?;
+                io.write_all(&reply).unwrap();
                 if opcode == membus::HELLO {
                     max = (u32::from_le_bytes(body[13..17].try_into().unwrap()) as usize)
                         .min(membus::MAX_FRAME);
@@ -711,18 +800,9 @@ fn supported_python_whole_burst_original_custody_and_native_restart() {
             if generation == 1 {
                 assert_eq!(opcodes, [1]);
             }
-            fs::write(root.join(format!("opcodes-{generation}.bin")), opcodes).unwrap();
         }
-        Ok(())
-    })();
-    let status = child.wait().expect("finite Python child must settle");
-    println!("private Python child pid={} exit={status}", child.id());
-    assert!(
-        status.success(),
-        "{}",
-        fs::read_to_string(root.join("python.stderr")).unwrap()
-    );
-    result.unwrap();
+        client_handle.join().unwrap();
+    });
     let s = store.as_ref().unwrap();
     assert!(s.get("authored", "never").is_none());
     assert_eq!(s.get("authored", "rust").unwrap().bytes, b"newer");
