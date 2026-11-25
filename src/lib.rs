@@ -8,6 +8,8 @@ pub mod subscription_resources;
 pub mod subscription_contract;
 mod timers;
 pub use timers::Owner as ResidentWorkers;
+mod resident_dispatch;
+pub use resident_dispatch::ResidentDispatch;
 pub use chunks::{Class, ManualClock, POLICY_NS};
 pub mod client;
 pub mod indexed;

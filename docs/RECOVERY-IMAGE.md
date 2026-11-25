@@ -43,16 +43,24 @@ fn inspect_stopped(source: &Path, image: &Path, private_working: &Path) -> std::
 
 The native resident starts its timer and heartbeat with
 `Store::start_resident_workers(heartbeat_ms)`. An in-process host keeps the
-returned `ResidentWorkers` guard and its original `Arc<Store>`. The host fences
-launch and write admission, settles accepted connections and subscription delivery,
-and retains every unconfirmed effect. It calls
+returned `ResidentWorkers` guard and its original `Arc<Store>`. Both native
+transports bind to that Store with `guard.wire_dispatch(&store)`. For each
+complete request, `dispatch_reply` holds admission through the original
+dispatch and the local reply write. The host fences launches and other writers,
+settles its listeners, connections and subscription delivery, and retains every
+unconfirmed effect. It calls
 `guard.poll_stop(&store, deadline, wall_deadline, check_owner)` with the selected
 Store, original absolute clocks and ownership/cancellation check. The guard
 retains the first authorized pair of deadlines for subsequent polls. A guard from
-another Store refuses before either worker receives a stop signal. A pending
-poll or a late error can follow an effective stop request. Retain that guard and
-operation. Once ready,
-`guard.join()` observes both thread results. Dropping the guard also waits.
+another Store refuses before wire admission closes or either worker is signalled.
+An admitted stop closes subsequent wire dispatch even on an already negotiated
+connection. A pending poll or a late error can follow an effective stop request.
+Retain that guard and operation. A ready poll observes that admitted wire
+requests have left dispatch and reply handling. Call `guard.join()` to collect
+both background thread results. A peer can lose a reply to a committed
+mutation. Reconcile the original result and identity with its caller. A premature
+consuming join with an outstanding wire request records a failed settlement.
+Dropping the guard also waits for the two background threads.
 The heartbeat wakes on a stop request even during a long interval. A failed
 join prevents worker restart and stopped capture on that Store.
 

@@ -1,5 +1,6 @@
 //! Persisted schedules, compact progress and one deadline owner. No payload execution.
 use crate::{lp, Cursor, Mutation, Store, Value, MAX_ID};
+use crate::{resident_dispatch::RequestGate, ResidentDispatch};
 #[cfg(test)]
 use crate::now_ms;
 use std::{collections::{BTreeSet, HashMap, HashSet}, io, sync::{Arc, Condvar, Mutex, Weak}, thread, time::Duration};
@@ -232,6 +233,7 @@ impl Store {
         state.stop = false;
         let mut owner = Owner {
             shared: self.timers.clone(),
+            requests: Arc::new(RequestGate::default()),
             timer: Some(timer),
             heartbeat: None,
             stop_deadlines: None,
@@ -261,11 +263,31 @@ impl Store {
 /// until its actual thread exits.
 pub struct Owner {
     shared: Shared,
+    requests: Arc<RequestGate>,
     timer: Option<thread::JoinHandle<()>>,
     heartbeat: Option<(mpsc::SyncSender<()>, thread::JoinHandle<()>)>,
     stop_deadlines: Option<(Instant, SystemTime)>,
 }
 impl Owner {
+    /// Bind the wire transport to the same Store as this worker generation.
+    pub fn wire_dispatch(&self, store: &Arc<Store>) -> io::Result<ResidentDispatch> {
+        self.check_store(store)?;
+        Ok(ResidentDispatch {
+            store: Arc::clone(store),
+            gate: Arc::clone(&self.requests),
+        })
+    }
+
+    fn check_store(&self, store: &Store) -> io::Result<()> {
+        if !Arc::ptr_eq(&self.shared, &store.timers) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "resident workers belong to another Store",
+            ));
+        }
+        Ok(())
+    }
+
     fn signal_heartbeat(&self) {
         if let Some((stop, _)) = &self.heartbeat {
             let _ = stop.try_send(());
@@ -274,8 +296,8 @@ impl Owner {
 
     /// Bind the Store to this guard. Check the original control and clocks before signalling
     /// and after sampling. A late refusal can follow an effective stop request.
-    /// Retain the guard in that case. A true return means both threads can be
-    /// joined; the join itself observes their results.
+    /// Retain the guard in that case. A true return means wire dispatch and
+    /// reply writes have drained and both background threads can be joined.
     pub fn poll_stop(
         &mut self,
         store: &Store,
@@ -284,12 +306,7 @@ impl Owner {
         mut check_owner: impl FnMut() -> io::Result<()>,
     ) -> io::Result<bool> {
         check_owner()?;
-        if !Arc::ptr_eq(&self.shared, &store.timers) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "resident workers belong to another Store",
-            ));
-        }
+        self.check_store(store)?;
         let selected = (deadline, wall_deadline);
         if *self.stop_deadlines.get_or_insert(selected) != selected {
             return Err(io::Error::new(
@@ -307,6 +324,7 @@ impl Owner {
             Ok(())
         };
         check_clocks()?;
+        self.requests.close();
         self.signal_heartbeat();
         let ready = match self.shared.0.try_lock() {
             Ok(mut state) => {
@@ -318,12 +336,14 @@ impl Owner {
             Err(TryLockError::WouldBlock) => false,
             Err(TryLockError::Poisoned(_)) => return Err(io::Error::other("timer state poisoned")),
         };
+        let ready = ready && self.requests.drained();
         check_owner()?;
         check_clocks()?;
         Ok(ready)
     }
 
-    /// Signal both workers and observe both joins, even after a worker failure.
+    /// Close wire admission, signal both workers and observe both joins.
+    /// Poll to readiness first if an admitted request could still be running.
     pub fn join(mut self) -> io::Result<()> {
         self.stop_and_join()
     }
@@ -331,6 +351,7 @@ impl Owner {
         let Some(timer) = self.timer.take() else {
             return Ok(());
         };
+        self.requests.close();
         self.signal_heartbeat();
         self.shared.0.lock().unwrap_or_else(|e| e.into_inner()).stop = true;
         self.shared.1.notify_all();
@@ -341,10 +362,12 @@ impl Owner {
             .is_some_and(|(_, t)| t.join().is_err());
         let mut state = self.shared.0.lock().unwrap_or_else(|e| e.into_inner());
         state.running = false;
-        state.join_failed = timer_failed || heartbeat_failed || self.shared.0.is_poisoned();
+        let requests_pending = !self.requests.drained();
+        state.join_failed =
+            timer_failed || heartbeat_failed || requests_pending || self.shared.0.is_poisoned();
         if state.join_failed {
             return Err(io::Error::other(format!(
-                "resident workers failed to settle cleanly: timer panic={timer_failed}, heartbeat panic={heartbeat_failed}, timer state poisoned={}",
+                "resident workers failed to settle cleanly: timer panic={timer_failed}, heartbeat panic={heartbeat_failed}, requests pending={requests_pending}, timer state poisoned={}",
                 self.shared.0.is_poisoned()
             )));
         }
@@ -519,7 +542,8 @@ mod tests {
             guard.join().unwrap();
         }
         let mut guard = store.start_resident_workers(60_000).unwrap();
-        let unrelated = Store::open(&path("other-worker-guard"), Default::default()).unwrap();
+        let unrelated = Arc::new(Store::open(&path("other-worker-guard"), Default::default()).unwrap());
+        assert_eq!(guard.wire_dispatch(&unrelated).err().unwrap().kind(), io::ErrorKind::InvalidInput);
         let error = guard
             .poll_stop(&unrelated, local + later, wall + later, || Ok(()))
             .unwrap_err();

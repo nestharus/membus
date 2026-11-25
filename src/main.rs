@@ -1,5 +1,7 @@
-use membus::{Config, Store};
+use membus::{Config, ResidentDispatch, Store};
 mod qualification;
+#[cfg(test)]
+mod resident_request_tests;
 #[cfg(windows)]
 use membus::pipe_io;
 use std::{
@@ -27,7 +29,7 @@ impl Drop for Permit {
 }
 fn serve<S: Read + Write>(
     mut stream: S,
-    store: Arc<Store>,
+    resident: ResidentDispatch,
     ingress: Arc<AtomicUsize>,
 ) -> io::Result<()> {
     let mut connection = membus::ConnectionDispatch::default();
@@ -52,17 +54,13 @@ fn serve<S: Read + Write>(
         let _frame = FramePermit(ingress.clone(), n);
         let mut b = vec![0; n];
         stream.read_exact(&mut b)?;
-        let was_ready = connection.is_ready();
-        let response = connection.dispatch(&store, &b);
-        let code = u16::from_le_bytes(response[17..19].try_into().unwrap());
-        stream.write_all(&response)?;
-        if code == 1 || (!was_ready && !connection.is_ready()) {
+        if !resident.dispatch_reply(&mut connection, &b, &mut stream)? {
             return Ok(());
         }
     }
 }
 #[cfg(windows)]
-fn pipes(address: &str, store: Arc<Store>, idle_ms: u32) -> io::Result<()> {
+fn pipes(address: &str, resident: ResidentDispatch, idle_ms: u32) -> io::Result<()> {
     use std::{ffi::c_void, fs::File, os::windows::io::FromRawHandle};
     type Handle = *mut c_void;
     #[link(name = "kernel32")]
@@ -208,17 +206,17 @@ fn pipes(address: &str, store: Arc<Store>, idle_ms: u32) -> io::Result<()> {
             }
             return Err(error);
         }
-        let s = store.clone();
+        let connection = resident.clone();
         active.fetch_add(1, Ordering::AcqRel);
         let permit = Permit(active.clone());
         let budget = ingress.clone();
         thread::spawn(move || {
             let _permit = permit;
-            let _ = serve(f, s, budget);
+            let _ = serve(f, connection, budget);
         });
     }
 }
-fn tcp(address: &str, store: Arc<Store>, idle_ms: u32) -> io::Result<()> {
+fn tcp(address: &str, resident: ResidentDispatch, idle_ms: u32) -> io::Result<()> {
     let listener = TcpListener::bind(address)?;
     if !listener.local_addr()?.ip().is_loopback() {
         return Err(io::Error::other("TCP must bind loopback"));
@@ -237,13 +235,13 @@ fn tcp(address: &str, store: Arc<Store>, idle_ms: u32) -> io::Result<()> {
         stream.set_nodelay(true)?;
         stream.set_read_timeout(Some(std::time::Duration::from_millis(idle_ms as u64)))?;
         stream.set_write_timeout(Some(std::time::Duration::from_millis(idle_ms as u64)))?;
-        let s = store.clone();
+        let connection = resident.clone();
         active.fetch_add(1, Ordering::AcqRel);
         let permit = Permit(active.clone());
         let budget = ingress.clone();
         thread::spawn(move || {
             let _permit = permit;
-            let _ = serve(stream, s, budget);
+            let _ = serve(stream, connection, budget);
         });
     }
     Ok(())
@@ -366,9 +364,9 @@ fn main() -> io::Result<()> {
         path.display()
     );
     let result = match args[2].as_str() {
-        "tcp" => tcp(&args[3], store.clone(), idle_ms),
+        "tcp" => tcp(&args[3], workers.wire_dispatch(&store)?, idle_ms),
         #[cfg(windows)]
-        "pipe" => pipes(&args[3], store.clone(), idle_ms),
+        "pipe" => pipes(&args[3], workers.wire_dispatch(&store)?, idle_ms),
         _ => Err(io::Error::other("unsupported transport")),
     };
     let settlement = workers.join();
