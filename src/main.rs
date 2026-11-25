@@ -1,9 +1,5 @@
-<<<<<<< HEAD
-use membus::{Config, ResidentDispatch, Store};
-=======
-use membus::Store;
+use membus::{ResidentDispatch, Store};
 mod cli;
->>>>>>> 45be92f (Validate server CLI before acquiring resources)
 mod qualification;
 #[cfg(test)]
 mod resident_request_tests;

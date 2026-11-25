@@ -96,7 +96,7 @@ fn fixture(label: &str) -> (PathBuf, Arc<Store>, usize) {
         namespace_counts: HashMap::from([("n".into(),8)]),keys:9,committed_bytes:9*store::index_charge(&("n".into(),"source/2".into())),
         dedup_bytes:0,dedup:HashMap::new(),policy_publishing:HashSet::new(),retired:VecDeque::new(),retired_set:HashSet::new(),
         expiry:VecDeque::new(),next:19,reserved_bytes:0,memory_reserved:0,stripe_reserved:[0;4],stripe_items:[0;4],
-        persisted_bytes:encoded.len() as u64,pending_disk:0,read_only:false,warming:false,tomb_candidates:HashSet::new()}));
+        persisted_bytes:encoded.len() as u64,pending_disk:0,namespace_reserves:Default::default(),read_only:false,warming:false,tomb_candidates:HashSet::new()}));
     let cache = Arc::new(cache::Cache::new(&config,clock.clone()));
     let chunks = Arc::new(Mutex::new(chunks::ChunkStore::new(path.clone())));
     let policies = Arc::new(RwLock::new(chunks::Policies::default()));

@@ -535,8 +535,8 @@ fn cache_selector_bounds_are_bytes_and_accept_the_exact_boundary() {
         for (text, valid) in [
             ("a".repeat(1024), true),
             ("a".repeat(1025), false),
-            ("Ã©".repeat(512), true),
-            ("Ã©".repeat(513), false),
+            ("\u{00e9}".repeat(512), true),
+            ("\u{00e9}".repeat(513), false),
         ] {
             let mut fields = ["logs".to_owned(), "prefix".to_owned(), "label".to_owned()];
             fields[field] = text;
