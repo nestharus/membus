@@ -16,6 +16,7 @@ pub mod indexed;
 pub mod atomic;
 pub mod atomic_population;
 mod atomic_wire;
+pub mod serving_authority;
 pub mod recovery_image;
 mod receiving;
 pub use receiving::DurablePlacement;
