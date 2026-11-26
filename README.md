@@ -1,153 +1,68 @@
-# Membus
+# Membus v2
 
-Membus is a local key/value resident and Rust library. The resident serves opaque
-values through `membus.kv/1`, with conditional writes, explicit OS or flush
-acknowledgments, bounded retry deduplication, immutable namespace snapshots,
-Windows change subscriptions, persisted timer schedules, and whole-chunk
-retirement. `membus::client` connects to an existing endpoint;
-`membus::indexed` adds declared append-only collections over that client.
-The package uses the Rust standard library and has no third-party crate dependencies.
+Membus v2 is a low-latency embedded and resident key/value engine built on
+multi-threaded RocksDB (`OptimisticTransactionDB`), a sharded in-memory signal
+ring with durable commit-log catch-up, and a multiplexed binary `membus/2`
+async RPC protocol over Windows IOCP Named Pipes and TCP.
 
-## Build and run
+## Modules
 
-With Rust and Cargo installed, build from the repository root:
+- `src/types.rs` — Core domain types (`Ack`, `ExpectedVersion`, `StoredRecord`,
+  `WriteMutation`, `VersionGuard`, `ScanPage`, `SignalEvent`, `MembusError`).
+- `src/storage/` — `StorageEngine` trait, `RocksDbStorage` over
+  `OptimisticTransactionDB` with dedicated column families (`kv`, `log`, `blob`,
+  `idx_ord`, `idx_edge`, `idx_rev`, `lease`, `meta`), `BlobDB` (>= 16 KiB with
+  Zstd compression), O(1) MVCC snapshots, stateless keyset pagination,
+  zero-downtime `Checkpoint` backups, WAL tailing (`read_wal_since`), and
+  bounded atomic admission backpressure.
+- `src/signals/` — Sharded per-namespace in-memory signal ring (`SignalRing`)
+  and `SignalBroker` supporting lossless `EachChange` (RAM-ring fast path with
+  seamless `log` CF catch-up and explicit `Gap` signaling on trimmed horizons)
+  and anti-starvation `LiveCoalesced` (per-key coalescing preserving the oldest
+  FIFO arrival ticket).
+- `src/protocol/` — Multiplexed `membus/2` binary framing
+  (`[u32 body_len][u16 version=2][u8 frame_kind][u8 flags][u64 stream_id][payload]`)
+  and strongly-typed message codec.
+- `src/transport/` — Async Tokio server over Windows IOCP Named Pipes
+  (unlimited instances, current-user-SID + LocalSystem DACL, remote clients
+  rejected) and TCP (`TCP_NODELAY`) with per-connection credit-window
+  backpressure returning retryable `Busy` without dropping connections, idle
+  snapshot TTL reaping, and root-confined checkpoint paths.
+- `src/client/` — Cloneable pipelined async `Client` supporting concurrent
+  in-flight RPCs, pinned MVCC snapshots, and live push subscription streams on a
+  single connection.
+- `src/cli/` — Resident command-line interface (`membus serve`, `membus health`,
+  `membus checkpoint`).
+
+## Durability Semantics
+
+- `Ack::Fast` commits with `WriteOptions::set_sync(false)`: updates land
+  immediately in the RocksDB MemTable and OS WAL buffer, are immediately visible
+  to readers, and immediately wake signal subscribers. An optional periodic
+  background WAL sync reduces exposure, but `Ack::Fast` does not guarantee
+  survival across sudden power loss.
+- `Ack::Flush` commits with `WriteOptions::set_sync(true)`, participating in
+  RocksDB's native lock-free `WriteThread` leader-follower group commit across
+  concurrent writers.
+
+## CLI Usage
+
+Start a resident listening on TCP and/or a Windows Named Pipe (choose a state
+directory outside the source tree):
 
 ```text
-cargo build --release --offline --locked
+membus serve --data-dir <STATE_DIR> --tcp 127.0.0.1:7420 --checkpoint-root <CHECKPOINT_ROOT>
+membus serve --data-dir <STATE_DIR> --pipe \\.\pipe\membus-resident
 ```
 
-Choose a state directory outside the source checkout and an explicit local pipe
-name. On Windows, for example (PowerShell):
+Check resident health:
 
-```powershell
-$state = Join-Path $env:LOCALAPPDATA 'membus-state'
-.\target\release\membus.exe $state pipe '\\.\pipe\membus-example'
+```text
+membus health --tcp 127.0.0.1:7420
 ```
 
-The server runs in the foreground. Keep its state directory across restarts.
-Another terminal can check transport and heartbeat together:
+Create a zero-downtime RocksDB checkpoint (relative destination inside `--checkpoint-root`):
 
-```powershell
-.\target\release\membus.exe health '\\.\pipe\membus-example' --state-dir $state
+```text
+membus checkpoint --tcp 127.0.0.1:7420 --dest snap_01
 ```
-
-Set `$state` to the same directory in that terminal. Health requires
-`--state-dir`, so it always inspects the intended instance. For loopback tests, the server
-also accepts `membus STATE_DIR tcp 127.0.0.1:PORT`. Windows named pipes reject
-remote clients and grant access to the resident's current user and LocalSystem.
-Loopback TCP provides no application authentication. Endpoint selection and
-service supervision belong to the deployment; this repository does not register
-a service automatically. See [resident operation](docs/RESIDENT.md).
-
-## Native Rust client
-
-Use this package as a path dependency, with the location selected by your build:
-
-```toml
-[dependencies]
-membus = { path = "../membus" }
-```
-
-This Windows example connects to the pipe above, writes an absent key with a
-caller-owned operation ID, and reads its committed value:
-
-```rust,no_run
-use membus::client::{Ack, Client, Deadline, MutationRequest, Options};
-use std::{path::Path, time::{Duration, Instant}};
-
-#[cfg(windows)]
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let deadline = Deadline {
-        unix_ms: membus::now_ms() + 2_000,
-        local: Instant::now() + Duration::from_secs(2),
-    };
-    let mut client = Client::connect_pipe(
-        Path::new(r"\\.\pipe\membus-example"),
-        Options::new("example-client", 65_536),
-        deadline.local,
-    )?;
-    let mut attempt = client.prepare(MutationRequest {
-        operation_id: "example-create-1".into(),
-        namespace: "example".into(),
-        key: "item/1".into(),
-        value: b"example-create-1: hello".to_vec(),
-        ack: Ack::Flush,
-        expected: Some(0),
-    })?;
-    // This one-shot example exits on error and drops its in-memory attempt.
-    // An uncertain outcome then requires deterministic-key reconciliation.
-    client.mutate(&mut attempt, deadline)?;
-    let value = client.get("example", "item/1", "example-read-1", Deadline {
-        unix_ms: membus::now_ms() + 2_000,
-        local: Instant::now() + Duration::from_secs(2),
-    })?;
-    println!("{value:?}");
-    Ok(())
-}
-#[cfg(not(windows))]
-fn main() {}
-```
-
-`Some(0)` means absent, `Some(version)` compares a committed revision, and
-`None` selects unconditional PUT. Choose a new operation ID for each intentional
-mutation. The example's fixed ID is for its one logical creation. The client
-never retries or reconnects automatically. The example exits on a mutation error,
-so it does not preserve the Attempt's in-memory retry context. An application
-handling recovery must retain the original attempt and uncertain result. If that
-context is lost, reconcile the deterministic key and embedded operation identity
-before choosing another send; preparing again does not restore the old retry
-window. See [Rust client usage and uncertainty](docs/RUST_CLIENT.md).
-
-## Documentation and checks
-
-- [Component ownership and runtime boundaries](docs/COMPONENTS.md)
-- [Instance clocks, deadlines and recovery windows](docs/CLOCK.md)
-- [Protocol, acknowledgments, refusals and snapshots](docs/KV1.md)
-- [Bounded immutable selected-view acquisition](docs/SELECTED-VIEW.md)
-- [Mutation retry comparators, encoding aliases and resource accounting](docs/RETRY_RETENTION.md)
-- [Recovered Flush prerequisites and historical backup limits](docs/RECOVERY_FLUSH.md)
-- [Recovery rename directory barriers](docs/RECOVERY-DIRECTORIES.md)
-- [Grouped append and flush behavior](docs/GROUPED-FLUSH.md)
-- [Change subscriptions and receiver responsibilities](docs/SUBSCRIPTIONS.md)
-- [Persisted timer wakes and crash boundaries](docs/TIMERS.md)
-- [Retention classes, retirement, replay and legacy import](docs/CHUNK-RETIREMENT.md)
-- [Unresolved catalogue append recovery](docs/CATALOGUE-APPEND-RECOVERY.md)
-- [Read-only retirement inspection](docs/RETIREMENT-INSPECTION.md)
-- [Indexed append-only collections](docs/INDEXED_COLLECTIONS.md)
-- [Receiving the Python SDK](docs/PYTHON_RECEIVING.md)
-- [Disk-backed values, bounded cache and cache policy](docs/VALUE_CACHE.md)
-
-The following guides distinguish current local behavior from proposed hosted
-service contracts; their gateways, adapters and distributed protocols are not
-implemented:
-
-- [External read-cache freshness and fill races](docs/CLIENT_CACHE.md)
-- [Complete-state backups, isolated recovery and restore lineage](docs/BACKUP_RECOVERY.md)
-- [Tenant admission and shared-resource boundaries](docs/TENANCY_BOUNDARY.md)
-- [Tenant offboarding and retained copies](docs/TENANT_LIFECYCLE.md)
-- [Remote storage capabilities and durability](docs/STORAGE_CAPABILITIES.md)
-- [Shard routing, uncertain dispatch and cutover](docs/SHARD_ROUTING.md)
-- [Durable delivery sources and progress checkpoints](docs/DURABLE_DELIVERY.md)
-- [Remote deadlines and timeout settlement](docs/DEADLINES.md)
-- [Service health and readiness evidence](docs/SERVICE_HEALTH.md)
-
-Rust checks use `cargo test --offline --locked`; Windows listener/forwarder tests
-need the explicit fixture inputs described in [RUST_CLIENT.md](docs/RUST_CLIENT.md).
-Tests create isolated state and some launch resident processes. Build and test
-commands here are usage instructions, not a claim that checks have run on your
-machine. `tests/resident_native.rs` supplies native resident process controls;
-the former `tests/resident.py` is retired. Historical design and review documents
-remain accessible through Git history.
-
-OS acknowledgment covers completed appends and process restart, not power loss.
-Flush acknowledgment additionally synchronizes the covering file; actual
-persistence still depends on filesystem and hardware behavior. Startup requires
-active recovered data-file synchronization before exposing values or retry
-outcomes; an on-disk acknowledgment byte alone does not prove achieved Flush.
-Already imported read-only legacy backups retain the historical limits described
-in [RECOVERY_FLUSH.md](docs/RECOVERY_FLUSH.md). Snapshots and
-change history are bounded. Subscriptions and timer wakes grant no lease,
-receiver receipt, or authority to execute an application effect. Committed values
-remain in chunk files with a bounded memory cache and cold reads by indexed
-offset. Replay rebuilds the index with an empty cache. Compressed archival tiers
-and replay index checkpoints are not implemented.

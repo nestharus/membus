@@ -1,183 +1,325 @@
-//! Binary command routing, resident server startup, and transport accept loops.
-mod admin;
-mod admission;
-mod qualification;
+use std::io::Write;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
 
-#[cfg(test)]
-#[path = "../unit_tests/cli/resident_request_tests.rs"]
-mod resident_request_tests;
+use crate::client::Client;
+use crate::signals::{SignalBroker, SignalConfig, SignalRing};
+use crate::storage::{RocksDbStorage, SignalPublisher, StorageConfig, StorageEngine};
+use crate::transport::{Endpoint, MembusServer, ServerConfig, ServerHandle};
+use crate::types::MembusError;
 
-#[cfg(windows)]
-use membus::pipe_io;
-use membus::{ResidentDispatch, Store};
-use std::{
-    env,
-    io::{self, Read, Write},
-    net::{TcpListener, TcpStream},
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
-    thread,
-};
-
-struct Permit(Arc<AtomicUsize>);
-struct FramePermit(Arc<AtomicUsize>, usize);
-impl Drop for FramePermit {
-    fn drop(&mut self) {
-        self.0.fetch_sub(self.1, Ordering::AcqRel);
-    }
-}
-impl Drop for Permit {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
-    }
+/// Parsed CLI command for `membus`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Command {
+    Serve(ServeArgs),
+    Health(Endpoint),
+    Checkpoint { endpoint: Endpoint, dest_dir: PathBuf },
 }
 
-fn serve<S: Read + Write>(
-    mut stream: S,
-    resident: ResidentDispatch,
-    ingress: Arc<AtomicUsize>,
-) -> io::Result<()> {
-    let mut connection = membus::ConnectionDispatch::default();
-    loop {
-        let mut head = [0u8; 4];
-        stream.read_exact(&mut head)?;
-        let n = u32::from_le_bytes(head) as usize;
-        if n < 13 || n > connection.max_frame() {
-            stream.write_all(&membus::reply(0, 0, if n < 13 { 3 } else { 4 }, &[]))?;
-            return Ok(());
-        }
-        if ingress
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                used.checked_add(n)
-                    .filter(|total| *total <= 64 * 1024 * 1024)
-            })
-            .is_err()
-        {
-            stream.write_all(&membus::reply(0, 0, 6, &[]))?;
-            return Ok(());
-        }
-        let _frame = FramePermit(ingress.clone(), n);
-        let mut b = vec![0; n];
-        stream.read_exact(&mut b)?;
-        if !resident.dispatch_reply(&mut connection, &b, &mut stream)? {
-            return Ok(());
-        }
+#[derive(Debug, PartialEq, Eq)]
+pub struct ServeArgs {
+    pub data_dir: PathBuf,
+    pub tcp: Option<SocketAddr>,
+    pub pipe: Option<String>,
+    pub checkpoint_root: Option<PathBuf>,
+    pub max_in_flight_ops: Option<usize>,
+    pub max_in_flight_bytes: Option<usize>,
+    pub max_in_flight_per_conn: Option<usize>,
+}
+
+/// Parse command-line arguments (excluding argv[0]) into a typed [`Command`].
+pub fn parse_args<I, S>(args: I) -> Result<Command, MembusError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let raw: Vec<String> = args.into_iter().map(|s| s.as_ref().to_owned()).collect();
+    if raw.is_empty() {
+        return Err(MembusError::InvalidArgument(usage_text().to_owned()));
+    }
+    match raw[0].as_str() {
+        "serve" => parse_serve(&raw[1..]),
+        "health" => parse_health(&raw[1..]),
+        "checkpoint" => parse_checkpoint(&raw[1..]),
+        "-h" | "--help" | "help" => Err(MembusError::InvalidArgument(usage_text().to_owned())),
+        other => Err(MembusError::InvalidArgument(format!(
+            "unknown subcommand '{other}'\n\n{}",
+            usage_text()
+        ))),
     }
 }
 
-#[cfg(windows)]
-fn pipes(address: &str, resident: ResidentDispatch, idle_ms: u32) -> io::Result<()> {
-    let mut listener = membus::platform::SecuredPipeListener::bind(address)?;
-    let active = Arc::new(AtomicUsize::new(0));
-    let ingress = Arc::new(AtomicUsize::new(0));
-    loop {
-        while active.load(Ordering::Acquire) >= 64 {
-            thread::sleep(std::time::Duration::from_millis(5));
-        }
-        let file = listener.next_instance()?;
-        let mut f = pipe_io::Pipe::new(file, idle_ms);
-        if let Err(error) = f.connect() {
-            if error.raw_os_error() == Some(232) {
-                continue;
-            }
-            return Err(error);
-        }
-        let connection = resident.clone();
-        active.fetch_add(1, Ordering::AcqRel);
-        let permit = Permit(active.clone());
-        let budget = ingress.clone();
-        thread::spawn(move || {
-            let _permit = permit;
-            let _ = serve(f, connection, budget);
-        });
+/// Execute a parsed CLI command on the Tokio runtime.
+pub async fn execute(cmd: Command) -> Result<(), MembusError> {
+    match cmd {
+        Command::Serve(args) => run_serve(args).await,
+        Command::Health(endpoint) => run_health(endpoint).await,
+        Command::Checkpoint { endpoint, dest_dir } => run_checkpoint(endpoint, dest_dir).await,
     }
 }
 
-fn tcp(address: &str, resident: ResidentDispatch, idle_ms: u32) -> io::Result<()> {
-    let listener = TcpListener::bind(address)?;
-    if !listener.local_addr()?.ip().is_loopback() {
-        return Err(io::Error::other("TCP must bind loopback"));
+async fn run_serve(args: ServeArgs) -> Result<(), MembusError> {
+    let mut storage_cfg = StorageConfig::default();
+    if let Some(ops) = args.max_in_flight_ops {
+        storage_cfg.admission.max_in_flight_ops = ops;
     }
-    let active = Arc::new(AtomicUsize::new(0));
-    let ingress = Arc::new(AtomicUsize::new(0));
-    for incoming in listener.incoming() {
-        let stream: TcpStream = match incoming {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        if active.load(Ordering::Acquire) >= 64 {
-            drop(stream);
-            continue;
+    if let Some(bytes) = args.max_in_flight_bytes {
+        storage_cfg.admission.max_in_flight_bytes = bytes;
+    }
+
+    let mut server_cfg = ServerConfig::default();
+    if let Some(per_conn) = args.max_in_flight_per_conn {
+        server_cfg.max_in_flight_per_conn = per_conn;
+    }
+    server_cfg.checkpoint_root = args.checkpoint_root;
+
+    let signal_cfg = SignalConfig::default();
+    let ring = Arc::new(SignalRing::new(signal_cfg));
+    let storage = Arc::new(RocksDbStorage::open(
+        &args.data_dir,
+        storage_cfg,
+        Arc::clone(&ring) as Arc<dyn SignalPublisher>,
+    )?);
+    let broker = Arc::new(SignalBroker::new(
+        Arc::clone(&storage) as Arc<dyn StorageEngine>,
+        ring,
+        signal_cfg,
+    ));
+
+    let server = MembusServer::new(
+        Arc::clone(&storage) as Arc<dyn StorageEngine>,
+        broker,
+        server_cfg,
+    );
+
+    let mut handles: Vec<ServerHandle> = Vec::new();
+    if let Some(tcp_addr) = args.tcp {
+        let handle = server.bind_tcp(tcp_addr).await?;
+        if let Endpoint::Tcp(bound) = handle.endpoint() {
+            println!("listening tcp={bound}");
         }
-        stream.set_nodelay(true)?;
-        stream.set_read_timeout(Some(std::time::Duration::from_millis(idle_ms as u64)))?;
-        stream.set_write_timeout(Some(std::time::Duration::from_millis(idle_ms as u64)))?;
-        let connection = resident.clone();
-        active.fetch_add(1, Ordering::AcqRel);
-        let permit = Permit(active.clone());
-        let budget = ingress.clone();
-        thread::spawn(move || {
-            let _permit = permit;
-            let _ = serve(stream, connection, budget);
-        });
+        handles.push(handle);
     }
+    if let Some(pipe_name) = args.pipe {
+        let handle = server.bind_named_pipe(&pipe_name).await?;
+        if let Endpoint::NamedPipe(name) = handle.endpoint() {
+            println!("listening pipe={name}");
+        }
+        handles.push(handle);
+    }
+    let _ = std::io::stdout().flush();
+
+    tokio::signal::ctrl_c().await?;
+
+    for handle in handles {
+        handle.shutdown().await;
+    }
+    storage.flush_wal(true)?;
     Ok(())
 }
 
-pub(crate) fn run() -> io::Result<()> {
-    let args: Vec<_> = env::args().collect();
-    admission::dispatch(&args, |command| match command {
-        admission::Command::Admin(admin, args) => match admin {
-            admission::Admin::Retirement => qualification::retirement_command(args),
-            admission::Admin::Catalogue => qualification::catalogue_command(args),
-            admission::Admin::Health => admin::health_command(args),
-            admission::Admin::Policy => admin::policy_command(args),
-            admission::Admin::Expiry => admin::expiry_command(args),
-        },
-        admission::Command::Server(command) => start_server(command),
+async fn run_health(endpoint: Endpoint) -> Result<(), MembusError> {
+    let client = Client::connect(&endpoint).await?;
+    let status = client.health().await?;
+    println!(
+        "ok epoch={} latest_seq={} log_horizon_seq={} in_flight_ops={} in_flight_bytes={} active_connections={} active_subscriptions={}",
+        status.epoch,
+        status.latest_seq,
+        status.log_horizon_seq,
+        status.in_flight_ops,
+        status.in_flight_bytes,
+        status.active_connections,
+        status.active_subscriptions
+    );
+    Ok(())
+}
+
+async fn run_checkpoint(endpoint: Endpoint, dest_dir: PathBuf) -> Result<(), MembusError> {
+    let client = Client::connect(&endpoint).await?;
+    let dest_str = dest_dir.to_string_lossy().into_owned();
+    let seq = client.checkpoint(&dest_str).await?;
+    println!("checkpoint_seq={seq} dest={dest_str}");
+    Ok(())
+}
+
+fn parse_serve(args: &[String]) -> Result<Command, MembusError> {
+    let mut data_dir: Option<PathBuf> = None;
+    let mut tcp: Option<SocketAddr> = None;
+    let mut pipe: Option<String> = None;
+    let mut checkpoint_root: Option<PathBuf> = None;
+    let mut max_in_flight_ops: Option<usize> = None;
+    let mut max_in_flight_bytes: Option<usize> = None;
+    let mut max_in_flight_per_conn: Option<usize> = None;
+
+    let mut idx = 0;
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "--data-dir" => {
+                idx += 1;
+                data_dir = Some(PathBuf::from(require_arg(args, idx, "--data-dir")?));
+            }
+            "--tcp" => {
+                idx += 1;
+                let val = require_arg(args, idx, "--tcp")?;
+                tcp = Some(val.parse::<SocketAddr>().map_err(|err| {
+                    MembusError::InvalidArgument(format!("invalid --tcp address '{val}': {err}"))
+                })?);
+            }
+            "--pipe" => {
+                idx += 1;
+                pipe = Some(require_arg(args, idx, "--pipe")?.to_owned());
+            }
+            "--checkpoint-root" => {
+                idx += 1;
+                checkpoint_root = Some(PathBuf::from(require_arg(args, idx, "--checkpoint-root")?));
+            }
+            "--max-in-flight-ops" => {
+                idx += 1;
+                max_in_flight_ops = Some(parse_usize(
+                    require_arg(args, idx, "--max-in-flight-ops")?,
+                    "--max-in-flight-ops",
+                )?);
+            }
+            "--max-in-flight-bytes" => {
+                idx += 1;
+                max_in_flight_bytes = Some(parse_usize(
+                    require_arg(args, idx, "--max-in-flight-bytes")?,
+                    "--max-in-flight-bytes",
+                )?);
+            }
+            "--max-in-flight-per-conn" => {
+                idx += 1;
+                max_in_flight_per_conn = Some(parse_usize(
+                    require_arg(args, idx, "--max-in-flight-per-conn")?,
+                    "--max-in-flight-per-conn",
+                )?);
+            }
+            other => {
+                return Err(MembusError::InvalidArgument(format!(
+                    "unexpected serve option '{other}'"
+                )));
+            }
+        }
+        idx += 1;
+    }
+
+    let data_dir = data_dir.ok_or_else(|| {
+        MembusError::InvalidArgument("serve requires --data-dir <PATH>".to_owned())
+    })?;
+    if tcp.is_none() && pipe.is_none() {
+        return Err(MembusError::InvalidArgument(
+            "serve requires at least one of --tcp <ADDR> or --pipe <NAME>".to_owned(),
+        ));
+    }
+
+    Ok(Command::Serve(ServeArgs {
+        data_dir,
+        tcp,
+        pipe,
+        checkpoint_root,
+        max_in_flight_ops,
+        max_in_flight_bytes,
+        max_in_flight_per_conn,
+    }))
+}
+
+fn parse_health(args: &[String]) -> Result<Command, MembusError> {
+    let endpoint = parse_single_endpoint(args, "health")?;
+    Ok(Command::Health(endpoint))
+}
+
+fn parse_checkpoint(args: &[String]) -> Result<Command, MembusError> {
+    let mut endpoint: Option<Endpoint> = None;
+    let mut dest_dir: Option<PathBuf> = None;
+    let mut idx = 0;
+    while idx < args.len() {
+        if try_parse_endpoint_flag(args, &mut idx, &mut endpoint)? {
+            idx += 1;
+            continue;
+        }
+        match args[idx].as_str() {
+            "--dest" => {
+                idx += 1;
+                dest_dir = Some(PathBuf::from(require_arg(args, idx, "--dest")?));
+            }
+            other => {
+                return Err(MembusError::InvalidArgument(format!(
+                    "unexpected checkpoint option '{other}'"
+                )));
+            }
+        }
+        idx += 1;
+    }
+
+    let endpoint = endpoint.ok_or_else(|| {
+        MembusError::InvalidArgument("checkpoint requires --tcp <ADDR> or --pipe <NAME>".to_owned())
+    })?;
+    let dest_dir = dest_dir.ok_or_else(|| {
+        MembusError::InvalidArgument("checkpoint requires --dest <DIR>".to_owned())
+    })?;
+    Ok(Command::Checkpoint { endpoint, dest_dir })
+}
+
+fn parse_single_endpoint(args: &[String], cmd: &str) -> Result<Endpoint, MembusError> {
+    let mut endpoint: Option<Endpoint> = None;
+    let mut idx = 0;
+    while idx < args.len() {
+        if try_parse_endpoint_flag(args, &mut idx, &mut endpoint)? {
+            idx += 1;
+            continue;
+        }
+        return Err(MembusError::InvalidArgument(format!(
+            "unexpected {cmd} option '{}'",
+            args[idx]
+        )));
+    }
+    endpoint.ok_or_else(|| {
+        MembusError::InvalidArgument(format!("{cmd} requires --tcp <ADDR> or --pipe <NAME>"))
     })
 }
 
-fn start_server(command: admission::Server) -> io::Result<()> {
-    let admission::Server {
-        path,
-        transport,
-        address,
-        mut config,
-        idle_ms,
-        heartbeat_ms,
-    } = command;
-    #[cfg(any(test, feature = "test-seams"))]
-    if env::var_os("MEMBUS_TEST_IMPORT_DIFFERENCE").is_some() {
-        config.import_inject_difference = true;
-    }
-    // Explicit owned-fixture seams; neither is enabled by an ordinary launch.
-    config.fail_after_append = env::var_os("MEMBUS_TEST_FAIL_AFTER_APPEND").is_some();
-    config.fail_recovery_sync = env::var_os("MEMBUS_TEST_FAIL_RECOVERY_SYNC").is_some();
-    let store = Arc::new(Store::open(&path, config)?);
-    // membus.log's one-line replay summary; state/replay.json holds the whole record (CHUNK-RETIREMENT.md 6).
-    eprintln!("{}", store.replay_report().summary());
-    let workers = store.start_resident_workers(heartbeat_ms)?;
-    eprintln!(
-        "ready epoch={} pid={} state={}",
-        store.epoch,
-        std::process::id(),
-        path.display()
-    );
-    let result = match transport {
-        admission::Transport::Tcp => tcp(&address, workers.wire_dispatch(&store)?, idle_ms),
-        #[cfg(windows)]
-        admission::Transport::Pipe => pipes(&address, workers.wire_dispatch(&store)?, idle_ms),
+fn try_parse_endpoint_flag(
+    args: &[String],
+    idx: &mut usize,
+    endpoint: &mut Option<Endpoint>,
+) -> Result<bool, MembusError> {
+    let parsed = match args[*idx].as_str() {
+        "--tcp" => {
+            *idx += 1;
+            let val = require_arg(args, *idx, "--tcp")?;
+            let addr = val.parse::<SocketAddr>().map_err(|err| {
+                MembusError::InvalidArgument(format!("invalid --tcp address '{val}': {err}"))
+            })?;
+            Endpoint::Tcp(addr)
+        }
+        "--pipe" => {
+            *idx += 1;
+            Endpoint::NamedPipe(require_arg(args, *idx, "--pipe")?.to_owned())
+        }
+        _ => return Ok(false),
     };
-    let settlement = workers.join();
-    if let Err(error) = &settlement {
-        eprintln!("resident worker settlement: {error}");
+    if endpoint.is_some() {
+        return Err(MembusError::InvalidArgument(
+            "specify only one of --tcp or --pipe".to_owned(),
+        ));
     }
-    #[cfg(not(windows))]
-    if settlement.is_ok() && Arc::try_unwrap(store).is_ok() {
-        let _ = std::fs::remove_file(path.join("owner.lock"));
-    }
-    result.and(settlement)
+    *endpoint = Some(parsed);
+    Ok(true)
+}
+
+fn require_arg<'a>(args: &'a [String], idx: usize, flag: &str) -> Result<&'a str, MembusError> {
+    args.get(idx).map(String::as_str).ok_or_else(|| {
+        MembusError::InvalidArgument(format!("missing value for option '{flag}'"))
+    })
+}
+
+fn parse_usize(val: &str, flag: &str) -> Result<usize, MembusError> {
+    val.parse::<usize>().map_err(|err| {
+        MembusError::InvalidArgument(format!("invalid integer for {flag} ('{val}'): {err}"))
+    })
+}
+
+fn usage_text() -> &'static str {
+    "Usage:\n  membus serve --data-dir <PATH> [--tcp <ADDR>] [--pipe <PIPE_NAME>] [--checkpoint-root <DIR>] [--max-in-flight-ops <N>] [--max-in-flight-bytes <N>] [--max-in-flight-per-conn <N>]\n  membus health (--tcp <ADDR> | --pipe <PIPE_NAME>)\n  membus checkpoint (--tcp <ADDR> | --pipe <PIPE_NAME>) --dest <RELATIVE_DIR>"
 }
