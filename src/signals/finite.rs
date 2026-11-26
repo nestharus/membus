@@ -101,5 +101,5 @@ impl crate::Store {
 }
 
 #[cfg(test)]
-#[path="finite_tests.rs"]
+#[path = "../unit_tests/signals/finite_tests.rs"]
 mod tests;

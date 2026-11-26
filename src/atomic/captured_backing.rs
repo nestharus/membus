@@ -113,4 +113,5 @@ impl NamespaceView {
 }
 
 #[cfg(test)]
+#[path = "../unit_tests/atomic/captured_backing_tests.rs"]
 mod tests;

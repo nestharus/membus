@@ -102,16 +102,11 @@ fn tokens(source: &str) -> Vec<Token<'_>> {
 
 fn violations(path: &str, source: &str) -> Vec<String> {
     // These run in client/CLI processes, or contain test fixtures only.
-    if matches!(
-        path,
-        "main.rs"
-            | "bin/storage-receive.rs"
-            | "qualification.rs"
-            | "client.rs"
-            | "client_m3.rs"
-            | "client_timers.rs"
-            | "client_listener.rs"
-    ) || path.ends_with("tests.rs")
+    if matches!(path, "main.rs" | "bin/storage-receive.rs")
+        || path.starts_with("cli/")
+        || path.starts_with("client/")
+        || path.starts_with("unit_tests/")
+        || path.ends_with("tests.rs")
     {
         return Vec::new();
     }
@@ -123,7 +118,7 @@ fn violations(path: &str, source: &str) -> Vec<String> {
                 .map(|x| x.text)
                 .eq(["#", "[", "cfg", "(", "test", ")", "]"])
         });
-        let clock = path == "chunks.rs"
+        let clock = path == "store/clock.rs"
             && t.get(i..i + 3)
                 .is_some_and(|s| s.iter().map(|x| x.text).eq(["impl", "Clock", "{"]));
         if !test && !clock {
@@ -198,13 +193,13 @@ fn guard_reports_multiline_qualified_calls_and_ignores_test_items_and_literals()
     );
     assert!(violations("lib.rs", "pub fn now_ms() -> u64 { 0 }").is_empty());
     assert!(violations(
-        "chunks.rs",
+        "store/clock.rs",
         "impl Clock { fn utc_ms(&self) -> u64 { crate::now_ms() } }"
     )
     .is_empty());
     assert_eq!(
         violations(
-            "chunks.rs",
+            "store/clock.rs",
             "impl Other { fn utc_ms(&self) -> u64 { crate::now_ms() } }"
         )
         .len(),

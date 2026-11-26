@@ -189,11 +189,13 @@ impl Hub {
         self.state.1.notify_one();
     }
     #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     pub fn subscribe(&self,ns:&str,prefix:String,endpoint:String,values:bool,cursor:&[u8],protocol:&str,frame_max:usize)->Result<Vec<u8>,u16> {
         self.account.get().unwrap().with_budget(|budget| {
             self.subscribe_locked(ns, prefix, endpoint, values, cursor, protocol, frame_max, budget)
         }).map_err(|_| 7u16)?
     }
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn subscribe_locked(&self,ns:&str,prefix:String,endpoint:String,values:bool,cursor:&[u8],protocol:&str,frame_max:usize,
         budget: &crate::subscription_resources::Budget<'_>) -> Result<Vec<u8>,u16> {
         if protocol!="membus.change/1" {return Err(2);}

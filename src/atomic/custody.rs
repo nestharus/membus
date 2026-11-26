@@ -100,18 +100,8 @@ impl AtomicRequest {
         path: &Path,
         sync_file: impl FnOnce(&File) -> io::Result<()>,
     ) -> io::Result<HeldOriginalFile> {
-        use std::os::windows::{ffi::OsStrExt, fs::OpenOptionsExt};
-
         // Named streams of the same file share FILE_ID_INFO.
-        if !path
-            .file_name()
-            .is_some_and(|leaf| !leaf.encode_wide().any(|c| c == b':' as u16))
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "expected a file name without a stream selector",
-            ));
-        }
+        crate::platform::validate_default_stream_leaf(path)?;
         let reserve = |bytes| {
             self.data
                 ._charge
@@ -121,11 +111,9 @@ impl AtomicRequest {
         };
         let charge = reserve(size_of::<HeldOriginalFile>())?;
         let _scratch = reserve(WRITE_BUFFER_BYTES)?;
-        let mut options = OpenOptions::new();
-        // GENERIC_WRITE | FILE_READ_ATTRIBUTES, with FILE_SHARE_READ only.
-        options.access_mode(0x4000_0080).share_mode(1);
+        let options = crate::platform::open_held_custody_options();
         let writer = self.persist_file(path, options, sync_file)?;
-        let id = file_id(&writer)?;
+        let id = crate::platform::file_id(&writer)?;
         Ok(HeldOriginalFile {
             _writer: writer,
             id,
@@ -134,42 +122,6 @@ impl AtomicRequest {
     }
 }
 
-#[cfg(windows)]
-fn file_id(file: &File) -> io::Result<[u8; 24]> {
-    use std::{ffi::c_void, os::windows::io::AsRawHandle};
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn GetFileInformationByHandleEx(
-            handle: *mut c_void,
-            class: u32,
-            buffer: *mut c_void,
-            size: u32,
-        ) -> i32;
-    }
-    #[repr(C)]
-    #[derive(Default)]
-    struct FileIdInfo {
-        volume: u64,
-        identifier: [u8; 16],
-    }
-    let mut info = FileIdInfo::default();
-    // FileIdInfo (18) fills exactly the FILE_ID_INFO layout above.
-    if unsafe {
-        GetFileInformationByHandleEx(
-            file.as_raw_handle(),
-            18,
-            (&raw mut info).cast(),
-            size_of::<FileIdInfo>() as u32,
-        )
-    } == 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    let mut id = [0; 24];
-    id[..8].copy_from_slice(&info.volume.to_le_bytes());
-    id[8..].copy_from_slice(&info.identifier);
-    Ok(id)
-}
-
 #[cfg(all(test, windows))]
+#[path = "../unit_tests/atomic/custody_tests.rs"]
 mod tests;
