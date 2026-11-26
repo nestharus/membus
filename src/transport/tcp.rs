@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
+use tokio::task::JoinSet;
 
 use crate::transport::connection::serve_connection;
 use crate::transport::{Endpoint, ServerContext, ServerHandle};
@@ -19,7 +20,9 @@ pub async fn spawn_tcp_listener(
     let active_connections = Arc::clone(&ctx.active_connections);
 
     let accept_task = tokio::spawn(async move {
+        let mut conn_tasks: JoinSet<()> = JoinSet::new();
         loop {
+            while conn_tasks.try_join_next().is_some() {}
             tokio::select! {
                 biased;
                 _ = shutdown_rx.changed() => {
@@ -33,7 +36,7 @@ pub async fn spawn_tcp_listener(
                             let _ = stream.set_nodelay(true);
                             let conn_ctx = ctx.clone();
                             let conn_shutdown = shutdown_rx.clone();
-                            tokio::spawn(serve_connection(stream, conn_ctx, conn_shutdown));
+                            conn_tasks.spawn(serve_connection(stream, conn_ctx, conn_shutdown));
                         }
                         Err(_) => {
                             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
@@ -42,6 +45,8 @@ pub async fn spawn_tcp_listener(
                 }
             }
         }
+        // Drain active connection tasks cleanly before listener shutdown completes.
+        while conn_tasks.join_next().await.is_some() {}
     });
 
     Ok(ServerHandle::new(

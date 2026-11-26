@@ -39,3 +39,16 @@ hyper-util = { version = "0.1.20", features = ["tokio"] }
 rcgen = "0.14.9"
 tempfile = "3.27.0"
 tokio-tungstenite = "0.27.0"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+unused_must_use = "warn"
+missing_debug_implementations = "allow"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "warn"
+missing_safety_doc = "warn"
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"

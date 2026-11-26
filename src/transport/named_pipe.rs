@@ -17,6 +17,8 @@ use tokio::net::windows::named_pipe::{
 };
 #[cfg(windows)]
 use tokio::sync::watch;
+#[cfg(windows)]
+use tokio::task::JoinSet;
 
 #[cfg(windows)]
 use crate::transport::connection::serve_connection;
@@ -51,8 +53,10 @@ pub async fn spawn_named_pipe_listener(
     let endpoint_name = pipe_name.clone();
 
     let accept_task = tokio::spawn(async move {
+        let mut conn_tasks: JoinSet<()> = JoinSet::new();
         let mut backoff_ms = 5u64;
         loop {
+            while conn_tasks.try_join_next().is_some() {}
             tokio::select! {
                 biased;
                 _ = shutdown_rx.changed() => {
@@ -67,7 +71,7 @@ pub async fn spawn_named_pipe_listener(
                             let connected_pipe = current_instance;
                             let conn_ctx = ctx.clone();
                             let conn_shutdown = shutdown_rx.clone();
-                            tokio::spawn(serve_connection(
+                            conn_tasks.spawn(serve_connection(
                                 connected_pipe,
                                 conn_ctx,
                                 conn_shutdown,
@@ -92,6 +96,8 @@ pub async fn spawn_named_pipe_listener(
                 }
             }
         }
+        // Drain active Named Pipe connections cleanly before shutdown completes.
+        while conn_tasks.join_next().await.is_some() {}
     });
 
     Ok(ServerHandle::new(
@@ -234,6 +240,8 @@ struct HandleGuard(isize);
 impl Drop for HandleGuard {
     fn drop(&mut self) {
         if self.0 != 0 {
+            // SAFETY: `self.0` is an owned non-zero Win32 handle opened by `OpenProcessToken`
+            // and closed at most once here on drop.
             unsafe {
                 CloseHandle(self.0);
             }
@@ -248,6 +256,8 @@ struct LocalAllocGuard(*mut c_void);
 impl Drop for LocalAllocGuard {
     fn drop(&mut self) {
         if !self.0.is_null() {
+            // SAFETY: `self.0` is a non-null `LocalAlloc` pointer returned by a Win32 API
+            // (e.g. `ConvertSidToStringSidW`) and freed at most once here on drop.
             unsafe {
                 LocalFree(self.0);
             }
@@ -264,9 +274,11 @@ struct OwnedPipeDacl {
 
 #[cfg(windows)]
 // SAFETY: A self-relative `SECURITY_DESCRIPTOR` allocated by Windows `LocalAlloc`
-// is immutable once created and safe to share/drop across threads.
+// is immutable once created and safe to transfer across threads.
 unsafe impl Send for OwnedPipeDacl {}
 #[cfg(windows)]
+// SAFETY: A self-relative `SECURITY_DESCRIPTOR` is immutable after creation and safe
+// for concurrent read-only references across threads.
 unsafe impl Sync for OwnedPipeDacl {}
 
 #[cfg(windows)]
@@ -277,6 +289,8 @@ impl OwnedPipeDacl {
         let sddl_wide: Vec<u16> = sddl.encode_utf16().collect();
         let mut sd: *mut c_void = ptr::null_mut();
         const SDDL_REVISION_1: u32 = 1;
+        // SAFETY: `sddl_wide` is a valid NUL-terminated UTF-16 buffer and `sd` is a valid
+        // writable out-pointer for the `LocalAlloc`-allocated self-relative descriptor.
         let ok = unsafe {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
                 sddl_wide.as_ptr(),
@@ -303,6 +317,8 @@ impl OwnedPipeDacl {
 impl Drop for OwnedPipeDacl {
     fn drop(&mut self) {
         if !self.sd.is_null() {
+            // SAFETY: `self.sd` was allocated by `ConvertStringSecurityDescriptorToSecurityDescriptorW`
+            // via `LocalAlloc` and is freed exactly once here on drop.
             unsafe {
                 LocalFree(self.sd);
             }
@@ -316,6 +332,8 @@ fn current_user_sid_string() -> Result<String, MembusError> {
     const TOKEN_USER_CLASS: u32 = 1;
 
     let mut token: isize = 0;
+    // SAFETY: `GetCurrentProcess` returns the pseudo-handle for the current process and
+    // `token` is a valid writable out-pointer for `OpenProcessToken`.
     let opened = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) };
     if opened == 0 || token == 0 {
         return Err(MembusError::Io(format!(
@@ -326,6 +344,8 @@ fn current_user_sid_string() -> Result<String, MembusError> {
     let _token_guard = HandleGuard(token);
 
     let mut needed: u32 = 0;
+    // SAFETY: Size-query call passing a null buffer and zero length with a valid `needed`
+    // out-pointer and valid open `token` handle.
     unsafe {
         GetTokenInformation(
             token,
@@ -346,6 +366,8 @@ fn current_user_sid_string() -> Result<String, MembusError> {
     let mut aligned_buf = vec![0usize; word_count];
     let buf_byte_len = aligned_buf.len() * size_of::<usize>();
     let mut returned_len: u32 = 0;
+    // SAFETY: `aligned_buf` provides `buf_byte_len` writable, `usize`-aligned bytes and
+    // `token` is a valid `TOKEN_QUERY` handle guarded by `_token_guard`.
     let ok = unsafe {
         GetTokenInformation(
             token,
@@ -370,6 +392,8 @@ fn current_user_sid_string() -> Result<String, MembusError> {
         ));
     }
     let mut sid_wstr: *mut u16 = ptr::null_mut();
+    // SAFETY: `token_user.user.sid` points to a valid Windows SID inside `aligned_buf` and
+    // `sid_wstr` is a valid out-pointer freed by `_sid_guard` on success.
     let converted = unsafe { ConvertSidToStringSidW(token_user.user.sid, &mut sid_wstr) };
     if converted == 0 || sid_wstr.is_null() {
         return Err(MembusError::Io(format!(
@@ -380,6 +404,8 @@ fn current_user_sid_string() -> Result<String, MembusError> {
     let _sid_guard = LocalAllocGuard(sid_wstr.cast::<c_void>());
 
     let mut len = 0usize;
+    // SAFETY: `ConvertSidToStringSidW` succeeded and returned a valid NUL-terminated UTF-16
+    // string owned for the lifetime of `_sid_guard`.
     unsafe {
         while *sid_wstr.add(len) != 0 {
             len += 1;

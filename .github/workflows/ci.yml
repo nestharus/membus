@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: Build, Clippy, Rust & Python Tests, Persistence Policy
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install native RocksDB build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-dev cmake g++ pkg-config
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify zero-SQLite persistence policy
+        run: |
+          if grep -rnE '(rusqlite|libsqlite3|sqlite3|sqlx.*sqlite)' Cargo.toml Cargo.lock src/; then
+            echo "ERROR: SQLite dependency or usage detected; Membus must remain RocksDB-native."
+            exit 1
+          fi
+
+      - name: Clippy (all targets, deny warnings)
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Rust unit and integration tests
+        run: cargo test --locked
+
+      - name: Build membus binary for Python E2E tests
+        run: cargo build --locked --bin membus
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Python stdlib client E2E tests
+        run: python3 -m unittest discover -s clients/python -p "test_*.py" -v

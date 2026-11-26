@@ -43,7 +43,8 @@ pub use storage::{
 };
 pub use tiering::{ArchiveReport, ColdStore, FileColdStore, TieringManager, TieringPolicy};
 pub use transport::{
-    Endpoint, MembusServer, ServerConfig, ServerHandle, TlsClientConfig, TlsServerConfig,
+    validate_listener_bind_security, CoordinatedCommit, Endpoint, MembusServer, ServerConfig,
+    ServerHandle, TlsClientConfig, TlsServerConfig,
 };
 pub use types::{
     sanitize_search_log_op, Ack, AclGrant, AuthMode, BfsResult, ColdRef, CollectionDescriptor,
@@ -53,6 +54,6 @@ pub use types::{
     MutationOp, NeighborPage, OrderedIndexEntry, OrderedIndexHit, OrderedIndexPage, Permission,
     Principal, ReadMode, RecordMeta, ReplicatedApplyResult, ReplicatedDelta, ReplicationStamp,
     RetentionPolicy, ScanOptions, ScanPage, SearchDocument, SearchHit, SearchLogOp, SearchLogPage,
-    SearchLogRecord, SearchMode, SearchPage, SearchQuery, SearchVisibility, SignalEvent,
-    SignalKind, StoreProfile, StoredRecord, VersionGuard, WalBatch, WriteMutation,
+    SearchLogRecord, SearchMode, SearchPage, SearchQuery, SearchSyncStatus, SearchVisibility,
+    SignalEvent, SignalKind, StoreProfile, StoredRecord, VersionGuard, WalBatch, WriteMutation,
 };

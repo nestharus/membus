@@ -1,4 +1,4 @@
-"""Pure-stdlib Python 3.14+ client for the Membus v2 HTTP/REST + SSE surface.
+"""Pure-stdlib Python 3.11+ client for the Membus v2 HTTP/REST + SSE surface.
 
 Zero third-party dependencies: built strictly on `urllib`, `http.client`,
 `json`, `base64`, and `dataclasses`.

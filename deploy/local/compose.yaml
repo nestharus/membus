@@ -1,0 +1,56 @@
+# Local container runtime topology for Membus v2.
+#
+# - Isolates container traffic onto a dedicated bridge network (`membus_local_net`).
+# - Publishes a single explicit loopback control surface on the host (`127.0.0.1:8080`).
+# - Persists RocksDB + Tantivy state in an isolated named volume (`membus_data`).
+# - Delivers SIGTERM with a 30s grace period exceeding the resident's 25s drain budget.
+#
+# NOTE: `--allow-insecure-non-loopback` is used strictly because container interface binding
+# (`0.0.0.0:8080`) is isolated behind `127.0.0.1:8080` host publishing for local development.
+# Production/networked deployments MUST mount TLS certificates + auth config instead.
+
+services:
+  membus:
+    build:
+      context: ../..
+      dockerfile: Containerfile
+    image: membus:local
+    user: "10001:10001"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:size=64m,noexec,nosuid
+    command:
+      - serve
+      - --data-dir
+      - /var/lib/membus
+      - --checkpoint-root
+      - /var/lib/membus/checkpoints
+      - --http-listen
+      - 0.0.0.0:8080
+      - --allow-insecure-non-loopback
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - membus_data:/var/lib/membus
+    networks:
+      - membus_local_net
+    stop_signal: SIGTERM
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/v2/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+
+networks:
+  membus_local_net:
+    driver: bridge
+
+volumes:
+  membus_data:

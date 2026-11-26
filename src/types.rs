@@ -622,8 +622,29 @@ pub struct WalBatch {
     pub op_count: usize,
 }
 
+/// Secondary search-index synchronization status reported after an authoritative storage commit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchSyncStatus {
+    /// Post-commit search ingestion into the Tier-0 overlay succeeded synchronously.
+    #[default]
+    Synced,
+    /// Authoritative storage committed, but secondary search ingestion failed and was
+    /// deferred for catch-up replay from `CF_LOG`.
+    Deferred,
+}
+
+impl SearchSyncStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Synced => "synced",
+            Self::Deferred => "deferred",
+        }
+    }
+}
+
 /// Point-in-time server and storage health report.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HealthStatus {
     pub epoch: u64,
     pub latest_seq: u64,
@@ -632,6 +653,14 @@ pub struct HealthStatus {
     pub in_flight_bytes: usize,
     pub active_connections: usize,
     pub active_subscriptions: usize,
+    #[serde(default)]
+    pub active_snapshots: usize,
+    #[serde(default)]
+    pub active_streams: usize,
+    #[serde(default)]
+    pub search_ingest_deferred_total: u64,
+    #[serde(default)]
+    pub search_dirty: bool,
 }
 
 /// Unified error type across storage, index, auth, catalog, search, signals, protocol, transport, and client boundaries.

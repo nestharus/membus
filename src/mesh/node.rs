@@ -38,6 +38,8 @@ pub struct MeshConfig {
     pub max_mesh_payload_bytes: usize,
     pub max_deltas_per_envelope: usize,
     pub max_catchup_rounds: usize,
+    /// Break-glass override permitting non-loopback Zenoh listen endpoints without transport TLS+auth.
+    pub allow_insecure_non_loopback: bool,
 }
 
 impl Default for MeshConfig {
@@ -54,6 +56,7 @@ impl Default for MeshConfig {
             max_mesh_payload_bytes: DEFAULT_MAX_MESH_PAYLOAD_BYTES,
             max_deltas_per_envelope: DEFAULT_MAX_DELTAS_PER_ENVELOPE,
             max_catchup_rounds: DEFAULT_MAX_CATCHUP_ROUNDS,
+            allow_insecure_non_loopback: false,
         }
     }
 }
@@ -128,6 +131,10 @@ impl MeshNode {
                 "mesh max_deltas_per_envelope and max_catchup_rounds must be > 0".to_owned(),
             ));
         }
+        validate_mesh_listen_endpoints(
+            &config.listen_endpoints,
+            config.allow_insecure_non_loopback,
+        )?;
 
         let zenoh_cfg = build_zenoh_config(&config)?;
         let session = zenoh::open(zenoh_cfg)
@@ -1037,7 +1044,9 @@ fn apply_envelope_blocking(
             if let (Some(engine), Some(local_seq), Some(op)) =
                 (search, res.local_seq, clean_delta.search_op)
             {
-                engine.ingest_committed_op(local_seq, 0, storage.epoch(), op)?;
+                if let Err(err) = engine.ingest_committed_op(local_seq, 0, storage.epoch(), op) {
+                    engine.record_deferred_ingest(local_seq, &err);
+                }
             }
         } else {
             skipped = skipped.saturating_add(1);
@@ -1074,12 +1083,14 @@ fn apply_envelope_blocking(
                 applied = applied.saturating_add(sanitized_ops.len());
                 if let (Some(engine), Some(local_seq)) = (search, res.local_seq) {
                     for (idx, op) in sanitized_ops.into_iter().enumerate() {
-                        engine.ingest_committed_op(
+                        if let Err(err) = engine.ingest_committed_op(
                             local_seq,
                             u32::try_from(idx).unwrap_or(u32::MAX),
                             storage.epoch(),
                             op,
-                        )?;
+                        ) {
+                            engine.record_deferred_ingest(local_seq, &err);
+                        }
                     }
                 }
             } else {
@@ -1400,6 +1411,52 @@ async fn wait_shutdown(rx: &mut watch::Receiver<bool>) {
         return;
     }
     let _ = rx.changed().await;
+}
+
+/// Validate that Zenoh mesh listen endpoints are loopback-only unless the explicit
+/// break-glass override `allow_insecure_non_loopback` is set.
+pub fn validate_mesh_listen_endpoints(
+    endpoints: &[String],
+    allow_insecure_non_loopback: bool,
+) -> Result<(), MembusError> {
+    for ep in endpoints {
+        if is_loopback_zenoh_endpoint(ep) {
+            continue;
+        }
+        if allow_insecure_non_loopback {
+            eprintln!(
+                "WARNING: binding Zenoh mesh listener on non-loopback endpoint '{ep}' with allow_insecure_non_loopback override"
+            );
+            continue;
+        }
+        return Err(MembusError::InvalidArgument(format!(
+            "refusing to bind Zenoh mesh listener on non-loopback endpoint '{ep}' without transport auth+TLS; pass --allow-insecure-non-loopback or set allow_insecure_non_loopback = true to override"
+        )));
+    }
+    Ok(())
+}
+
+fn is_loopback_zenoh_endpoint(endpoint: &str) -> bool {
+    let Some((proto, rest)) = endpoint.split_once('/') else {
+        return false;
+    };
+    if proto.is_empty()
+        || rest.is_empty()
+        || rest.contains('#')
+        || rest.contains('?')
+        || rest.chars().any(char::is_whitespace)
+    {
+        return false;
+    }
+    if let Ok(sock) = rest.parse::<std::net::SocketAddr>() {
+        return sock.ip().is_loopback();
+    }
+    if let Some((host, port_str)) = rest.rsplit_once(':') {
+        if host.eq_ignore_ascii_case("localhost") && port_str.parse::<u16>().is_ok() {
+            return true;
+        }
+    }
+    false
 }
 
 /// Ensure a search op is sanitized before transmission (exposed for tests).

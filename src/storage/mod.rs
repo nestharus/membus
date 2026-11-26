@@ -1,6 +1,17 @@
 pub mod admission;
 pub mod codec;
-pub mod rocksdb_engine;
+pub mod hlc;
+pub mod mesh_replication;
+pub mod rocksdb_kv;
+pub mod sequencer;
+pub mod snapshot;
+pub mod wal_sync;
+
+/// Compatibility re-export module preserving `membus::storage::rocksdb_engine::*` paths.
+pub mod rocksdb_engine {
+    pub use super::rocksdb_kv::RocksDbStorage;
+    pub use super::snapshot::OwnedSnapshot;
+}
 
 use std::path::Path;
 use std::time::Duration;
@@ -14,7 +25,8 @@ use crate::types::{
 };
 
 pub use admission::{AdmissionConfig, AdmissionGate, AdmissionPermit};
-pub use rocksdb_engine::{OwnedSnapshot, RocksDbStorage};
+pub use rocksdb_kv::RocksDbStorage;
+pub use snapshot::OwnedSnapshot;
 
 /// Reserved column family names provisioned on open.
 pub const CF_KV: &str = "kv";
@@ -76,6 +88,12 @@ pub struct StorageConfig {
     pub wal_size_limit_mb: u64,
     pub bg_sync_interval: Option<Duration>,
     pub admission: AdmissionConfig,
+    /// Global maximum number of concurrently pinned MVCC [`OwnedSnapshot`] handles.
+    pub max_active_snapshots: usize,
+    /// Upper bound on requested items/nodes per scan, index query, or graph traversal page.
+    pub max_scan_limit: usize,
+    /// Optional cooperative execution deadline for scan, index query, and graph traversal loops.
+    pub query_timeout: Option<Duration>,
 }
 
 impl Default for StorageConfig {
@@ -94,6 +112,9 @@ impl Default for StorageConfig {
             wal_size_limit_mb: 256,
             bg_sync_interval: Some(Duration::from_millis(250)),
             admission: AdmissionConfig::default(),
+            max_active_snapshots: 1024,
+            max_scan_limit: 10_000,
+            query_timeout: Some(Duration::from_secs(30)),
         }
     }
 }
@@ -107,6 +128,10 @@ pub trait StorageEngine: Send + Sync {
     fn rocksdb_latest_sequence(&self) -> u64;
     fn in_flight_ops(&self) -> usize;
     fn in_flight_bytes(&self) -> usize;
+    /// Number of currently pinned MVCC snapshots held against this storage instance.
+    fn active_snapshots(&self) -> usize {
+        0
+    }
     /// Current monotonic HLC timestamp in milliseconds.
     fn hlc_now_ms(&self) -> u64;
 

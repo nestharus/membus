@@ -1,13 +1,15 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{DefaultBodyLimit, Path, Query, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::extract::{DefaultBodyLimit, Path, Query, Request as AxumRequest, State};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response as AxumResponse};
 use axum::routing::{delete, get, post, put};
@@ -17,27 +19,69 @@ use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot, watch, Semaphore};
+use tokio_rustls::server::TlsStream;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::index::{BfsOptions, NeighborQueryOptions, OrderedKeyFilter, OrderedQueryOptions};
 use crate::signals::{EachChangeSubscription, LiveCoalescedSubscription};
 use crate::transport::connection::{
-    authorize_index_mutations, authorize_search_op, resolve_checkpoint_path, ConnectionGuard,
+    authorize_index_mutations, authorize_search_op, resolve_checkpoint_path, run_blocking_query,
+    ConnectionGuard,
 };
-use crate::transport::{Endpoint, ServerContext, ServerHandle};
+use crate::transport::tls::{build_http_tls_acceptor, MAX_CONCURRENT_TLS_HANDSHAKES};
+use crate::transport::write_coord::{
+    coordinated_commit_indexed_tx, coordinated_delete_search_document, coordinated_index_document,
+    coordinated_put_indexed, coordinated_remove_indexed, coordinated_revoke_search_prefix,
+    CoordinatedCommit,
+};
+use crate::transport::{Endpoint, ServerContext, ServerHandle, TlsServerConfig};
 use crate::types::{
-    Ack, AuthMode, CollectionDescriptor, ExpectedVersion, GraphDirection, HealthStatus,
-    IndexMutations, IndexedMutation, MembusError, Permission, Principal, ScanOptions,
-    SearchDocument, SearchLogOp, SearchQuery, SignalEvent, VersionGuard,
+    Ack, AuthMode, CollectionDescriptor, CommitResult, ExpectedVersion, GraphDirection,
+    HealthStatus, IndexMutations, IndexedMutation, MembusError, Permission, Principal, ScanOptions,
+    SearchDocument, SearchLogOp, SearchQuery, SearchSyncStatus, SignalEvent, VersionGuard,
 };
+
+const HEADER_SEARCH_SYNC: HeaderName = HeaderName::from_static("x-membus-search-sync");
 
 #[derive(Clone)]
 pub(crate) struct HttpState {
     ctx: ServerContext,
     shutdown_rx: watch::Receiver<bool>,
+}
+
+/// Axum [`axum::serve::Listener`] adapter terminating TLS/mTLS off the accept loop
+/// with bounded concurrent handshakes and per-handshake timeout.
+struct TlsHttpListener {
+    local_addr: SocketAddr,
+    accepted_rx: mpsc::Receiver<(TlsStream<TcpStream>, SocketAddr)>,
+    accept_loop: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for TlsHttpListener {
+    fn drop(&mut self) {
+        if let Some(handle) = self.accept_loop.take() {
+            handle.abort();
+        }
+    }
+}
+
+impl axum::serve::Listener for TlsHttpListener {
+    type Io = TlsStream<TcpStream>;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        match self.accepted_rx.recv().await {
+            Some(conn) => conn,
+            None => std::future::pending().await,
+        }
+    }
+
+    fn local_addr(&self) -> io::Result<Self::Addr> {
+        Ok(self.local_addr)
+    }
 }
 
 /// Bind an Axum HTTP/2 + HTTP/1.1 REST, SSE, and WebSocket listener sharing `ServerContext`.
@@ -57,9 +101,12 @@ pub async fn spawn_http_listener(
     let app = build_router(state);
 
     let accept_task = tokio::spawn(async move {
-        let _ = axum::serve(listener, app)
+        if let Err(err) = axum::serve(listener, app)
             .with_graceful_shutdown(wait_shutdown(shutdown_rx))
-            .await;
+            .await
+        {
+            eprintln!("membus HTTP listener error: {err}");
+        }
     });
 
     Ok(ServerHandle::new(
@@ -70,10 +117,124 @@ pub async fn spawn_http_listener(
     ))
 }
 
+/// Bind an Axum HTTPS (TLS/mTLS with HTTP/2 + HTTP/1.1 ALPN) REST, SSE, and WebSocket listener.
+pub async fn spawn_http_tls_listener(
+    addr: SocketAddr,
+    tls_cfg: &TlsServerConfig,
+    ctx: ServerContext,
+) -> Result<ServerHandle, MembusError> {
+    let acceptor = build_http_tls_acceptor(tls_cfg)?;
+    let listener = TcpListener::bind(addr).await?;
+    let local_addr = listener.local_addr()?;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let active_connections = Arc::clone(&ctx.active_connections);
+
+    let (accepted_tx, accepted_rx) = mpsc::channel::<(TlsStream<TcpStream>, SocketAddr)>(256);
+    let handshake_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_TLS_HANDSHAKES));
+    let mut loop_shutdown = shutdown_rx.clone();
+
+    let accept_loop = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                biased;
+                _ = wait_shutdown_ref(&mut loop_shutdown) => break,
+                accepted = listener.accept() => {
+                    match accepted {
+                        Ok((tcp_stream, peer)) => {
+                            let Ok(permit) = Arc::clone(&handshake_sem).try_acquire_owned() else {
+                                drop(tcp_stream);
+                                continue;
+                            };
+                            let _ = tcp_stream.set_nodelay(true);
+                            let acceptor_ref = acceptor.clone();
+                            let tx = accepted_tx.clone();
+                            let mut hs_shutdown = loop_shutdown.clone();
+                            tokio::spawn(async move {
+                                let hs_res = {
+                                    let _hs_permit = permit;
+                                    tokio::select! {
+                                        biased;
+                                        _ = wait_shutdown_ref(&mut hs_shutdown) => None,
+                                        res = tokio::time::timeout(
+                                            Duration::from_secs(10),
+                                            acceptor_ref.accept(tcp_stream),
+                                        ) => res.ok().and_then(Result::ok),
+                                    }
+                                };
+                                if let Some(tls_stream) = hs_res {
+                                    tokio::select! {
+                                        biased;
+                                        _ = wait_shutdown_ref(&mut hs_shutdown) => {}
+                                        _ = tx.send((tls_stream, peer)) => {}
+                                    }
+                                }
+                            });
+                        }
+                        Err(_) => {
+                            tokio::time::sleep(Duration::from_millis(2)).await;
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    let tls_listener = TlsHttpListener {
+        local_addr,
+        accepted_rx,
+        accept_loop: Some(accept_loop),
+    };
+
+    let state = HttpState {
+        ctx,
+        shutdown_rx: shutdown_rx.clone(),
+    };
+    let app = build_router(state);
+
+    let accept_task = tokio::spawn(async move {
+        if let Err(err) = axum::serve(tls_listener, app)
+            .with_graceful_shutdown(wait_shutdown(shutdown_rx))
+            .await
+        {
+            eprintln!("membus HTTPS listener error: {err}");
+        }
+    });
+
+    Ok(ServerHandle::new(
+        Endpoint::HttpTls(local_addr),
+        shutdown_tx,
+        accept_task,
+        active_connections,
+    ))
+}
+
+async fn enforce_http_concurrency_limit(
+    State(state): State<HttpState>,
+    req: AxumRequest,
+    next: Next,
+) -> AxumResponse {
+    let Ok(_permit) = Arc::clone(&state.ctx.http_in_flight_sem).try_acquire_owned() else {
+        return HttpError(MembusError::Busy {
+            retry_after_ms: 10,
+            reason: format!(
+                "global HTTP in-flight request limit reached ({})",
+                state.ctx.config.max_http_in_flight.max(1)
+            ),
+        })
+        .into_response();
+    };
+    next.run(req).await
+}
+
 pub(crate) fn build_router(state: HttpState) -> Router {
     let max_body = state.ctx.config.max_frame_body;
-    Router::new()
+    // Keep `/v2/health` outside the data-plane concurrency gate so liveness/readiness probes
+    // and live saturation metrics remain observable even while data-plane traffic is saturated.
+    let health_router = Router::new()
         .route("/v2/health", get(handle_health))
+        .with_state(state.clone());
+
+    let data_router = Router::new()
         .route("/v2/checkpoint", post(handle_checkpoint))
         .route(
             "/v2/kv/{ns}/{*key}",
@@ -127,8 +288,32 @@ pub(crate) fn build_router(state: HttpState) -> Router {
         .route("/v2/search/query", post(handle_search_query))
         .route("/v2/signals/{ns}/stream", get(handle_signals_sse))
         .route("/v2/ws", get(handle_ws_upgrade))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            enforce_http_concurrency_limit,
+        ))
         .layer(DefaultBodyLimit::max(max_body))
-        .with_state(state)
+        .with_state(state);
+
+    health_router.merge(data_router)
+}
+
+#[derive(Serialize)]
+struct HttpCommitResp {
+    #[serde(flatten)]
+    commit: CommitResult,
+    search_sync: SearchSyncStatus,
+}
+
+fn coordinated_commit_response(res: CoordinatedCommit) -> AxumResponse {
+    let header_val = HeaderValue::from_static(res.search_sync.as_str());
+    let body = HttpCommitResp {
+        commit: res.commit,
+        search_sync: res.search_sync,
+    };
+    let mut resp = (StatusCode::OK, Json(body)).into_response();
+    resp.headers_mut().insert(HEADER_SEARCH_SYNC, header_val);
+    resp
 }
 
 #[derive(Serialize)]
@@ -282,17 +467,11 @@ async fn handle_health(
     State(state): State<HttpState>,
     headers: HeaderMap,
 ) -> Result<Json<HealthStatus>, HttpError> {
-    let principal = authenticate_http(&state, &headers)?;
-    state.ctx.auth.require_authenticated(principal.as_ref())?;
-    Ok(Json(HealthStatus {
-        epoch: state.ctx.storage.epoch(),
-        latest_seq: state.ctx.storage.latest_seq(),
-        log_horizon_seq: state.ctx.storage.log_horizon_seq(),
-        in_flight_ops: state.ctx.storage.in_flight_ops(),
-        in_flight_bytes: state.ctx.storage.in_flight_bytes(),
-        active_connections: state.ctx.active_connections(),
-        active_subscriptions: state.ctx.broker.active_subscriptions(),
-    }))
+    if !state.ctx.config.public_health_probe {
+        let principal = authenticate_http(&state, &headers)?;
+        state.ctx.auth.require_authenticated(principal.as_ref())?;
+    }
+    Ok(Json(state.ctx.health_status()))
 }
 
 #[derive(Deserialize)]
@@ -360,7 +539,7 @@ async fn handle_kv_put(
     headers: HeaderMap,
     Path((ns, key)): Path<(String, String)>,
     Json(req): Json<HttpKvPutReq>,
-) -> Result<Json<crate::types::CommitResult>, HttpError> {
+) -> Result<AxumResponse, HttpError> {
     let principal = authenticate_http(&state, &headers)?;
     state
         .ctx
@@ -375,24 +554,22 @@ async fn handle_kv_put(
     let value = decode_bytes_field(req.value_utf8, req.value_b64, "value")?;
     let storage = Arc::clone(&state.ctx.storage);
     let search = state.ctx.search.clone();
-    let commit = tokio::task::spawn_blocking(move || {
-        let commit = storage.put_indexed(
+    let coord = tokio::task::spawn_blocking(move || {
+        coordinated_put_indexed(
+            &storage,
+            search.as_ref(),
             &ns,
             key.as_bytes(),
             &value,
             req.ack,
             req.expected,
             req.indexes.as_ref(),
-            req.search_op.as_ref(),
-        )?;
-        if let (Some(engine), Some(op)) = (search, req.search_op) {
-            engine.ingest_committed_op(commit.seq, 0, commit.epoch, op)?;
-        }
-        Ok::<_, MembusError>(commit)
+            req.search_op,
+        )
     })
     .await
     .map_err(|e| MembusError::Storage(format!("kv put failed: {e}")))??;
-    Ok(Json(commit))
+    Ok(coordinated_commit_response(coord))
 }
 
 #[derive(Deserialize)]
@@ -419,7 +596,7 @@ async fn handle_kv_delete(
     headers: HeaderMap,
     Path((ns, key)): Path<(String, String)>,
     body: Bytes,
-) -> Result<Json<crate::types::CommitResult>, HttpError> {
+) -> Result<AxumResponse, HttpError> {
     let principal = authenticate_http(&state, &headers)?;
     state
         .ctx
@@ -437,22 +614,20 @@ async fn handle_kv_delete(
     }
     let storage = Arc::clone(&state.ctx.storage);
     let search = state.ctx.search.clone();
-    let commit = tokio::task::spawn_blocking(move || {
-        let commit = storage.remove_indexed(
+    let coord = tokio::task::spawn_blocking(move || {
+        coordinated_remove_indexed(
+            &storage,
+            search.as_ref(),
             &ns,
             key.as_bytes(),
             req.ack,
             req.expected,
-            req.search_op.as_ref(),
-        )?;
-        if let (Some(engine), Some(op)) = (search, req.search_op) {
-            engine.ingest_committed_op(commit.seq, 0, commit.epoch, op)?;
-        }
-        Ok::<_, MembusError>(commit)
+            req.search_op,
+        )
     })
     .await
     .map_err(|e| MembusError::Storage(format!("kv delete failed: {e}")))??;
-    Ok(Json(commit))
+    Ok(coordinated_commit_response(coord))
 }
 
 #[derive(Deserialize)]
@@ -468,7 +643,7 @@ async fn handle_tx(
     State(state): State<HttpState>,
     headers: HeaderMap,
     Json(req): Json<HttpTxReq>,
-) -> Result<Json<crate::types::CommitResult>, HttpError> {
+) -> Result<AxumResponse, HttpError> {
     let principal = authenticate_http(&state, &headers)?;
     state.ctx.auth.require_authenticated(principal.as_ref())?;
     for g in &req.guards {
@@ -498,22 +673,12 @@ async fn handle_tx(
     }
     let storage = Arc::clone(&state.ctx.storage);
     let search = state.ctx.search.clone();
-    let commit = tokio::task::spawn_blocking(move || {
-        let commit = storage.commit_indexed_tx(&req.guards, &req.mutations, req.ack)?;
-        if let Some(engine) = search {
-            let mut op_idx = 0u32;
-            for m in req.mutations {
-                if let Some(op) = m.search_op {
-                    engine.ingest_committed_op(commit.seq, op_idx, commit.epoch, op)?;
-                    op_idx = op_idx.saturating_add(1);
-                }
-            }
-        }
-        Ok::<_, MembusError>(commit)
+    let coord = tokio::task::spawn_blocking(move || {
+        coordinated_commit_indexed_tx(&storage, search.as_ref(), &req.guards, req.mutations, req.ack)
     })
     .await
     .map_err(|e| MembusError::Storage(format!("tx task failed: {e}")))??;
-    Ok(Json(commit))
+    Ok(coordinated_commit_response(coord))
 }
 
 #[derive(Deserialize)]
@@ -546,12 +711,15 @@ async fn handle_scan_prefix(
         max_bytes: req.max_bytes.unwrap_or(defaults.max_bytes),
     };
     let storage = Arc::clone(&state.ctx.storage);
-    let page = tokio::task::spawn_blocking(move || {
-        let snap = storage.open_snapshot()?;
-        storage.scan_prefix(&snap, &req.namespace, &prefix, &options)
-    })
-    .await
-    .map_err(|e| MembusError::Storage(format!("scan_prefix failed: {e}")))??;
+    let page = run_blocking_query(
+        state.ctx.config.query_timeout,
+        "scan_prefix",
+        move || {
+            let snap = storage.open_snapshot()?;
+            storage.scan_prefix(&snap, &req.namespace, &prefix, &options)
+        },
+    )
+    .await?;
     Ok(Json(page))
 }
 
@@ -589,12 +757,15 @@ async fn handle_scan_range(
         max_bytes: req.max_bytes.unwrap_or(defaults.max_bytes),
     };
     let storage = Arc::clone(&state.ctx.storage);
-    let page = tokio::task::spawn_blocking(move || {
-        let snap = storage.open_snapshot()?;
-        storage.scan_range(&snap, &req.namespace, &start_key, &end_key, &options)
-    })
-    .await
-    .map_err(|e| MembusError::Storage(format!("scan_range failed: {e}")))??;
+    let page = run_blocking_query(
+        state.ctx.config.query_timeout,
+        "scan_range",
+        move || {
+            let snap = storage.open_snapshot()?;
+            storage.scan_range(&snap, &req.namespace, &start_key, &end_key, &options)
+        },
+    )
+    .await?;
     Ok(Json(page))
 }
 
@@ -672,12 +843,15 @@ async fn handle_ordered_query(
         max_bytes: req.max_bytes.unwrap_or(defaults.max_bytes),
     };
     let storage = Arc::clone(&state.ctx.storage);
-    let page = tokio::task::spawn_blocking(move || {
-        let snap = storage.open_snapshot()?;
-        storage.query_ordered_index(&snap, &req.namespace, &req.index_id, &options)
-    })
-    .await
-    .map_err(|e| MembusError::Storage(format!("ordered index query failed: {e}")))??;
+    let page = run_blocking_query(
+        state.ctx.config.query_timeout,
+        "ordered_index_query",
+        move || {
+            let snap = storage.open_snapshot()?;
+            storage.query_ordered_index(&snap, &req.namespace, &req.index_id, &options)
+        },
+    )
+    .await?;
     Ok(Json(page))
 }
 
@@ -719,12 +893,15 @@ async fn handle_graph_neighbors(
         limit: req.limit.unwrap_or(NeighborQueryOptions::default().limit),
     };
     let storage = Arc::clone(&state.ctx.storage);
-    let page = tokio::task::spawn_blocking(move || {
-        let snap = storage.open_snapshot()?;
-        storage.query_neighbors(&snap, &req.namespace, &req.index_id, &node_id, &options)
-    })
-    .await
-    .map_err(|e| MembusError::Storage(format!("graph neighbors failed: {e}")))??;
+    let page = run_blocking_query(
+        state.ctx.config.query_timeout,
+        "graph_neighbors",
+        move || {
+            let snap = storage.open_snapshot()?;
+            storage.query_neighbors(&snap, &req.namespace, &req.index_id, &node_id, &options)
+        },
+    )
+    .await?;
     Ok(Json(page))
 }
 
@@ -763,12 +940,15 @@ async fn handle_graph_bfs(
         max_nodes: req.max_nodes.unwrap_or(defaults.max_nodes),
     };
     let storage = Arc::clone(&state.ctx.storage);
-    let res = tokio::task::spawn_blocking(move || {
-        let snap = storage.open_snapshot()?;
-        storage.bfs_traverse(&snap, &req.namespace, &req.index_id, &seed_node, &options)
-    })
-    .await
-    .map_err(|e| MembusError::Storage(format!("graph bfs failed: {e}")))??;
+    let res = run_blocking_query(
+        state.ctx.config.query_timeout,
+        "graph_bfs",
+        move || {
+            let snap = storage.open_snapshot()?;
+            storage.bfs_traverse(&snap, &req.namespace, &req.index_id, &seed_node, &options)
+        },
+    )
+    .await?;
     Ok(Json(res))
 }
 
@@ -1197,7 +1377,7 @@ async fn handle_search_index_doc(
     State(state): State<HttpState>,
     headers: HeaderMap,
     Json(req): Json<IndexDocReq>,
-) -> Result<Json<crate::types::CommitResult>, HttpError> {
+) -> Result<AxumResponse, HttpError> {
     let principal = authenticate_http(&state, &headers)?;
     state.ctx.auth.authorize(
         principal.as_ref(),
@@ -1208,10 +1388,12 @@ async fn handle_search_index_doc(
     let search = state.ctx.search.clone().ok_or_else(|| {
         MembusError::InvalidArgument("search engine is not enabled on this server".to_owned())
     })?;
-    let commit = tokio::task::spawn_blocking(move || search.index_document(req.doc, req.ack))
-        .await
-        .map_err(|e| MembusError::Storage(format!("index_document failed: {e}")))??;
-    Ok(Json(commit))
+    let coord = tokio::task::spawn_blocking(move || {
+        coordinated_index_document(&search, req.doc, req.ack)
+    })
+    .await
+    .map_err(|e| MembusError::Storage(format!("index_document failed: {e}")))??;
+    Ok(coordinated_commit_response(coord))
 }
 
 #[derive(Deserialize)]
@@ -1224,7 +1406,7 @@ async fn handle_search_delete_doc(
     headers: HeaderMap,
     Path((ns, doc_id)): Path<(String, String)>,
     Query(q): Query<SearchDeleteQuery>,
-) -> Result<Json<crate::types::CommitResult>, HttpError> {
+) -> Result<AxumResponse, HttpError> {
     let principal = authenticate_http(&state, &headers)?;
     state.ctx.auth.authorize(
         principal.as_ref(),
@@ -1236,10 +1418,12 @@ async fn handle_search_delete_doc(
     let search = state.ctx.search.clone().ok_or_else(|| {
         MembusError::InvalidArgument("search engine is not enabled on this server".to_owned())
     })?;
-    let commit = tokio::task::spawn_blocking(move || search.delete_document(&ns, &doc_id, ack))
-        .await
-        .map_err(|e| MembusError::Storage(format!("delete_search_document failed: {e}")))??;
-    Ok(Json(commit))
+    let coord = tokio::task::spawn_blocking(move || {
+        coordinated_delete_search_document(&search, &ns, &doc_id, ack)
+    })
+    .await
+    .map_err(|e| MembusError::Storage(format!("delete_search_document failed: {e}")))??;
+    Ok(coordinated_commit_response(coord))
 }
 
 #[derive(Deserialize)]
@@ -1254,7 +1438,7 @@ async fn handle_search_revoke_prefix(
     State(state): State<HttpState>,
     headers: HeaderMap,
     Json(req): Json<RevokePrefixReq>,
-) -> Result<Json<crate::types::CommitResult>, HttpError> {
+) -> Result<AxumResponse, HttpError> {
     let principal = authenticate_http(&state, &headers)?;
     state
         .ctx
@@ -1263,12 +1447,12 @@ async fn handle_search_revoke_prefix(
     let search = state.ctx.search.clone().ok_or_else(|| {
         MembusError::InvalidArgument("search engine is not enabled on this server".to_owned())
     })?;
-    let commit = tokio::task::spawn_blocking(move || {
-        search.revoke_search_prefix(&req.namespace, &req.prefix, req.ack)
+    let coord = tokio::task::spawn_blocking(move || {
+        coordinated_revoke_search_prefix(&search, &req.namespace, &req.prefix, req.ack)
     })
     .await
     .map_err(|e| MembusError::Storage(format!("revoke_search_prefix failed: {e}")))??;
-    Ok(Json(commit))
+    Ok(coordinated_commit_response(coord))
 }
 
 async fn handle_search_query(
@@ -1285,9 +1469,12 @@ async fn handle_search_query(
     let search = state.ctx.search.clone().ok_or_else(|| {
         MembusError::InvalidArgument("search engine is not enabled on this server".to_owned())
     })?;
-    let page = tokio::task::spawn_blocking(move || search.search(&query))
-        .await
-        .map_err(|e| MembusError::Storage(format!("search failed: {e}")))??;
+    let page = run_blocking_query(
+        state.ctx.config.query_timeout,
+        "search",
+        move || search.search(&query),
+    )
+    .await?;
     Ok(Json(page))
 }
 
@@ -1355,11 +1542,13 @@ async fn handle_signals_sse(
         ))));
     };
 
+    let stream_guard = state.ctx.try_acquire_stream_guard()?;
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(256);
     let mut shutdown_rx = state.shutdown_rx.clone();
     let active_connections = Arc::clone(&state.ctx.active_connections);
 
     tokio::spawn(async move {
+        let _stream_guard = stream_guard;
         let _conn_guard = ConnectionGuard::acquire(&active_connections);
         let init_json = serde_json::json!({
             "epoch": epoch,
@@ -1799,15 +1988,7 @@ async fn handle_ws_envelope(
                     .await;
                 return;
             }
-            let status = HealthStatus {
-                epoch: conn.ctx.storage.epoch(),
-                latest_seq: conn.ctx.storage.latest_seq(),
-                log_horizon_seq: conn.ctx.storage.log_horizon_seq(),
-                in_flight_ops: conn.ctx.storage.in_flight_ops(),
-                in_flight_bytes: conn.ctx.storage.in_flight_bytes(),
-                active_connections: conn.ctx.active_connections(),
-                active_subscriptions: conn.ctx.broker.active_subscriptions(),
-            };
+            let status = conn.ctx.health_status();
             let _ = send_ws_or_shutdown(
                 &conn.control_tx,
                 ws_ok_msg(
@@ -1939,30 +2120,32 @@ async fn handle_ws_envelope(
             let storage = Arc::clone(&conn.ctx.storage);
             let search = conn.ctx.search.clone();
             let res = tokio::task::spawn_blocking(move || {
-                let commit = storage.put_indexed(
+                coordinated_put_indexed(
+                    &storage,
+                    search.as_ref(),
                     &namespace,
                     &key,
                     &value,
                     ack,
                     expected,
                     indexes.as_ref(),
-                    search_op.as_ref(),
-                )?;
-                if let (Some(engine), Some(op)) = (search, search_op) {
-                    engine.ingest_committed_op(commit.seq, 0, commit.epoch, op)?;
-                }
-                Ok::<_, MembusError>(commit)
+                    search_op,
+                )
             })
             .await
             .unwrap_or_else(|e| Err(MembusError::Storage(format!("ws put failed: {e}"))));
             match res {
-                Ok(commit) => {
+                Ok(coord) => {
+                    let payload = HttpCommitResp {
+                        commit: coord.commit,
+                        search_sync: coord.search_sync,
+                    };
                     let _ = send_ws_or_shutdown(
                         &conn.control_tx,
                         ws_ok_msg(
                             id,
                             "commit",
-                            serde_json::to_value(commit).unwrap_or_default(),
+                            serde_json::to_value(payload).unwrap_or_default(),
                         ),
                         &mut shutdown_rx,
                     )
@@ -2021,23 +2204,30 @@ async fn handle_ws_envelope(
             let storage = Arc::clone(&conn.ctx.storage);
             let search = conn.ctx.search.clone();
             let res = tokio::task::spawn_blocking(move || {
-                let commit =
-                    storage.remove_indexed(&namespace, &key, ack, expected, search_op.as_ref())?;
-                if let (Some(engine), Some(op)) = (search, search_op) {
-                    engine.ingest_committed_op(commit.seq, 0, commit.epoch, op)?;
-                }
-                Ok::<_, MembusError>(commit)
+                coordinated_remove_indexed(
+                    &storage,
+                    search.as_ref(),
+                    &namespace,
+                    &key,
+                    ack,
+                    expected,
+                    search_op,
+                )
             })
             .await
             .unwrap_or_else(|e| Err(MembusError::Storage(format!("ws remove failed: {e}"))));
             match res {
-                Ok(commit) => {
+                Ok(coord) => {
+                    let payload = HttpCommitResp {
+                        commit: coord.commit,
+                        search_sync: coord.search_sync,
+                    };
                     let _ = send_ws_or_shutdown(
                         &conn.control_tx,
                         ws_ok_msg(
                             id,
                             "commit",
-                            serde_json::to_value(commit).unwrap_or_default(),
+                            serde_json::to_value(payload).unwrap_or_default(),
                         ),
                         &mut shutdown_rx,
                     )
@@ -2078,9 +2268,12 @@ async fn handle_ws_envelope(
                 .await;
                 return;
             };
-            let res = tokio::task::spawn_blocking(move || search.search(&query))
-                .await
-                .unwrap_or_else(|e| Err(MembusError::Storage(format!("ws search failed: {e}"))));
+            let res = run_blocking_query(
+                conn.ctx.config.query_timeout,
+                "ws_search",
+                move || search.search(&query),
+            )
+            .await;
             match res {
                 Ok(page) => {
                     let _ = send_ws_or_shutdown(
@@ -2228,6 +2421,15 @@ async fn launch_ws_subscription(
     mut sub: StreamSub,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
+    let stream_guard = match conn.ctx.try_acquire_stream_guard() {
+        Ok(guard) => guard,
+        Err(err) => {
+            let _ =
+                send_ws_or_shutdown(&conn.control_tx, ws_err_msg(stream_id, &err), &mut shutdown_rx)
+                    .await;
+            return;
+        }
+    };
     let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
     let register_result = {
         let mut table = conn.active_streams.lock();
@@ -2269,6 +2471,7 @@ async fn launch_ws_subscription(
     }
 
     tokio::spawn(async move {
+        let _stream_guard = stream_guard;
         let end_err: Option<String> = loop {
             tokio::select! {
                 biased;

@@ -4,7 +4,67 @@ Membus v2 is a low-latency embedded and resident key/value, secondary-index,
 graph-adjacency, full-text search, multi-node replication, and signal-streaming
 engine built on multi-threaded RocksDB (`OptimisticTransactionDB`), embedded
 `Tantivy`, embedded `Zenoh`, a sharded in-memory signal ring with durable
-commit-log catch-up, and an Axum HTTP/2 + REST + WebSocket + SSE service plane.
+commit-log catch-up, and an Axum HTTP/2 + REST + WebSocket + SSE service plane
+(with optional TLS/mTLS).
+
+See [docs/ARCHITECTURE_AND_TRUST_BOUNDARIES.md](docs/ARCHITECTURE_AND_TRUST_BOUNDARIES.md)
+for consistency guarantees (single-node ACID/leases vs. multi-node HLC LWW mesh),
+fail-closed transport security, global admission limits, and `CF_LOG` search recovery.
+
+## Prerequisites
+
+- **Rust `1.85+`** (`cargo`, `rustc`)
+- **C/C++ & Clang toolchain** (`clang`, `libclang`, `cmake`, `g++` or MSVC Build Tools)
+  for RocksDB `bindgen-runtime` compilation
+- **Python `3.11+`** (pure stdlib; zero third-party packages) if using the Python client
+
+## Build / Install
+
+```bash
+cargo build --release --locked --bin membus
+```
+
+The compiled binary is written to `target/release/membus` (or `target/release/membus.exe` on Windows).
+Verify CLI usage at any time with:
+
+```bash
+./target/release/membus --help
+```
+
+## 2-Minute Verified Quickstart
+
+1. **Start a local resident** (loopback binds require zero TLS/auth ceremony for local dev):
+
+```bash
+./target/release/membus serve \
+  --data-dir ./membus-quickstart-data \
+  --http-listen 127.0.0.1:7480 \
+  --tcp 127.0.0.1:7420
+```
+
+2. **Verify health** via HTTP or the binary CLI:
+
+```bash
+curl -s http://127.0.0.1:7480/v2/health
+./target/release/membus health --tcp 127.0.0.1:7420
+```
+
+3. **Write and read via the pure-stdlib Python client** (from the repository root):
+
+```bash
+PYTHONPATH=clients/python python3 -c '
+from membus_v2_client import MembusClient
+c = MembusClient("http://127.0.0.1:7480")
+commit = c.put("demo", "hello", "world", ack="Flush")
+rec = c.get("demo", "hello")
+print("seq:", commit.seq, "value:", rec.value_text)
+'
+```
+
+Press `Ctrl+C` (or send `SIGTERM` on Unix) to drain listeners, flush Tantivy search + RocksDB WAL,
+and shut down cleanly. Non-loopback binds (`0.0.0.0`, LAN IPs) fail closed unless both
+`--auth-config` and TLS (`--http-tls-cert`/`--http-tls-key` or `--tls-cert`/`--tls-key`) are
+configured, or `--allow-insecure-non-loopback` is explicitly supplied.
 
 ## Unified Transport Boundary
 
@@ -85,7 +145,7 @@ commit-log catch-up, and an Axum HTTP/2 + REST + WebSocket + SSE service plane.
 - `src/cli/` — Resident and break-glass diagnostic CLI (`membus serve`,
   `membus health`, `membus checkpoint`, `membus diag inspect`,
   `membus diag verify`, `membus diag restore`).
-- `clients/python/` — Zero-dependency pure-stdlib Python 3.14+ client
+- `clients/python/` — Zero-dependency pure-stdlib Python 3.11+ client
   (`membus_v2_client.py`) and end-to-end test suite targeting the HTTP/REST +
   SSE surface.
 

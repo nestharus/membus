@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: membus
+  labels:
+    app.kubernetes.io/name: membus
+    app.kubernetes.io/component: storage-resident
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: membus
+  ports:
+    - name: https
+      port: 8443
+      targetPort: https
+      protocol: TCP

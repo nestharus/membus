@@ -1097,6 +1097,19 @@ impl Client {
         }
     }
 
+    /// Query extended v2 server health including active snapshots, active streams,
+    /// and deferred secondary search synchronization gauges.
+    pub async fn health_v2(&self) -> Result<HealthStatus, MembusError> {
+        let resp = self.call(Request::HealthV2).await?;
+        match resp {
+            Response::HealthV2(status) => Ok(status),
+            Response::Error(e) => Err(e),
+            other => Err(MembusError::Protocol(format!(
+                "unexpected response for health_v2: {other:?}"
+            ))),
+        }
+    }
+
     async fn get_with_snapshot(
         &self,
         namespace: &str,

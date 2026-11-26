@@ -1,18 +1,16 @@
-use std::collections::{BTreeMap, HashSet, VecDeque};
-use std::mem::ManuallyDrop;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, Weak};
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex as FastMutex;
 use rocksdb::checkpoint::Checkpoint;
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamilyDescriptor, DBCompressionType, Direction, ErrorKind,
     IteratorMode, OptimisticTransactionDB, OptimisticTransactionOptions, Options, ReadOptions,
-    SliceTransform, SnapshotWithThreadMode, Transaction, WriteBufferManager, WriteOptions,
-    DEFAULT_COLUMN_FAMILY_NAME,
+    SliceTransform, Transaction, WriteBufferManager, WriteOptions, DEFAULT_COLUMN_FAMILY_NAME,
 };
 use sha2::{Digest, Sha256};
 
@@ -26,19 +24,25 @@ use crate::storage::admission::AdmissionGate;
 use crate::storage::codec::{
     decode_kv_key, decode_log_entry, decode_log_entry_delta, decode_log_entry_full, decode_log_seq,
     decode_record, decode_record_parts, encode_cas_blob_key, encode_kv_key, encode_log_entry_v4,
-    encode_log_seq, encode_raw_blob_key, kv_prefix_in_domain, kv_prefix_transform, next_key_after,
+    encode_log_seq, encode_raw_blob_key, encode_record, kv_prefix_in_domain, kv_prefix_transform,
+    next_key_after,
 };
+use crate::storage::hlc::HlcClock;
+use crate::storage::mesh_replication::{META_PREFIX_MESH_PEER, META_PREFIX_MESH_TOMB};
+use crate::storage::sequencer::PublishSequencer;
+use crate::storage::snapshot::{OwnedSnapshot, SnapshotAdmissionGate};
+use crate::storage::wal_sync::BackgroundWalSync;
 use crate::storage::{
     MetaCasGuard, SignalPublisher, StorageConfig, StorageEngine, ALL_COLUMN_FAMILIES, CF_BLOB,
     CF_IDX_EDGE, CF_IDX_ORD, CF_IDX_REV, CF_KV, CF_LEASE, CF_LOG, CF_META,
 };
 use crate::types::{
-    now_unix_ms, sanitize_search_log_op, validate_key, validate_namespace, validate_value, Ack,
-    BfsResult, CommitResult, DeltaLogPage, ExpectedVersion, GraphDirection, GraphEdgeRecord,
-    IndexMutations, IndexedMutation, LogMutationDelta, LogScanPage, LogWatermark, MembusError,
-    MutationOp, NeighborPage, OrderedIndexHit, OrderedIndexPage, ReplicatedApplyResult,
-    ReplicatedDelta, ReplicationStamp, ScanOptions, ScanPage, SearchLogOp, SearchLogPage,
-    SearchLogRecord, SignalEvent, SignalKind, StoredRecord, VersionGuard, WalBatch, WriteMutation,
+    sanitize_search_log_op, validate_key, validate_namespace, validate_value, Ack, BfsResult,
+    CommitResult, DeltaLogPage, ExpectedVersion, GraphDirection, GraphEdgeRecord, IndexMutations,
+    IndexedMutation, LogMutationDelta, LogScanPage, LogWatermark, MembusError, MutationOp,
+    NeighborPage, OrderedIndexHit, OrderedIndexPage, ReplicatedApplyResult, ReplicatedDelta,
+    ReplicationStamp, ScanOptions, ScanPage, SearchLogOp, SearchLogPage, SearchLogRecord,
+    SignalEvent, SignalKind, StoredRecord, VersionGuard, WalBatch, WriteMutation,
 };
 
 const META_KEY_EPOCH: &[u8] = b"db_epoch";
@@ -46,258 +50,21 @@ const META_KEY_LOG_HORIZON: &[u8] = b"log_horizon_seq";
 const META_KEY_SEARCH_CHECKPOINT: &[u8] = b"search:checkpoint";
 const META_KEY_BACKUP_LAST_SEQ: &[u8] = b"backup:last_seq";
 const META_KEY_MESH_PUB_SEQ: &[u8] = b"mesh:pub_seq";
-const META_PREFIX_MESH_LWW: &[u8] = b"mesh:lww:";
-const META_PREFIX_MESH_LOCAL_LWW: &[u8] = b"mesh:local_lww:";
-const META_PREFIX_MESH_TOMB: &[u8] = b"mesh:tomb:";
-const META_PREFIX_MESH_PEER: &[u8] = b"mesh:peer:";
-const META_PREFIX_MESH_SEARCH_SEEN: &[u8] = b"mesh:search_seen:";
 static EPOCH_ENTROPY_COUNTER: AtomicU64 = AtomicU64::new(1);
-
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-struct StoredLwwRecord {
-    local_applied_seq: u64,
-    stamp: ReplicationStamp,
-}
-
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-struct StoredLocalLwwRecord {
-    applied_seq: u64,
-    logical_seq: u64,
-    ts_ms: u64,
-    value_sha256: [u8; 32],
-}
-
-/// Monotonic in-process Hybrid Logical Clock (millisecond precision) ensuring causal
-/// local writes always advance past observed remote timestamps even under negative clock skew.
-struct HlcClock {
-    last_ms: AtomicU64,
-}
-
-impl HlcClock {
-    fn new(initial_ms: u64) -> Self {
-        Self {
-            last_ms: AtomicU64::new(initial_ms.max(now_unix_ms())),
-        }
-    }
-
-    fn current(&self) -> u64 {
-        self.last_ms.load(Ordering::Acquire).max(now_unix_ms())
-    }
-
-    /// Advance the clock for a new local write: `max(wall_ms, prev + 1)`.
-    fn tick(&self) -> u64 {
-        let wall = now_unix_ms();
-        let mut prev = self.last_ms.load(Ordering::Acquire);
-        loop {
-            let next = wall.max(prev.saturating_add(1));
-            match self.last_ms.compare_exchange_weak(
-                prev,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return next,
-                Err(actual) => prev = actual,
-            }
-        }
-    }
-
-    /// Observe a remote peer's timestamp so any subsequent local `tick()` is strictly greater.
-    fn observe(&self, remote_ts_ms: u64) {
-        let floor = remote_ts_ms.max(now_unix_ms());
-        let mut prev = self.last_ms.load(Ordering::Acquire);
-        while floor > prev {
-            match self.last_ms.compare_exchange_weak(
-                prev,
-                floor,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(actual) => prev = actual,
-            }
-        }
-    }
-}
-
-/// Owned, `'static` handle to an O(1) MVCC RocksDB snapshot.
-///
-/// The snapshot is released strictly before the underlying database handle drops.
-pub struct OwnedSnapshot {
-    snapshot: ManuallyDrop<SnapshotWithThreadMode<'static, OptimisticTransactionDB>>,
-    _db: Arc<OptimisticTransactionDB>,
-    snapshot_seq: u64,
-}
-
-impl OwnedSnapshot {
-    pub fn snapshot_seq(&self) -> u64 {
-        self.snapshot_seq
-    }
-
-    pub(crate) fn inner(&self) -> &SnapshotWithThreadMode<'static, OptimisticTransactionDB> {
-        &self.snapshot
-    }
-}
-
-impl Drop for OwnedSnapshot {
-    fn drop(&mut self) {
-        // SAFETY: `self.snapshot` is never accessed again and is dropped while `self._db`
-        // still keeps the underlying `OptimisticTransactionDB` alive at a fixed address.
-        unsafe {
-            ManuallyDrop::drop(&mut self.snapshot);
-        }
-    }
-}
-
-struct SequencerState {
-    next_publish_seq: u64,
-    ready: BTreeMap<u64, Option<Vec<SignalEvent>>>,
-}
-
-struct PublishSequencer {
-    next_seq: AtomicU64,
-    published_seq: AtomicU64,
-    state: FastMutex<SequencerState>,
-    publisher: Arc<dyn SignalPublisher>,
-}
-
-impl PublishSequencer {
-    fn new(initial_seq: u64, publisher: Arc<dyn SignalPublisher>) -> Self {
-        Self {
-            next_seq: AtomicU64::new(initial_seq.saturating_add(1)),
-            published_seq: AtomicU64::new(initial_seq),
-            state: FastMutex::new(SequencerState {
-                next_publish_seq: initial_seq.saturating_add(1),
-                ready: BTreeMap::new(),
-            }),
-            publisher,
-        }
-    }
-
-    fn reserve(self: &Arc<Self>) -> SeqTicket {
-        let seq = self.next_seq.fetch_add(1, Ordering::AcqRel);
-        SeqTicket {
-            seq,
-            sequencer: Arc::clone(self),
-            settled: false,
-        }
-    }
-
-    fn published_seq(&self) -> u64 {
-        self.published_seq.load(Ordering::Acquire)
-    }
-
-    fn settle(&self, seq: u64, events: Option<Vec<SignalEvent>>) {
-        let mut guard = self.state.lock();
-        guard.ready.insert(seq, events);
-        loop {
-            let current = guard.next_publish_seq;
-            let Some(entry) = guard.ready.remove(&current) else {
-                break;
-            };
-            guard.next_publish_seq = current.saturating_add(1);
-            if let Some(committed_events) = entry {
-                self.published_seq.store(current, Ordering::Release);
-                self.publisher.publish_ordered(&committed_events);
-            } else {
-                self.published_seq.store(current, Ordering::Release);
-            }
-        }
-    }
-}
-
-struct SeqTicket {
-    seq: u64,
-    sequencer: Arc<PublishSequencer>,
-    settled: bool,
-}
-
-impl SeqTicket {
-    fn seq(&self) -> u64 {
-        self.seq
-    }
-
-    fn commit(mut self, events: Vec<SignalEvent>) {
-        self.settled = true;
-        self.sequencer.settle(self.seq, Some(events));
-    }
-}
-
-impl Drop for SeqTicket {
-    fn drop(&mut self) {
-        if !self.settled {
-            self.sequencer.settle(self.seq, None);
-        }
-    }
-}
-
-struct BackgroundWalSync {
-    stop_flag: Arc<(Mutex<bool>, Condvar)>,
-    handle: Option<JoinHandle<()>>,
-}
-
-impl BackgroundWalSync {
-    fn spawn(db: &Arc<OptimisticTransactionDB>, interval: Duration) -> Result<Self, MembusError> {
-        let stop_flag = Arc::new((Mutex::new(false), Condvar::new()));
-        let stop_ref = Arc::clone(&stop_flag);
-        let weak_db: Weak<OptimisticTransactionDB> = Arc::downgrade(db);
-
-        let handle = thread::Builder::new()
-            .name("membus-wal-sync".to_owned())
-            .spawn(move || {
-                let (lock, condvar) = &*stop_ref;
-                let mut stopped = lock.lock().unwrap_or_else(|e| e.into_inner());
-                while !*stopped {
-                    let (guard, _) = condvar
-                        .wait_timeout(stopped, interval)
-                        .unwrap_or_else(|e| e.into_inner());
-                    stopped = guard;
-                    if *stopped {
-                        break;
-                    }
-                    drop(stopped);
-                    if let Some(db) = weak_db.upgrade() {
-                        let _ = db.flush_wal(true);
-                    } else {
-                        break;
-                    }
-                    stopped = lock.lock().unwrap_or_else(|e| e.into_inner());
-                }
-            })
-            .map_err(|err| MembusError::Storage(format!("failed to spawn wal sync thread: {err}")))?;
-
-        Ok(Self {
-            stop_flag,
-            handle: Some(handle),
-        })
-    }
-}
-
-impl Drop for BackgroundWalSync {
-    fn drop(&mut self) {
-        let (lock, condvar) = &*self.stop_flag;
-        if let Ok(mut stopped) = lock.lock() {
-            *stopped = true;
-            condvar.notify_all();
-        }
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
-    }
-}
 
 /// Multi-threaded RocksDB storage engine backed by `OptimisticTransactionDB`.
 pub struct RocksDbStorage {
     data_dir: PathBuf,
-    db: Arc<OptimisticTransactionDB>,
-    config: StorageConfig,
-    epoch: u64,
+    pub(crate) db: Arc<OptimisticTransactionDB>,
+    pub(crate) config: StorageConfig,
+    pub(crate) epoch: u64,
     log_horizon: AtomicU64,
     trim_lock: FastMutex<()>,
-    hlc: HlcClock,
-    sequencer: Arc<PublishSequencer>,
-    admission: AdmissionGate,
-    _bg_sync: Option<BackgroundWalSync>,
+    pub(crate) hlc: HlcClock,
+    pub(crate) sequencer: Arc<PublishSequencer>,
+    pub(crate) admission: AdmissionGate,
+    snapshot_gate: SnapshotAdmissionGate,
+    bg_sync: Option<BackgroundWalSync>,
 }
 
 impl RocksDbStorage {
@@ -395,6 +162,7 @@ impl RocksDbStorage {
         };
 
         let admission = AdmissionGate::new(config.admission);
+        let snapshot_gate = SnapshotAdmissionGate::new(config.max_active_snapshots);
         let sequencer = Arc::new(PublishSequencer::new(initial_seq, publisher));
 
         Ok(Self {
@@ -407,7 +175,8 @@ impl RocksDbStorage {
             hlc: HlcClock::new(last_log_ts),
             sequencer,
             admission,
-            _bg_sync: bg_sync,
+            snapshot_gate,
+            bg_sync,
         })
     }
 
@@ -419,13 +188,31 @@ impl RocksDbStorage {
             .collect()
     }
 
-    fn cf(&self, name: &str) -> Result<Arc<rocksdb::BoundColumnFamily<'_>>, MembusError> {
+    /// Number of background WAL sync failures observed since opening this instance.
+    pub fn background_wal_sync_errors(&self) -> u64 {
+        self.bg_sync
+            .as_ref()
+            .map_or(0, BackgroundWalSync::error_count)
+    }
+
+    /// Trigger manual RocksDB flush + full range compaction across `CF_KV` and `CF_LOG`.
+    /// Useful for operational maintenance and snapshot-lifetime compaction stress testing.
+    pub fn compact_all(&self) -> Result<(), MembusError> {
+        for cf_name in [CF_KV, CF_LOG, CF_IDX_ORD, CF_IDX_EDGE, CF_IDX_REV] {
+            let cf = self.cf(cf_name)?;
+            self.db.flush_cf(&cf).map_err(map_rocksdb_err)?;
+            self.db.compact_range_cf(&cf, None::<&[u8]>, None::<&[u8]>);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn cf(&self, name: &str) -> Result<Arc<rocksdb::BoundColumnFamily<'_>>, MembusError> {
         self.db
             .cf_handle(name)
             .ok_or_else(|| MembusError::Storage(format!("missing column family '{name}'")))
     }
 
-    fn build_value_hint(&self, value: &[u8]) -> Option<Vec<u8>> {
+    pub(crate) fn build_value_hint(&self, value: &[u8]) -> Option<Vec<u8>> {
         if value.len() <= self.config.max_signal_hint_bytes {
             Some(value.to_vec())
         } else {
@@ -434,10 +221,28 @@ impl RocksDbStorage {
     }
 
     fn verify_snapshot_owner(&self, snapshot: &OwnedSnapshot) -> Result<(), MembusError> {
-        if !Arc::ptr_eq(&self.db, &snapshot._db) {
+        if !snapshot.belongs_to(&self.db) {
             return Err(MembusError::InvalidArgument(
                 "snapshot belongs to a different RocksDbStorage instance".to_owned(),
             ));
+        }
+        Ok(())
+    }
+
+    fn query_deadline(&self) -> Option<Instant> {
+        self.config
+            .query_timeout
+            .and_then(|d| Instant::now().checked_add(d))
+    }
+
+    fn check_query_deadline(deadline: Option<Instant>) -> Result<(), MembusError> {
+        if let Some(dl) = deadline {
+            if Instant::now() >= dl {
+                return Err(MembusError::Busy {
+                    retry_after_ms: 50,
+                    reason: "query timeout exceeded".to_owned(),
+                });
+            }
         }
         Ok(())
     }
@@ -453,6 +258,7 @@ impl RocksDbStorage {
     where
         F: Fn(&[u8]) -> bool,
     {
+        let deadline = self.query_deadline();
         let seek_key = encode_kv_key(namespace, effective_start);
         let kv_cf = self.cf(CF_KV)?;
         let mut read_opts = ReadOptions::default();
@@ -469,7 +275,10 @@ impl RocksDbStorage {
         let mut accum_bytes = 0usize;
         let mut truncated = false;
 
-        for item in iter {
+        for (step, item) in iter.enumerate() {
+            if step & 63 == 0 {
+                Self::check_query_deadline(deadline)?;
+            }
             let (raw_k, raw_v) = item.map_err(map_rocksdb_err)?;
             let (rec_ns, rec_key) = decode_kv_key(&raw_k)?;
             if rec_ns != namespace || !in_bounds(rec_key) {
@@ -605,8 +414,7 @@ impl RocksDbStorage {
 
             let (kind, value_hint) = match &op {
                 MutationOp::Put { value } => {
-                    let encoded_val =
-                        crate::storage::codec::encode_record(seq, flags, ts_ms, value);
+                    let encoded_val = encode_record(seq, flags, ts_ms, value);
                     tx.put_cf(&kv_cf, &enc_key, &encoded_val)
                         .map_err(map_tx_err)?;
                     (SignalKind::Put, self.build_value_hint(value))
@@ -681,6 +489,7 @@ impl RocksDbStorage {
             "unconditional write exceeded optimistic retry limit under contention".to_owned(),
         ))
     }
+
     fn trim_log_before_locked(&self, keep_from_seq: u64) -> Result<(), MembusError> {
         if keep_from_seq <= 1 {
             return Ok(());
@@ -752,6 +561,10 @@ impl StorageEngine for RocksDbStorage {
 
     fn in_flight_bytes(&self) -> usize {
         self.admission.in_flight_bytes()
+    }
+
+    fn active_snapshots(&self) -> usize {
+        self.snapshot_gate.active()
     }
 
     fn hlc_now_ms(&self) -> u64 {
@@ -838,147 +651,15 @@ impl StorageEngine for RocksDbStorage {
         ack: Ack,
         expected: ExpectedVersion,
     ) -> Result<CommitResult, MembusError> {
-        validate_namespace(namespace)?;
-        validate_key(key)?;
-        validate_value(new_value, self.config.max_value_bytes)?;
-
-        let estimated_bytes = namespace
-            .len()
-            .saturating_add(key.len())
-            .saturating_add(new_value.len())
-            .saturating_add(128);
-        let _permit = self.admission.try_acquire(estimated_bytes)?;
-
-        let kv_cf = self.cf(CF_KV)?;
-        let log_cf = self.cf(CF_LOG)?;
-        let meta_cf = self.cf(CF_META)?;
-        let enc_key = encode_kv_key(namespace, key);
-        let lww_key = encode_prefixed_key(META_PREFIX_MESH_LWW, &enc_key);
-        let local_lww_key = encode_prefixed_key(META_PREFIX_MESH_LOCAL_LWW, &enc_key);
-
-        let mut write_opts = WriteOptions::default();
-        write_opts.set_sync(ack == Ack::Flush);
-        let mut tx_opts = OptimisticTransactionOptions::default();
-        tx_opts.set_snapshot(true);
-
-        let tx = self.db.transaction_opt(&write_opts, &tx_opts);
-        let (old_meta, prev_lww, prev_local_lww) = {
-            let tx_snap = tx.snapshot();
-            let mut read_opts = ReadOptions::default();
-            read_opts.set_snapshot(&tx_snap);
-
-            let current = tx
-                .get_pinned_for_update_cf_opt(&kv_cf, &enc_key, true, &read_opts)
-                .map_err(map_tx_err)?;
-            let Some(raw) = current else {
-                verify_expected_version(namespace, key, expected, None)?;
-                return Err(MembusError::NotFound(
-                    "tier_swap_record target key does not exist".to_owned(),
-                ));
-            };
-            let (meta, _old_val) = decode_record_parts(raw.as_ref())?;
-            verify_expected_version(namespace, key, expected, Some(meta.version))?;
-
-            let lww = tx
-                .get_pinned_for_update_cf_opt(&meta_cf, &lww_key, true, &read_opts)
-                .map_err(map_tx_err)?
-                .map(|r| {
-                    serde_json::from_slice::<StoredLwwRecord>(r.as_ref()).map_err(|err| {
-                        MembusError::Corruption(format!("corrupt mesh lww record: {err}"))
-                    })
-                })
-                .transpose()?;
-            let local_lww = tx
-                .get_pinned_for_update_cf_opt(&meta_cf, &local_lww_key, true, &read_opts)
-                .map_err(map_tx_err)?
-                .map(|r| {
-                    serde_json::from_slice::<StoredLocalLwwRecord>(r.as_ref()).map_err(|err| {
-                        MembusError::Corruption(format!("corrupt mesh local_lww record: {err}"))
-                    })
-                })
-                .transpose()?;
-            (meta, lww, local_lww)
-        };
-
-        let new_flags = if set_cold_flag {
-            old_meta.flags | crate::storage::codec::RECORD_FLAG_COLD_REF
-        } else {
-            old_meta.flags & !crate::storage::codec::RECORD_FLAG_COLD_REF
-        };
-
-        let ticket = self.sequencer.reserve();
-        let seq = ticket.seq();
-
-        // Preserve original logical timestamp (`old_meta.ts_ms`) and bitwise-update ONLY cold flag.
-        let encoded_val =
-            crate::storage::codec::encode_record(seq, new_flags, old_meta.ts_ms, new_value);
-        tx.put_cf(&kv_cf, &enc_key, &encoded_val)
-            .map_err(map_tx_err)?;
-
-        // Preserve original LWW stamp so tier archival/rehydration NEVER changes LWW precedence.
-        if let Some(mut stored) = prev_lww.filter(|r| r.local_applied_seq == old_meta.version) {
-            stored.local_applied_seq = seq;
-            let bytes = serde_json::to_vec(&stored).map_err(|err| {
-                MembusError::Storage(format!("encode mesh lww record failed: {err}"))
-            })?;
-            tx.put_cf(&meta_cf, &lww_key, &bytes).map_err(map_tx_err)?;
-        } else {
-            let next_local_lww = match prev_local_lww.filter(|r| r.applied_seq == old_meta.version)
-            {
-                Some(mut existing) => {
-                    existing.applied_seq = seq;
-                    existing
-                }
-                None => StoredLocalLwwRecord {
-                    applied_seq: seq,
-                    logical_seq: old_meta.version,
-                    ts_ms: old_meta.ts_ms,
-                    value_sha256: logical_value_sha256,
-                },
-            };
-            let bytes = serde_json::to_vec(&next_local_lww).map_err(|err| {
-                MembusError::Storage(format!("encode mesh local_lww record failed: {err}"))
-            })?;
-            tx.put_cf(&meta_cf, &local_lww_key, &bytes)
-                .map_err(map_tx_err)?;
-        }
-
-        // Emit ZERO signal events and tag `is_tier_swap = true, preserve_indexes = true`
-        // so mesh replication ignores local tiering while backup replay preserves indexes.
-        let delta = LogMutationDelta {
-            namespace: namespace.to_owned(),
-            key: key.to_vec(),
-            op: MutationOp::Put {
-                value: new_value.to_vec(),
-            },
-            flags: new_flags,
-            preserve_indexes: true,
-            is_tier_swap: true,
-            indexes: None,
-            search_op: None,
-            origin_stamp: None,
-        };
-        let encoded_log = encode_log_entry_v4(
-            self.epoch,
-            seq,
-            old_meta.ts_ms,
-            false,
-            &[],
-            &[],
-            &[delta],
-            None,
-        );
-        tx.put_cf(&log_cf, encode_log_seq(seq), &encoded_log)
-            .map_err(map_tx_err)?;
-
-        tx.commit().map_err(map_tx_err)?;
-        ticket.commit(Vec::new());
-
-        Ok(CommitResult {
-            seq,
-            epoch: self.epoch,
-            versions: vec![seq],
-        })
+        self.tier_swap_record_impl(
+            namespace,
+            key,
+            new_value,
+            set_cold_flag,
+            logical_value_sha256,
+            ack,
+            expected,
+        )
     }
 
     fn apply_replicated_delta(
@@ -987,267 +668,7 @@ impl StorageEngine for RocksDbStorage {
         delta: &ReplicatedDelta,
         ack: Ack,
     ) -> Result<ReplicatedApplyResult, MembusError> {
-        if local_node_id.is_empty() || delta.stamp.origin_node_id.is_empty() {
-            return Err(MembusError::InvalidArgument(
-                "replication node_id must not be empty".to_owned(),
-            ));
-        }
-        validate_namespace(&delta.namespace)?;
-        validate_key(&delta.key)?;
-        if let Some(idx_muts) = &delta.indexes {
-            validate_index_mutations(idx_muts, self.config.max_value_bytes)?;
-        }
-        let sanitized_search_op = match &delta.search_op {
-            Some(op) => Some(sanitize_search_log_op(op)?),
-            None => None,
-        };
-        let payload_bytes = match &delta.op {
-            MutationOp::Put { value } => {
-                validate_value(value, self.config.max_value_bytes)?;
-                let actual_hash: [u8; 32] = Sha256::digest(value).into();
-                if actual_hash != delta.stamp.value_sha256 {
-                    return Err(MembusError::Corruption(
-                        "replicated delta value_sha256 mismatch".to_owned(),
-                    ));
-                }
-                value.len()
-            }
-            MutationOp::Remove => {
-                if delta.stamp.value_sha256 != [0u8; 32] {
-                    return Err(MembusError::Corruption(
-                        "replicated remove delta must carry zero value_sha256".to_owned(),
-                    ));
-                }
-                0
-            }
-        };
-
-        // Observe remote timestamp in local monotonic HLC so any subsequent causal local
-        // write gets a strictly higher timestamp even under negative clock skew.
-        self.hlc.observe(delta.stamp.timestamp_ms);
-
-        let estimated_bytes = delta
-            .namespace
-            .len()
-            .saturating_add(delta.key.len())
-            .saturating_add(payload_bytes)
-            .saturating_add(delta.indexes.as_ref().map_or(0, estimate_index_bytes))
-            .saturating_add(
-                sanitized_search_op
-                    .as_ref()
-                    .map_or(0, estimate_search_op_bytes),
-            )
-            .saturating_add(128);
-        let _permit = self.admission.try_acquire(estimated_bytes)?;
-
-        let kv_cf = self.cf(CF_KV)?;
-        let log_cf = self.cf(CF_LOG)?;
-        let meta_cf = self.cf(CF_META)?;
-        let idx_ord_cf = self.cf(CF_IDX_ORD)?;
-        let idx_edge_cf = self.cf(CF_IDX_EDGE)?;
-        let idx_rev_cf = self.cf(CF_IDX_REV)?;
-        let enc_key = encode_kv_key(&delta.namespace, &delta.key);
-        let lww_key = encode_prefixed_key(META_PREFIX_MESH_LWW, &enc_key);
-        let local_lww_key = encode_prefixed_key(META_PREFIX_MESH_LOCAL_LWW, &enc_key);
-        let tomb_key = encode_prefixed_key(META_PREFIX_MESH_TOMB, &enc_key);
-
-        let mut write_opts = WriteOptions::default();
-        write_opts.set_sync(ack == Ack::Flush);
-        let mut tx_opts = OptimisticTransactionOptions::default();
-        tx_opts.set_snapshot(true);
-
-        for attempt in 0..32 {
-            let tx = self.db.transaction_opt(&write_opts, &tx_opts);
-            {
-                let tx_snap = tx.snapshot();
-                let mut read_opts = ReadOptions::default();
-                read_opts.set_snapshot(&tx_snap);
-
-                let kv_raw = tx
-                    .get_pinned_for_update_cf_opt(&kv_cf, &enc_key, true, &read_opts)
-                    .map_err(map_tx_err)?;
-                let lww_raw = tx
-                    .get_pinned_for_update_cf_opt(&meta_cf, &lww_key, true, &read_opts)
-                    .map_err(map_tx_err)?;
-                let local_lww_raw = tx
-                    .get_pinned_for_update_cf_opt(&meta_cf, &local_lww_key, true, &read_opts)
-                    .map_err(map_tx_err)?;
-                let tomb_raw = tx
-                    .get_pinned_for_update_cf_opt(&meta_cf, &tomb_key, true, &read_opts)
-                    .map_err(map_tx_err)?;
-
-                let mut current_local_seq = 0u64;
-                let mut current_stamp: Option<ReplicationStamp> = None;
-
-                if let Some(raw) = lww_raw {
-                    let stored: StoredLwwRecord =
-                        serde_json::from_slice(raw.as_ref()).map_err(|err| {
-                            MembusError::Corruption(format!("corrupt mesh lww record: {err}"))
-                        })?;
-                    current_local_seq = stored.local_applied_seq;
-                    current_stamp = Some(stored.stamp);
-                }
-
-                let local_lww_parsed = match local_lww_raw {
-                    Some(raw) => Some(
-                        serde_json::from_slice::<StoredLocalLwwRecord>(raw.as_ref()).map_err(
-                            |err| {
-                                MembusError::Corruption(format!(
-                                    "corrupt mesh local_lww record: {err}"
-                                ))
-                            },
-                        )?,
-                    ),
-                    None => None,
-                };
-
-                if let Some(raw) = kv_raw {
-                    let (meta, val) = decode_record_parts(raw.as_ref())?;
-                    if meta.version > current_local_seq {
-                        current_local_seq = meta.version;
-                        if let Some(local_lww) =
-                            local_lww_parsed.filter(|r| r.applied_seq == meta.version)
-                        {
-                            current_stamp = Some(ReplicationStamp {
-                                timestamp_ms: local_lww.ts_ms,
-                                origin_node_id: local_node_id.to_owned(),
-                                origin_seq: local_lww.logical_seq,
-                                value_sha256: local_lww.value_sha256,
-                            });
-                        } else {
-                            current_stamp = Some(ReplicationStamp {
-                                timestamp_ms: meta.ts_ms,
-                                origin_node_id: local_node_id.to_owned(),
-                                origin_seq: meta.version,
-                                value_sha256: Sha256::digest(val).into(),
-                            });
-                        }
-                    }
-                }
-
-                if let Some(raw) = tomb_raw {
-                    let bytes = raw.as_ref();
-                    if bytes.len() != 16 {
-                        return Err(MembusError::Corruption(
-                            "corrupt mesh tombstone metadata".to_owned(),
-                        ));
-                    }
-                    let tomb_seq = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
-                    let tomb_ts = u64::from_be_bytes(bytes[8..16].try_into().unwrap());
-                    if tomb_seq > current_local_seq {
-                        current_stamp = Some(ReplicationStamp {
-                            timestamp_ms: tomb_ts,
-                            origin_node_id: local_node_id.to_owned(),
-                            origin_seq: tomb_seq,
-                            value_sha256: [0u8; 32],
-                        });
-                    }
-                }
-
-                if let Some(cur) = &current_stamp {
-                    if delta.stamp.cmp_lww(cur) != std::cmp::Ordering::Greater {
-                        return Ok(ReplicatedApplyResult {
-                            applied: false,
-                            local_seq: None,
-                        });
-                    }
-                }
-
-                let applied_indexes = match &delta.op {
-                    MutationOp::Put { .. } => delta.indexes.as_ref(),
-                    MutationOp::Remove => None,
-                };
-                apply_index_mutations_in_tx(
-                    &tx,
-                    &read_opts,
-                    &idx_ord_cf,
-                    &idx_edge_cf,
-                    &idx_rev_cf,
-                    &delta.namespace,
-                    &delta.key,
-                    &enc_key,
-                    applied_indexes,
-                )?;
-            }
-
-            let ticket = self.sequencer.reserve();
-            let seq = ticket.seq();
-            let ts_ms = delta.stamp.timestamp_ms;
-
-            let (kind, value_hint) = match &delta.op {
-                MutationOp::Put { value } => {
-                    let encoded_val = crate::storage::codec::encode_record(seq, 0, ts_ms, value);
-                    tx.put_cf(&kv_cf, &enc_key, &encoded_val)
-                        .map_err(map_tx_err)?;
-                    (SignalKind::Put, self.build_value_hint(value))
-                }
-                MutationOp::Remove => {
-                    tx.delete_cf(&kv_cf, &enc_key).map_err(map_tx_err)?;
-                    (SignalKind::Delete, None)
-                }
-            };
-
-            let lww_val = serde_json::to_vec(&StoredLwwRecord {
-                local_applied_seq: seq,
-                stamp: delta.stamp.clone(),
-            })
-            .map_err(|err| MembusError::Storage(format!("encode mesh lww record failed: {err}")))?;
-            tx.put_cf(&meta_cf, &lww_key, &lww_val)
-                .map_err(map_tx_err)?;
-
-            let event = SignalEvent {
-                seq,
-                epoch: self.epoch,
-                namespace: delta.namespace.clone(),
-                key: delta.key.clone(),
-                version: seq,
-                kind,
-                value_hint,
-            };
-            let events = vec![event];
-            let log_delta = LogMutationDelta {
-                namespace: delta.namespace.clone(),
-                key: delta.key.clone(),
-                op: delta.op.clone(),
-                flags: 0,
-                preserve_indexes: false,
-                is_tier_swap: false,
-                indexes: match &delta.op {
-                    MutationOp::Put { .. } => delta.indexes.clone(),
-                    MutationOp::Remove => None,
-                },
-                search_op: sanitized_search_op.clone(),
-                origin_stamp: Some(delta.stamp.clone()),
-            };
-            let encoded_log = encode_log_entry_v4(
-                self.epoch,
-                seq,
-                ts_ms,
-                true,
-                &events,
-                &[],
-                &[log_delta],
-                None,
-            );
-            tx.put_cf(&log_cf, encode_log_seq(seq), &encoded_log)
-                .map_err(map_tx_err)?;
-
-            match tx.commit().map_err(map_tx_err) {
-                Ok(()) => {
-                    ticket.commit(events);
-                    return Ok(ReplicatedApplyResult {
-                        applied: true,
-                        local_seq: Some(seq),
-                    });
-                }
-                Err(MembusError::TxConflict(_)) if attempt + 1 < 32 => continue,
-                Err(err) => return Err(err),
-            }
-        }
-
-        Err(MembusError::TxConflict(
-            "replicated delta exceeded optimistic retry limit under contention".to_owned(),
-        ))
+        self.apply_replicated_delta_impl(local_node_id, delta, ack)
     }
 
     fn append_replicated_search_ops(
@@ -1256,99 +677,7 @@ impl StorageEngine for RocksDbStorage {
         ops: &[SearchLogOp],
         ack: Ack,
     ) -> Result<ReplicatedApplyResult, MembusError> {
-        if origin_stamp.origin_node_id.is_empty() {
-            return Err(MembusError::InvalidArgument(
-                "origin_node_id must not be empty".to_owned(),
-            ));
-        }
-        if ops.is_empty() {
-            return Ok(ReplicatedApplyResult {
-                applied: false,
-                local_seq: None,
-            });
-        }
-        let mut sanitized = Vec::with_capacity(ops.len());
-        let mut total_bytes = 64usize;
-        for op in ops {
-            let s = sanitize_search_log_op(op)?;
-            total_bytes = total_bytes.saturating_add(estimate_search_op_bytes(&s));
-            sanitized.push(s);
-        }
-        if total_bytes > self.config.max_value_bytes {
-            return Err(MembusError::InvalidArgument(format!(
-                "replicated search ops size {total_bytes} exceeds max_value_bytes {}",
-                self.config.max_value_bytes
-            )));
-        }
-        self.hlc.observe(origin_stamp.timestamp_ms);
-        let _permit = self.admission.try_acquire(total_bytes)?;
-
-        let log_cf = self.cf(CF_LOG)?;
-        let meta_cf = self.cf(CF_META)?;
-        let dedup_key = encode_prefixed_key(
-            META_PREFIX_MESH_SEARCH_SEEN,
-            format!(
-                "{}:{}:{}",
-                origin_stamp.origin_node_id, origin_stamp.origin_seq, origin_stamp.timestamp_ms
-            )
-            .as_bytes(),
-        );
-
-        let mut wo = WriteOptions::default();
-        wo.set_sync(ack == Ack::Flush);
-        let mut tx_opts = OptimisticTransactionOptions::default();
-        tx_opts.set_snapshot(true);
-
-        for attempt in 0..16 {
-            let tx = self.db.transaction_opt(&wo, &tx_opts);
-            {
-                let tx_snap = tx.snapshot();
-                let mut read_opts = ReadOptions::default();
-                read_opts.set_snapshot(&tx_snap);
-                if tx
-                    .get_pinned_for_update_cf_opt(&meta_cf, &dedup_key, true, &read_opts)
-                    .map_err(map_tx_err)?
-                    .is_some()
-                {
-                    return Ok(ReplicatedApplyResult {
-                        applied: false,
-                        local_seq: None,
-                    });
-                }
-            }
-            let ticket = self.sequencer.reserve();
-            let seq = ticket.seq();
-            tx.put_cf(&meta_cf, &dedup_key, seq.to_be_bytes())
-                .map_err(map_tx_err)?;
-            let encoded_log = encode_log_entry_v4(
-                self.epoch,
-                seq,
-                origin_stamp.timestamp_ms,
-                true,
-                &[],
-                &sanitized,
-                &[],
-                Some(origin_stamp),
-            );
-            tx.put_cf(&log_cf, encode_log_seq(seq), &encoded_log)
-                .map_err(map_tx_err)?;
-
-            match tx.commit().map_err(map_tx_err) {
-                Ok(()) => {
-                    ticket.commit(Vec::new());
-                    return Ok(ReplicatedApplyResult {
-                        applied: true,
-                        local_seq: Some(seq),
-                    });
-                }
-                Err(MembusError::TxConflict(_)) if attempt + 1 < 16 => continue,
-                Err(err) => return Err(err),
-            }
-        }
-
-        Err(MembusError::TxConflict(
-            "replicated search ops exceeded optimistic retry limit".to_owned(),
-        ))
+        self.append_replicated_search_ops_impl(origin_stamp, ops, ack)
     }
 
     fn put_indexed(
@@ -1555,7 +884,7 @@ impl StorageEngine for RocksDbStorage {
             let enc_key = encode_kv_key(&mutation.namespace, &mutation.key);
             let (kind, value_hint) = match &mutation.op {
                 MutationOp::Put { value } => {
-                    let encoded_val = crate::storage::codec::encode_record(seq, 0, ts_ms, value);
+                    let encoded_val = encode_record(seq, 0, ts_ms, value);
                     tx.put_cf(&kv_cf, &enc_key, &encoded_val)
                         .map_err(map_tx_err)?;
                     (SignalKind::Put, self.build_value_hint(value))
@@ -1621,21 +950,16 @@ impl StorageEngine for RocksDbStorage {
     }
 
     fn open_snapshot(&self) -> Result<OwnedSnapshot, MembusError> {
+        let permit = self.snapshot_gate.try_acquire()?;
         // Capture contiguous published sequence BEFORE pinning the RocksDB snapshot so
         // every `seq <= snapshot_seq` is guaranteed visible in the snapshot and tailing
         // from `snapshot_seq` never skips an in-flight lower sequence number.
         let snapshot_seq = self.sequencer.published_seq();
-        let db_arc = Arc::clone(&self.db);
-        let db_ptr: *const OptimisticTransactionDB = Arc::as_ptr(&db_arc);
-        // SAFETY: `db_arc` is stored in `OwnedSnapshot::_db`, keeping the heap-allocated
-        // `OptimisticTransactionDB` alive at a stable address until after `snapshot` drops.
-        let db_ref: &'static OptimisticTransactionDB = unsafe { &*db_ptr };
-        let snapshot = SnapshotWithThreadMode::new(db_ref);
-        Ok(OwnedSnapshot {
-            snapshot: ManuallyDrop::new(snapshot),
-            _db: db_arc,
+        Ok(OwnedSnapshot::new(
+            Arc::clone(&self.db),
             snapshot_seq,
-        })
+            permit,
+        ))
     }
 
     fn get_in_snapshot(
@@ -1689,7 +1013,7 @@ impl StorageEngine for RocksDbStorage {
     ) -> Result<ScanPage, MembusError> {
         self.verify_snapshot_owner(snapshot)?;
         validate_namespace(namespace)?;
-        validate_scan_options(options)?;
+        validate_scan_options(options, self.config.max_scan_limit)?;
         let effective_start = compute_scan_start(prefix, options.after_key.as_deref());
         self.execute_keyset_scan(snapshot, namespace, &effective_start, options, |key| {
             key.starts_with(prefix)
@@ -1706,7 +1030,7 @@ impl StorageEngine for RocksDbStorage {
     ) -> Result<ScanPage, MembusError> {
         self.verify_snapshot_owner(snapshot)?;
         validate_namespace(namespace)?;
-        validate_scan_options(options)?;
+        validate_scan_options(options, self.config.max_scan_limit)?;
 
         if !end_key.is_empty() && end_key <= start_key {
             return Ok(ScanPage {
@@ -1747,7 +1071,14 @@ impl StorageEngine for RocksDbStorage {
                 "ordered index limit and max_bytes must be > 0".to_owned(),
             ));
         }
+        if options.limit > self.config.max_scan_limit {
+            return Err(MembusError::InvalidArgument(format!(
+                "ordered index limit {} exceeds max_scan_limit {}",
+                options.limit, self.config.max_scan_limit
+            )));
+        }
 
+        let deadline = self.query_deadline();
         let ns_idx_prefix = encode_index_prefix(namespace, index_id);
         let base_suffix: Vec<u8> = match &options.filter {
             OrderedKeyFilter::All => Vec::new(),
@@ -1791,7 +1122,10 @@ impl StorageEngine for RocksDbStorage {
         let mut accum_bytes = 0usize;
         let mut truncated = false;
 
-        for item in iter {
+        for (step, item) in iter.enumerate() {
+            if step & 63 == 0 {
+                Self::check_query_deadline(deadline)?;
+            }
             let (raw_k, raw_v) = item.map_err(map_rocksdb_err)?;
             if !raw_k.starts_with(&ns_idx_prefix) {
                 break;
@@ -1857,7 +1191,14 @@ impl StorageEngine for RocksDbStorage {
                 "query_neighbors limit must be > 0".to_owned(),
             ));
         }
+        if options.limit > self.config.max_scan_limit {
+            return Err(MembusError::InvalidArgument(format!(
+                "query_neighbors limit {} exceeds max_scan_limit {}",
+                options.limit, self.config.max_scan_limit
+            )));
+        }
 
+        let deadline = self.query_deadline();
         let dirs: &[u8] = match options.direction {
             GraphDirection::Out => &[EDGE_DIR_FORWARD],
             GraphDirection::In => &[EDGE_DIR_REVERSE],
@@ -1928,7 +1269,10 @@ impl StorageEngine for RocksDbStorage {
                 IteratorMode::From(&seek_key, Direction::Forward),
             );
 
-            for item in iter {
+            for (step, item) in iter.enumerate() {
+                if step & 63 == 0 {
+                    Self::check_query_deadline(deadline)?;
+                }
                 let (raw_k, raw_v) = item.map_err(map_rocksdb_err)?;
                 if !raw_k.starts_with(&seek_prefix) {
                     break;
@@ -1982,7 +1326,14 @@ impl StorageEngine for RocksDbStorage {
         if let Some(rel) = &options.rel_filter {
             validate_key(rel)?;
         }
+        if options.max_nodes > self.config.max_scan_limit {
+            return Err(MembusError::InvalidArgument(format!(
+                "bfs max_nodes {} exceeds max_scan_limit {}",
+                options.max_nodes, self.config.max_scan_limit
+            )));
+        }
 
+        let deadline = self.query_deadline();
         let mut visited_set: HashSet<Vec<u8>> = HashSet::new();
         let mut visited_nodes: Vec<Vec<u8>> = Vec::new();
         let mut traversed_edges: Vec<GraphEdgeRecord> = Vec::new();
@@ -2013,6 +1364,7 @@ impl StorageEngine for RocksDbStorage {
         };
         let idx_edge_cf = self.cf(CF_IDX_EDGE)?;
         let dir_base_len = encode_index_prefix(namespace, index_id).len() + 1;
+        let mut total_steps = 0usize;
 
         'bfs: while let Some((node, hop)) = queue.pop_front() {
             if hop >= options.max_hops {
@@ -2034,6 +1386,10 @@ impl StorageEngine for RocksDbStorage {
                     IteratorMode::From(&seek_prefix, Direction::Forward),
                 );
                 for item in iter {
+                    if total_steps & 63 == 0 {
+                        Self::check_query_deadline(deadline)?;
+                    }
+                    total_steps = total_steps.saturating_add(1);
                     let (raw_k, raw_v) = item.map_err(map_rocksdb_err)?;
                     if !raw_k.starts_with(&seek_prefix) {
                         break;
@@ -2711,7 +2067,7 @@ impl StorageEngine for RocksDbStorage {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn apply_index_mutations_in_tx(
+pub(crate) fn apply_index_mutations_in_tx(
     tx: &Transaction<'_, OptimisticTransactionDB>,
     read_opts: &ReadOptions,
     idx_ord_cf: &Arc<rocksdb::BoundColumnFamily<'_>>,
@@ -2770,8 +2126,10 @@ fn apply_index_mutations_in_tx(
                 &edge.src_id,
                 pk,
             );
-            tx.put_cf(idx_edge_cf, &fwd, &edge.meta).map_err(map_tx_err)?;
-            tx.put_cf(idx_edge_cf, &rev, &edge.meta).map_err(map_tx_err)?;
+            tx.put_cf(idx_edge_cf, &fwd, &edge.meta)
+                .map_err(map_tx_err)?;
+            tx.put_cf(idx_edge_cf, &rev, &edge.meta)
+                .map_err(map_tx_err)?;
             if seen_edge.insert(fwd.clone()) {
                 new_rev.edge_keys.push(fwd);
             }
@@ -2788,7 +2146,7 @@ fn apply_index_mutations_in_tx(
     Ok(())
 }
 
-fn estimate_index_bytes(muts: &IndexMutations) -> usize {
+pub(crate) fn estimate_index_bytes(muts: &IndexMutations) -> usize {
     let ord_bytes: usize = muts
         .ordered
         .iter()
@@ -2797,12 +2155,20 @@ fn estimate_index_bytes(muts: &IndexMutations) -> usize {
     let edge_bytes: usize = muts
         .edges
         .iter()
-        .map(|e| (e.index_id.len() + e.src_id.len() + e.rel_label.len() + e.dst_id.len() + e.meta.len() + 24) * 2)
+        .map(|e| {
+            (e.index_id.len()
+                + e.src_id.len()
+                + e.rel_label.len()
+                + e.dst_id.len()
+                + e.meta.len()
+                + 24)
+                * 2
+        })
         .sum();
     ord_bytes.saturating_add(edge_bytes)
 }
 
-fn estimate_search_op_bytes(op: &SearchLogOp) -> usize {
+pub(crate) fn estimate_search_op_bytes(op: &SearchLogOp) -> usize {
     match op {
         SearchLogOp::Index(doc) => {
             let tags_len: usize = doc.tags.iter().map(String::len).sum();
@@ -2870,14 +2236,25 @@ fn validate_config(config: &StorageConfig) -> Result<(), MembusError> {
             "admission limits must be positive".to_owned(),
         ));
     }
+    if config.max_active_snapshots == 0 || config.max_scan_limit == 0 {
+        return Err(MembusError::InvalidArgument(
+            "max_active_snapshots and max_scan_limit must be positive".to_owned(),
+        ));
+    }
     Ok(())
 }
 
-fn validate_scan_options(options: &ScanOptions) -> Result<(), MembusError> {
+fn validate_scan_options(options: &ScanOptions, max_scan_limit: usize) -> Result<(), MembusError> {
     if options.limit == 0 {
         return Err(MembusError::InvalidArgument(
             "scan limit must be > 0".to_owned(),
         ));
+    }
+    if options.limit > max_scan_limit {
+        return Err(MembusError::InvalidArgument(format!(
+            "scan limit {} exceeds max_scan_limit {max_scan_limit}",
+            options.limit
+        )));
     }
     if options.max_bytes == 0 {
         return Err(MembusError::InvalidArgument(
@@ -2953,7 +2330,7 @@ fn configure_blob_db(opts: &mut Options, min_blob_size: u64) {
     opts.set_blob_gc_force_threshold(0.8);
 }
 
-fn verify_expected_version(
+pub(crate) fn verify_expected_version(
     namespace: &str,
     key: &[u8],
     expected: ExpectedVersion,
@@ -3013,7 +2390,7 @@ fn generate_unique_epoch() -> u64 {
     }
 }
 
-fn encode_prefixed_key(prefix: &[u8], suffix: &[u8]) -> Vec<u8> {
+pub(crate) fn encode_prefixed_key(prefix: &[u8], suffix: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(prefix.len() + suffix.len());
     out.extend_from_slice(prefix);
     out.extend_from_slice(suffix);
@@ -3041,7 +2418,7 @@ fn decode_u64_meta(bytes: &[u8], name: &str) -> Result<u64, MembusError> {
     ]))
 }
 
-fn map_rocksdb_err(err: rocksdb::Error) -> MembusError {
+pub(crate) fn map_rocksdb_err(err: rocksdb::Error) -> MembusError {
     match err.kind() {
         ErrorKind::Corruption => MembusError::Corruption(err.into_string()),
         ErrorKind::InvalidArgument => MembusError::InvalidArgument(err.into_string()),
@@ -3053,7 +2430,7 @@ fn map_rocksdb_err(err: rocksdb::Error) -> MembusError {
     }
 }
 
-fn map_tx_err(err: rocksdb::Error) -> MembusError {
+pub(crate) fn map_tx_err(err: rocksdb::Error) -> MembusError {
     match err.kind() {
         ErrorKind::Busy | ErrorKind::TryAgain => MembusError::TxConflict(err.into_string()),
         ErrorKind::Corruption => MembusError::Corruption(err.into_string()),

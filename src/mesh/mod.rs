@@ -1,7 +1,9 @@
 pub mod node;
 pub mod protocol;
 
-pub use node::{CatchupStats, MeshConfig, MeshNode, ReconcileReport};
+pub use node::{
+    validate_mesh_listen_endpoints, CatchupStats, MeshConfig, MeshNode, ReconcileReport,
+};
 pub use protocol::{
     validate_cluster_prefix, validate_node_id, CatchupRequest, CatchupResponse, DigestReply,
     DigestRequest, DigestResponse, MeshDeltaEnvelope, MeshPeerWatermark, WireGraphEdgeEntry,

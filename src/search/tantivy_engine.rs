@@ -1,7 +1,7 @@
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BinaryHeap, HashMap};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -20,7 +20,7 @@ use crate::search::trigram::{contains_exact_substring, extract_trigrams, query_t
 use crate::storage::StorageEngine;
 use crate::types::{
     sanitize_score, sanitize_search_log_op, validate_namespace, Ack, CommitResult, MembusError,
-    SearchDocument, SearchHit, SearchLogOp, SearchMode, SearchPage, SearchQuery,
+    SearchDocument, SearchHit, SearchLogOp, SearchMode, SearchPage, SearchQuery, SearchSyncStatus,
 };
 
 const SEARCH_CHECKPOINT_META_KEY: &[u8] = b"search:checkpoint";
@@ -101,11 +101,22 @@ fn build_schema() -> (Schema, SearchSchemaFields) {
 
 struct WorkerState {
     pending_hint_seq: u64,
+    dirty_through_seq: u64,
     pending_count: usize,
     flush_requested_seq: u64,
     committed_seq: u64,
     last_error: Option<String>,
     shutdown: bool,
+}
+
+fn maybe_clear_dirty(state: &WorkerState, search_dirty: &AtomicBool, latest_seq: u64) {
+    if state.last_error.is_none()
+        && state.committed_seq >= state.dirty_through_seq
+        && state.committed_seq >= state.pending_hint_seq
+        && state.committed_seq >= latest_seq
+    {
+        search_dirty.store(false, Ordering::Release);
+    }
 }
 
 /// Embedded disk-persisted Tantivy search engine with 0 ms Tier-0 RAM live delta overlay,
@@ -118,6 +129,10 @@ pub struct SearchEngine {
     epoch: u64,
     overlay: Arc<Tier0Overlay>,
     committed_seq: Arc<AtomicU64>,
+    deferred_ingest_total: Arc<AtomicU64>,
+    search_dirty: Arc<AtomicBool>,
+    fail_ingest_remaining: Arc<AtomicUsize>,
+    fail_flush_remaining: Arc<AtomicUsize>,
     worker_state: Arc<(Mutex<WorkerState>, Condvar)>,
     worker_handle: Mutex<Option<JoinHandle<()>>>,
 }
@@ -211,9 +226,14 @@ impl SearchEngine {
 
         let overlay = Arc::new(Tier0Overlay::new(current_epoch, config.max_overlay_docs));
         let committed_seq = Arc::new(AtomicU64::new(last_indexed_seq));
+        let deferred_ingest_total = Arc::new(AtomicU64::new(0));
+        let search_dirty = Arc::new(AtomicBool::new(false));
+        let fail_ingest_remaining = Arc::new(AtomicUsize::new(0));
+        let fail_flush_remaining = Arc::new(AtomicUsize::new(0));
         let worker_state = Arc::new((
             Mutex::new(WorkerState {
                 pending_hint_seq: last_indexed_seq,
+                dirty_through_seq: 0,
                 pending_count: 0,
                 flush_requested_seq: 0,
                 committed_seq: last_indexed_seq,
@@ -230,6 +250,7 @@ impl SearchEngine {
             Arc::clone(&storage),
             Arc::clone(&overlay),
             Arc::clone(&committed_seq),
+            Arc::clone(&search_dirty),
             Arc::clone(&worker_state),
             current_epoch,
             config,
@@ -243,6 +264,10 @@ impl SearchEngine {
             epoch: current_epoch,
             overlay,
             committed_seq,
+            deferred_ingest_total,
+            search_dirty,
+            fail_ingest_remaining,
+            fail_flush_remaining,
             worker_state,
             worker_handle: Mutex::new(Some(handle)),
         })
@@ -258,16 +283,99 @@ impl SearchEngine {
         self.overlay.len()
     }
 
+    /// Total number of post-commit search ingestion operations that failed and were deferred
+    /// for `CF_LOG` catch-up replay.
+    pub fn deferred_ingest_total(&self) -> u64 {
+        self.deferred_ingest_total.load(Ordering::Acquire)
+    }
+
+    /// Whether the search index currently has deferred post-commit operations pending `CF_LOG` replay.
+    pub fn is_dirty(&self) -> bool {
+        self.search_dirty.load(Ordering::Acquire)
+    }
+
+    /// Record a post-commit secondary search ingestion failure without rejecting the authoritative
+    /// storage commit, marking the search index dirty and waking the background `CF_LOG` committer.
+    pub fn record_deferred_ingest(&self, seq: u64, err: &MembusError) {
+        self.deferred_ingest_total.fetch_add(1, Ordering::AcqRel);
+        eprintln!(
+            "membus search ingest deferred for committed seq={seq} (epoch={}): {err}; scheduled CF_LOG catch-up",
+            self.epoch
+        );
+        let (lock, cv) = &*self.worker_state;
+        let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+        state.dirty_through_seq = state.dirty_through_seq.max(seq);
+        state.pending_hint_seq = state.pending_hint_seq.max(seq);
+        state.pending_count = state.pending_count.saturating_add(1);
+        self.search_dirty.store(true, Ordering::Release);
+        cv.notify_all();
+    }
+
+    /// Replay any deferred or uncommitted `CF_LOG` search operations synchronously into Tantivy.
+    pub fn catch_up_from_log(&self) -> Result<u64, MembusError> {
+        self.flush_sync()
+    }
+
+    /// Inject deterministic post-commit ingest failures for testing deferred search recovery.
+    #[doc(hidden)]
+    pub fn inject_ingest_failure(&self, count: usize) {
+        self.fail_ingest_remaining.store(count, Ordering::Release);
+    }
+
+    /// Inject deterministic `flush_sync` failures for testing observable shutdown/flush error handling.
+    #[doc(hidden)]
+    pub fn inject_flush_failure(&self, count: usize) {
+        self.fail_flush_remaining.store(count, Ordering::Release);
+    }
+
+    /// Durably log a visibility-sanitized search document in `CF_LOG` and ingest it into search,
+    /// returning [`SearchSyncStatus::Deferred`] instead of rejecting if post-commit ingest fails.
+    pub fn index_document_coordinated(
+        &self,
+        doc: SearchDocument,
+        ack: Ack,
+    ) -> Result<(CommitResult, SearchSyncStatus), MembusError> {
+        let sanitized = sanitize_search_log_op(&SearchLogOp::Index(doc))?;
+        let commit = self.storage.append_search_log_op(sanitized.clone(), ack)?;
+        let sync = match self.ingest_committed_op(commit.seq, 0, commit.epoch, sanitized) {
+            Ok(()) => SearchSyncStatus::Synced,
+            Err(err) => {
+                self.record_deferred_ingest(commit.seq, &err);
+                SearchSyncStatus::Deferred
+            }
+        };
+        Ok((commit, sync))
+    }
+
     /// Durably log a visibility-sanitized search document in `CF_LOG` and make it searchable at 0 ms lag.
     pub fn index_document(
         &self,
         doc: SearchDocument,
         ack: Ack,
     ) -> Result<CommitResult, MembusError> {
-        let sanitized = sanitize_search_log_op(&SearchLogOp::Index(doc))?;
+        self.index_document_coordinated(doc, ack).map(|(c, _)| c)
+    }
+
+    /// Durably delete a search document and return its secondary search synchronization status.
+    pub fn delete_document_coordinated(
+        &self,
+        namespace: &str,
+        doc_id: &str,
+        ack: Ack,
+    ) -> Result<(CommitResult, SearchSyncStatus), MembusError> {
+        let sanitized = sanitize_search_log_op(&SearchLogOp::Delete {
+            namespace: namespace.to_owned(),
+            doc_id: doc_id.to_owned(),
+        })?;
         let commit = self.storage.append_search_log_op(sanitized.clone(), ack)?;
-        self.ingest_committed_op(commit.seq, 0, commit.epoch, sanitized)?;
-        Ok(commit)
+        let sync = match self.ingest_committed_op(commit.seq, 0, commit.epoch, sanitized) {
+            Ok(()) => SearchSyncStatus::Synced,
+            Err(err) => {
+                self.record_deferred_ingest(commit.seq, &err);
+                SearchSyncStatus::Deferred
+            }
+        };
+        Ok((commit, sync))
     }
 
     /// Durably delete a search document and immediately tombstone it in Tier-0 overlay.
@@ -277,13 +385,30 @@ impl SearchEngine {
         doc_id: &str,
         ack: Ack,
     ) -> Result<CommitResult, MembusError> {
-        let sanitized = sanitize_search_log_op(&SearchLogOp::Delete {
+        self.delete_document_coordinated(namespace, doc_id, ack)
+            .map(|(c, _)| c)
+    }
+
+    /// Atomically revoke all documents matching `(namespace, prefix)` and report secondary sync status.
+    pub fn revoke_search_prefix_coordinated(
+        &self,
+        namespace: &str,
+        prefix: &str,
+        ack: Ack,
+    ) -> Result<(CommitResult, SearchSyncStatus), MembusError> {
+        let sanitized = sanitize_search_log_op(&SearchLogOp::RevokePrefix {
             namespace: namespace.to_owned(),
-            doc_id: doc_id.to_owned(),
+            prefix: prefix.to_owned(),
         })?;
         let commit = self.storage.append_search_log_op(sanitized.clone(), ack)?;
-        self.ingest_committed_op(commit.seq, 0, commit.epoch, sanitized)?;
-        Ok(commit)
+        let sync = match self.ingest_committed_op(commit.seq, 0, commit.epoch, sanitized) {
+            Ok(()) => SearchSyncStatus::Synced,
+            Err(err) => {
+                self.record_deferred_ingest(commit.seq, &err);
+                SearchSyncStatus::Deferred
+            }
+        };
+        Ok((commit, sync))
     }
 
     /// Atomically revoke all documents matching `(namespace, prefix)` in Tier-0 + Tantivy,
@@ -294,13 +419,8 @@ impl SearchEngine {
         prefix: &str,
         ack: Ack,
     ) -> Result<CommitResult, MembusError> {
-        let sanitized = sanitize_search_log_op(&SearchLogOp::RevokePrefix {
-            namespace: namespace.to_owned(),
-            prefix: prefix.to_owned(),
-        })?;
-        let commit = self.storage.append_search_log_op(sanitized.clone(), ack)?;
-        self.ingest_committed_op(commit.seq, 0, commit.epoch, sanitized)?;
-        Ok(commit)
+        self.revoke_search_prefix_coordinated(namespace, prefix, ack)
+            .map(|(c, _)| c)
     }
 
     /// Ingest an already-logged `SearchLogOp` (tagged with `(seq, op_idx)`) into the 0 ms
@@ -318,6 +438,11 @@ impl SearchEngine {
     ) -> Result<(), MembusError> {
         if epoch != self.epoch {
             return Ok(());
+        }
+        if consume_fault(&self.fail_ingest_remaining) {
+            return Err(MembusError::Storage(
+                "injected search ingest failure".to_owned(),
+            ));
         }
         let sanitized = sanitize_search_log_op(&op)?;
         self.overlay.apply(seq, op_idx, epoch, &sanitized);
@@ -341,13 +466,22 @@ impl SearchEngine {
 
     /// Synchronously flush all settled `CF_LOG` search mutations into Tantivy and persist checkpoint.
     pub fn flush_sync(&self) -> Result<u64, MembusError> {
+        if consume_fault(&self.fail_flush_remaining) {
+            return Err(MembusError::Storage(
+                "injected search flush failure".to_owned(),
+            ));
+        }
         let (lock, cv) = &*self.worker_state;
         let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
-        let target = state.pending_hint_seq.max(self.storage.latest_seq());
+        let target = state
+            .pending_hint_seq
+            .max(state.dirty_through_seq)
+            .max(self.storage.latest_seq());
         if target <= state.committed_seq {
             if let Some(err) = state.last_error.take() {
                 return Err(MembusError::Storage(err));
             }
+            maybe_clear_dirty(&state, &self.search_dirty, self.storage.latest_seq());
             return Ok(state.committed_seq);
         }
         state.last_error = None;
@@ -362,6 +496,7 @@ impl SearchEngine {
         if let Some(err) = state.last_error.take() {
             return Err(MembusError::Storage(err));
         }
+        maybe_clear_dirty(&state, &self.search_dirty, self.storage.latest_seq());
         Ok(state.committed_seq)
     }
 
@@ -539,6 +674,17 @@ struct StagedDoc {
     op_idx: u32,
 }
 
+fn consume_fault(counter: &AtomicUsize) -> bool {
+    let mut cur = counter.load(Ordering::Acquire);
+    while cur > 0 {
+        match counter.compare_exchange_weak(cur, cur - 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(actual) => cur = actual,
+        }
+    }
+    false
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_commit_worker(
     mut writer: IndexWriter,
@@ -547,6 +693,7 @@ fn spawn_commit_worker(
     storage: Arc<dyn StorageEngine>,
     overlay: Arc<Tier0Overlay>,
     committed_seq_atomic: Arc<AtomicU64>,
+    search_dirty: Arc<AtomicBool>,
     worker_state: Arc<(Mutex<WorkerState>, Condvar)>,
     epoch: u64,
     config: SearchConfig,
@@ -563,7 +710,8 @@ fn spawn_commit_worker(
                 let (want_commit, shutting_down) = {
                     let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
                     while !state.shutdown {
-                        let has_pending = state.pending_hint_seq > state.committed_seq;
+                        let dirty = search_dirty.load(Ordering::Acquire);
+                        let has_pending = state.pending_hint_seq > state.committed_seq || dirty;
                         let explicit_flush = state.flush_requested_seq > state.committed_seq;
                         let count_ready = state.pending_count >= max_buffered;
                         let time_ready = has_pending && last_commit.elapsed() >= commit_interval;
@@ -583,7 +731,8 @@ fn spawn_commit_worker(
                     }
                     let want = state.pending_hint_seq > state.committed_seq
                         || state.flush_requested_seq > state.committed_seq
-                        || state.pending_count > 0;
+                        || state.pending_count > 0
+                        || search_dirty.load(Ordering::Acquire);
                     (want, state.shutdown)
                 };
 
@@ -593,6 +742,9 @@ fn spawn_commit_worker(
 
                     if settled_seq <= current_committed {
                         if !shutting_down {
+                            let state = lock.lock().unwrap_or_else(|e| e.into_inner());
+                            maybe_clear_dirty(&state, &search_dirty, settled_seq);
+                            drop(state);
                             // Yield cleanly while an in-flight lower-seq writer finishes committing.
                             thread::sleep(Duration::from_millis(1));
                             continue;
@@ -622,11 +774,13 @@ fn spawn_commit_worker(
                                     state.pending_count = 0;
                                 }
                                 state.last_error = None;
+                                maybe_clear_dirty(&state, &search_dirty, storage.latest_seq());
                                 cv.notify_all();
                             }
                             Err(err) => {
                                 // Roll back uncommitted Tantivy ops; do NOT advance committed_seq or prune Tier-0!
                                 let _ = writer.rollback();
+                                search_dirty.store(true, Ordering::Release);
                                 let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
                                 state.last_error = Some(err.to_string());
                                 state.flush_requested_seq = state.committed_seq;

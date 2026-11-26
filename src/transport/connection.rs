@@ -17,10 +17,13 @@ use crate::protocol::{
 };
 use crate::signals::{EachChangeSubscription, LiveCoalescedSubscription};
 use crate::storage::OwnedSnapshot;
+use crate::transport::write_coord::{
+    coordinated_commit_indexed_tx, coordinated_delete_search_document, coordinated_index_document,
+    coordinated_put_indexed, coordinated_remove_indexed, coordinated_revoke_search_prefix,
+};
 use crate::transport::ServerContext;
 use crate::types::{
-    AuthMode, HealthStatus, IndexMutations, MembusError, Permission, Principal, SearchLogOp,
-    SignalEvent,
+    AuthMode, IndexMutations, MembusError, Permission, Principal, SearchLogOp, SignalEvent,
 };
 
 pub(crate) struct ConnectionGuard {
@@ -507,6 +510,7 @@ fn authorize_request(
         Request::OpenSnapshot
         | Request::CloseSnapshot { .. }
         | Request::Health
+        | Request::HealthV2
         | Request::ListCollections => auth.require_authenticated(principal),
         Request::ScanPrefix {
             namespace, prefix, ..
@@ -664,24 +668,22 @@ async fn dispatch_unary(
         } => {
             let search = conn.ctx.search.clone();
             let result = tokio::task::spawn_blocking(move || {
-                let commit = storage.put_indexed(
+                coordinated_put_indexed(
+                    &storage,
+                    search.as_ref(),
                     &namespace,
                     &key,
                     &value,
                     ack,
                     expected,
                     indexes.as_ref(),
-                    search_op.as_ref(),
-                )?;
-                if let (Some(engine), Some(op)) = (search, search_op) {
-                    engine.ingest_committed_op(commit.seq, 0, commit.epoch, op)?;
-                }
-                Ok(commit)
+                    search_op,
+                )
             })
             .await
             .unwrap_or_else(|e| Err(MembusError::Storage(format!("put_indexed failed: {e}"))));
             match result {
-                Ok(commit) => Response::Commit(commit),
+                Ok(coord) => Response::Commit(coord.commit),
                 Err(e) => Response::Error(e),
             }
         }
@@ -710,22 +712,20 @@ async fn dispatch_unary(
         } => {
             let search = conn.ctx.search.clone();
             let result = tokio::task::spawn_blocking(move || {
-                let commit = storage.remove_indexed(
+                coordinated_remove_indexed(
+                    &storage,
+                    search.as_ref(),
                     &namespace,
                     &key,
                     ack,
                     expected,
-                    search_op.as_ref(),
-                )?;
-                if let (Some(engine), Some(op)) = (search, search_op) {
-                    engine.ingest_committed_op(commit.seq, 0, commit.epoch, op)?;
-                }
-                Ok(commit)
+                    search_op,
+                )
             })
             .await
             .unwrap_or_else(|e| Err(MembusError::Storage(format!("remove_indexed failed: {e}"))));
             match result {
-                Ok(commit) => Response::Commit(commit),
+                Ok(coord) => Response::Commit(coord.commit),
                 Err(e) => Response::Error(e),
             }
         }
@@ -752,17 +752,7 @@ async fn dispatch_unary(
         } => {
             let search = conn.ctx.search.clone();
             let result = tokio::task::spawn_blocking(move || {
-                let commit = storage.commit_indexed_tx(&guards, &mutations, ack)?;
-                if let Some(engine) = search {
-                    let mut op_idx = 0u32;
-                    for m in mutations {
-                        if let Some(op) = m.search_op {
-                            engine.ingest_committed_op(commit.seq, op_idx, commit.epoch, op)?;
-                            op_idx = op_idx.saturating_add(1);
-                        }
-                    }
-                }
-                Ok(commit)
+                coordinated_commit_indexed_tx(&storage, search.as_ref(), &guards, mutations, ack)
             })
             .await
             .unwrap_or_else(|e| {
@@ -771,7 +761,7 @@ async fn dispatch_unary(
                 )))
             });
             match result {
-                Ok(commit) => Response::Commit(commit),
+                Ok(coord) => Response::Commit(coord.commit),
                 Err(e) => Response::Error(e),
             }
         }
@@ -833,15 +823,18 @@ async fn dispatch_unary(
                 Ok(s) => s,
                 Err(e) => return Response::Error(e),
             };
-            let result = tokio::task::spawn_blocking(move || {
-                let snap = match pinned_snap {
-                    Some(s) => s,
-                    None => Arc::new(storage.open_snapshot()?),
-                };
-                storage.scan_prefix(&snap, &namespace, &prefix, &options)
-            })
-            .await
-            .unwrap_or_else(|e| Err(MembusError::Storage(format!("scan_prefix failed: {e}"))));
+            let result = run_blocking_query(
+                conn.ctx.config.query_timeout,
+                "scan_prefix",
+                move || {
+                    let snap = match pinned_snap {
+                        Some(s) => s,
+                        None => Arc::new(storage.open_snapshot()?),
+                    };
+                    storage.scan_prefix(&snap, &namespace, &prefix, &options)
+                },
+            )
+            .await;
             match result {
                 Ok(page) => Response::Scan(page),
                 Err(e) => Response::Error(e),
@@ -858,15 +851,18 @@ async fn dispatch_unary(
                 Ok(s) => s,
                 Err(e) => return Response::Error(e),
             };
-            let result = tokio::task::spawn_blocking(move || {
-                let snap = match pinned_snap {
-                    Some(s) => s,
-                    None => Arc::new(storage.open_snapshot()?),
-                };
-                storage.scan_range(&snap, &namespace, &start_key, &end_key, &options)
-            })
-            .await
-            .unwrap_or_else(|e| Err(MembusError::Storage(format!("scan_range failed: {e}"))));
+            let result = run_blocking_query(
+                conn.ctx.config.query_timeout,
+                "scan_range",
+                move || {
+                    let snap = match pinned_snap {
+                        Some(s) => s,
+                        None => Arc::new(storage.open_snapshot()?),
+                    };
+                    storage.scan_range(&snap, &namespace, &start_key, &end_key, &options)
+                },
+            )
+            .await;
             match result {
                 Ok(page) => Response::Scan(page),
                 Err(e) => Response::Error(e),
@@ -882,19 +878,18 @@ async fn dispatch_unary(
                 Ok(s) => s,
                 Err(e) => return Response::Error(e),
             };
-            let result = tokio::task::spawn_blocking(move || {
-                let snap = match pinned_snap {
-                    Some(s) => s,
-                    None => Arc::new(storage.open_snapshot()?),
-                };
-                storage.query_ordered_index(&snap, &namespace, &index_id, &options)
-            })
-            .await
-            .unwrap_or_else(|e| {
-                Err(MembusError::Storage(format!(
-                    "query_ordered_index failed: {e}"
-                )))
-            });
+            let result = run_blocking_query(
+                conn.ctx.config.query_timeout,
+                "query_ordered_index",
+                move || {
+                    let snap = match pinned_snap {
+                        Some(s) => s,
+                        None => Arc::new(storage.open_snapshot()?),
+                    };
+                    storage.query_ordered_index(&snap, &namespace, &index_id, &options)
+                },
+            )
+            .await;
             match result {
                 Ok(page) => Response::OrderedIndex(page),
                 Err(e) => Response::Error(e),
@@ -911,15 +906,18 @@ async fn dispatch_unary(
                 Ok(s) => s,
                 Err(e) => return Response::Error(e),
             };
-            let result = tokio::task::spawn_blocking(move || {
-                let snap = match pinned_snap {
-                    Some(s) => s,
-                    None => Arc::new(storage.open_snapshot()?),
-                };
-                storage.query_neighbors(&snap, &namespace, &index_id, &node_id, &options)
-            })
-            .await
-            .unwrap_or_else(|e| Err(MembusError::Storage(format!("query_neighbors failed: {e}"))));
+            let result = run_blocking_query(
+                conn.ctx.config.query_timeout,
+                "query_neighbors",
+                move || {
+                    let snap = match pinned_snap {
+                        Some(s) => s,
+                        None => Arc::new(storage.open_snapshot()?),
+                    };
+                    storage.query_neighbors(&snap, &namespace, &index_id, &node_id, &options)
+                },
+            )
+            .await;
             match result {
                 Ok(page) => Response::Neighbors(page),
                 Err(e) => Response::Error(e),
@@ -936,15 +934,18 @@ async fn dispatch_unary(
                 Ok(s) => s,
                 Err(e) => return Response::Error(e),
             };
-            let result = tokio::task::spawn_blocking(move || {
-                let snap = match pinned_snap {
-                    Some(s) => s,
-                    None => Arc::new(storage.open_snapshot()?),
-                };
-                storage.bfs_traverse(&snap, &namespace, &index_id, &seed_node, &options)
-            })
-            .await
-            .unwrap_or_else(|e| Err(MembusError::Storage(format!("bfs_traverse failed: {e}"))));
+            let result = run_blocking_query(
+                conn.ctx.config.query_timeout,
+                "bfs_traverse",
+                move || {
+                    let snap = match pinned_snap {
+                        Some(s) => s,
+                        None => Arc::new(storage.open_snapshot()?),
+                    };
+                    storage.bfs_traverse(&snap, &namespace, &index_id, &seed_node, &options)
+                },
+            )
+            .await;
             match result {
                 Ok(res) => Response::Bfs(res),
                 Err(e) => Response::Error(e),
@@ -966,15 +967,8 @@ async fn dispatch_unary(
                 Err(e) => Response::Error(e),
             }
         }
-        Request::Health => Response::Health(HealthStatus {
-            epoch: storage.epoch(),
-            latest_seq: storage.latest_seq(),
-            log_horizon_seq: storage.log_horizon_seq(),
-            in_flight_ops: storage.in_flight_ops(),
-            in_flight_bytes: storage.in_flight_bytes(),
-            active_connections: conn.ctx.active_connections(),
-            active_subscriptions: conn.ctx.broker.active_subscriptions(),
-        }),
+        Request::Health => Response::Health(conn.ctx.health_status()),
+        Request::HealthV2 => Response::HealthV2(conn.ctx.health_status()),
         Request::PutBlob { digest, data, ack } => {
             let result = tokio::task::spawn_blocking(move || storage.put_blob(&digest, &data, ack))
                 .await
@@ -1257,11 +1251,13 @@ async fn dispatch_unary(
                     "search engine is not enabled on this server".to_owned(),
                 ));
             };
-            let result = tokio::task::spawn_blocking(move || search.index_document(doc, ack))
-                .await
-                .unwrap_or_else(|e| Err(MembusError::Storage(format!("index_document failed: {e}"))));
+            let result = tokio::task::spawn_blocking(move || {
+                coordinated_index_document(&search, doc, ack)
+            })
+            .await
+            .unwrap_or_else(|e| Err(MembusError::Storage(format!("index_document failed: {e}"))));
             match result {
-                Ok(commit) => Response::Commit(commit),
+                Ok(coord) => Response::Commit(coord.commit),
                 Err(e) => Response::Error(e),
             }
         }
@@ -1276,7 +1272,7 @@ async fn dispatch_unary(
                 ));
             };
             let result = tokio::task::spawn_blocking(move || {
-                search.delete_document(&namespace, &doc_id, ack)
+                coordinated_delete_search_document(&search, &namespace, &doc_id, ack)
             })
             .await
             .unwrap_or_else(|e| {
@@ -1285,7 +1281,7 @@ async fn dispatch_unary(
                 )))
             });
             match result {
-                Ok(commit) => Response::Commit(commit),
+                Ok(coord) => Response::Commit(coord.commit),
                 Err(e) => Response::Error(e),
             }
         }
@@ -1300,7 +1296,7 @@ async fn dispatch_unary(
                 ));
             };
             let result = tokio::task::spawn_blocking(move || {
-                search.revoke_search_prefix(&namespace, &prefix, ack)
+                coordinated_revoke_search_prefix(&search, &namespace, &prefix, ack)
             })
             .await
             .unwrap_or_else(|e| {
@@ -1309,7 +1305,7 @@ async fn dispatch_unary(
                 )))
             });
             match result {
-                Ok(commit) => Response::Commit(commit),
+                Ok(coord) => Response::Commit(coord.commit),
                 Err(e) => Response::Error(e),
             }
         }
@@ -1319,9 +1315,12 @@ async fn dispatch_unary(
                     "search engine is not enabled on this server".to_owned(),
                 ));
             };
-            let result = tokio::task::spawn_blocking(move || search.search(&query))
-                .await
-                .unwrap_or_else(|e| Err(MembusError::Storage(format!("search failed: {e}"))));
+            let result = run_blocking_query(
+                conn.ctx.config.query_timeout,
+                "search",
+                move || search.search(&query),
+            )
+            .await;
             match result {
                 Ok(page) => Response::Search(page),
                 Err(e) => Response::Error(e),
@@ -1440,6 +1439,14 @@ async fn launch_subscription_stream(
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let max_frame_body = conn.ctx.config.max_frame_body;
+    let stream_guard = match conn.ctx.try_acquire_stream_guard() {
+        Ok(guard) => guard,
+        Err(err) => {
+            let reply = build_response_frame(stream_id, &Response::Error(err), max_frame_body);
+            let _ = send_or_shutdown(&conn.outbound_tx, reply, &mut shutdown_rx).await;
+            return;
+        }
+    };
     let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
     let register_result = {
         let mut table = conn.active_streams.lock();
@@ -1480,6 +1487,7 @@ async fn launch_subscription_stream(
     let outbound_tx = conn.outbound_tx.clone();
     let active_streams = Arc::clone(&conn.active_streams);
     tokio::spawn(async move {
+        let _stream_guard = stream_guard;
         let end_err = loop {
             tokio::select! {
                 biased;
@@ -1547,6 +1555,34 @@ fn resolve_snapshot(
             entry.last_used = Instant::now();
             Ok(Some(Arc::clone(&entry.snapshot)))
         }
+    }
+}
+
+/// Run a blocking query closure with an optional server-side timeout.
+pub(crate) async fn run_blocking_query<T, F>(
+    timeout: Option<Duration>,
+    op_name: &'static str,
+    f: F,
+) -> Result<T, MembusError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, MembusError> + Send + 'static,
+{
+    let handle = tokio::task::spawn_blocking(f);
+    match timeout {
+        Some(limit) => match tokio::time::timeout(limit, handle).await {
+            Ok(Ok(res)) => res,
+            Ok(Err(join_err)) => Err(MembusError::Storage(format!(
+                "{op_name} task failed: {join_err}"
+            ))),
+            Err(_) => Err(MembusError::Busy {
+                retry_after_ms: 50,
+                reason: format!("{op_name} query timeout exceeded ({limit:?})"),
+            }),
+        },
+        None => handle
+            .await
+            .map_err(|join_err| MembusError::Storage(format!("{op_name} task failed: {join_err}")))?,
     }
 }
 

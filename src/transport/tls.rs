@@ -9,9 +9,10 @@ use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, Semaphore};
+use tokio::task::JoinSet;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-const MAX_CONCURRENT_TLS_HANDSHAKES: usize = 256;
+pub(crate) const MAX_CONCURRENT_TLS_HANDSHAKES: usize = 256;
 
 use crate::transport::connection::serve_connection;
 use crate::transport::{Endpoint, ServerContext, ServerHandle};
@@ -35,8 +36,10 @@ pub struct TlsClientConfig {
     pub client_key_pem_path: Option<PathBuf>,
 }
 
-/// Build a `tokio_rustls::TlsAcceptor` backed by the `ring` crypto provider with zero global state.
-pub fn build_tls_acceptor(cfg: &TlsServerConfig) -> Result<TlsAcceptor, MembusError> {
+fn build_rustls_server_config(
+    cfg: &TlsServerConfig,
+    alpn_protocols: &[&[u8]],
+) -> Result<RustlsServerConfig, MembusError> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let certs = load_certs(&cfg.cert_pem_path)?;
     let key = load_private_key(&cfg.key_pem_path)?;
@@ -45,7 +48,7 @@ pub fn build_tls_acceptor(cfg: &TlsServerConfig) -> Result<TlsAcceptor, MembusEr
         .with_safe_default_protocol_versions()
         .map_err(|err| MembusError::InvalidArgument(format!("tls protocol config error: {err}")))?;
 
-    let server_cfg = if let Some(ca_path) = &cfg.client_ca_pem_path {
+    let mut server_cfg = if let Some(ca_path) = &cfg.client_ca_pem_path {
         let roots = load_root_store(ca_path)?;
         let verifier = WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider)
             .build()
@@ -63,6 +66,21 @@ pub fn build_tls_acceptor(cfg: &TlsServerConfig) -> Result<TlsAcceptor, MembusEr
             .map_err(|err| MembusError::InvalidArgument(format!("tls server cert error: {err}")))?
     };
 
+    if !alpn_protocols.is_empty() {
+        server_cfg.alpn_protocols = alpn_protocols.iter().map(|p| p.to_vec()).collect();
+    }
+    Ok(server_cfg)
+}
+
+/// Build a `tokio_rustls::TlsAcceptor` backed by the `ring` crypto provider with zero global state.
+pub fn build_tls_acceptor(cfg: &TlsServerConfig) -> Result<TlsAcceptor, MembusError> {
+    let server_cfg = build_rustls_server_config(cfg, &[])?;
+    Ok(TlsAcceptor::from(Arc::new(server_cfg)))
+}
+
+/// Build a `tokio_rustls::TlsAcceptor` advertising HTTP/2 (`h2`) and HTTP/1.1 (`http/1.1`) ALPN.
+pub fn build_http_tls_acceptor(cfg: &TlsServerConfig) -> Result<TlsAcceptor, MembusError> {
+    let server_cfg = build_rustls_server_config(cfg, &[b"h2", b"http/1.1"])?;
     Ok(TlsAcceptor::from(Arc::new(server_cfg)))
 }
 
@@ -113,7 +131,9 @@ pub async fn spawn_tls_tcp_listener(
     let handshake_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_TLS_HANDSHAKES));
 
     let accept_task = tokio::spawn(async move {
+        let mut conn_tasks: JoinSet<()> = JoinSet::new();
         loop {
+            while conn_tasks.try_join_next().is_some() {}
             tokio::select! {
                 biased;
                 _ = shutdown_rx.changed() => {
@@ -133,7 +153,7 @@ pub async fn spawn_tls_tcp_listener(
                             let conn_ctx = ctx.clone();
                             let mut conn_shutdown = shutdown_rx.clone();
                             // Run TLS handshake off accept loop, bounded & cancelable on shutdown.
-                            tokio::spawn(async move {
+                            conn_tasks.spawn(async move {
                                 let handshake_res = {
                                     let _hs_permit = permit;
                                     tokio::select! {
@@ -157,6 +177,8 @@ pub async fn spawn_tls_tcp_listener(
                 }
             }
         }
+        // Drain active TLS handshakes & binary connections cleanly before shutdown completes.
+        while conn_tasks.join_next().await.is_some() {}
     });
 
     Ok(ServerHandle::new(

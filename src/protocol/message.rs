@@ -50,6 +50,7 @@ const OP_INDEX_DOCUMENT: u8 = 38;
 const OP_DELETE_SEARCH_DOCUMENT: u8 = 39;
 const OP_REVOKE_SEARCH_PREFIX: u8 = 40;
 const OP_SEARCH: u8 = 41;
+const OP_HEALTH_V2: u8 = 42;
 
 const RESP_GET: u8 = 1;
 const RESP_GET_MANY: u8 = 2;
@@ -73,6 +74,7 @@ const RESP_COLLECTION: u8 = 19;
 const RESP_OPT_COLLECTION: u8 = 20;
 const RESP_COLLECTIONS: u8 = 21;
 const RESP_SEARCH: u8 = 22;
+const RESP_HEALTH_V2: u8 = 23;
 const RESP_ERROR: u8 = 255;
 
 const ERR_INVALID_ARG: u8 = 1;
@@ -295,6 +297,7 @@ pub enum Request {
         ack: Ack,
     },
     Search(SearchQuery),
+    HealthV2,
 }
 
 /// Strongly-typed RPC response carried in `FrameKind::Response`.
@@ -309,6 +312,7 @@ pub enum Response {
     Subscribed { epoch: u64, start_seq: u64 },
     Checkpoint { seq: u64 },
     Health(HealthStatus),
+    HealthV2(HealthStatus),
     Blob(Option<Vec<u8>>),
     Authenticated { principal_id: String },
     OrderedIndex(OrderedIndexPage),
@@ -748,6 +752,9 @@ pub fn encode_request(req: &Request) -> Result<Bytes, MembusError> {
             buf.put_u8(OP_SEARCH);
             put_json(&mut buf, query)?;
         }
+        Request::HealthV2 => {
+            buf.put_u8(OP_HEALTH_V2);
+        }
     }
     Ok(buf.freeze())
 }
@@ -1108,6 +1115,7 @@ pub fn decode_request(raw: &[u8]) -> Result<Request, MembusError> {
             ack: Ack::from_u8(take_u8(&mut cur)?)?,
         },
         OP_SEARCH => Request::Search(take_json(&mut cur)?),
+        OP_HEALTH_V2 => Request::HealthV2,
         other => {
             return Err(MembusError::Protocol(format!(
                 "unknown request opcode: {other}"
@@ -1186,6 +1194,10 @@ pub fn encode_response(resp: &Response) -> Bytes {
             buf.put_u64(h.in_flight_bytes as u64);
             buf.put_u64(h.active_connections as u64);
             buf.put_u64(h.active_subscriptions as u64);
+        }
+        Response::HealthV2(h) => {
+            buf.put_u8(RESP_HEALTH_V2);
+            put_json_infallible(&mut buf, h);
         }
         Response::Blob(data) => {
             buf.put_u8(RESP_BLOB);
@@ -1328,7 +1340,9 @@ pub fn decode_response(raw: &[u8]) -> Result<Response, MembusError> {
             in_flight_bytes: take_u64(&mut cur)? as usize,
             active_connections: take_u64(&mut cur)? as usize,
             active_subscriptions: take_u64(&mut cur)? as usize,
+            ..HealthStatus::default()
         }),
+        RESP_HEALTH_V2 => Response::HealthV2(take_json(&mut cur)?),
         RESP_BLOB => {
             let blob = match take_u8(&mut cur)? {
                 0 => None,
