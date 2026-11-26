@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::mem::ManuallyDrop;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,24 +11,33 @@ use rocksdb::checkpoint::Checkpoint;
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamilyDescriptor, DBCompressionType, Direction, ErrorKind,
     IteratorMode, OptimisticTransactionDB, OptimisticTransactionOptions, Options, ReadOptions,
-    SliceTransform, SnapshotWithThreadMode, WriteBufferManager, WriteOptions,
+    SliceTransform, SnapshotWithThreadMode, Transaction, WriteBufferManager, WriteOptions,
     DEFAULT_COLUMN_FAMILY_NAME,
 };
+use sha2::{Digest, Sha256};
 
+use crate::index::{
+    decode_edge_suffix, decode_ordered_suffix, encode_edge_key, encode_edge_seek_prefix,
+    encode_index_prefix, encode_order_preserving_prefix, encode_ordered_key, validate_bfs_options,
+    validate_index_id, validate_index_mutations, BfsOptions, NeighborQueryOptions,
+    OrderedKeyFilter, OrderedQueryOptions, ReversePostings, EDGE_DIR_FORWARD, EDGE_DIR_REVERSE,
+};
 use crate::storage::admission::AdmissionGate;
 use crate::storage::codec::{
-    decode_kv_key, decode_log_entry, decode_log_seq, decode_record, decode_record_parts,
-    encode_kv_key, encode_log_entry, encode_log_seq, kv_prefix_in_domain, kv_prefix_transform,
-    next_key_after,
+    decode_kv_key, decode_log_entry, decode_log_entry_full, decode_log_seq, decode_record,
+    decode_record_parts, encode_cas_blob_key, encode_kv_key, encode_log_entry_with_search,
+    encode_log_seq, encode_raw_blob_key, kv_prefix_in_domain, kv_prefix_transform, next_key_after,
 };
 use crate::storage::{
-    SignalPublisher, StorageConfig, StorageEngine, ALL_COLUMN_FAMILIES, CF_BLOB, CF_IDX_EDGE,
-    CF_IDX_ORD, CF_IDX_REV, CF_KV, CF_LEASE, CF_LOG, CF_META,
+    MetaCasGuard, SignalPublisher, StorageConfig, StorageEngine, ALL_COLUMN_FAMILIES, CF_BLOB,
+    CF_IDX_EDGE, CF_IDX_ORD, CF_IDX_REV, CF_KV, CF_LEASE, CF_LOG, CF_META,
 };
 use crate::types::{
-    now_unix_ms, validate_key, validate_namespace, validate_value, Ack, CommitResult,
-    ExpectedVersion, LogScanPage, MembusError, MutationOp, ScanOptions, ScanPage, SignalEvent,
-    SignalKind, StoredRecord, VersionGuard, WalBatch, WriteMutation,
+    now_unix_ms, sanitize_search_log_op, validate_key, validate_namespace, validate_value, Ack,
+    BfsResult, CommitResult, ExpectedVersion, GraphDirection, GraphEdgeRecord, IndexMutations,
+    IndexedMutation, LogScanPage, MembusError, MutationOp, NeighborPage, OrderedIndexHit,
+    OrderedIndexPage, ScanOptions, ScanPage, SearchLogOp, SearchLogPage, SearchLogRecord,
+    SignalEvent, SignalKind, StoredRecord, VersionGuard, WalBatch, WriteMutation,
 };
 
 const META_KEY_EPOCH: &[u8] = b"db_epoch";
@@ -413,6 +422,7 @@ impl RocksDbStorage {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn execute_single_mutation(
         &self,
         namespace: &str,
@@ -420,9 +430,18 @@ impl RocksDbStorage {
         op: MutationOp,
         ack: Ack,
         expected: ExpectedVersion,
+        indexes: Option<&IndexMutations>,
+        search_op: Option<&SearchLogOp>,
     ) -> Result<CommitResult, MembusError> {
         validate_namespace(namespace)?;
         validate_key(key)?;
+        if let Some(idx_muts) = indexes {
+            validate_index_mutations(idx_muts, self.config.max_value_bytes)?;
+        }
+        let sanitized_search_op = match search_op {
+            Some(op) => Some(sanitize_search_log_op(op)?),
+            None => None,
+        };
         let payload_bytes = match &op {
             MutationOp::Put { value } => {
                 validate_value(value, self.config.max_value_bytes)?;
@@ -430,11 +449,24 @@ impl RocksDbStorage {
             }
             MutationOp::Remove => 0,
         };
-        let estimated_bytes = namespace.len() + key.len() + payload_bytes + 64;
+        let index_bytes = indexes.map_or(0, estimate_index_bytes);
+        let search_bytes = sanitized_search_op
+            .as_ref()
+            .map_or(0, estimate_search_op_bytes);
+        let estimated_bytes = namespace
+            .len()
+            .saturating_add(key.len())
+            .saturating_add(payload_bytes)
+            .saturating_add(index_bytes)
+            .saturating_add(search_bytes)
+            .saturating_add(64);
         let _permit = self.admission.try_acquire(estimated_bytes)?;
 
         let kv_cf = self.cf(CF_KV)?;
         let log_cf = self.cf(CF_LOG)?;
+        let idx_ord_cf = self.cf(CF_IDX_ORD)?;
+        let idx_edge_cf = self.cf(CF_IDX_EDGE)?;
+        let idx_rev_cf = self.cf(CF_IDX_REV)?;
         let enc_key = encode_kv_key(namespace, key);
 
         let mut write_opts = WriteOptions::default();
@@ -449,18 +481,37 @@ impl RocksDbStorage {
         for attempt in 0..max_attempts {
             let tx = self.db.transaction_opt(&write_opts, &tx_opts);
 
-            if needs_check {
+            {
                 let tx_snap = tx.snapshot();
                 let mut read_opts = ReadOptions::default();
                 read_opts.set_snapshot(&tx_snap);
-                let current = tx
-                    .get_pinned_for_update_cf_opt(&kv_cf, &enc_key, true, &read_opts)
-                    .map_err(map_tx_err)?;
-                let actual_version = match current {
-                    Some(raw) => Some(decode_record_parts(raw.as_ref())?.0.version),
-                    None => None,
+
+                if needs_check {
+                    let current = tx
+                        .get_pinned_for_update_cf_opt(&kv_cf, &enc_key, true, &read_opts)
+                        .map_err(map_tx_err)?;
+                    let actual_version = match current {
+                        Some(raw) => Some(decode_record_parts(raw.as_ref())?.0.version),
+                        None => None,
+                    };
+                    verify_expected_version(namespace, key, expected, actual_version)?;
+                }
+
+                let applied_indexes = match &op {
+                    MutationOp::Put { .. } => indexes,
+                    MutationOp::Remove => None,
                 };
-                verify_expected_version(namespace, key, expected, actual_version)?;
+                apply_index_mutations_in_tx(
+                    &tx,
+                    &read_opts,
+                    &idx_ord_cf,
+                    &idx_edge_cf,
+                    &idx_rev_cf,
+                    namespace,
+                    key,
+                    &enc_key,
+                    applied_indexes,
+                )?;
             }
 
             let ticket = self.sequencer.reserve();
@@ -490,7 +541,8 @@ impl RocksDbStorage {
                 value_hint,
             };
             let events = vec![event];
-            let encoded_log = encode_log_entry(self.epoch, seq, &events);
+            let search_ops: Vec<SearchLogOp> = sanitized_search_op.iter().cloned().collect();
+            let encoded_log = encode_log_entry_with_search(self.epoch, seq, &events, &search_ops);
             tx.put_cf(&log_cf, encode_log_seq(seq), &encoded_log)
                 .map_err(map_tx_err)?;
 
@@ -584,6 +636,19 @@ impl StorageEngine for RocksDbStorage {
         ack: Ack,
         expected: ExpectedVersion,
     ) -> Result<CommitResult, MembusError> {
+        self.put_indexed(namespace, key, value, ack, expected, None, None)
+    }
+
+    fn put_indexed(
+        &self,
+        namespace: &str,
+        key: &[u8],
+        value: &[u8],
+        ack: Ack,
+        expected: ExpectedVersion,
+        indexes: Option<&IndexMutations>,
+        search_op: Option<&SearchLogOp>,
+    ) -> Result<CommitResult, MembusError> {
         self.execute_single_mutation(
             namespace,
             key,
@@ -592,6 +657,8 @@ impl StorageEngine for RocksDbStorage {
             },
             ack,
             expected,
+            indexes,
+            search_op,
         )
     }
 
@@ -602,7 +669,26 @@ impl StorageEngine for RocksDbStorage {
         ack: Ack,
         expected: ExpectedVersion,
     ) -> Result<CommitResult, MembusError> {
-        self.execute_single_mutation(namespace, key, MutationOp::Remove, ack, expected)
+        self.remove_indexed(namespace, key, ack, expected, None)
+    }
+
+    fn remove_indexed(
+        &self,
+        namespace: &str,
+        key: &[u8],
+        ack: Ack,
+        expected: ExpectedVersion,
+        search_op: Option<&SearchLogOp>,
+    ) -> Result<CommitResult, MembusError> {
+        self.execute_single_mutation(
+            namespace,
+            key,
+            MutationOp::Remove,
+            ack,
+            expected,
+            None,
+            search_op,
+        )
     }
 
     fn commit_tx(
@@ -611,13 +697,31 @@ impl StorageEngine for RocksDbStorage {
         mutations: &[WriteMutation],
         ack: Ack,
     ) -> Result<CommitResult, MembusError> {
+        let wrapped: Vec<IndexedMutation> = mutations
+            .iter()
+            .cloned()
+            .map(|mutation| IndexedMutation {
+                mutation,
+                indexes: None,
+                search_op: None,
+            })
+            .collect();
+        self.commit_indexed_tx(guards, &wrapped, ack)
+    }
+
+    fn commit_indexed_tx(
+        &self,
+        guards: &[VersionGuard],
+        mutations: &[IndexedMutation],
+        ack: Ack,
+    ) -> Result<CommitResult, MembusError> {
         if mutations.is_empty() {
             return Err(MembusError::InvalidArgument(
                 "commit_tx requires at least one mutation".to_owned(),
             ));
         }
 
-        // Validate all guards and mutations cleanly before entering RocksDB.
+        // Validate all guards, mutations, and index entries cleanly before entering RocksDB.
         let mut total_bytes = 0usize;
         for guard in guards {
             validate_namespace(&guard.namespace)?;
@@ -626,7 +730,9 @@ impl StorageEngine for RocksDbStorage {
         }
 
         let mut seen_targets: HashSet<(&str, &[u8])> = HashSet::with_capacity(mutations.len());
-        for mutation in mutations {
+        let mut sanitized_search_ops: Vec<SearchLogOp> = Vec::new();
+        for item in mutations {
+            let mutation = &item.mutation;
             validate_namespace(&mutation.namespace)?;
             validate_key(&mutation.key)?;
             if !seen_targets.insert((mutation.namespace.as_str(), mutation.key.as_slice())) {
@@ -634,6 +740,15 @@ impl StorageEngine for RocksDbStorage {
                     "duplicate mutation target in commit_tx for namespace '{}'",
                     mutation.namespace
                 )));
+            }
+            if let Some(idx_muts) = &item.indexes {
+                validate_index_mutations(idx_muts, self.config.max_value_bytes)?;
+                total_bytes = total_bytes.saturating_add(estimate_index_bytes(idx_muts));
+            }
+            if let Some(op) = &item.search_op {
+                let sanitized = sanitize_search_log_op(op)?;
+                total_bytes = total_bytes.saturating_add(estimate_search_op_bytes(&sanitized));
+                sanitized_search_ops.push(sanitized);
             }
             let payload_len = match &mutation.op {
                 MutationOp::Put { value } => {
@@ -650,6 +765,9 @@ impl StorageEngine for RocksDbStorage {
 
         let kv_cf = self.cf(CF_KV)?;
         let log_cf = self.cf(CF_LOG)?;
+        let idx_ord_cf = self.cf(CF_IDX_ORD)?;
+        let idx_edge_cf = self.cf(CF_IDX_EDGE)?;
+        let idx_rev_cf = self.cf(CF_IDX_REV)?;
 
         let mut write_opts = WriteOptions::default();
         write_opts.set_sync(ack == Ack::Flush);
@@ -659,7 +777,7 @@ impl StorageEngine for RocksDbStorage {
 
         let tx = self.db.transaction_opt(&write_opts, &tx_opts);
 
-        // Register and verify every nominated guard key against the transaction's snapshot.
+        // Register & verify guards and retract/apply secondary indexes against the tx snapshot.
         {
             let tx_snap = tx.snapshot();
             let mut read_opts = ReadOptions::default();
@@ -680,6 +798,26 @@ impl StorageEngine for RocksDbStorage {
                     actual_version,
                 )?;
             }
+
+            for item in mutations {
+                let mutation = &item.mutation;
+                let enc_key = encode_kv_key(&mutation.namespace, &mutation.key);
+                let applied_indexes = match &mutation.op {
+                    MutationOp::Put { .. } => item.indexes.as_ref(),
+                    MutationOp::Remove => None,
+                };
+                apply_index_mutations_in_tx(
+                    &tx,
+                    &read_opts,
+                    &idx_ord_cf,
+                    &idx_edge_cf,
+                    &idx_rev_cf,
+                    &mutation.namespace,
+                    &mutation.key,
+                    &enc_key,
+                    applied_indexes,
+                )?;
+            }
         }
 
         let ticket = self.sequencer.reserve();
@@ -689,7 +827,8 @@ impl StorageEngine for RocksDbStorage {
         let mut events = Vec::with_capacity(mutations.len());
         let mut versions = Vec::with_capacity(mutations.len());
 
-        for mutation in mutations {
+        for item in mutations {
+            let mutation = &item.mutation;
             let enc_key = encode_kv_key(&mutation.namespace, &mutation.key);
             let (kind, value_hint) = match &mutation.op {
                 MutationOp::Put { value } => {
@@ -715,7 +854,8 @@ impl StorageEngine for RocksDbStorage {
             });
         }
 
-        let encoded_log = encode_log_entry(self.epoch, seq, &events);
+        let encoded_log =
+            encode_log_entry_with_search(self.epoch, seq, &events, &sanitized_search_ops);
         tx.put_cf(&log_cf, encode_log_seq(seq), &encoded_log)
             .map_err(map_tx_err)?;
 
@@ -841,24 +981,461 @@ impl StorageEngine for RocksDbStorage {
         })
     }
 
+    fn query_ordered_index(
+        &self,
+        snapshot: &OwnedSnapshot,
+        namespace: &str,
+        index_id: &str,
+        options: &OrderedQueryOptions,
+    ) -> Result<OrderedIndexPage, MembusError> {
+        self.verify_snapshot_owner(snapshot)?;
+        validate_namespace(namespace)?;
+        validate_index_id(index_id)?;
+        if options.limit == 0 || options.max_bytes == 0 {
+            return Err(MembusError::InvalidArgument(
+                "ordered index limit and max_bytes must be > 0".to_owned(),
+            ));
+        }
+
+        let ns_idx_prefix = encode_index_prefix(namespace, index_id);
+        let base_suffix: Vec<u8> = match &options.filter {
+            OrderedKeyFilter::All => Vec::new(),
+            OrderedKeyFilter::Prefix(p) => {
+                let mut out = Vec::with_capacity(p.len() + 2);
+                encode_order_preserving_prefix(p, &mut out);
+                out
+            }
+            OrderedKeyFilter::Range { start, end } => {
+                if !end.is_empty() && end <= start {
+                    return Ok(OrderedIndexPage {
+                        entries: Vec::new(),
+                        next_cursor: None,
+                        truncated: false,
+                        snapshot_seq: snapshot.snapshot_seq(),
+                    });
+                }
+                let mut out = Vec::with_capacity(start.len() + 2);
+                encode_order_preserving_prefix(start, &mut out);
+                out
+            }
+        };
+
+        let effective_suffix = compute_scan_start(&base_suffix, options.after_cursor.as_deref());
+        let mut seek_key = Vec::with_capacity(ns_idx_prefix.len() + effective_suffix.len());
+        seek_key.extend_from_slice(&ns_idx_prefix);
+        seek_key.extend_from_slice(&effective_suffix);
+
+        let idx_ord_cf = self.cf(CF_IDX_ORD)?;
+        let mut read_opts = ReadOptions::default();
+        read_opts.fill_cache(false);
+
+        let iter = snapshot.inner().iterator_cf_opt(
+            &idx_ord_cf,
+            read_opts,
+            IteratorMode::From(&seek_key, Direction::Forward),
+        );
+
+        let mut entries = Vec::new();
+        let mut last_suffix: Option<Vec<u8>> = None;
+        let mut accum_bytes = 0usize;
+        let mut truncated = false;
+
+        for item in iter {
+            let (raw_k, raw_v) = item.map_err(map_rocksdb_err)?;
+            if !raw_k.starts_with(&ns_idx_prefix) {
+                break;
+            }
+            let suffix = &raw_k[ns_idx_prefix.len()..];
+            let (sort_key, primary_key) = decode_ordered_suffix(suffix)?;
+            let in_bounds = match &options.filter {
+                OrderedKeyFilter::All => true,
+                OrderedKeyFilter::Prefix(p) => sort_key.starts_with(p),
+                OrderedKeyFilter::Range { start, end } => {
+                    sort_key.as_slice() >= start.as_slice()
+                        && (end.is_empty() || sort_key.as_slice() < end.as_slice())
+                }
+            };
+            if !in_bounds {
+                break;
+            }
+            let item_bytes = sort_key
+                .len()
+                .saturating_add(primary_key.len())
+                .saturating_add(raw_v.len());
+            if entries.len() >= options.limit
+                || (!entries.is_empty()
+                    && accum_bytes.saturating_add(item_bytes) > options.max_bytes)
+            {
+                truncated = true;
+                break;
+            }
+            accum_bytes = accum_bytes.saturating_add(item_bytes);
+            last_suffix = Some(suffix.to_vec());
+            entries.push(OrderedIndexHit {
+                sort_key,
+                primary_key,
+                summary: raw_v.to_vec(),
+            });
+        }
+
+        Ok(OrderedIndexPage {
+            entries,
+            next_cursor: if truncated { last_suffix } else { None },
+            truncated,
+            snapshot_seq: snapshot.snapshot_seq(),
+        })
+    }
+
+    fn query_neighbors(
+        &self,
+        snapshot: &OwnedSnapshot,
+        namespace: &str,
+        index_id: &str,
+        node_id: &[u8],
+        options: &NeighborQueryOptions,
+    ) -> Result<NeighborPage, MembusError> {
+        self.verify_snapshot_owner(snapshot)?;
+        validate_namespace(namespace)?;
+        validate_index_id(index_id)?;
+        validate_key(node_id)?;
+        if let Some(rel) = &options.rel_filter {
+            validate_key(rel)?;
+        }
+        if options.limit == 0 {
+            return Err(MembusError::InvalidArgument(
+                "query_neighbors limit must be > 0".to_owned(),
+            ));
+        }
+
+        let dirs: &[u8] = match options.direction {
+            GraphDirection::Out => &[EDGE_DIR_FORWARD],
+            GraphDirection::In => &[EDGE_DIR_REVERSE],
+            GraphDirection::Both => &[EDGE_DIR_FORWARD, EDGE_DIR_REVERSE],
+        };
+
+        let (resume_dir, resume_suffix): (Option<u8>, Option<&[u8]>) =
+            match options.after_cursor.as_deref() {
+                Some(cur) if !cur.is_empty() => {
+                    if !dirs.contains(&cur[0]) {
+                        return Err(MembusError::InvalidArgument(format!(
+                            "graph neighbor cursor direction tag 0x{:02x} is invalid for {:?}",
+                            cur[0], options.direction
+                        )));
+                    }
+                    (Some(cur[0]), Some(&cur[1..]))
+                }
+                Some(_) => {
+                    return Err(MembusError::InvalidArgument(
+                        "invalid empty graph neighbor cursor".to_owned(),
+                    ));
+                }
+                None => (None, None),
+            };
+
+        let idx_edge_cf = self.cf(CF_IDX_EDGE)?;
+        let ns_idx_prefix = encode_index_prefix(namespace, index_id);
+        let mut edges = Vec::new();
+        let mut last_cursor: Option<Vec<u8>> = None;
+        let mut truncated = false;
+
+        'dir_loop: for &dir_tag in dirs {
+            if let Some(rd) = resume_dir {
+                if rd == EDGE_DIR_REVERSE && dir_tag == EDGE_DIR_FORWARD {
+                    continue;
+                }
+            }
+            let seek_prefix = encode_edge_seek_prefix(
+                namespace,
+                index_id,
+                dir_tag,
+                node_id,
+                options.rel_filter.as_deref(),
+            );
+            let dir_base_len = ns_idx_prefix.len() + 1;
+
+            let seek_key = if resume_dir == Some(dir_tag) {
+                let after = resume_suffix.unwrap_or(&[]);
+                let next_after = next_key_after(after);
+                let mut candidate = Vec::with_capacity(dir_base_len + next_after.len());
+                candidate.extend_from_slice(&ns_idx_prefix);
+                candidate.push(dir_tag);
+                candidate.extend_from_slice(&next_after);
+                if candidate.as_slice() > seek_prefix.as_slice() {
+                    candidate
+                } else {
+                    seek_prefix.clone()
+                }
+            } else {
+                seek_prefix.clone()
+            };
+
+            let mut read_opts = ReadOptions::default();
+            read_opts.fill_cache(false);
+            let iter = snapshot.inner().iterator_cf_opt(
+                &idx_edge_cf,
+                read_opts,
+                IteratorMode::From(&seek_key, Direction::Forward),
+            );
+
+            for item in iter {
+                let (raw_k, raw_v) = item.map_err(map_rocksdb_err)?;
+                if !raw_k.starts_with(&seek_prefix) {
+                    break;
+                }
+                if edges.len() >= options.limit {
+                    truncated = true;
+                    break 'dir_loop;
+                }
+                let suffix = &raw_k[dir_base_len..];
+                let (first, rel_label, second, _owner_pk) = decode_edge_suffix(suffix)?;
+                let (src_id, dst_id, direction) = if dir_tag == EDGE_DIR_FORWARD {
+                    (first, second, GraphDirection::Out)
+                } else {
+                    (second, first, GraphDirection::In)
+                };
+                let mut cursor = Vec::with_capacity(1 + suffix.len());
+                cursor.push(dir_tag);
+                cursor.extend_from_slice(suffix);
+                last_cursor = Some(cursor);
+                edges.push(GraphEdgeRecord {
+                    src_id,
+                    rel_label,
+                    dst_id,
+                    direction,
+                    meta: raw_v.to_vec(),
+                });
+            }
+        }
+
+        Ok(NeighborPage {
+            edges,
+            next_cursor: if truncated { last_cursor } else { None },
+            truncated,
+            snapshot_seq: snapshot.snapshot_seq(),
+        })
+    }
+
+    fn bfs_traverse(
+        &self,
+        snapshot: &OwnedSnapshot,
+        namespace: &str,
+        index_id: &str,
+        seed_node: &[u8],
+        options: &BfsOptions,
+    ) -> Result<BfsResult, MembusError> {
+        self.verify_snapshot_owner(snapshot)?;
+        validate_namespace(namespace)?;
+        validate_index_id(index_id)?;
+        validate_key(seed_node)?;
+        validate_bfs_options(options)?;
+        if let Some(rel) = &options.rel_filter {
+            validate_key(rel)?;
+        }
+
+        let mut visited_set: HashSet<Vec<u8>> = HashSet::new();
+        let mut visited_nodes: Vec<Vec<u8>> = Vec::new();
+        let mut traversed_edges: Vec<GraphEdgeRecord> = Vec::new();
+        let mut frontier_set: HashSet<Vec<u8>> = HashSet::new();
+        let mut frontier_nodes: Vec<Vec<u8>> = Vec::new();
+        let mut queue: VecDeque<(Vec<u8>, u8)> = VecDeque::new();
+        let mut truncated = false;
+
+        visited_set.insert(seed_node.to_vec());
+        visited_nodes.push(seed_node.to_vec());
+
+        if options.max_hops == 0 {
+            frontier_nodes.push(seed_node.to_vec());
+            return Ok(BfsResult {
+                visited_nodes,
+                traversed_edges,
+                frontier_nodes,
+                truncated: false,
+                snapshot_seq: snapshot.snapshot_seq(),
+            });
+        }
+        queue.push_back((seed_node.to_vec(), 0));
+
+        let dirs: &[u8] = match options.direction {
+            GraphDirection::Out => &[EDGE_DIR_FORWARD],
+            GraphDirection::In => &[EDGE_DIR_REVERSE],
+            GraphDirection::Both => &[EDGE_DIR_FORWARD, EDGE_DIR_REVERSE],
+        };
+        let idx_edge_cf = self.cf(CF_IDX_EDGE)?;
+        let dir_base_len = encode_index_prefix(namespace, index_id).len() + 1;
+
+        'bfs: while let Some((node, hop)) = queue.pop_front() {
+            if hop >= options.max_hops {
+                continue;
+            }
+            for &dir_tag in dirs {
+                let seek_prefix = encode_edge_seek_prefix(
+                    namespace,
+                    index_id,
+                    dir_tag,
+                    &node,
+                    options.rel_filter.as_deref(),
+                );
+                let mut read_opts = ReadOptions::default();
+                read_opts.fill_cache(false);
+                let iter = snapshot.inner().iterator_cf_opt(
+                    &idx_edge_cf,
+                    read_opts,
+                    IteratorMode::From(&seek_prefix, Direction::Forward),
+                );
+                for item in iter {
+                    let (raw_k, raw_v) = item.map_err(map_rocksdb_err)?;
+                    if !raw_k.starts_with(&seek_prefix) {
+                        break;
+                    }
+                    let (first, rel_label, second, _owner_pk) =
+                        decode_edge_suffix(&raw_k[dir_base_len..])?;
+                    let (src_id, dst_id, neighbor, direction) = if dir_tag == EDGE_DIR_FORWARD {
+                        (first, second.clone(), second, GraphDirection::Out)
+                    } else {
+                        (second.clone(), first, second, GraphDirection::In)
+                    };
+
+                    if visited_set.contains(&neighbor) {
+                        traversed_edges.push(GraphEdgeRecord {
+                            src_id,
+                            rel_label,
+                            dst_id,
+                            direction,
+                            meta: raw_v.to_vec(),
+                        });
+                        continue;
+                    }
+
+                    if visited_set.len() >= options.max_nodes {
+                        truncated = true;
+                        if frontier_set.insert(node.clone()) {
+                            frontier_nodes.push(node.clone());
+                        }
+                        while let Some((queued_node, _)) = queue.pop_front() {
+                            if frontier_set.insert(queued_node.clone()) {
+                                frontier_nodes.push(queued_node);
+                            }
+                        }
+                        break 'bfs;
+                    }
+
+                    visited_set.insert(neighbor.clone());
+                    visited_nodes.push(neighbor.clone());
+                    traversed_edges.push(GraphEdgeRecord {
+                        src_id,
+                        rel_label,
+                        dst_id,
+                        direction,
+                        meta: raw_v.to_vec(),
+                    });
+                    if hop + 1 < options.max_hops {
+                        queue.push_back((neighbor, hop + 1));
+                    } else if frontier_set.insert(neighbor.clone()) {
+                        frontier_nodes.push(neighbor);
+                    }
+                }
+            }
+        }
+
+        Ok(BfsResult {
+            visited_nodes,
+            traversed_edges,
+            frontier_nodes,
+            truncated,
+            snapshot_seq: snapshot.snapshot_seq(),
+        })
+    }
+
     fn put_blob(&self, digest: &[u8], data: &[u8], ack: Ack) -> Result<(), MembusError> {
         validate_key(digest)?;
         validate_value(data, self.config.max_value_bytes)?;
+        let key = encode_raw_blob_key(digest);
         let _permit = self
             .admission
-            .try_acquire(digest.len().saturating_add(data.len()))?;
+            .try_acquire(key.len().saturating_add(data.len()))?;
         let blob_cf = self.cf(CF_BLOB)?;
         let mut wo = WriteOptions::default();
         wo.set_sync(ack == Ack::Flush);
         self.db
-            .put_cf_opt(&blob_cf, digest, data, &wo)
+            .put_cf_opt(&blob_cf, &key, data, &wo)
             .map_err(map_rocksdb_err)
     }
 
     fn get_blob(&self, digest: &[u8]) -> Result<Option<Vec<u8>>, MembusError> {
         validate_key(digest)?;
+        let key = encode_raw_blob_key(digest);
         let blob_cf = self.cf(CF_BLOB)?;
-        self.db.get_cf(&blob_cf, digest).map_err(map_rocksdb_err)
+        self.db.get_cf(&blob_cf, &key).map_err(map_rocksdb_err)
+    }
+
+    fn put_cas_blob(
+        &self,
+        namespace: &str,
+        data: &[u8],
+        ack: Ack,
+    ) -> Result<[u8; 32], MembusError> {
+        validate_namespace(namespace)?;
+        validate_value(data, self.config.max_value_bytes)?;
+        let digest: [u8; 32] = Sha256::digest(data).into();
+        let key = encode_cas_blob_key(namespace, &digest)?;
+        let blob_cf = self.cf(CF_BLOB)?;
+
+        // Idempotent put-if-absent verifying stored integrity if already present.
+        if let Some(existing) = self
+            .db
+            .get_pinned_cf(&blob_cf, &key)
+            .map_err(map_rocksdb_err)?
+        {
+            let existing_digest: [u8; 32] = Sha256::digest(existing.as_ref()).into();
+            if existing_digest != digest {
+                return Err(MembusError::Corruption(
+                    "existing CAS blob SHA-256 mismatch".to_owned(),
+                ));
+            }
+            if ack == Ack::Flush {
+                self.db.flush_wal(true).map_err(map_rocksdb_err)?;
+            }
+            return Ok(digest);
+        }
+
+        let _permit = self
+            .admission
+            .try_acquire(key.len().saturating_add(data.len()))?;
+        let mut wo = WriteOptions::default();
+        wo.set_sync(ack == Ack::Flush);
+        self.db
+            .put_cf_opt(&blob_cf, &key, data, &wo)
+            .map_err(map_rocksdb_err)?;
+        Ok(digest)
+    }
+
+    fn get_cas_blob(
+        &self,
+        namespace: &str,
+        sha256: &[u8; 32],
+    ) -> Result<Option<Vec<u8>>, MembusError> {
+        let key = encode_cas_blob_key(namespace, sha256)?;
+        let blob_cf = self.cf(CF_BLOB)?;
+        let Some(data) = self.db.get_cf(&blob_cf, &key).map_err(map_rocksdb_err)? else {
+            return Ok(None);
+        };
+        let actual: [u8; 32] = Sha256::digest(&data).into();
+        if actual != *sha256 {
+            return Err(MembusError::Corruption(
+                "CAS blob SHA-256 verification failed on readback".to_owned(),
+            ));
+        }
+        Ok(Some(data))
+    }
+
+    fn has_cas_blob(&self, namespace: &str, sha256: &[u8; 32]) -> Result<bool, MembusError> {
+        let key = encode_cas_blob_key(namespace, sha256)?;
+        let blob_cf = self.cf(CF_BLOB)?;
+        Ok(self
+            .db
+            .get_pinned_cf(&blob_cf, &key)
+            .map_err(map_rocksdb_err)?
+            .is_some())
     }
 
     fn scan_log_after(
@@ -930,6 +1507,261 @@ impl StorageEngine for RocksDbStorage {
             events,
             scanned_through_seq,
         })
+    }
+
+    fn append_search_log_op(
+        &self,
+        op: SearchLogOp,
+        ack: Ack,
+    ) -> Result<CommitResult, MembusError> {
+        let sanitized = sanitize_search_log_op(&op)?;
+        let op_bytes = estimate_search_op_bytes(&sanitized);
+        if op_bytes > self.config.max_value_bytes {
+            return Err(MembusError::InvalidArgument(format!(
+                "search op size {op_bytes} exceeds max_value_bytes {}",
+                self.config.max_value_bytes
+            )));
+        }
+        let _permit = self.admission.try_acquire(op_bytes.max(64))?;
+        let log_cf = self.cf(CF_LOG)?;
+        let mut wo = WriteOptions::default();
+        wo.set_sync(ack == Ack::Flush);
+        let tx = self
+            .db
+            .transaction_opt(&wo, &OptimisticTransactionOptions::default());
+
+        let ticket = self.sequencer.reserve();
+        let seq = ticket.seq();
+        let encoded_log = encode_log_entry_with_search(self.epoch, seq, &[], &[sanitized]);
+        tx.put_cf(&log_cf, encode_log_seq(seq), &encoded_log)
+            .map_err(map_tx_err)?;
+        tx.commit().map_err(map_tx_err)?;
+        ticket.commit(Vec::new());
+
+        Ok(CommitResult {
+            seq,
+            epoch: self.epoch,
+            versions: vec![seq],
+        })
+    }
+
+    fn scan_search_log_after(
+        &self,
+        after_seq: u64,
+        limit: usize,
+    ) -> Result<SearchLogPage, MembusError> {
+        if limit == 0 {
+            return Err(MembusError::InvalidArgument(
+                "scan_search_log_after limit must be > 0".to_owned(),
+            ));
+        }
+        let horizon_before = self.log_horizon.load(Ordering::Acquire);
+        if after_seq < horizon_before {
+            return Err(MembusError::Gap {
+                earliest_available_seq: horizon_before.saturating_add(1),
+                current_epoch: self.epoch,
+            });
+        }
+
+        let upper_seq = self.sequencer.published_seq();
+        if after_seq >= upper_seq {
+            return Ok(SearchLogPage {
+                records: Vec::new(),
+                scanned_through_seq: after_seq,
+            });
+        }
+
+        let log_cf = self.cf(CF_LOG)?;
+        let start_key = encode_log_seq(after_seq.saturating_add(1));
+        let mut read_opts = ReadOptions::default();
+        read_opts.fill_cache(false);
+
+        let iter = self.db.iterator_cf_opt(
+            &log_cf,
+            read_opts,
+            IteratorMode::From(&start_key, Direction::Forward),
+        );
+
+        let mut records = Vec::new();
+        let mut last_seen_seq = after_seq;
+        let mut hit_limit = false;
+
+        for (entries_read, item) in iter.enumerate() {
+            let (raw_k, raw_v) = item.map_err(map_rocksdb_err)?;
+            let seq = decode_log_seq(&raw_k)?;
+            if seq > upper_seq {
+                break;
+            }
+            if entries_read >= limit {
+                hit_limit = true;
+                break;
+            }
+            let (epoch, entry_seq, _events, ops) = decode_log_entry_full(&raw_v)?;
+            for (idx, op) in ops.into_iter().enumerate() {
+                records.push(SearchLogRecord {
+                    seq: entry_seq,
+                    op_idx: u32::try_from(idx).unwrap_or(u32::MAX),
+                    epoch,
+                    op,
+                });
+            }
+            last_seen_seq = seq;
+        }
+
+        let horizon_after = self.log_horizon.load(Ordering::Acquire);
+        if after_seq < horizon_after {
+            return Err(MembusError::Gap {
+                earliest_available_seq: horizon_after.saturating_add(1),
+                current_epoch: self.epoch,
+            });
+        }
+
+        let scanned_through_seq = if hit_limit { last_seen_seq } else { upper_seq };
+        Ok(SearchLogPage {
+            records,
+            scanned_through_seq,
+        })
+    }
+
+    fn meta_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, MembusError> {
+        validate_key(key)?;
+        let meta_cf = self.cf(CF_META)?;
+        self.db.get_cf(&meta_cf, key).map_err(map_rocksdb_err)
+    }
+
+    fn meta_put(&self, key: &[u8], value: &[u8], sync: bool) -> Result<(), MembusError> {
+        validate_key(key)?;
+        validate_value(value, self.config.max_value_bytes)?;
+        let meta_cf = self.cf(CF_META)?;
+        let mut wo = WriteOptions::default();
+        wo.set_sync(sync);
+        self.db
+            .put_cf_opt(&meta_cf, key, value, &wo)
+            .map_err(map_rocksdb_err)
+    }
+
+    fn meta_scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, MembusError> {
+        let meta_cf = self.cf(CF_META)?;
+        let mut read_opts = ReadOptions::default();
+        read_opts.fill_cache(false);
+        let iter = self.db.iterator_cf_opt(
+            &meta_cf,
+            read_opts,
+            IteratorMode::From(prefix, Direction::Forward),
+        );
+        let mut out = Vec::new();
+        for item in iter {
+            let (k, v) = item.map_err(map_rocksdb_err)?;
+            if !k.starts_with(prefix) {
+                break;
+            }
+            out.push((k.to_vec(), v.to_vec()));
+        }
+        Ok(out)
+    }
+
+    fn meta_cas_batch(
+        &self,
+        guards: &[MetaCasGuard],
+        puts: &[(Vec<u8>, Vec<u8>)],
+        deletes: &[Vec<u8>],
+        sync: bool,
+    ) -> Result<(), MembusError> {
+        let mut total_bytes = 64usize;
+        for guard in guards {
+            validate_key(&guard.key)?;
+            total_bytes = total_bytes.saturating_add(guard.key.len());
+        }
+        for (k, v) in puts {
+            validate_key(k)?;
+            validate_value(v, self.config.max_value_bytes)?;
+            total_bytes = total_bytes
+                .saturating_add(k.len())
+                .saturating_add(v.len());
+        }
+        for k in deletes {
+            validate_key(k)?;
+            total_bytes = total_bytes.saturating_add(k.len());
+        }
+        let _permit = self.admission.try_acquire(total_bytes)?;
+
+        let meta_cf = self.cf(CF_META)?;
+        let mut wo = WriteOptions::default();
+        wo.set_sync(sync);
+        let mut tx_opts = OptimisticTransactionOptions::default();
+        tx_opts.set_snapshot(true);
+
+        let tx = self.db.transaction_opt(&wo, &tx_opts);
+        {
+            let tx_snap = tx.snapshot();
+            let mut read_opts = ReadOptions::default();
+            read_opts.set_snapshot(&tx_snap);
+            for guard in guards {
+                let actual = tx
+                    .get_pinned_for_update_cf_opt(&meta_cf, &guard.key, true, &read_opts)
+                    .map_err(map_tx_err)?;
+                let matched = match (&guard.expected, &actual) {
+                    (None, None) => true,
+                    (Some(exp), Some(act)) => exp.as_slice() == act.as_ref(),
+                    _ => false,
+                };
+                if !matched {
+                    return Err(MembusError::TxConflict(
+                        "meta CAS precondition mismatch".to_owned(),
+                    ));
+                }
+            }
+        }
+        for (k, v) in puts {
+            tx.put_cf(&meta_cf, k, v).map_err(map_tx_err)?;
+        }
+        for k in deletes {
+            tx.delete_cf(&meta_cf, k).map_err(map_tx_err)?;
+        }
+        tx.commit().map_err(map_tx_err)
+    }
+
+    fn lease_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, MembusError> {
+        validate_key(key)?;
+        let lease_cf = self.cf(CF_LEASE)?;
+        self.db.get_cf(&lease_cf, key).map_err(map_rocksdb_err)
+    }
+
+    fn lease_cas(
+        &self,
+        key: &[u8],
+        expected: Option<&[u8]>,
+        new_value: &[u8],
+    ) -> Result<(), MembusError> {
+        validate_key(key)?;
+        validate_value(new_value, self.config.max_value_bytes)?;
+        let lease_cf = self.cf(CF_LEASE)?;
+        let mut wo = WriteOptions::default();
+        wo.set_sync(true);
+        let mut tx_opts = OptimisticTransactionOptions::default();
+        tx_opts.set_snapshot(true);
+
+        let tx = self.db.transaction_opt(&wo, &tx_opts);
+        {
+            let tx_snap = tx.snapshot();
+            let mut read_opts = ReadOptions::default();
+            read_opts.set_snapshot(&tx_snap);
+            let actual = tx
+                .get_pinned_for_update_cf_opt(&lease_cf, key, true, &read_opts)
+                .map_err(map_tx_err)?;
+            let matched = match (expected, &actual) {
+                (None, None) => true,
+                (Some(exp), Some(act)) => exp == act.as_ref(),
+                _ => false,
+            };
+            if !matched {
+                return Err(MembusError::TxConflict(
+                    "lease optimistic CAS conflict".to_owned(),
+                ));
+            }
+        }
+        tx.put_cf(&lease_cf, key, new_value).map_err(map_tx_err)?;
+        tx.commit().map_err(map_tx_err)
     }
 
     fn trim_log_before(&self, keep_from_seq: u64) -> Result<(), MembusError> {
@@ -1015,6 +1847,120 @@ impl StorageEngine for RocksDbStorage {
 
     fn flush_wal(&self, sync: bool) -> Result<(), MembusError> {
         self.db.flush_wal(sync).map_err(map_rocksdb_err)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_index_mutations_in_tx(
+    tx: &Transaction<'_, OptimisticTransactionDB>,
+    read_opts: &ReadOptions,
+    idx_ord_cf: &Arc<rocksdb::BoundColumnFamily<'_>>,
+    idx_edge_cf: &Arc<rocksdb::BoundColumnFamily<'_>>,
+    idx_rev_cf: &Arc<rocksdb::BoundColumnFamily<'_>>,
+    namespace: &str,
+    pk: &[u8],
+    enc_pk: &[u8],
+    new_indexes: Option<&IndexMutations>,
+) -> Result<(), MembusError> {
+    let prev_raw = tx
+        .get_pinned_for_update_cf_opt(idx_rev_cf, enc_pk, true, read_opts)
+        .map_err(map_tx_err)?;
+
+    let had_prev = if let Some(raw) = prev_raw {
+        let prev = ReversePostings::decode(raw.as_ref())?;
+        for old_ord in &prev.ord_keys {
+            tx.delete_cf(idx_ord_cf, old_ord).map_err(map_tx_err)?;
+        }
+        for old_edge in &prev.edge_keys {
+            tx.delete_cf(idx_edge_cf, old_edge).map_err(map_tx_err)?;
+        }
+        true
+    } else {
+        false
+    };
+
+    if let Some(muts) = new_indexes.filter(|m| !m.is_empty()) {
+        let mut new_rev = ReversePostings::default();
+        let mut seen_ord: HashSet<Vec<u8>> = HashSet::with_capacity(muts.ordered.len());
+        let mut seen_edge: HashSet<Vec<u8>> = HashSet::with_capacity(muts.edges.len() * 2);
+
+        for ord in &muts.ordered {
+            let k = encode_ordered_key(namespace, &ord.index_id, &ord.sort_key, pk);
+            tx.put_cf(idx_ord_cf, &k, &ord.summary).map_err(map_tx_err)?;
+            if seen_ord.insert(k.clone()) {
+                new_rev.ord_keys.push(k);
+            }
+        }
+        for edge in &muts.edges {
+            let fwd = encode_edge_key(
+                namespace,
+                &edge.index_id,
+                EDGE_DIR_FORWARD,
+                &edge.src_id,
+                &edge.rel_label,
+                &edge.dst_id,
+                pk,
+            );
+            let rev = encode_edge_key(
+                namespace,
+                &edge.index_id,
+                EDGE_DIR_REVERSE,
+                &edge.dst_id,
+                &edge.rel_label,
+                &edge.src_id,
+                pk,
+            );
+            tx.put_cf(idx_edge_cf, &fwd, &edge.meta).map_err(map_tx_err)?;
+            tx.put_cf(idx_edge_cf, &rev, &edge.meta).map_err(map_tx_err)?;
+            if seen_edge.insert(fwd.clone()) {
+                new_rev.edge_keys.push(fwd);
+            }
+            if seen_edge.insert(rev.clone()) {
+                new_rev.edge_keys.push(rev);
+            }
+        }
+        tx.put_cf(idx_rev_cf, enc_pk, new_rev.encode())
+            .map_err(map_tx_err)?;
+    } else if had_prev {
+        tx.delete_cf(idx_rev_cf, enc_pk).map_err(map_tx_err)?;
+    }
+
+    Ok(())
+}
+
+fn estimate_index_bytes(muts: &IndexMutations) -> usize {
+    let ord_bytes: usize = muts
+        .ordered
+        .iter()
+        .map(|o| o.index_id.len() + o.sort_key.len() + o.summary.len() + 16)
+        .sum();
+    let edge_bytes: usize = muts
+        .edges
+        .iter()
+        .map(|e| (e.index_id.len() + e.src_id.len() + e.rel_label.len() + e.dst_id.len() + e.meta.len() + 24) * 2)
+        .sum();
+    ord_bytes.saturating_add(edge_bytes)
+}
+
+fn estimate_search_op_bytes(op: &SearchLogOp) -> usize {
+    match op {
+        SearchLogOp::Index(doc) => {
+            let tags_len: usize = doc.tags.iter().map(String::len).sum();
+            doc.namespace
+                .len()
+                .saturating_add(doc.doc_id.len())
+                .saturating_add(doc.kind.len())
+                .saturating_add(doc.title.len())
+                .saturating_add(tags_len)
+                .saturating_add(doc.body.len())
+                .saturating_add(64)
+        }
+        SearchLogOp::Delete { namespace, doc_id } => {
+            namespace.len().saturating_add(doc_id.len()).saturating_add(32)
+        }
+        SearchLogOp::RevokePrefix { namespace, prefix } => {
+            namespace.len().saturating_add(prefix.len()).saturating_add(32)
+        }
     }
 }
 

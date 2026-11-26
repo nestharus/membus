@@ -1,4 +1,7 @@
-use crate::types::{MembusError, RecordMeta, SignalEvent, SignalKind, StoredRecord};
+use crate::types::{
+    validate_namespace, MembusError, RecordMeta, SearchDocument, SearchLogOp, SearchVisibility,
+    SignalEvent, SignalKind, StoredRecord,
+};
 
 const RECORD_MAGIC: u8 = 0x4D;
 const RECORD_FORMAT_V2: u8 = 2;
@@ -6,7 +9,32 @@ pub const RECORD_HEADER_LEN: usize = 24;
 
 const LOG_MAGIC: u8 = 0x4C;
 const LOG_FORMAT_V2: u8 = 2;
+const LOG_FORMAT_V3: u8 = 3;
 const LOG_HEADER_LEN: usize = 26;
+
+/// Domain prefix separating legacy unscoped raw blobs from namespace-scoped CAS blobs in `CF_BLOB`.
+pub const BLOB_DOMAIN_RAW: u8 = 0x01;
+pub const BLOB_DOMAIN_CAS: u8 = 0x02;
+
+/// Encode a legacy unscoped raw blob key `[0x01][digest]`.
+pub fn encode_raw_blob_key(digest: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + digest.len());
+    out.push(BLOB_DOMAIN_RAW);
+    out.extend_from_slice(digest);
+    out
+}
+
+/// Encode a namespace-scoped CAS blob key `[0x02][u32_be ns_len][ns][sha256: 32B]`.
+pub fn encode_cas_blob_key(namespace: &str, sha256: &[u8; 32]) -> Result<Vec<u8>, MembusError> {
+    validate_namespace(namespace)?;
+    let ns_b = namespace.as_bytes();
+    let mut out = Vec::with_capacity(1 + 4 + ns_b.len() + 32);
+    out.push(BLOB_DOMAIN_CAS);
+    out.extend_from_slice(&(ns_b.len() as u32).to_be_bytes());
+    out.extend_from_slice(ns_b);
+    out.extend_from_slice(sha256);
+    Ok(out)
+}
 
 /// Encode `(namespace, key)` as `[u32_be ns_len][ns_bytes][key_bytes]`.
 ///
@@ -187,8 +215,23 @@ pub fn decode_log_seq(raw: &[u8]) -> Result<u64, MembusError> {
     ]))
 }
 
-/// Encode a commit log entry storing all signal events for one atomic commit.
+/// Encode a commit log entry storing signal events (v2 compatibility wrapper).
 pub fn encode_log_entry(epoch: u64, seq: u64, events: &[SignalEvent]) -> Vec<u8> {
+    encode_log_entry_with_search(epoch, seq, events, &[])
+}
+
+/// Encode a commit log entry storing both signal events and optional search mutations.
+pub fn encode_log_entry_with_search(
+    epoch: u64,
+    seq: u64,
+    events: &[SignalEvent],
+    search_ops: &[SearchLogOp],
+) -> Vec<u8> {
+    let format_ver = if search_ops.is_empty() {
+        LOG_FORMAT_V2
+    } else {
+        LOG_FORMAT_V3
+    };
     let body_capacity: usize = events
         .iter()
         .map(|ev| {
@@ -201,7 +244,7 @@ pub fn encode_log_entry(epoch: u64, seq: u64, events: &[SignalEvent]) -> Vec<u8>
                 + ev.value_hint.as_ref().map_or(0, |h| 4 + h.len())
         })
         .sum();
-    let mut body = Vec::with_capacity(20 + body_capacity);
+    let mut body = Vec::with_capacity(24 + body_capacity);
     body.extend_from_slice(&epoch.to_be_bytes());
     body.extend_from_slice(&seq.to_be_bytes());
     body.extend_from_slice(&(events.len() as u32).to_be_bytes());
@@ -221,32 +264,47 @@ pub fn encode_log_entry(epoch: u64, seq: u64, events: &[SignalEvent]) -> Vec<u8>
             None => body.push(0),
         }
     }
+    if format_ver == LOG_FORMAT_V3 {
+        body.extend_from_slice(&(search_ops.len() as u32).to_be_bytes());
+        for op in search_ops {
+            encode_search_log_op(op, &mut body);
+        }
+    }
 
     let mut hasher = crc32fast::Hasher::new();
-    hasher.update(&[LOG_MAGIC, LOG_FORMAT_V2]);
+    hasher.update(&[LOG_MAGIC, format_ver]);
     hasher.update(&body);
     let crc = hasher.finalize();
 
     let mut out = Vec::with_capacity(6 + body.len());
     out.push(LOG_MAGIC);
-    out.push(LOG_FORMAT_V2);
+    out.push(format_ver);
     out.extend_from_slice(&crc.to_be_bytes());
     out.extend_from_slice(&body);
     out
 }
 
-/// Decode and CRC-verify a commit log entry from the `log` CF.
+/// Decode and CRC-verify signal events from a `CF_LOG` commit entry.
 pub fn decode_log_entry(raw: &[u8]) -> Result<Vec<SignalEvent>, MembusError> {
+    let (_epoch, _seq, events, _search_ops) = decode_log_entry_full(raw)?;
+    Ok(events)
+}
+
+/// Decode and CRC-verify `(epoch, seq, events, search_ops)` from a `CF_LOG` entry.
+pub fn decode_log_entry_full(
+    raw: &[u8],
+) -> Result<(u64, u64, Vec<SignalEvent>, Vec<SearchLogOp>), MembusError> {
     if raw.len() < LOG_HEADER_LEN {
         return Err(MembusError::Corruption(format!(
             "log entry shorter than {LOG_HEADER_LEN} bytes: {}",
             raw.len()
         )));
     }
-    if raw[0] != LOG_MAGIC || raw[1] != LOG_FORMAT_V2 {
+    let format_ver = raw[1];
+    if raw[0] != LOG_MAGIC || (format_ver != LOG_FORMAT_V2 && format_ver != LOG_FORMAT_V3) {
         return Err(MembusError::Corruption(format!(
-            "unexpected log entry magic/version: 0x{:02x}/{}",
-            raw[0], raw[1]
+            "unexpected log entry magic/version: 0x{:02x}/{format_ver}",
+            raw[0]
         )));
     }
     let stored_crc = u32::from_be_bytes([raw[2], raw[3], raw[4], raw[5]]);
@@ -265,7 +323,7 @@ pub fn decode_log_entry(raw: &[u8]) -> Result<Vec<SignalEvent>, MembusError> {
     let seq = read_u64(&mut cur)?;
     let count = read_u32(&mut cur)? as usize;
 
-    let mut events = Vec::with_capacity(count.min(1024));
+    let mut events = Vec::with_capacity(count.min(cur.len()).min(256));
     for _ in 0..count {
         let kind = SignalKind::from_u8(read_u8(&mut cur)?)?;
         let version = read_u64(&mut cur)?;
@@ -299,13 +357,103 @@ pub fn decode_log_entry(raw: &[u8]) -> Result<Vec<SignalEvent>, MembusError> {
             value_hint,
         });
     }
+
+    let mut search_ops = Vec::new();
+    if format_ver == LOG_FORMAT_V3 {
+        let op_count = read_u32(&mut cur)? as usize;
+        search_ops.reserve(op_count.min(cur.len()).min(256));
+        for _ in 0..op_count {
+            search_ops.push(decode_search_log_op(&mut cur)?);
+        }
+    }
+
     if !cur.is_empty() {
         return Err(MembusError::Corruption(format!(
             "trailing {} bytes in log entry",
             cur.len()
         )));
     }
-    Ok(events)
+    Ok((epoch, seq, events, search_ops))
+}
+
+fn encode_search_log_op(op: &SearchLogOp, out: &mut Vec<u8>) {
+    match op {
+        SearchLogOp::Index(doc) => {
+            out.push(1);
+            push_str32(out, &doc.namespace);
+            push_str32(out, &doc.doc_id);
+            push_str32(out, &doc.kind);
+            push_str32(out, &doc.title);
+            out.extend_from_slice(&(doc.tags.len() as u32).to_be_bytes());
+            for tag in &doc.tags {
+                push_str32(out, tag);
+            }
+            push_str32(out, &doc.body);
+            out.push(doc.visibility as u8);
+        }
+        SearchLogOp::Delete { namespace, doc_id } => {
+            out.push(2);
+            push_str32(out, namespace);
+            push_str32(out, doc_id);
+        }
+        SearchLogOp::RevokePrefix { namespace, prefix } => {
+            out.push(3);
+            push_str32(out, namespace);
+            push_str32(out, prefix);
+        }
+    }
+}
+
+fn decode_search_log_op(cur: &mut &[u8]) -> Result<SearchLogOp, MembusError> {
+    match read_u8(cur)? {
+        1 => {
+            let namespace = read_str32(cur)?;
+            let doc_id = read_str32(cur)?;
+            let kind = read_str32(cur)?;
+            let title = read_str32(cur)?;
+            let tag_count = read_u32(cur)? as usize;
+            let mut tags = Vec::with_capacity(tag_count.min(cur.len() / 4).min(256));
+            for _ in 0..tag_count {
+                tags.push(read_str32(cur)?);
+            }
+            let body = read_str32(cur)?;
+            let visibility = SearchVisibility::from_u8(read_u8(cur)?)
+                .map_err(|e| MembusError::Corruption(e.to_string()))?;
+            Ok(SearchLogOp::Index(SearchDocument {
+                namespace,
+                doc_id,
+                kind,
+                title,
+                tags,
+                body,
+                visibility,
+            }))
+        }
+        2 => Ok(SearchLogOp::Delete {
+            namespace: read_str32(cur)?,
+            doc_id: read_str32(cur)?,
+        }),
+        3 => Ok(SearchLogOp::RevokePrefix {
+            namespace: read_str32(cur)?,
+            prefix: read_str32(cur)?,
+        }),
+        other => Err(MembusError::Corruption(format!(
+            "unknown search log op tag: {other}"
+        ))),
+    }
+}
+
+fn push_str32(out: &mut Vec<u8>, s: &str) {
+    out.extend_from_slice(&(s.len() as u32).to_be_bytes());
+    out.extend_from_slice(s.as_bytes());
+}
+
+fn read_str32(cur: &mut &[u8]) -> Result<String, MembusError> {
+    let len = read_u32(cur)? as usize;
+    let bytes = read_slice(cur, len)?;
+    std::str::from_utf8(bytes)
+        .map(str::to_owned)
+        .map_err(|err| MembusError::Corruption(format!("log entry utf8 error: {err}")))
 }
 
 fn read_u8(cur: &mut &[u8]) -> Result<u8, MembusError> {

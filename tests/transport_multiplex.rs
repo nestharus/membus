@@ -89,7 +89,7 @@ fn cli_argument_parser_handles_serve_health_and_checkpoint() {
     assert!(matches!(serve, Command::Serve(args) if args.max_in_flight_ops == Some(1024)));
 
     let health = parse_args(["health", "--tcp", "127.0.0.1:7420"]).expect("parse health");
-    assert!(matches!(health, Command::Health(Endpoint::Tcp(_))));
+    assert!(matches!(health, Command::Health(c) if matches!(c.endpoint, Endpoint::Tcp(_))));
 
     let ckpt = parse_args([
         "checkpoint",

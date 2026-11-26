@@ -1,8 +1,12 @@
 use bytes::{BufMut, Bytes, BytesMut};
+use serde::{Deserialize, Serialize};
 
+use crate::index::{BfsOptions, NeighborQueryOptions, OrderedQueryOptions};
 use crate::types::{
-    Ack, CommitResult, ExpectedVersion, HealthStatus, MembusError, MutationOp, RecordMeta,
-    ScanOptions, ScanPage, SignalEvent, SignalKind, StoredRecord, VersionGuard, WriteMutation,
+    sanitize_score, Ack, BfsResult, CollectionDescriptor, CommitResult, ExpectedVersion,
+    HealthStatus, IndexMutations, IndexedMutation, LeaseGrant, LeaseInfo, MembusError, MutationOp,
+    NeighborPage, OrderedIndexPage, RecordMeta, ScanOptions, ScanPage, SearchDocument, SearchLogOp,
+    SearchPage, SearchQuery, SignalEvent, SignalKind, StoredRecord, VersionGuard, WriteMutation,
 };
 
 const OP_GET: u8 = 1;
@@ -20,6 +24,32 @@ const OP_CHECKPOINT: u8 = 12;
 const OP_HEALTH: u8 = 13;
 const OP_PUT_BLOB: u8 = 14;
 const OP_GET_BLOB: u8 = 15;
+pub(crate) const OP_AUTHENTICATE: u8 = 16;
+const OP_PUT_INDEXED: u8 = 17;
+const OP_REMOVE_INDEXED: u8 = 18;
+const OP_COMMIT_INDEXED_TX: u8 = 19;
+const OP_QUERY_ORDERED_INDEX: u8 = 20;
+const OP_QUERY_NEIGHBORS: u8 = 21;
+const OP_BFS_TRAVERSE: u8 = 22;
+const OP_PUT_CAS_BLOB: u8 = 23;
+const OP_GET_CAS_BLOB: u8 = 24;
+const OP_HAS_CAS_BLOB: u8 = 25;
+const OP_ACQUIRE_LEASE: u8 = 26;
+const OP_RENEW_LEASE: u8 = 27;
+const OP_RELEASE_LEASE: u8 = 28;
+const OP_INSPECT_LEASE: u8 = 29;
+const OP_VALIDATE_LEASE: u8 = 30;
+const OP_REGISTER_COLLECTION: u8 = 31;
+const OP_GET_COLLECTION: u8 = 32;
+const OP_LIST_COLLECTIONS: u8 = 33;
+const OP_GET_COLLECTION_VERSION: u8 = 34;
+const OP_BEGIN_MIGRATION: u8 = 35;
+const OP_COMMIT_MIGRATION: u8 = 36;
+const OP_ABORT_MIGRATION: u8 = 37;
+const OP_INDEX_DOCUMENT: u8 = 38;
+const OP_DELETE_SEARCH_DOCUMENT: u8 = 39;
+const OP_REVOKE_SEARCH_PREFIX: u8 = 40;
+const OP_SEARCH: u8 = 41;
 
 const RESP_GET: u8 = 1;
 const RESP_GET_MANY: u8 = 2;
@@ -31,6 +61,18 @@ const RESP_SUBSCRIBED: u8 = 7;
 const RESP_CHECKPOINT: u8 = 8;
 const RESP_HEALTH: u8 = 9;
 const RESP_BLOB: u8 = 10;
+const RESP_AUTHENTICATED: u8 = 11;
+const RESP_ORDERED_INDEX: u8 = 12;
+const RESP_NEIGHBORS: u8 = 13;
+const RESP_BFS: u8 = 14;
+const RESP_CAS_BLOB_DIGEST: u8 = 15;
+const RESP_BOOL: u8 = 16;
+const RESP_LEASE: u8 = 17;
+const RESP_OPT_LEASE: u8 = 18;
+const RESP_COLLECTION: u8 = 19;
+const RESP_OPT_COLLECTION: u8 = 20;
+const RESP_COLLECTIONS: u8 = 21;
+const RESP_SEARCH: u8 = 22;
 const RESP_ERROR: u8 = 255;
 
 const ERR_INVALID_ARG: u8 = 1;
@@ -45,6 +87,8 @@ const ERR_PROTOCOL: u8 = 9;
 const ERR_IO: u8 = 10;
 const ERR_CLOSED: u8 = 11;
 const ERR_FRAME_TOO_LARGE: u8 = 12;
+const ERR_UNAUTHORIZED: u8 = 13;
+const ERR_LEASE_HELD: u8 = 14;
 
 const MAX_BATCH_ITEMS: usize = 65_536;
 
@@ -119,10 +163,142 @@ pub enum Request {
     GetBlob {
         digest: Vec<u8>,
     },
+    Authenticate {
+        token: String,
+    },
+    PutIndexed {
+        namespace: String,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        ack: Ack,
+        expected: ExpectedVersion,
+        indexes: Option<IndexMutations>,
+        search_op: Option<SearchLogOp>,
+    },
+    RemoveIndexed {
+        namespace: String,
+        key: Vec<u8>,
+        ack: Ack,
+        expected: ExpectedVersion,
+        search_op: Option<SearchLogOp>,
+    },
+    CommitIndexedTx {
+        ack: Ack,
+        guards: Vec<VersionGuard>,
+        mutations: Vec<IndexedMutation>,
+    },
+    QueryOrderedIndex {
+        namespace: String,
+        index_id: String,
+        options: OrderedQueryOptions,
+        snapshot_id: Option<u64>,
+    },
+    QueryNeighbors {
+        namespace: String,
+        index_id: String,
+        node_id: Vec<u8>,
+        options: NeighborQueryOptions,
+        snapshot_id: Option<u64>,
+    },
+    BfsTraverse {
+        namespace: String,
+        index_id: String,
+        seed_node: Vec<u8>,
+        options: BfsOptions,
+        snapshot_id: Option<u64>,
+    },
+    PutCasBlob {
+        namespace: String,
+        data: Vec<u8>,
+        ack: Ack,
+    },
+    GetCasBlob {
+        namespace: String,
+        sha256: [u8; 32],
+    },
+    HasCasBlob {
+        namespace: String,
+        sha256: [u8; 32],
+    },
+    AcquireLease {
+        namespace: String,
+        resource: String,
+        holder: String,
+        ttl_ms: u64,
+    },
+    RenewLease {
+        namespace: String,
+        resource: String,
+        holder: String,
+        generation: u64,
+        token: String,
+        ttl_ms: u64,
+    },
+    ReleaseLease {
+        namespace: String,
+        resource: String,
+        holder: String,
+        generation: u64,
+        token: String,
+    },
+    InspectLease {
+        namespace: String,
+        resource: String,
+    },
+    ValidateLease {
+        namespace: String,
+        resource: String,
+        holder: String,
+        generation: u64,
+        token: String,
+    },
+    RegisterCollection {
+        expected_version: Option<u32>,
+        descriptor: CollectionDescriptor,
+    },
+    GetCollection {
+        namespace: String,
+    },
+    ListCollections,
+    GetCollectionVersion {
+        namespace: String,
+        version: u32,
+    },
+    BeginMigration {
+        namespace: String,
+        expected_version: u32,
+        target_version: u32,
+        target_sha256: [u8; 32],
+        target_schema_bytes: Vec<u8>,
+    },
+    CommitMigration {
+        namespace: String,
+        target_version: u32,
+        verified_through: u64,
+    },
+    AbortMigration {
+        namespace: String,
+        target_version: u32,
+    },
+    IndexDocument {
+        doc: SearchDocument,
+        ack: Ack,
+    },
+    DeleteSearchDocument {
+        namespace: String,
+        doc_id: String,
+        ack: Ack,
+    },
+    RevokeSearchPrefix {
+        namespace: String,
+        prefix: String,
+        ack: Ack,
+    },
+    Search(SearchQuery),
 }
 
 /// Strongly-typed RPC response carried in `FrameKind::Response`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Response {
     Get(Option<StoredRecord>),
     GetMany(Vec<Option<StoredRecord>>),
@@ -134,6 +310,18 @@ pub enum Response {
     Checkpoint { seq: u64 },
     Health(HealthStatus),
     Blob(Option<Vec<u8>>),
+    Authenticated { principal_id: String },
+    OrderedIndex(OrderedIndexPage),
+    Neighbors(NeighborPage),
+    Bfs(BfsResult),
+    CasBlobDigest([u8; 32]),
+    Bool(bool),
+    Lease(LeaseGrant),
+    OptLease(Option<LeaseInfo>),
+    Collection(CollectionDescriptor),
+    OptCollection(Option<CollectionDescriptor>),
+    Collections(Vec<CollectionDescriptor>),
+    Search(SearchPage),
     Error(MembusError),
 }
 
@@ -303,6 +491,262 @@ pub fn encode_request(req: &Request) -> Result<Bytes, MembusError> {
         Request::GetBlob { digest } => {
             buf.put_u8(OP_GET_BLOB);
             put_bytes(&mut buf, digest);
+        }
+        Request::Authenticate { token } => {
+            buf.put_u8(OP_AUTHENTICATE);
+            put_str(&mut buf, token);
+        }
+        Request::PutIndexed {
+            namespace,
+            key,
+            value,
+            ack,
+            expected,
+            indexes,
+            search_op,
+        } => {
+            buf.put_u8(OP_PUT_INDEXED);
+            put_str(&mut buf, namespace);
+            put_bytes(&mut buf, key);
+            put_bytes(&mut buf, value);
+            buf.put_u8(*ack as u8);
+            put_expected(&mut buf, *expected);
+            put_json(&mut buf, &(indexes, search_op))?;
+        }
+        Request::RemoveIndexed {
+            namespace,
+            key,
+            ack,
+            expected,
+            search_op,
+        } => {
+            buf.put_u8(OP_REMOVE_INDEXED);
+            put_str(&mut buf, namespace);
+            put_bytes(&mut buf, key);
+            buf.put_u8(*ack as u8);
+            put_expected(&mut buf, *expected);
+            put_json(&mut buf, search_op)?;
+        }
+        Request::CommitIndexedTx {
+            ack,
+            guards,
+            mutations,
+        } => {
+            if guards.len() > MAX_BATCH_ITEMS || mutations.len() > MAX_BATCH_ITEMS {
+                return Err(MembusError::InvalidArgument(format!(
+                    "commit_indexed_tx batch size exceeds maximum {MAX_BATCH_ITEMS}"
+                )));
+            }
+            buf.put_u8(OP_COMMIT_INDEXED_TX);
+            buf.put_u8(*ack as u8);
+            put_json(&mut buf, &(guards, mutations))?;
+        }
+        Request::QueryOrderedIndex {
+            namespace,
+            index_id,
+            options,
+            snapshot_id,
+        } => {
+            buf.put_u8(OP_QUERY_ORDERED_INDEX);
+            put_str(&mut buf, namespace);
+            put_str(&mut buf, index_id);
+            let wire_opts = WireOrderedQueryOptions::from_options(options)?;
+            put_json(&mut buf, &wire_opts)?;
+            put_opt_u64(&mut buf, *snapshot_id);
+        }
+        Request::QueryNeighbors {
+            namespace,
+            index_id,
+            node_id,
+            options,
+            snapshot_id,
+        } => {
+            buf.put_u8(OP_QUERY_NEIGHBORS);
+            put_str(&mut buf, namespace);
+            put_str(&mut buf, index_id);
+            put_bytes(&mut buf, node_id);
+            let wire_opts = WireNeighborQueryOptions::from_options(options)?;
+            put_json(&mut buf, &wire_opts)?;
+            put_opt_u64(&mut buf, *snapshot_id);
+        }
+        Request::BfsTraverse {
+            namespace,
+            index_id,
+            seed_node,
+            options,
+            snapshot_id,
+        } => {
+            buf.put_u8(OP_BFS_TRAVERSE);
+            put_str(&mut buf, namespace);
+            put_str(&mut buf, index_id);
+            put_bytes(&mut buf, seed_node);
+            let wire_opts = WireBfsOptions::from_options(options)?;
+            put_json(&mut buf, &wire_opts)?;
+            put_opt_u64(&mut buf, *snapshot_id);
+        }
+        Request::PutCasBlob {
+            namespace,
+            data,
+            ack,
+        } => {
+            buf.put_u8(OP_PUT_CAS_BLOB);
+            put_str(&mut buf, namespace);
+            put_bytes(&mut buf, data);
+            buf.put_u8(*ack as u8);
+        }
+        Request::GetCasBlob { namespace, sha256 } => {
+            buf.put_u8(OP_GET_CAS_BLOB);
+            put_str(&mut buf, namespace);
+            buf.put_slice(sha256);
+        }
+        Request::HasCasBlob { namespace, sha256 } => {
+            buf.put_u8(OP_HAS_CAS_BLOB);
+            put_str(&mut buf, namespace);
+            buf.put_slice(sha256);
+        }
+        Request::AcquireLease {
+            namespace,
+            resource,
+            holder,
+            ttl_ms,
+        } => {
+            buf.put_u8(OP_ACQUIRE_LEASE);
+            put_str(&mut buf, namespace);
+            put_str(&mut buf, resource);
+            put_str(&mut buf, holder);
+            buf.put_u64(*ttl_ms);
+        }
+        Request::RenewLease {
+            namespace,
+            resource,
+            holder,
+            generation,
+            token,
+            ttl_ms,
+        } => {
+            buf.put_u8(OP_RENEW_LEASE);
+            put_str(&mut buf, namespace);
+            put_str(&mut buf, resource);
+            put_str(&mut buf, holder);
+            buf.put_u64(*generation);
+            put_str(&mut buf, token);
+            buf.put_u64(*ttl_ms);
+        }
+        Request::ReleaseLease {
+            namespace,
+            resource,
+            holder,
+            generation,
+            token,
+        } => {
+            buf.put_u8(OP_RELEASE_LEASE);
+            put_str(&mut buf, namespace);
+            put_str(&mut buf, resource);
+            put_str(&mut buf, holder);
+            buf.put_u64(*generation);
+            put_str(&mut buf, token);
+        }
+        Request::InspectLease {
+            namespace,
+            resource,
+        } => {
+            buf.put_u8(OP_INSPECT_LEASE);
+            put_str(&mut buf, namespace);
+            put_str(&mut buf, resource);
+        }
+        Request::ValidateLease {
+            namespace,
+            resource,
+            holder,
+            generation,
+            token,
+        } => {
+            buf.put_u8(OP_VALIDATE_LEASE);
+            put_str(&mut buf, namespace);
+            put_str(&mut buf, resource);
+            put_str(&mut buf, holder);
+            buf.put_u64(*generation);
+            put_str(&mut buf, token);
+        }
+        Request::RegisterCollection {
+            expected_version,
+            descriptor,
+        } => {
+            buf.put_u8(OP_REGISTER_COLLECTION);
+            put_json(&mut buf, &(expected_version, descriptor))?;
+        }
+        Request::GetCollection { namespace } => {
+            buf.put_u8(OP_GET_COLLECTION);
+            put_str(&mut buf, namespace);
+        }
+        Request::ListCollections => {
+            buf.put_u8(OP_LIST_COLLECTIONS);
+        }
+        Request::GetCollectionVersion { namespace, version } => {
+            buf.put_u8(OP_GET_COLLECTION_VERSION);
+            put_str(&mut buf, namespace);
+            buf.put_u32(*version);
+        }
+        Request::BeginMigration {
+            namespace,
+            expected_version,
+            target_version,
+            target_sha256,
+            target_schema_bytes,
+        } => {
+            buf.put_u8(OP_BEGIN_MIGRATION);
+            put_str(&mut buf, namespace);
+            buf.put_u32(*expected_version);
+            buf.put_u32(*target_version);
+            buf.put_slice(target_sha256);
+            put_bytes(&mut buf, target_schema_bytes);
+        }
+        Request::CommitMigration {
+            namespace,
+            target_version,
+            verified_through,
+        } => {
+            buf.put_u8(OP_COMMIT_MIGRATION);
+            put_str(&mut buf, namespace);
+            buf.put_u32(*target_version);
+            buf.put_u64(*verified_through);
+        }
+        Request::AbortMigration {
+            namespace,
+            target_version,
+        } => {
+            buf.put_u8(OP_ABORT_MIGRATION);
+            put_str(&mut buf, namespace);
+            buf.put_u32(*target_version);
+        }
+        Request::IndexDocument { doc, ack } => {
+            buf.put_u8(OP_INDEX_DOCUMENT);
+            buf.put_u8(*ack as u8);
+            put_json(&mut buf, doc)?;
+        }
+        Request::DeleteSearchDocument {
+            namespace,
+            doc_id,
+            ack,
+        } => {
+            buf.put_u8(OP_DELETE_SEARCH_DOCUMENT);
+            put_str(&mut buf, namespace);
+            put_str(&mut buf, doc_id);
+            buf.put_u8(*ack as u8);
+        }
+        Request::RevokeSearchPrefix {
+            namespace,
+            prefix,
+            ack,
+        } => {
+            buf.put_u8(OP_REVOKE_SEARCH_PREFIX);
+            put_str(&mut buf, namespace);
+            put_str(&mut buf, prefix);
+            buf.put_u8(*ack as u8);
+        }
+        Request::Search(query) => {
+            buf.put_u8(OP_SEARCH);
+            put_json(&mut buf, query)?;
         }
     }
     Ok(buf.freeze())
@@ -474,6 +918,196 @@ pub fn decode_request(raw: &[u8]) -> Result<Request, MembusError> {
         OP_GET_BLOB => Request::GetBlob {
             digest: take_bytes(&mut cur)?,
         },
+        OP_AUTHENTICATE => Request::Authenticate {
+            token: take_string(&mut cur)?,
+        },
+        OP_PUT_INDEXED => {
+            let namespace = take_string(&mut cur)?;
+            let key = take_bytes(&mut cur)?;
+            let value = take_bytes(&mut cur)?;
+            let ack = Ack::from_u8(take_u8(&mut cur)?)?;
+            let expected = take_expected(&mut cur)?;
+            let (indexes, search_op): (Option<IndexMutations>, Option<SearchLogOp>) =
+                take_json(&mut cur)?;
+            Request::PutIndexed {
+                namespace,
+                key,
+                value,
+                ack,
+                expected,
+                indexes,
+                search_op,
+            }
+        }
+        OP_REMOVE_INDEXED => {
+            let namespace = take_string(&mut cur)?;
+            let key = take_bytes(&mut cur)?;
+            let ack = Ack::from_u8(take_u8(&mut cur)?)?;
+            let expected = take_expected(&mut cur)?;
+            let search_op: Option<SearchLogOp> = take_json(&mut cur)?;
+            Request::RemoveIndexed {
+                namespace,
+                key,
+                ack,
+                expected,
+                search_op,
+            }
+        }
+        OP_COMMIT_INDEXED_TX => {
+            let ack = Ack::from_u8(take_u8(&mut cur)?)?;
+            let (guards, mutations): (Vec<VersionGuard>, Vec<IndexedMutation>) =
+                take_json(&mut cur)?;
+            if guards.len() > MAX_BATCH_ITEMS || mutations.len() > MAX_BATCH_ITEMS {
+                return Err(MembusError::Protocol(format!(
+                    "commit_indexed_tx batch size exceeds maximum {MAX_BATCH_ITEMS}"
+                )));
+            }
+            Request::CommitIndexedTx {
+                ack,
+                guards,
+                mutations,
+            }
+        }
+        OP_QUERY_ORDERED_INDEX => {
+            let namespace = take_string(&mut cur)?;
+            let index_id = take_string(&mut cur)?;
+            let wire_opts: WireOrderedQueryOptions = take_json(&mut cur)?;
+            let snapshot_id = take_opt_u64(&mut cur)?;
+            Request::QueryOrderedIndex {
+                namespace,
+                index_id,
+                options: wire_opts.into_options(),
+                snapshot_id,
+            }
+        }
+        OP_QUERY_NEIGHBORS => {
+            let namespace = take_string(&mut cur)?;
+            let index_id = take_string(&mut cur)?;
+            let node_id = take_bytes(&mut cur)?;
+            let wire_opts: WireNeighborQueryOptions = take_json(&mut cur)?;
+            let snapshot_id = take_opt_u64(&mut cur)?;
+            Request::QueryNeighbors {
+                namespace,
+                index_id,
+                node_id,
+                options: wire_opts.into_options(),
+                snapshot_id,
+            }
+        }
+        OP_BFS_TRAVERSE => {
+            let namespace = take_string(&mut cur)?;
+            let index_id = take_string(&mut cur)?;
+            let seed_node = take_bytes(&mut cur)?;
+            let wire_opts: WireBfsOptions = take_json(&mut cur)?;
+            let snapshot_id = take_opt_u64(&mut cur)?;
+            Request::BfsTraverse {
+                namespace,
+                index_id,
+                seed_node,
+                options: wire_opts.into_options(),
+                snapshot_id,
+            }
+        }
+        OP_PUT_CAS_BLOB => {
+            let namespace = take_string(&mut cur)?;
+            let data = take_bytes(&mut cur)?;
+            let ack = Ack::from_u8(take_u8(&mut cur)?)?;
+            Request::PutCasBlob {
+                namespace,
+                data,
+                ack,
+            }
+        }
+        OP_GET_CAS_BLOB => {
+            let namespace = take_string(&mut cur)?;
+            let sha256 = take_sha256(&mut cur)?;
+            Request::GetCasBlob { namespace, sha256 }
+        }
+        OP_HAS_CAS_BLOB => {
+            let namespace = take_string(&mut cur)?;
+            let sha256 = take_sha256(&mut cur)?;
+            Request::HasCasBlob { namespace, sha256 }
+        }
+        OP_ACQUIRE_LEASE => Request::AcquireLease {
+            namespace: take_string(&mut cur)?,
+            resource: take_string(&mut cur)?,
+            holder: take_string(&mut cur)?,
+            ttl_ms: take_u64(&mut cur)?,
+        },
+        OP_RENEW_LEASE => Request::RenewLease {
+            namespace: take_string(&mut cur)?,
+            resource: take_string(&mut cur)?,
+            holder: take_string(&mut cur)?,
+            generation: take_u64(&mut cur)?,
+            token: take_string(&mut cur)?,
+            ttl_ms: take_u64(&mut cur)?,
+        },
+        OP_RELEASE_LEASE => Request::ReleaseLease {
+            namespace: take_string(&mut cur)?,
+            resource: take_string(&mut cur)?,
+            holder: take_string(&mut cur)?,
+            generation: take_u64(&mut cur)?,
+            token: take_string(&mut cur)?,
+        },
+        OP_INSPECT_LEASE => Request::InspectLease {
+            namespace: take_string(&mut cur)?,
+            resource: take_string(&mut cur)?,
+        },
+        OP_VALIDATE_LEASE => Request::ValidateLease {
+            namespace: take_string(&mut cur)?,
+            resource: take_string(&mut cur)?,
+            holder: take_string(&mut cur)?,
+            generation: take_u64(&mut cur)?,
+            token: take_string(&mut cur)?,
+        },
+        OP_REGISTER_COLLECTION => {
+            let (expected_version, descriptor): (Option<u32>, CollectionDescriptor) =
+                take_json(&mut cur)?;
+            Request::RegisterCollection {
+                expected_version,
+                descriptor,
+            }
+        }
+        OP_GET_COLLECTION => Request::GetCollection {
+            namespace: take_string(&mut cur)?,
+        },
+        OP_LIST_COLLECTIONS => Request::ListCollections,
+        OP_GET_COLLECTION_VERSION => Request::GetCollectionVersion {
+            namespace: take_string(&mut cur)?,
+            version: take_u32(&mut cur)?,
+        },
+        OP_BEGIN_MIGRATION => Request::BeginMigration {
+            namespace: take_string(&mut cur)?,
+            expected_version: take_u32(&mut cur)?,
+            target_version: take_u32(&mut cur)?,
+            target_sha256: take_sha256(&mut cur)?,
+            target_schema_bytes: take_bytes(&mut cur)?,
+        },
+        OP_COMMIT_MIGRATION => Request::CommitMigration {
+            namespace: take_string(&mut cur)?,
+            target_version: take_u32(&mut cur)?,
+            verified_through: take_u64(&mut cur)?,
+        },
+        OP_ABORT_MIGRATION => Request::AbortMigration {
+            namespace: take_string(&mut cur)?,
+            target_version: take_u32(&mut cur)?,
+        },
+        OP_INDEX_DOCUMENT => {
+            let ack = Ack::from_u8(take_u8(&mut cur)?)?;
+            let doc: SearchDocument = take_json(&mut cur)?;
+            Request::IndexDocument { doc, ack }
+        }
+        OP_DELETE_SEARCH_DOCUMENT => Request::DeleteSearchDocument {
+            namespace: take_string(&mut cur)?,
+            doc_id: take_string(&mut cur)?,
+            ack: Ack::from_u8(take_u8(&mut cur)?)?,
+        },
+        OP_REVOKE_SEARCH_PREFIX => Request::RevokeSearchPrefix {
+            namespace: take_string(&mut cur)?,
+            prefix: take_string(&mut cur)?,
+            ack: Ack::from_u8(take_u8(&mut cur)?)?,
+        },
+        OP_SEARCH => Request::Search(take_json(&mut cur)?),
         other => {
             return Err(MembusError::Protocol(format!(
                 "unknown request opcode: {other}"
@@ -562,6 +1196,58 @@ pub fn encode_response(resp: &Response) -> Bytes {
                 }
                 None => buf.put_u8(0),
             }
+        }
+        Response::Authenticated { principal_id } => {
+            buf.put_u8(RESP_AUTHENTICATED);
+            put_str(&mut buf, principal_id);
+        }
+        Response::OrderedIndex(page) => {
+            buf.put_u8(RESP_ORDERED_INDEX);
+            put_json_infallible(&mut buf, page);
+        }
+        Response::Neighbors(page) => {
+            buf.put_u8(RESP_NEIGHBORS);
+            put_json_infallible(&mut buf, page);
+        }
+        Response::Bfs(res) => {
+            buf.put_u8(RESP_BFS);
+            put_json_infallible(&mut buf, res);
+        }
+        Response::CasBlobDigest(digest) => {
+            buf.put_u8(RESP_CAS_BLOB_DIGEST);
+            buf.put_slice(digest);
+        }
+        Response::Bool(v) => {
+            buf.put_u8(RESP_BOOL);
+            buf.put_u8(u8::from(*v));
+        }
+        Response::Lease(grant) => {
+            buf.put_u8(RESP_LEASE);
+            put_json_infallible(&mut buf, grant);
+        }
+        Response::OptLease(grant) => {
+            buf.put_u8(RESP_OPT_LEASE);
+            put_json_infallible(&mut buf, grant);
+        }
+        Response::Collection(desc) => {
+            buf.put_u8(RESP_COLLECTION);
+            put_json_infallible(&mut buf, desc);
+        }
+        Response::OptCollection(desc) => {
+            buf.put_u8(RESP_OPT_COLLECTION);
+            put_json_infallible(&mut buf, desc);
+        }
+        Response::Collections(list) => {
+            buf.put_u8(RESP_COLLECTIONS);
+            put_json_infallible(&mut buf, list);
+        }
+        Response::Search(page) => {
+            buf.put_u8(RESP_SEARCH);
+            let mut clean = page.clone();
+            for hit in &mut clean.hits {
+                hit.score = sanitize_score(hit.score);
+            }
+            put_json_infallible(&mut buf, &clean);
         }
         Response::Error(err) => {
             buf.put_u8(RESP_ERROR);
@@ -655,6 +1341,20 @@ pub fn decode_response(raw: &[u8]) -> Result<Response, MembusError> {
             };
             Response::Blob(blob)
         }
+        RESP_AUTHENTICATED => Response::Authenticated {
+            principal_id: take_string(&mut cur)?,
+        },
+        RESP_ORDERED_INDEX => Response::OrderedIndex(take_json(&mut cur)?),
+        RESP_NEIGHBORS => Response::Neighbors(take_json(&mut cur)?),
+        RESP_BFS => Response::Bfs(take_json(&mut cur)?),
+        RESP_CAS_BLOB_DIGEST => Response::CasBlobDigest(take_sha256(&mut cur)?),
+        RESP_BOOL => Response::Bool(take_u8(&mut cur)? != 0),
+        RESP_LEASE => Response::Lease(take_json(&mut cur)?),
+        RESP_OPT_LEASE => Response::OptLease(take_json(&mut cur)?),
+        RESP_COLLECTION => Response::Collection(take_json(&mut cur)?),
+        RESP_OPT_COLLECTION => Response::OptCollection(take_json(&mut cur)?),
+        RESP_COLLECTIONS => Response::Collections(take_json(&mut cur)?),
+        RESP_SEARCH => Response::Search(take_json(&mut cur)?),
         RESP_ERROR => Response::Error(take_error(&mut cur)?),
         other => {
             return Err(MembusError::Protocol(format!(
@@ -815,6 +1515,10 @@ fn put_error(buf: &mut BytesMut, err: &MembusError) {
             buf.put_u8(ERR_INVALID_ARG);
             put_str(buf, msg);
         }
+        MembusError::Unauthorized(msg) => {
+            buf.put_u8(ERR_UNAUTHORIZED);
+            put_str(buf, msg);
+        }
         MembusError::Conflict {
             namespace,
             key,
@@ -826,6 +1530,18 @@ fn put_error(buf: &mut BytesMut, err: &MembusError) {
             put_bytes(buf, key);
             put_expected(buf, *expected);
             put_opt_u64(buf, *actual);
+        }
+        MembusError::LeaseHeld {
+            resource,
+            holder,
+            generation,
+            expires_at_ms,
+        } => {
+            buf.put_u8(ERR_LEASE_HELD);
+            put_str(buf, resource);
+            put_str(buf, holder);
+            buf.put_u64(*generation);
+            buf.put_u64(*expires_at_ms);
         }
         MembusError::TxConflict(msg) => {
             buf.put_u8(ERR_TX_CONFLICT);
@@ -1008,11 +1724,18 @@ fn take_opt_record(cur: &mut &[u8]) -> Result<Option<StoredRecord>, MembusError>
 fn take_error(cur: &mut &[u8]) -> Result<MembusError, MembusError> {
     match take_u8(cur)? {
         ERR_INVALID_ARG => Ok(MembusError::InvalidArgument(take_string(cur)?)),
+        ERR_UNAUTHORIZED => Ok(MembusError::Unauthorized(take_string(cur)?)),
         ERR_CONFLICT => Ok(MembusError::Conflict {
             namespace: take_string(cur)?,
             key: take_bytes(cur)?,
             expected: take_expected(cur)?,
             actual: take_opt_u64(cur)?,
+        }),
+        ERR_LEASE_HELD => Ok(MembusError::LeaseHeld {
+            resource: take_string(cur)?,
+            holder: take_string(cur)?,
+            generation: take_u64(cur)?,
+            expires_at_ms: take_u64(cur)?,
         }),
         ERR_TX_CONFLICT => Ok(MembusError::TxConflict(take_string(cur)?)),
         ERR_BUSY => Ok(MembusError::Busy {
@@ -1047,5 +1770,146 @@ fn ensure_empty(cur: &[u8]) -> Result<(), MembusError> {
             "trailing {} bytes in wire message",
             cur.len()
         )))
+    }
+}
+
+fn put_json<T: Serialize>(buf: &mut BytesMut, val: &T) -> Result<(), MembusError> {
+    let bytes = serde_json::to_vec(val)
+        .map_err(|err| MembusError::Protocol(format!("wire JSON encode failed: {err}")))?;
+    put_bytes(buf, &bytes);
+    Ok(())
+}
+
+fn put_json_infallible<T: Serialize>(buf: &mut BytesMut, val: &T) {
+    let bytes = serde_json::to_vec(val).unwrap_or_default();
+    put_bytes(buf, &bytes);
+}
+
+fn take_json<T: for<'de> Deserialize<'de>>(cur: &mut &[u8]) -> Result<T, MembusError> {
+    let len = take_u32(cur)? as usize;
+    let slice = take_slice(cur, len)?;
+    serde_json::from_slice(slice)
+        .map_err(|err| MembusError::Protocol(format!("wire JSON decode failed: {err}")))
+}
+
+fn take_sha256(cur: &mut &[u8]) -> Result<[u8; 32], MembusError> {
+    let slice = take_slice(cur, 32)?;
+    let mut out = [0u8; 32];
+    out.copy_from_slice(slice);
+    Ok(out)
+}
+
+#[derive(Serialize, Deserialize)]
+enum WireOrderedFilter {
+    All,
+    Prefix(Vec<u8>),
+    Range { start: Vec<u8>, end: Vec<u8> },
+}
+
+#[derive(Serialize, Deserialize)]
+struct WireOrderedQueryOptions {
+    filter: WireOrderedFilter,
+    after_cursor: Option<Vec<u8>>,
+    limit: u32,
+    max_bytes: u64,
+}
+
+impl WireOrderedQueryOptions {
+    fn from_options(opts: &OrderedQueryOptions) -> Result<Self, MembusError> {
+        let limit = u32::try_from(opts.limit).map_err(|_| {
+            MembusError::InvalidArgument("ordered query limit exceeds u32".to_owned())
+        })?;
+        let filter = match &opts.filter {
+            crate::index::OrderedKeyFilter::All => WireOrderedFilter::All,
+            crate::index::OrderedKeyFilter::Prefix(p) => WireOrderedFilter::Prefix(p.clone()),
+            crate::index::OrderedKeyFilter::Range { start, end } => WireOrderedFilter::Range {
+                start: start.clone(),
+                end: end.clone(),
+            },
+        };
+        Ok(Self {
+            filter,
+            after_cursor: opts.after_cursor.clone(),
+            limit,
+            max_bytes: opts.max_bytes as u64,
+        })
+    }
+
+    fn into_options(self) -> OrderedQueryOptions {
+        let filter = match self.filter {
+            WireOrderedFilter::All => crate::index::OrderedKeyFilter::All,
+            WireOrderedFilter::Prefix(p) => crate::index::OrderedKeyFilter::Prefix(p),
+            WireOrderedFilter::Range { start, end } => {
+                crate::index::OrderedKeyFilter::Range { start, end }
+            }
+        };
+        OrderedQueryOptions {
+            filter,
+            after_cursor: self.after_cursor,
+            limit: self.limit as usize,
+            max_bytes: self.max_bytes as usize,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct WireNeighborQueryOptions {
+    direction: crate::types::GraphDirection,
+    rel_filter: Option<Vec<u8>>,
+    after_cursor: Option<Vec<u8>>,
+    limit: u32,
+}
+
+impl WireNeighborQueryOptions {
+    fn from_options(opts: &NeighborQueryOptions) -> Result<Self, MembusError> {
+        let limit = u32::try_from(opts.limit).map_err(|_| {
+            MembusError::InvalidArgument("neighbor query limit exceeds u32".to_owned())
+        })?;
+        Ok(Self {
+            direction: opts.direction,
+            rel_filter: opts.rel_filter.clone(),
+            after_cursor: opts.after_cursor.clone(),
+            limit,
+        })
+    }
+
+    fn into_options(self) -> NeighborQueryOptions {
+        NeighborQueryOptions {
+            direction: self.direction,
+            rel_filter: self.rel_filter,
+            after_cursor: self.after_cursor,
+            limit: self.limit as usize,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct WireBfsOptions {
+    direction: crate::types::GraphDirection,
+    rel_filter: Option<Vec<u8>>,
+    max_hops: u8,
+    max_nodes: u32,
+}
+
+impl WireBfsOptions {
+    fn from_options(opts: &BfsOptions) -> Result<Self, MembusError> {
+        let max_nodes = u32::try_from(opts.max_nodes).map_err(|_| {
+            MembusError::InvalidArgument("bfs max_nodes exceeds u32".to_owned())
+        })?;
+        Ok(Self {
+            direction: opts.direction,
+            rel_filter: opts.rel_filter.clone(),
+            max_hops: opts.max_hops,
+            max_nodes,
+        })
+    }
+
+    fn into_options(self) -> BfsOptions {
+        BfsOptions {
+            direction: self.direction,
+            rel_filter: self.rel_filter,
+            max_hops: self.max_hops,
+            max_nodes: self.max_nodes as usize,
+        }
     }
 }

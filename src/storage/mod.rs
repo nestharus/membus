@@ -5,8 +5,10 @@ pub mod rocksdb_engine;
 use std::path::Path;
 use std::time::Duration;
 
+use crate::index::{BfsOptions, NeighborQueryOptions, OrderedQueryOptions};
 use crate::types::{
-    Ack, CommitResult, ExpectedVersion, LogScanPage, MembusError, ScanOptions, ScanPage,
+    Ack, BfsResult, CommitResult, ExpectedVersion, IndexMutations, IndexedMutation, LogScanPage,
+    MembusError, NeighborPage, OrderedIndexPage, ScanOptions, ScanPage, SearchLogOp, SearchLogPage,
     SignalEvent, StoredRecord, VersionGuard, WalBatch, WriteMutation, DEFAULT_MAX_VALUE_BYTES,
 };
 
@@ -45,6 +47,16 @@ pub struct NoopPublisher;
 
 impl SignalPublisher for NoopPublisher {
     fn publish_ordered(&self, _events: &[SignalEvent]) {}
+}
+
+/// Raw `(key, value)` byte pair returned by low-level `CF_META` prefix scans.
+pub type RawKeyValue = (Vec<u8>, Vec<u8>);
+
+/// Atomic compare-and-swap precondition on a raw `CF_META` key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MetaCasGuard {
+    pub key: Vec<u8>,
+    pub expected: Option<Vec<u8>>,
 }
 
 /// Configuration for [`RocksDbStorage`].
@@ -110,6 +122,18 @@ pub trait StorageEngine: Send + Sync {
         expected: ExpectedVersion,
     ) -> Result<CommitResult, MembusError>;
 
+    #[allow(clippy::too_many_arguments)]
+    fn put_indexed(
+        &self,
+        namespace: &str,
+        key: &[u8],
+        value: &[u8],
+        ack: Ack,
+        expected: ExpectedVersion,
+        indexes: Option<&IndexMutations>,
+        search_op: Option<&SearchLogOp>,
+    ) -> Result<CommitResult, MembusError>;
+
     fn remove(
         &self,
         namespace: &str,
@@ -118,10 +142,26 @@ pub trait StorageEngine: Send + Sync {
         expected: ExpectedVersion,
     ) -> Result<CommitResult, MembusError>;
 
+    fn remove_indexed(
+        &self,
+        namespace: &str,
+        key: &[u8],
+        ack: Ack,
+        expected: ExpectedVersion,
+        search_op: Option<&SearchLogOp>,
+    ) -> Result<CommitResult, MembusError>;
+
     fn commit_tx(
         &self,
         guards: &[VersionGuard],
         mutations: &[WriteMutation],
+        ack: Ack,
+    ) -> Result<CommitResult, MembusError>;
+
+    fn commit_indexed_tx(
+        &self,
+        guards: &[VersionGuard],
+        mutations: &[IndexedMutation],
         ack: Ack,
     ) -> Result<CommitResult, MembusError>;
 
@@ -158,8 +198,47 @@ pub trait StorageEngine: Send + Sync {
         options: &ScanOptions,
     ) -> Result<ScanPage, MembusError>;
 
+    fn query_ordered_index(
+        &self,
+        snapshot: &OwnedSnapshot,
+        namespace: &str,
+        index_id: &str,
+        options: &OrderedQueryOptions,
+    ) -> Result<OrderedIndexPage, MembusError>;
+
+    fn query_neighbors(
+        &self,
+        snapshot: &OwnedSnapshot,
+        namespace: &str,
+        index_id: &str,
+        node_id: &[u8],
+        options: &NeighborQueryOptions,
+    ) -> Result<NeighborPage, MembusError>;
+
+    fn bfs_traverse(
+        &self,
+        snapshot: &OwnedSnapshot,
+        namespace: &str,
+        index_id: &str,
+        seed_node: &[u8],
+        options: &BfsOptions,
+    ) -> Result<BfsResult, MembusError>;
+
     fn put_blob(&self, digest: &[u8], data: &[u8], ack: Ack) -> Result<(), MembusError>;
     fn get_blob(&self, digest: &[u8]) -> Result<Option<Vec<u8>>, MembusError>;
+
+    fn put_cas_blob(
+        &self,
+        namespace: &str,
+        data: &[u8],
+        ack: Ack,
+    ) -> Result<[u8; 32], MembusError>;
+    fn get_cas_blob(
+        &self,
+        namespace: &str,
+        sha256: &[u8; 32],
+    ) -> Result<Option<Vec<u8>>, MembusError>;
+    fn has_cas_blob(&self, namespace: &str, sha256: &[u8; 32]) -> Result<bool, MembusError>;
 
     fn scan_log_after(
         &self,
@@ -167,7 +246,38 @@ pub trait StorageEngine: Send + Sync {
         limit: usize,
     ) -> Result<LogScanPage, MembusError>;
 
+    fn append_search_log_op(
+        &self,
+        op: SearchLogOp,
+        ack: Ack,
+    ) -> Result<CommitResult, MembusError>;
+
+    fn scan_search_log_after(
+        &self,
+        after_seq: u64,
+        limit: usize,
+    ) -> Result<SearchLogPage, MembusError>;
+
     fn trim_log_before(&self, keep_from_seq: u64) -> Result<(), MembusError>;
+
+    fn meta_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, MembusError>;
+    fn meta_put(&self, key: &[u8], value: &[u8], sync: bool) -> Result<(), MembusError>;
+    fn meta_scan_prefix(&self, prefix: &[u8]) -> Result<Vec<RawKeyValue>, MembusError>;
+    fn meta_cas_batch(
+        &self,
+        guards: &[MetaCasGuard],
+        puts: &[(Vec<u8>, Vec<u8>)],
+        deletes: &[Vec<u8>],
+        sync: bool,
+    ) -> Result<(), MembusError>;
+
+    fn lease_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, MembusError>;
+    fn lease_cas(
+        &self,
+        key: &[u8],
+        expected: Option<&[u8]>,
+        new_value: &[u8],
+    ) -> Result<(), MembusError>;
 
     fn create_checkpoint(&self, dest_dir: &Path) -> Result<u64, MembusError>;
     fn read_wal_since(&self, rocksdb_seq: u64, limit: usize) -> Result<Vec<WalBatch>, MembusError>;

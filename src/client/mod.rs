@@ -9,13 +9,17 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot, watch};
 
+use crate::index::{BfsOptions, NeighborQueryOptions, OrderedQueryOptions};
 use crate::protocol::{
     decode_response, decode_signal_event, decode_stream_end, encode_request, read_frame,
     run_batched_frame_writer, Frame, FrameKind, Request, Response, DEFAULT_MAX_FRAME_BODY,
 };
-use crate::transport::{connect_endpoint, Endpoint};
+use crate::transport::tls::connect_tcp_tls;
+use crate::transport::{connect_endpoint, Endpoint, TlsClientConfig};
 use crate::types::{
-    Ack, CommitResult, ExpectedVersion, HealthStatus, MembusError, ScanOptions, ScanPage,
+    Ack, BfsResult, CollectionDescriptor, CommitResult, ExpectedVersion, HealthStatus,
+    IndexMutations, IndexedMutation, LeaseGrant, LeaseInfo, MembusError, NeighborPage,
+    OrderedIndexPage, ScanOptions, ScanPage, SearchDocument, SearchLogOp, SearchPage, SearchQuery,
     SignalEvent, StoredRecord, VersionGuard, WriteMutation,
 };
 
@@ -72,8 +76,8 @@ struct ClientInner {
 /// Pipelined, multiplexed async `membus/2` client.
 ///
 /// Cheaply cloneable: hundreds or thousands of concurrent async tasks can share one
-/// underlying TCP or Windows Named Pipe connection with full RPC pipelining and live
-/// subscription push streams multiplexed by `stream_id`.
+/// underlying TCP, TLS/mTLS TCP, or Windows Named Pipe connection with full RPC pipelining
+/// and live subscription push streams multiplexed by `stream_id`.
 #[derive(Clone)]
 pub struct Client {
     inner: Arc<ClientInner>,
@@ -87,6 +91,14 @@ impl Client {
 
     pub async fn connect_tcp(addr: SocketAddr) -> Result<Self, MembusError> {
         Self::connect(&Endpoint::Tcp(addr)).await
+    }
+
+    pub async fn connect_tcp_tls(
+        addr: SocketAddr,
+        tls_cfg: &TlsClientConfig,
+    ) -> Result<Self, MembusError> {
+        let tls_stream = connect_tcp_tls(addr, tls_cfg).await?;
+        Ok(Self::from_stream(tls_stream, DEFAULT_MAX_FRAME_BODY))
     }
 
     pub async fn connect_named_pipe(pipe_name: &str) -> Result<Self, MembusError> {
@@ -129,8 +141,6 @@ impl Client {
 
         let reader_state = Arc::clone(&state);
         let reader_shutdown_tx = shutdown_tx;
-        // Downgrade so the reader task never keeps `outbound_rx` alive once all
-        // `Client` and `ClientSubscription` handles have been dropped.
         let reader_outbound = outbound_tx.downgrade();
         tokio::spawn(async move {
             let mut read_buf = BytesMut::with_capacity(64 * 1024);
@@ -162,8 +172,6 @@ impl Client {
                     }
                     FrameKind::StreamEvent => {
                         let decoded = decode_signal_event(&frame.payload);
-                        // Non-blocking try_send ensures a slow subscription can NEVER
-                        // stall unrelated RPCs or other subscriptions on the shared connection.
                         let lagged_stream = {
                             let mut guard = reader_state.lock();
                             if let Some(entry) = guard.active_streams.get(&frame.stream_id) {
@@ -245,6 +253,21 @@ impl Client {
         self.inner.state.lock().pending_rpcs.len()
     }
 
+    pub async fn authenticate(&self, token: &str) -> Result<String, MembusError> {
+        let resp = self
+            .call(Request::Authenticate {
+                token: token.to_owned(),
+            })
+            .await?;
+        match resp {
+            Response::Authenticated { principal_id } => Ok(principal_id),
+            Response::Error(e) => Err(e),
+            other => Err(MembusError::Protocol(format!(
+                "unexpected response for authenticate: {other:?}"
+            ))),
+        }
+    }
+
     pub async fn ping(&self) -> Result<(), MembusError> {
         let stream_id = self.alloc_stream_id();
         let (tx, rx) = oneshot::channel();
@@ -323,6 +346,37 @@ impl Client {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn put_indexed(
+        &self,
+        namespace: &str,
+        key: &[u8],
+        value: &[u8],
+        ack: Ack,
+        expected: ExpectedVersion,
+        indexes: Option<IndexMutations>,
+        search_op: Option<SearchLogOp>,
+    ) -> Result<CommitResult, MembusError> {
+        let resp = self
+            .call(Request::PutIndexed {
+                namespace: namespace.to_owned(),
+                key: key.to_vec(),
+                value: value.to_vec(),
+                ack,
+                expected,
+                indexes,
+                search_op,
+            })
+            .await?;
+        match resp {
+            Response::Commit(c) => Ok(c),
+            Response::Error(e) => Err(e),
+            other => Err(MembusError::Protocol(format!(
+                "unexpected response for put_indexed: {other:?}"
+            ))),
+        }
+    }
+
     pub async fn remove(
         &self,
         namespace: &str,
@@ -347,6 +401,32 @@ impl Client {
         }
     }
 
+    pub async fn remove_indexed(
+        &self,
+        namespace: &str,
+        key: &[u8],
+        ack: Ack,
+        expected: ExpectedVersion,
+        search_op: Option<SearchLogOp>,
+    ) -> Result<CommitResult, MembusError> {
+        let resp = self
+            .call(Request::RemoveIndexed {
+                namespace: namespace.to_owned(),
+                key: key.to_vec(),
+                ack,
+                expected,
+                search_op,
+            })
+            .await?;
+        match resp {
+            Response::Commit(c) => Ok(c),
+            Response::Error(e) => Err(e),
+            other => Err(MembusError::Protocol(format!(
+                "unexpected response for remove_indexed: {other:?}"
+            ))),
+        }
+    }
+
     pub async fn commit_tx(
         &self,
         guards: Vec<VersionGuard>,
@@ -365,6 +445,28 @@ impl Client {
             Response::Error(e) => Err(e),
             other => Err(MembusError::Protocol(format!(
                 "unexpected response for commit_tx: {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn commit_indexed_tx(
+        &self,
+        guards: Vec<VersionGuard>,
+        mutations: Vec<IndexedMutation>,
+        ack: Ack,
+    ) -> Result<CommitResult, MembusError> {
+        let resp = self
+            .call(Request::CommitIndexedTx {
+                ack,
+                guards,
+                mutations,
+            })
+            .await?;
+        match resp {
+            Response::Commit(c) => Ok(c),
+            Response::Error(e) => Err(e),
+            other => Err(MembusError::Protocol(format!(
+                "unexpected response for commit_indexed_tx: {other:?}"
             ))),
         }
     }
@@ -438,6 +540,82 @@ impl Client {
         }
     }
 
+    pub async fn query_ordered_index(
+        &self,
+        namespace: &str,
+        index_id: &str,
+        options: OrderedQueryOptions,
+        snapshot_id: Option<u64>,
+    ) -> Result<OrderedIndexPage, MembusError> {
+        let resp = self
+            .call(Request::QueryOrderedIndex {
+                namespace: namespace.to_owned(),
+                index_id: index_id.to_owned(),
+                options,
+                snapshot_id,
+            })
+            .await?;
+        match resp {
+            Response::OrderedIndex(page) => Ok(page),
+            Response::Error(e) => Err(e),
+            other => Err(MembusError::Protocol(format!(
+                "unexpected response for query_ordered_index: {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn query_neighbors(
+        &self,
+        namespace: &str,
+        index_id: &str,
+        node_id: &[u8],
+        options: NeighborQueryOptions,
+        snapshot_id: Option<u64>,
+    ) -> Result<NeighborPage, MembusError> {
+        let resp = self
+            .call(Request::QueryNeighbors {
+                namespace: namespace.to_owned(),
+                index_id: index_id.to_owned(),
+                node_id: node_id.to_vec(),
+                options,
+                snapshot_id,
+            })
+            .await?;
+        match resp {
+            Response::Neighbors(page) => Ok(page),
+            Response::Error(e) => Err(e),
+            other => Err(MembusError::Protocol(format!(
+                "unexpected response for query_neighbors: {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn bfs_traverse(
+        &self,
+        namespace: &str,
+        index_id: &str,
+        seed_node: &[u8],
+        options: BfsOptions,
+        snapshot_id: Option<u64>,
+    ) -> Result<BfsResult, MembusError> {
+        let resp = self
+            .call(Request::BfsTraverse {
+                namespace: namespace.to_owned(),
+                index_id: index_id.to_owned(),
+                seed_node: seed_node.to_vec(),
+                options,
+                snapshot_id,
+            })
+            .await?;
+        match resp {
+            Response::Bfs(res) => Ok(res),
+            Response::Error(e) => Err(e),
+            other => Err(MembusError::Protocol(format!(
+                "unexpected response for bfs_traverse: {other:?}"
+            ))),
+        }
+    }
+
     pub async fn put_blob(&self, digest: &[u8], data: &[u8], ack: Ack) -> Result<(), MembusError> {
         let resp = self
             .call(Request::PutBlob {
@@ -466,6 +644,399 @@ impl Client {
             Response::Error(e) => Err(e),
             other => Err(MembusError::Protocol(format!(
                 "unexpected response for get_blob: {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn put_cas_blob(
+        &self,
+        namespace: &str,
+        data: &[u8],
+        ack: Ack,
+    ) -> Result<[u8; 32], MembusError> {
+        let resp = self
+            .call(Request::PutCasBlob {
+                namespace: namespace.to_owned(),
+                data: data.to_vec(),
+                ack,
+            })
+            .await?;
+        match resp {
+            Response::CasBlobDigest(digest) => Ok(digest),
+            Response::Error(e) => Err(e),
+            other => Err(MembusError::Protocol(format!(
+                "unexpected response for put_cas_blob: {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn get_cas_blob(
+        &self,
+        namespace: &str,
+        sha256: [u8; 32],
+    ) -> Result<Option<Vec<u8>>, MembusError> {
+        let resp = self
+            .call(Request::GetCasBlob {
+                namespace: namespace.to_owned(),
+                sha256,
+            })
+            .await?;
+        match resp {
+            Response::Blob(data) => Ok(data),
+            Response::Error(e) => Err(e),
+            other => Err(MembusError::Protocol(format!(
+                "unexpected response for get_cas_blob: {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn has_cas_blob(
+        &self,
+        namespace: &str,
+        sha256: [u8; 32],
+    ) -> Result<bool, MembusError> {
+        let resp = self
+            .call(Request::HasCasBlob {
+                namespace: namespace.to_owned(),
+                sha256,
+            })
+            .await?;
+        match resp {
+            Response::Bool(exists) => Ok(exists),
+            Response::Error(e) => Err(e),
+            other => Err(MembusError::Protocol(format!(
+                "unexpected response for has_cas_blob: {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn acquire_lease(
+        &self,
+        namespace: &str,
+        resource: &str,
+        holder: &str,
+        ttl_ms: u64,
+    ) -> Result<LeaseGrant, MembusError> {
+        let resp = self
+            .call(Request::AcquireLease {
+                namespace: namespace.to_owned(),
+                resource: resource.to_owned(),
+                holder: holder.to_owned(),
+                ttl_ms,
+            })
+            .await?;
+        match resp {
+            Response::Lease(g) => Ok(g),
+            Response::Error(e) => Err(e),
+            other => Err(MembusError::Protocol(format!(
+                "unexpected response for acquire_lease: {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn renew_lease(
+        &self,
+        namespace: &str,
+        resource: &str,
+        holder: &str,
+        generation: u64,
+        token: &str,
+        ttl_ms: u64,
+    ) -> Result<LeaseGrant, MembusError> {
+        let resp = self
+            .call(Request::RenewLease {
+                namespace: namespace.to_owned(),
+                resource: resource.to_owned(),
+                holder: holder.to_owned(),
+                generation,
+                token: token.to_owned(),
+                ttl_ms,
+            })
+            .await?;
+        match resp {
+            Response::Lease(g) => Ok(g),
+            Response::Error(e) => Err(e),
+            other => Err(MembusError::Protocol(format!(
+                "unexpected response for renew_lease: {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn release_lease(
+        &self,
+        namespace: &str,
+        resource: &str,
+        holder: &str,
+        generation: u64,
+        token: &str,
+    ) -> Result<(), MembusError> {
+        let resp = self
+            .call(Request::ReleaseLease {
+                namespace: namespace.to_owned(),
+                resource: resource.to_owned(),
+                holder: holder.to_owned(),
+                generation,
+                token: token.to_owned(),
+            })
+            .await?;
+        match resp {
+            Response::Unit => Ok(()),
+            Response::Error(e) => Err(e),
+            other => Err(MembusError::Protocol(format!(
+                "unexpected response for release_lease: {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn inspect_lease(
+        &self,
+        namespace: &str,
+        resource: &str,
+    ) -> Result<Option<LeaseInfo>, MembusError> {
+        let resp = self
+            .call(Request::InspectLease {
+                namespace: namespace.to_owned(),
+                resource: resource.to_owned(),
+            })
+            .await?;
+        match resp {
+            Response::OptLease(g) => Ok(g),
+            Response::Error(e) => Err(e),
+            other => Err(MembusError::Protocol(format!(
+                "unexpected response for inspect_lease: {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn validate_lease(
+        &self,
+        namespace: &str,
+        resource: &str,
+        holder: &str,
+        generation: u64,
+        token: &str,
+    ) -> Result<bool, MembusError> {
+        let resp = self
+            .call(Request::ValidateLease {
+                namespace: namespace.to_owned(),
+                resource: resource.to_owned(),
+                holder: holder.to_owned(),
+                generation,
+                token: token.to_owned(),
+            })
+            .await?;
+        match resp {
+            Response::Bool(v) => Ok(v),
+            Response::Error(e) => Err(e),
+            other => Err(MembusError::Protocol(format!(
+                "unexpected response for validate_lease: {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn register_collection(
+        &self,
+        expected_version: Option<u32>,
+        descriptor: CollectionDescriptor,
+    ) -> Result<CollectionDescriptor, MembusError> {
+        let resp = self
+            .call(Request::RegisterCollection {
+                expected_version,
+                descriptor,
+            })
+            .await?;
+        match resp {
+            Response::Collection(c) => Ok(c),
+            Response::Error(e) => Err(e),
+            other => Err(MembusError::Protocol(format!(
+                "unexpected response for register_collection: {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn get_collection(
+        &self,
+        namespace: &str,
+    ) -> Result<Option<CollectionDescriptor>, MembusError> {
+        let resp = self
+            .call(Request::GetCollection {
+                namespace: namespace.to_owned(),
+            })
+            .await?;
+        match resp {
+            Response::OptCollection(c) => Ok(c),
+            Response::Error(e) => Err(e),
+            other => Err(MembusError::Protocol(format!(
+                "unexpected response for get_collection: {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn list_collections(&self) -> Result<Vec<CollectionDescriptor>, MembusError> {
+        let resp = self.call(Request::ListCollections).await?;
+        match resp {
+            Response::Collections(list) => Ok(list),
+            Response::Error(e) => Err(e),
+            other => Err(MembusError::Protocol(format!(
+                "unexpected response for list_collections: {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn get_collection_version(
+        &self,
+        namespace: &str,
+        version: u32,
+    ) -> Result<Option<CollectionDescriptor>, MembusError> {
+        let resp = self
+            .call(Request::GetCollectionVersion {
+                namespace: namespace.to_owned(),
+                version,
+            })
+            .await?;
+        match resp {
+            Response::OptCollection(c) => Ok(c),
+            Response::Error(e) => Err(e),
+            other => Err(MembusError::Protocol(format!(
+                "unexpected response for get_collection_version: {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn begin_migration(
+        &self,
+        namespace: &str,
+        expected_version: u32,
+        target_version: u32,
+        target_sha256: [u8; 32],
+        target_schema_bytes: Vec<u8>,
+    ) -> Result<CollectionDescriptor, MembusError> {
+        let resp = self
+            .call(Request::BeginMigration {
+                namespace: namespace.to_owned(),
+                expected_version,
+                target_version,
+                target_sha256,
+                target_schema_bytes,
+            })
+            .await?;
+        match resp {
+            Response::Collection(c) => Ok(c),
+            Response::Error(e) => Err(e),
+            other => Err(MembusError::Protocol(format!(
+                "unexpected response for begin_migration: {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn commit_migration(
+        &self,
+        namespace: &str,
+        target_version: u32,
+        verified_through: u64,
+    ) -> Result<CollectionDescriptor, MembusError> {
+        let resp = self
+            .call(Request::CommitMigration {
+                namespace: namespace.to_owned(),
+                target_version,
+                verified_through,
+            })
+            .await?;
+        match resp {
+            Response::Collection(c) => Ok(c),
+            Response::Error(e) => Err(e),
+            other => Err(MembusError::Protocol(format!(
+                "unexpected response for commit_migration: {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn abort_migration(
+        &self,
+        namespace: &str,
+        target_version: u32,
+    ) -> Result<CollectionDescriptor, MembusError> {
+        let resp = self
+            .call(Request::AbortMigration {
+                namespace: namespace.to_owned(),
+                target_version,
+            })
+            .await?;
+        match resp {
+            Response::Collection(c) => Ok(c),
+            Response::Error(e) => Err(e),
+            other => Err(MembusError::Protocol(format!(
+                "unexpected response for abort_migration: {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn index_document(
+        &self,
+        doc: SearchDocument,
+        ack: Ack,
+    ) -> Result<CommitResult, MembusError> {
+        let resp = self.call(Request::IndexDocument { doc, ack }).await?;
+        match resp {
+            Response::Commit(c) => Ok(c),
+            Response::Error(e) => Err(e),
+            other => Err(MembusError::Protocol(format!(
+                "unexpected response for index_document: {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn delete_search_document(
+        &self,
+        namespace: &str,
+        doc_id: &str,
+        ack: Ack,
+    ) -> Result<CommitResult, MembusError> {
+        let resp = self
+            .call(Request::DeleteSearchDocument {
+                namespace: namespace.to_owned(),
+                doc_id: doc_id.to_owned(),
+                ack,
+            })
+            .await?;
+        match resp {
+            Response::Commit(c) => Ok(c),
+            Response::Error(e) => Err(e),
+            other => Err(MembusError::Protocol(format!(
+                "unexpected response for delete_search_document: {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn revoke_search_prefix(
+        &self,
+        namespace: &str,
+        prefix: &str,
+        ack: Ack,
+    ) -> Result<CommitResult, MembusError> {
+        let resp = self
+            .call(Request::RevokeSearchPrefix {
+                namespace: namespace.to_owned(),
+                prefix: prefix.to_owned(),
+                ack,
+            })
+            .await?;
+        match resp {
+            Response::Commit(c) => Ok(c),
+            Response::Error(e) => Err(e),
+            other => Err(MembusError::Protocol(format!(
+                "unexpected response for revoke_search_prefix: {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn search(&self, query: SearchQuery) -> Result<SearchPage, MembusError> {
+        let resp = self.call(Request::Search(query)).await?;
+        match resp {
+            Response::Search(page) => Ok(page),
+            Response::Error(e) => Err(e),
+            other => Err(MembusError::Protocol(format!(
+                "unexpected response for search: {other:?}"
             ))),
         }
     }
@@ -595,8 +1166,6 @@ impl Client {
             if state.closed {
                 return Err(MembusError::Closed);
             }
-            // Register stream before sending request so immediate push frames arriving
-            // right after `Response::Subscribed` are never missed.
             state.active_streams.insert(
                 stream_id,
                 StreamDispatchEntry {
@@ -798,6 +1367,47 @@ impl ClientSnapshot {
     ) -> Result<ScanPage, MembusError> {
         self.client
             .scan_range(namespace, start_key, end_key, options, Some(self.snapshot_id))
+            .await
+    }
+
+    pub async fn query_ordered_index(
+        &self,
+        namespace: &str,
+        index_id: &str,
+        options: OrderedQueryOptions,
+    ) -> Result<OrderedIndexPage, MembusError> {
+        self.client
+            .query_ordered_index(namespace, index_id, options, Some(self.snapshot_id))
+            .await
+    }
+
+    pub async fn query_neighbors(
+        &self,
+        namespace: &str,
+        index_id: &str,
+        node_id: &[u8],
+        options: NeighborQueryOptions,
+    ) -> Result<NeighborPage, MembusError> {
+        self.client
+            .query_neighbors(namespace, index_id, node_id, options, Some(self.snapshot_id))
+            .await
+    }
+
+    pub async fn bfs_traverse(
+        &self,
+        namespace: &str,
+        index_id: &str,
+        seed_node: &[u8],
+        options: BfsOptions,
+    ) -> Result<BfsResult, MembusError> {
+        self.client
+            .bfs_traverse(
+                namespace,
+                index_id,
+                seed_node,
+                options,
+                Some(self.snapshot_id),
+            )
             .await
     }
 

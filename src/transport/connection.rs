@@ -9,6 +9,8 @@ use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot, watch, Semaphore};
 
+use crate::auth::AuthConfig;
+use crate::protocol::message::OP_AUTHENTICATE;
 use crate::protocol::{
     decode_request, encode_response, encode_signal_event, encode_stream_end, read_frame,
     run_batched_frame_writer, Frame, FrameFlags, FrameKind, Request, Response,
@@ -16,14 +18,17 @@ use crate::protocol::{
 use crate::signals::{EachChangeSubscription, LiveCoalescedSubscription};
 use crate::storage::OwnedSnapshot;
 use crate::transport::ServerContext;
-use crate::types::{HealthStatus, MembusError, SignalEvent};
+use crate::types::{
+    AuthMode, HealthStatus, IndexMutations, MembusError, Permission, Principal, SearchLogOp,
+    SignalEvent,
+};
 
-struct ConnectionGuard {
+pub(crate) struct ConnectionGuard {
     counter: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl ConnectionGuard {
-    fn acquire(counter: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
+    pub(crate) fn acquire(counter: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
         counter.fetch_add(1, Ordering::AcqRel);
         Self {
             counter: Arc::clone(counter),
@@ -39,6 +44,8 @@ impl Drop for ConnectionGuard {
 
 struct StreamTable {
     closed: bool,
+    auth_epoch: u64,
+    authenticated: Option<Principal>,
     streams: HashMap<u64, oneshot::Sender<()>>,
 }
 
@@ -102,6 +109,11 @@ struct ConnectionState {
 }
 
 impl ConnectionState {
+    fn snapshot_auth(&self) -> (Option<Principal>, u64) {
+        let table = self.active_streams.lock();
+        (table.authenticated.clone(), table.auth_epoch)
+    }
+
     fn close_and_cancel_all_streams(&self) {
         let mut table = self.active_streams.lock();
         table.closed = true;
@@ -137,6 +149,8 @@ pub async fn serve_connection<S>(
         next_snapshot_id: AtomicU64::new(1),
         active_streams: Arc::new(Mutex::new(StreamTable {
             closed: false,
+            auth_epoch: 0,
+            authenticated: None,
             streams: HashMap::new(),
         })),
         outbound_tx,
@@ -192,6 +206,26 @@ pub async fn serve_connection<S>(
                 }
             }
             FrameKind::Request => {
+                // Process `Authenticate` synchronously inline on the reader loop BEFORE
+                // dispatching any subsequent pipelined frames so `[Authenticate, Get]`
+                // never races and principal switches immediately revoke active streams.
+                if frame.payload.first() == Some(&OP_AUTHENTICATE) {
+                    let response = match decode_request(&frame.payload) {
+                        Ok(Request::Authenticate { token }) => {
+                            apply_authenticate_inline(&conn, &token)
+                        }
+                        Ok(_) => Response::Error(MembusError::Protocol(
+                            "malformed authenticate frame".to_owned(),
+                        )),
+                        Err(err) => Response::Error(err),
+                    };
+                    let reply = build_response_frame(frame.stream_id, &response, max_frame_body);
+                    if !send_or_shutdown(&conn.outbound_tx, reply, &mut shutdown_rx).await {
+                        break;
+                    }
+                    continue;
+                }
+
                 let permit = match Arc::clone(&conn.credit_window).try_acquire_owned() {
                     Ok(permit) => permit,
                     Err(_) => {
@@ -263,6 +297,13 @@ async fn handle_request_frame(
         }
     };
 
+    let (principal, captured_auth_epoch) = conn.snapshot_auth();
+    if let Err(err) = authorize_request(&conn.ctx.auth, principal.as_ref(), &request) {
+        let reply = build_response_frame(stream_id, &Response::Error(err), max_frame_body);
+        let _ = send_or_shutdown(&conn.outbound_tx, reply, &mut shutdown_rx).await;
+        return;
+    }
+
     match request {
         Request::SubscribeEachChange {
             namespace,
@@ -273,6 +314,7 @@ async fn handle_request_frame(
             start_each_change_stream(
                 conn,
                 stream_id,
+                captured_auth_epoch,
                 namespace,
                 key_prefix,
                 epoch,
@@ -290,6 +332,7 @@ async fn handle_request_frame(
             start_live_stream(
                 conn,
                 stream_id,
+                captured_auth_epoch,
                 namespace,
                 key_prefix,
                 max_pending,
@@ -301,14 +344,258 @@ async fn handle_request_frame(
         _ => {}
     }
 
-    let response = dispatch_unary(&conn, request).await;
+    let response = dispatch_unary(&conn, principal.as_ref(), request).await;
     let reply = build_response_frame(stream_id, &response, max_frame_body);
     let _ = send_or_shutdown(&conn.outbound_tx, reply, &mut shutdown_rx).await;
 }
 
-async fn dispatch_unary(conn: &Arc<ConnectionState>, req: Request) -> Response {
+pub(crate) fn authorize_index_mutations(
+    auth: &AuthConfig,
+    principal: Option<&Principal>,
+    namespace: &str,
+    indexes: &IndexMutations,
+) -> Result<(), MembusError> {
+    if auth.mode() == AuthMode::Disabled {
+        return Ok(());
+    }
+    for edge in &indexes.edges {
+        auth.authorize(principal, namespace, &edge.src_id, Permission::Write)?;
+        auth.authorize(principal, namespace, &edge.dst_id, Permission::Write)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn authorize_search_op(
+    auth: &AuthConfig,
+    principal: Option<&Principal>,
+    op: &SearchLogOp,
+) -> Result<(), MembusError> {
+    match op {
+        SearchLogOp::Index(doc) => {
+            auth.authorize(principal, &doc.namespace, doc.doc_id.as_bytes(), Permission::Write)
+        }
+        SearchLogOp::Delete { namespace, doc_id } => {
+            auth.authorize(principal, namespace, doc_id.as_bytes(), Permission::Write)
+        }
+        SearchLogOp::RevokePrefix { namespace, .. } => {
+            auth.authorize_admin(principal, Some(namespace))
+        }
+    }
+}
+
+fn apply_authenticate_inline(conn: &ConnectionState, token: &str) -> Response {
+    let auth_res = conn.ctx.auth.authenticate_token(Some(token));
+    let mut table = conn.active_streams.lock();
+    match auth_res {
+        Ok(Some(p)) => {
+            let principal_id = p.id.clone();
+            let changed = table.authenticated.as_ref() != Some(&p);
+            table.authenticated = Some(p);
+            if changed {
+                table.auth_epoch = table.auth_epoch.saturating_add(1);
+                for (_id, cancel_tx) in table.streams.drain() {
+                    let _ = cancel_tx.send(());
+                }
+            }
+            Response::Authenticated { principal_id }
+        }
+        Ok(None) => Response::Authenticated {
+            principal_id: "anonymous".to_owned(),
+        },
+        Err(err) => {
+            table.authenticated = None;
+            table.auth_epoch = table.auth_epoch.saturating_add(1);
+            for (_id, cancel_tx) in table.streams.drain() {
+                let _ = cancel_tx.send(());
+            }
+            Response::Error(err)
+        }
+    }
+}
+
+fn authorize_request(
+    auth: &AuthConfig,
+    principal: Option<&Principal>,
+    req: &Request,
+) -> Result<(), MembusError> {
+    if auth.mode() == AuthMode::Disabled {
+        return Ok(());
+    }
+    match req {
+        Request::Authenticate { .. } => Ok(()),
+        Request::Get { namespace, key, .. } => {
+            auth.authorize(principal, namespace, key, Permission::Read)
+        }
+        Request::GetMany {
+            namespace, keys, ..
+        } => {
+            if keys.is_empty() {
+                auth.authorize(principal, namespace, b"", Permission::Read)
+            } else {
+                for key in keys {
+                    auth.authorize(principal, namespace, key, Permission::Read)?;
+                }
+                Ok(())
+            }
+        }
+        Request::Put { namespace, key, .. } | Request::Remove { namespace, key, .. } => {
+            auth.authorize(principal, namespace, key, Permission::Write)
+        }
+        Request::PutIndexed {
+            namespace,
+            key,
+            indexes,
+            search_op,
+            ..
+        } => {
+            auth.authorize(principal, namespace, key, Permission::Write)?;
+            if let Some(idx) = indexes {
+                authorize_index_mutations(auth, principal, namespace, idx)?;
+            }
+            if let Some(op) = search_op {
+                authorize_search_op(auth, principal, op)?;
+            }
+            Ok(())
+        }
+        Request::RemoveIndexed {
+            namespace,
+            key,
+            search_op,
+            ..
+        } => {
+            auth.authorize(principal, namespace, key, Permission::Write)?;
+            if let Some(op) = search_op {
+                authorize_search_op(auth, principal, op)?;
+            }
+            Ok(())
+        }
+        Request::CommitTx {
+            guards, mutations, ..
+        } => {
+            auth.require_authenticated(principal)?;
+            for g in guards {
+                auth.authorize(principal, &g.namespace, &g.key, Permission::Read)?;
+            }
+            for m in mutations {
+                auth.authorize(principal, &m.namespace, &m.key, Permission::Write)?;
+            }
+            Ok(())
+        }
+        Request::CommitIndexedTx {
+            guards, mutations, ..
+        } => {
+            auth.require_authenticated(principal)?;
+            for g in guards {
+                auth.authorize(principal, &g.namespace, &g.key, Permission::Read)?;
+            }
+            for m in mutations {
+                auth.authorize(
+                    principal,
+                    &m.mutation.namespace,
+                    &m.mutation.key,
+                    Permission::Write,
+                )?;
+                if let Some(idx) = &m.indexes {
+                    authorize_index_mutations(auth, principal, &m.mutation.namespace, idx)?;
+                }
+                if let Some(op) = &m.search_op {
+                    authorize_search_op(auth, principal, op)?;
+                }
+            }
+            Ok(())
+        }
+        Request::OpenSnapshot
+        | Request::CloseSnapshot { .. }
+        | Request::Health
+        | Request::ListCollections => auth.require_authenticated(principal),
+        Request::ScanPrefix {
+            namespace, prefix, ..
+        } => auth.authorize(principal, namespace, prefix, Permission::Read),
+        Request::ScanRange {
+            namespace,
+            start_key,
+            end_key,
+            ..
+        } => auth.authorize_range(principal, namespace, start_key, end_key, Permission::Read),
+        Request::SubscribeEachChange {
+            namespace,
+            key_prefix,
+            ..
+        }
+        | Request::SubscribeLive {
+            namespace,
+            key_prefix,
+            ..
+        } => auth.authorize(principal, namespace, key_prefix, Permission::Read),
+        Request::Checkpoint { .. } => auth.authorize_admin(principal, None),
+        Request::PutBlob { .. } => auth.authorize(principal, "*", b"", Permission::Write),
+        Request::GetBlob { .. } => auth.authorize(principal, "*", b"", Permission::Read),
+        Request::QueryOrderedIndex { namespace, .. }
+        | Request::QueryNeighbors { namespace, .. }
+        | Request::BfsTraverse { namespace, .. }
+        | Request::GetCasBlob { namespace, .. }
+        | Request::HasCasBlob { namespace, .. }
+        | Request::GetCollection { namespace }
+        | Request::GetCollectionVersion { namespace, .. } => {
+            auth.authorize(principal, namespace, b"", Permission::Read)
+        }
+        Request::PutCasBlob { namespace, .. } => {
+            auth.authorize(principal, namespace, b"", Permission::Write)
+        }
+        Request::AcquireLease {
+            namespace,
+            resource,
+            ..
+        }
+        | Request::RenewLease {
+            namespace,
+            resource,
+            ..
+        }
+        | Request::ReleaseLease {
+            namespace,
+            resource,
+            ..
+        } => auth.authorize(principal, namespace, resource.as_bytes(), Permission::Write),
+        Request::InspectLease {
+            namespace,
+            resource,
+        }
+        | Request::ValidateLease {
+            namespace,
+            resource,
+            ..
+        } => auth.authorize(principal, namespace, resource.as_bytes(), Permission::Read),
+        Request::RegisterCollection { descriptor, .. } => {
+            auth.authorize_admin(principal, Some(&descriptor.namespace))
+        }
+        Request::BeginMigration { namespace, .. }
+        | Request::CommitMigration { namespace, .. }
+        | Request::AbortMigration { namespace, .. }
+        | Request::RevokeSearchPrefix { namespace, .. } => {
+            auth.authorize_admin(principal, Some(namespace))
+        }
+        Request::IndexDocument { doc, .. } => {
+            auth.authorize(principal, &doc.namespace, doc.doc_id.as_bytes(), Permission::Write)
+        }
+        Request::DeleteSearchDocument {
+            namespace, doc_id, ..
+        } => auth.authorize(principal, namespace, doc_id.as_bytes(), Permission::Write),
+        Request::Search(query) => {
+            let ns = query.namespace.as_deref().unwrap_or("*");
+            auth.authorize(principal, ns, b"", Permission::Read)
+        }
+    }
+}
+
+async fn dispatch_unary(
+    conn: &Arc<ConnectionState>,
+    principal: Option<&Principal>,
+    req: Request,
+) -> Response {
     let storage = Arc::clone(&conn.ctx.storage);
     match req {
+        Request::Authenticate { token } => apply_authenticate_inline(conn, &token),
         Request::Get {
             namespace,
             key,
@@ -366,6 +653,38 @@ async fn dispatch_unary(conn: &Arc<ConnectionState>, req: Request) -> Response {
                 Err(e) => Response::Error(e),
             }
         }
+        Request::PutIndexed {
+            namespace,
+            key,
+            value,
+            ack,
+            expected,
+            indexes,
+            search_op,
+        } => {
+            let search = conn.ctx.search.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let commit = storage.put_indexed(
+                    &namespace,
+                    &key,
+                    &value,
+                    ack,
+                    expected,
+                    indexes.as_ref(),
+                    search_op.as_ref(),
+                )?;
+                if let (Some(engine), Some(op)) = (search, search_op) {
+                    engine.ingest_committed_op(commit.seq, 0, commit.epoch, op)?;
+                }
+                Ok(commit)
+            })
+            .await
+            .unwrap_or_else(|e| Err(MembusError::Storage(format!("put_indexed failed: {e}"))));
+            match result {
+                Ok(commit) => Response::Commit(commit),
+                Err(e) => Response::Error(e),
+            }
+        }
         Request::Remove {
             namespace,
             key,
@@ -382,6 +701,34 @@ async fn dispatch_unary(conn: &Arc<ConnectionState>, req: Request) -> Response {
                 Err(e) => Response::Error(e),
             }
         }
+        Request::RemoveIndexed {
+            namespace,
+            key,
+            ack,
+            expected,
+            search_op,
+        } => {
+            let search = conn.ctx.search.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let commit = storage.remove_indexed(
+                    &namespace,
+                    &key,
+                    ack,
+                    expected,
+                    search_op.as_ref(),
+                )?;
+                if let (Some(engine), Some(op)) = (search, search_op) {
+                    engine.ingest_committed_op(commit.seq, 0, commit.epoch, op)?;
+                }
+                Ok(commit)
+            })
+            .await
+            .unwrap_or_else(|e| Err(MembusError::Storage(format!("remove_indexed failed: {e}"))));
+            match result {
+                Ok(commit) => Response::Commit(commit),
+                Err(e) => Response::Error(e),
+            }
+        }
         Request::CommitTx {
             ack,
             guards,
@@ -393,6 +740,36 @@ async fn dispatch_unary(conn: &Arc<ConnectionState>, req: Request) -> Response {
                     .unwrap_or_else(|e| {
                         Err(MembusError::Storage(format!("commit_tx task failed: {e}")))
                     });
+            match result {
+                Ok(commit) => Response::Commit(commit),
+                Err(e) => Response::Error(e),
+            }
+        }
+        Request::CommitIndexedTx {
+            ack,
+            guards,
+            mutations,
+        } => {
+            let search = conn.ctx.search.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let commit = storage.commit_indexed_tx(&guards, &mutations, ack)?;
+                if let Some(engine) = search {
+                    let mut op_idx = 0u32;
+                    for m in mutations {
+                        if let Some(op) = m.search_op {
+                            engine.ingest_committed_op(commit.seq, op_idx, commit.epoch, op)?;
+                            op_idx = op_idx.saturating_add(1);
+                        }
+                    }
+                }
+                Ok(commit)
+            })
+            .await
+            .unwrap_or_else(|e| {
+                Err(MembusError::Storage(format!(
+                    "commit_indexed_tx failed: {e}"
+                )))
+            });
             match result {
                 Ok(commit) => Response::Commit(commit),
                 Err(e) => Response::Error(e),
@@ -495,6 +872,84 @@ async fn dispatch_unary(conn: &Arc<ConnectionState>, req: Request) -> Response {
                 Err(e) => Response::Error(e),
             }
         }
+        Request::QueryOrderedIndex {
+            namespace,
+            index_id,
+            options,
+            snapshot_id,
+        } => {
+            let pinned_snap = match resolve_snapshot(conn, snapshot_id) {
+                Ok(s) => s,
+                Err(e) => return Response::Error(e),
+            };
+            let result = tokio::task::spawn_blocking(move || {
+                let snap = match pinned_snap {
+                    Some(s) => s,
+                    None => Arc::new(storage.open_snapshot()?),
+                };
+                storage.query_ordered_index(&snap, &namespace, &index_id, &options)
+            })
+            .await
+            .unwrap_or_else(|e| {
+                Err(MembusError::Storage(format!(
+                    "query_ordered_index failed: {e}"
+                )))
+            });
+            match result {
+                Ok(page) => Response::OrderedIndex(page),
+                Err(e) => Response::Error(e),
+            }
+        }
+        Request::QueryNeighbors {
+            namespace,
+            index_id,
+            node_id,
+            options,
+            snapshot_id,
+        } => {
+            let pinned_snap = match resolve_snapshot(conn, snapshot_id) {
+                Ok(s) => s,
+                Err(e) => return Response::Error(e),
+            };
+            let result = tokio::task::spawn_blocking(move || {
+                let snap = match pinned_snap {
+                    Some(s) => s,
+                    None => Arc::new(storage.open_snapshot()?),
+                };
+                storage.query_neighbors(&snap, &namespace, &index_id, &node_id, &options)
+            })
+            .await
+            .unwrap_or_else(|e| Err(MembusError::Storage(format!("query_neighbors failed: {e}"))));
+            match result {
+                Ok(page) => Response::Neighbors(page),
+                Err(e) => Response::Error(e),
+            }
+        }
+        Request::BfsTraverse {
+            namespace,
+            index_id,
+            seed_node,
+            options,
+            snapshot_id,
+        } => {
+            let pinned_snap = match resolve_snapshot(conn, snapshot_id) {
+                Ok(s) => s,
+                Err(e) => return Response::Error(e),
+            };
+            let result = tokio::task::spawn_blocking(move || {
+                let snap = match pinned_snap {
+                    Some(s) => s,
+                    None => Arc::new(storage.open_snapshot()?),
+                };
+                storage.bfs_traverse(&snap, &namespace, &index_id, &seed_node, &options)
+            })
+            .await
+            .unwrap_or_else(|e| Err(MembusError::Storage(format!("bfs_traverse failed: {e}"))));
+            match result {
+                Ok(res) => Response::Bfs(res),
+                Err(e) => Response::Error(e),
+            }
+        }
         Request::Checkpoint { dest_dir } => {
             let safe_dest = match resolve_checkpoint_path(
                 conn.ctx.config.checkpoint_root.as_deref(),
@@ -538,6 +993,340 @@ async fn dispatch_unary(conn: &Arc<ConnectionState>, req: Request) -> Response {
                 Err(e) => Response::Error(e),
             }
         }
+        Request::PutCasBlob {
+            namespace,
+            data,
+            ack,
+        } => {
+            let result =
+                tokio::task::spawn_blocking(move || storage.put_cas_blob(&namespace, &data, ack))
+                    .await
+                    .unwrap_or_else(|e| {
+                        Err(MembusError::Storage(format!("put_cas_blob failed: {e}")))
+                    });
+            match result {
+                Ok(digest) => Response::CasBlobDigest(digest),
+                Err(e) => Response::Error(e),
+            }
+        }
+        Request::GetCasBlob { namespace, sha256 } => {
+            let result =
+                tokio::task::spawn_blocking(move || storage.get_cas_blob(&namespace, &sha256))
+                    .await
+                    .unwrap_or_else(|e| {
+                        Err(MembusError::Storage(format!("get_cas_blob failed: {e}")))
+                    });
+            match result {
+                Ok(data) => Response::Blob(data),
+                Err(e) => Response::Error(e),
+            }
+        }
+        Request::HasCasBlob { namespace, sha256 } => {
+            let result =
+                tokio::task::spawn_blocking(move || storage.has_cas_blob(&namespace, &sha256))
+                    .await
+                    .unwrap_or_else(|e| {
+                        Err(MembusError::Storage(format!("has_cas_blob failed: {e}")))
+                    });
+            match result {
+                Ok(exists) => Response::Bool(exists),
+                Err(e) => Response::Error(e),
+            }
+        }
+        Request::AcquireLease {
+            namespace,
+            resource,
+            holder,
+            ttl_ms,
+        } => {
+            let leases = Arc::clone(&conn.ctx.leases);
+            let result = tokio::task::spawn_blocking(move || {
+                leases.acquire_lease(&namespace, &resource, &holder, ttl_ms)
+            })
+            .await
+            .unwrap_or_else(|e| Err(MembusError::Storage(format!("acquire_lease failed: {e}"))));
+            match result {
+                Ok(grant) => Response::Lease(grant),
+                Err(e) => Response::Error(e),
+            }
+        }
+        Request::RenewLease {
+            namespace,
+            resource,
+            holder,
+            generation,
+            token,
+            ttl_ms,
+        } => {
+            let leases = Arc::clone(&conn.ctx.leases);
+            let result = tokio::task::spawn_blocking(move || {
+                leases.renew_lease(&namespace, &resource, &holder, generation, &token, ttl_ms)
+            })
+            .await
+            .unwrap_or_else(|e| Err(MembusError::Storage(format!("renew_lease failed: {e}"))));
+            match result {
+                Ok(grant) => Response::Lease(grant),
+                Err(e) => Response::Error(e),
+            }
+        }
+        Request::ReleaseLease {
+            namespace,
+            resource,
+            holder,
+            generation,
+            token,
+        } => {
+            let leases = Arc::clone(&conn.ctx.leases);
+            let result = tokio::task::spawn_blocking(move || {
+                leases.release_lease(&namespace, &resource, &holder, generation, &token)
+            })
+            .await
+            .unwrap_or_else(|e| Err(MembusError::Storage(format!("release_lease failed: {e}"))));
+            match result {
+                Ok(()) => Response::Unit,
+                Err(e) => Response::Error(e),
+            }
+        }
+        Request::InspectLease {
+            namespace,
+            resource,
+        } => {
+            let leases = Arc::clone(&conn.ctx.leases);
+            let result =
+                tokio::task::spawn_blocking(move || leases.inspect_lease(&namespace, &resource))
+                    .await
+                    .unwrap_or_else(|e| {
+                        Err(MembusError::Storage(format!("inspect_lease failed: {e}")))
+                    });
+            match result {
+                Ok(grant) => Response::OptLease(grant),
+                Err(e) => Response::Error(e),
+            }
+        }
+        Request::ValidateLease {
+            namespace,
+            resource,
+            holder,
+            generation,
+            token,
+        } => {
+            let leases = Arc::clone(&conn.ctx.leases);
+            let result = tokio::task::spawn_blocking(move || {
+                leases.validate_lease(&namespace, &resource, &holder, generation, &token)
+            })
+            .await
+            .unwrap_or_else(|e| Err(MembusError::Storage(format!("validate_lease failed: {e}"))));
+            match result {
+                Ok(valid) => Response::Bool(valid),
+                Err(e) => Response::Error(e),
+            }
+        }
+        Request::RegisterCollection {
+            expected_version,
+            descriptor,
+        } => {
+            let catalog = Arc::clone(&conn.ctx.catalog);
+            let result = tokio::task::spawn_blocking(move || {
+                catalog.register_collection(expected_version, descriptor)
+            })
+            .await
+            .unwrap_or_else(|e| {
+                Err(MembusError::Storage(format!(
+                    "register_collection failed: {e}"
+                )))
+            });
+            match result {
+                Ok(desc) => Response::Collection(desc),
+                Err(e) => Response::Error(e),
+            }
+        }
+        Request::GetCollection { namespace } => {
+            let catalog = Arc::clone(&conn.ctx.catalog);
+            let result = tokio::task::spawn_blocking(move || catalog.get_collection(&namespace))
+                .await
+                .unwrap_or_else(|e| {
+                    Err(MembusError::Storage(format!("get_collection failed: {e}")))
+                });
+            match result {
+                Ok(desc) => Response::OptCollection(desc),
+                Err(e) => Response::Error(e),
+            }
+        }
+        Request::ListCollections => {
+            let catalog = Arc::clone(&conn.ctx.catalog);
+            let result = tokio::task::spawn_blocking(move || catalog.list_collections())
+                .await
+                .unwrap_or_else(|e| {
+                    Err(MembusError::Storage(format!(
+                        "list_collections failed: {e}"
+                    )))
+                });
+            match result {
+                Ok(mut list) => {
+                    if conn.ctx.auth.mode() == AuthMode::Enforced {
+                        list.retain(|desc| {
+                            conn.ctx
+                                .auth
+                                .authorize(principal, &desc.namespace, b"", Permission::Read)
+                                .is_ok()
+                        });
+                    }
+                    Response::Collections(list)
+                }
+                Err(e) => Response::Error(e),
+            }
+        }
+        Request::GetCollectionVersion { namespace, version } => {
+            let catalog = Arc::clone(&conn.ctx.catalog);
+            let result = tokio::task::spawn_blocking(move || {
+                catalog.get_collection_version(&namespace, version)
+            })
+            .await
+            .unwrap_or_else(|e| {
+                Err(MembusError::Storage(format!(
+                    "get_collection_version failed: {e}"
+                )))
+            });
+            match result {
+                Ok(desc) => Response::OptCollection(desc),
+                Err(e) => Response::Error(e),
+            }
+        }
+        Request::BeginMigration {
+            namespace,
+            expected_version,
+            target_version,
+            target_sha256,
+            target_schema_bytes,
+        } => {
+            let catalog = Arc::clone(&conn.ctx.catalog);
+            let result = tokio::task::spawn_blocking(move || {
+                catalog.begin_migration(
+                    &namespace,
+                    expected_version,
+                    target_version,
+                    target_sha256,
+                    target_schema_bytes,
+                )
+            })
+            .await
+            .unwrap_or_else(|e| Err(MembusError::Storage(format!("begin_migration failed: {e}"))));
+            match result {
+                Ok(desc) => Response::Collection(desc),
+                Err(e) => Response::Error(e),
+            }
+        }
+        Request::CommitMigration {
+            namespace,
+            target_version,
+            verified_through,
+        } => {
+            let catalog = Arc::clone(&conn.ctx.catalog);
+            let result = tokio::task::spawn_blocking(move || {
+                catalog.commit_migration(&namespace, target_version, verified_through)
+            })
+            .await
+            .unwrap_or_else(|e| {
+                Err(MembusError::Storage(format!(
+                    "commit_migration failed: {e}"
+                )))
+            });
+            match result {
+                Ok(desc) => Response::Collection(desc),
+                Err(e) => Response::Error(e),
+            }
+        }
+        Request::AbortMigration {
+            namespace,
+            target_version,
+        } => {
+            let catalog = Arc::clone(&conn.ctx.catalog);
+            let result = tokio::task::spawn_blocking(move || {
+                catalog.abort_migration(&namespace, target_version)
+            })
+            .await
+            .unwrap_or_else(|e| Err(MembusError::Storage(format!("abort_migration failed: {e}"))));
+            match result {
+                Ok(desc) => Response::Collection(desc),
+                Err(e) => Response::Error(e),
+            }
+        }
+        Request::IndexDocument { doc, ack } => {
+            let Some(search) = conn.ctx.search.clone() else {
+                return Response::Error(MembusError::InvalidArgument(
+                    "search engine is not enabled on this server".to_owned(),
+                ));
+            };
+            let result = tokio::task::spawn_blocking(move || search.index_document(doc, ack))
+                .await
+                .unwrap_or_else(|e| Err(MembusError::Storage(format!("index_document failed: {e}"))));
+            match result {
+                Ok(commit) => Response::Commit(commit),
+                Err(e) => Response::Error(e),
+            }
+        }
+        Request::DeleteSearchDocument {
+            namespace,
+            doc_id,
+            ack,
+        } => {
+            let Some(search) = conn.ctx.search.clone() else {
+                return Response::Error(MembusError::InvalidArgument(
+                    "search engine is not enabled on this server".to_owned(),
+                ));
+            };
+            let result = tokio::task::spawn_blocking(move || {
+                search.delete_document(&namespace, &doc_id, ack)
+            })
+            .await
+            .unwrap_or_else(|e| {
+                Err(MembusError::Storage(format!(
+                    "delete_search_document failed: {e}"
+                )))
+            });
+            match result {
+                Ok(commit) => Response::Commit(commit),
+                Err(e) => Response::Error(e),
+            }
+        }
+        Request::RevokeSearchPrefix {
+            namespace,
+            prefix,
+            ack,
+        } => {
+            let Some(search) = conn.ctx.search.clone() else {
+                return Response::Error(MembusError::InvalidArgument(
+                    "search engine is not enabled on this server".to_owned(),
+                ));
+            };
+            let result = tokio::task::spawn_blocking(move || {
+                search.revoke_search_prefix(&namespace, &prefix, ack)
+            })
+            .await
+            .unwrap_or_else(|e| {
+                Err(MembusError::Storage(format!(
+                    "revoke_search_prefix failed: {e}"
+                )))
+            });
+            match result {
+                Ok(commit) => Response::Commit(commit),
+                Err(e) => Response::Error(e),
+            }
+        }
+        Request::Search(query) => {
+            let Some(search) = conn.ctx.search.clone() else {
+                return Response::Error(MembusError::InvalidArgument(
+                    "search engine is not enabled on this server".to_owned(),
+                ));
+            };
+            let result = tokio::task::spawn_blocking(move || search.search(&query))
+                .await
+                .unwrap_or_else(|e| Err(MembusError::Storage(format!("search failed: {e}"))));
+            match result {
+                Ok(page) => Response::Search(page),
+                Err(e) => Response::Error(e),
+            }
+        }
         Request::SubscribeEachChange { .. } | Request::SubscribeLive { .. } => {
             Response::Error(MembusError::Protocol(
                 "subscription request misrouted to unary dispatch".to_owned(),
@@ -560,9 +1349,11 @@ impl ActiveSubscription {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_each_change_stream(
     conn: Arc<ConnectionState>,
     stream_id: u64,
+    captured_auth_epoch: u64,
     namespace: String,
     key_prefix: Vec<u8>,
     epoch: u64,
@@ -580,6 +1371,7 @@ async fn start_each_change_stream(
             launch_subscription_stream(
                 conn,
                 stream_id,
+                captured_auth_epoch,
                 epoch,
                 start_seq,
                 ActiveSubscription::EachChange(sub),
@@ -598,9 +1390,11 @@ async fn start_each_change_stream(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_live_stream(
     conn: Arc<ConnectionState>,
     stream_id: u64,
+    captured_auth_epoch: u64,
     namespace: String,
     key_prefix: Vec<u8>,
     max_pending: Option<u32>,
@@ -617,6 +1411,7 @@ async fn start_live_stream(
             launch_subscription_stream(
                 conn,
                 stream_id,
+                captured_auth_epoch,
                 epoch,
                 start_seq,
                 ActiveSubscription::Live(sub),
@@ -638,6 +1433,7 @@ async fn start_live_stream(
 async fn launch_subscription_stream(
     conn: Arc<ConnectionState>,
     stream_id: u64,
+    captured_auth_epoch: u64,
     epoch: u64,
     start_seq: u64,
     mut sub: ActiveSubscription,
@@ -650,7 +1446,11 @@ async fn launch_subscription_stream(
         if table.closed {
             return;
         }
-        if table.streams.contains_key(&stream_id) {
+        if table.auth_epoch != captured_auth_epoch {
+            Err(MembusError::Unauthorized(
+                "connection authentication changed while opening subscription".to_owned(),
+            ))
+        } else if table.streams.contains_key(&stream_id) {
             Err(MembusError::Protocol(format!(
                 "duplicate active subscription stream_id {stream_id}"
             )))
@@ -741,7 +1541,9 @@ fn resolve_snapshot(
             let entry = table
                 .entries
                 .get_mut(&id)
-                .ok_or_else(|| MembusError::NotFound(format!("unknown or expired snapshot_id {id}")))?;
+                .ok_or_else(|| {
+                    MembusError::NotFound(format!("unknown or expired snapshot_id {id}"))
+                })?;
             entry.last_used = Instant::now();
             Ok(Some(Arc::clone(&entry.snapshot)))
         }

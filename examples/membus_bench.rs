@@ -6,11 +6,20 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
+use futures_util::{SinkExt, StreamExt};
+use http_body_util::{BodyExt, Empty};
+use hyper::{Method, Request as HyperRequest};
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use membus::{
-    Ack, AdmissionConfig, Client, ExpectedVersion, MembusError, MembusServer, NoopPublisher,
-    RocksDbStorage, ServerConfig, SignalBroker, SignalConfig, SignalPublisher, SignalRing,
-    StorageConfig, StorageEngine,
+    Ack, AdmissionConfig, BfsOptions, Client, Endpoint, ExpectedVersion, GraphDirection,
+    GraphEdgeEntry, IndexMutations, MembusError, MembusServer, NoopPublisher, OrderedIndexEntry,
+    OrderedKeyFilter, OrderedQueryOptions, RocksDbStorage, SearchConfig, SearchDocument,
+    SearchEngine, SearchMode, SearchQuery, SearchVisibility, ServerConfig, SignalBroker,
+    SignalConfig, SignalPublisher, SignalRing, StorageConfig, StorageEngine,
 };
+use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 struct LatencyStats {
     ops: usize,
@@ -53,7 +62,7 @@ impl LatencyStats {
 
     fn print(&self, label: &str) {
         println!(
-            "{label:<52} | {:>10.0} ops/s | p50 {:>8.1} us | p95 {:>8.1} us | p99 {:>8.1} us | max {:>9.1} us",
+            "{label:<58} | {:>10.0} ops/s | p50 {:>8.1} us | p95 {:>8.1} us | p99 {:>8.1} us | max {:>9.1} us",
             self.ops_per_sec(),
             self.p50_us,
             self.p95_us,
@@ -93,6 +102,9 @@ async fn main() {
     bench_group_commit_flush(&root, 10_000, 32, 2).await;
     bench_backpressure_saturation(&root).await;
     bench_warm_cold_reads_and_mvcc_snapshots(&root).await;
+    bench_partial_ordered_queue_and_graph_bfs(&root);
+    bench_tantivy_and_tier0_search(&root);
+    bench_http2_and_websocket(&root).await;
 
     let _ = std::fs::remove_dir_all(&root);
     println!("=== Benchmarks Complete (scratch cleaned) ===");
@@ -100,12 +112,9 @@ async fn main() {
 
 fn bench_in_process_fast_write_read(root: &std::path::Path) {
     let dir = make_bench_dir(root, "inproc_fast");
-    let storage = RocksDbStorage::open(
-        &dir,
-        StorageConfig::default(),
-        Arc::new(NoopPublisher),
-    )
-    .expect("open");
+    let storage =
+        RocksDbStorage::open(&dir, StorageConfig::default(), Arc::new(NoopPublisher))
+            .expect("open");
 
     let n = 20_000usize;
     let payload = vec![0xABu8; 256];
@@ -170,20 +179,43 @@ async fn bench_ipc_fast_write_read_and_signal_wake(root: &std::path::Path) {
         .bind_tcp("127.0.0.1:0".parse::<SocketAddr>().unwrap())
         .await
         .expect("bind tcp");
-    let tcp_client = Client::connect(tcp_handle.endpoint()).await.expect("tcp client");
+    let tcp_client = Client::connect(tcp_handle.endpoint())
+        .await
+        .expect("tcp client");
     run_ipc_latency_probe("2a. TCP IPC Ack::Fast put+get (256B)", &tcp_client, 5_000).await;
 
-    let tcp_sub_client = Client::connect(tcp_handle.endpoint()).await.expect("tcp sub client");
-    run_signal_wake_probe("3a. TCP Signal Wake (pub -> sub)", &tcp_client, &tcp_sub_client, "sig_tcp", 2_000).await;
+    let tcp_sub_client = Client::connect(tcp_handle.endpoint())
+        .await
+        .expect("tcp sub client");
+    run_signal_wake_probe(
+        "3a. TCP Signal Wake (pub -> sub)",
+        &tcp_client,
+        &tcp_sub_client,
+        "sig_tcp",
+        2_000,
+    )
+    .await;
 
     #[cfg(windows)]
     {
         let pipe_name = format!(r"\\.\pipe\membus-v2-bench-{}", std::process::id());
-        let pipe_handle = server.bind_named_pipe(&pipe_name).await.expect("bind pipe");
-        let pipe_client = Client::connect_named_pipe(&pipe_name).await.expect("pipe client");
-        run_ipc_latency_probe("2b. NamedPipe IOCP Ack::Fast put+get (256B)", &pipe_client, 5_000).await;
+        let pipe_handle = server
+            .bind_named_pipe(&pipe_name)
+            .await
+            .expect("bind pipe");
+        let pipe_client = Client::connect_named_pipe(&pipe_name)
+            .await
+            .expect("pipe client");
+        run_ipc_latency_probe(
+            "2b. NamedPipe IOCP Ack::Fast put+get (256B)",
+            &pipe_client,
+            5_000,
+        )
+        .await;
 
-        let pipe_sub_client = Client::connect_named_pipe(&pipe_name).await.expect("pipe sub client");
+        let pipe_sub_client = Client::connect_named_pipe(&pipe_name)
+            .await
+            .expect("pipe sub client");
         run_signal_wake_probe(
             "3b. NamedPipe IOCP Signal Wake (pub -> sub)",
             &pipe_client,
@@ -261,7 +293,7 @@ async fn bench_cross_process_signal_wake(root: &std::path::Path) {
         .filter(|p| p.exists())
     else {
         println!(
-            "3c. Cross-process Signal Wake                        | skipped (build `membus` binary first)"
+            "3c. Cross-process Signal Wake                              | skipped (build `membus` binary first)"
         );
         return;
     };
@@ -507,7 +539,7 @@ async fn bench_backpressure_saturation(root: &std::path::Path) {
         c.ping().await.expect("post-saturation ping must succeed");
     }
     println!(
-        "5. Backpressure saturation (512 writers)             | ok={} busy={} unexpected_err={} dropped_conns={}",
+        "5. Backpressure saturation (512 writers)                   | ok={} busy={} unexpected_err={} dropped_conns={}",
         ok_ops.load(Ordering::Relaxed),
         busy_ops.load(Ordering::Relaxed),
         err_ops.load(Ordering::Relaxed),
@@ -550,7 +582,6 @@ async fn bench_warm_cold_reads_and_mvcc_snapshots(root: &std::path::Path) {
         storage.flush_wal(true).expect("flush");
     }
 
-    // Reopen with a tiny 1 MiB block cache to measure cold point reads from NVMe/SSTs.
     let cold_cfg = StorageConfig {
         block_cache_bytes: 1024 * 1024,
         ..StorageConfig::default()
@@ -575,7 +606,6 @@ async fn bench_warm_cold_reads_and_mvcc_snapshots(root: &std::path::Path) {
     LatencyStats::from_samples_ns(cold_lat, start_cold.elapsed())
         .print("6a. Cold point get (1 KiB, 30k keys, 1 MiB cache)");
 
-    // Warm reads over hot subset.
     let mut warm_lat = Vec::with_capacity(20_000);
     let start_warm = Instant::now();
     for i in 0..20_000usize {
@@ -592,7 +622,6 @@ async fn bench_warm_cold_reads_and_mvcc_snapshots(root: &std::path::Path) {
     LatencyStats::from_samples_ns(warm_lat, start_warm.elapsed())
         .print("6b. Warm point get 1t (1 KiB, hot 512-key subset)");
 
-    // 8-thread warm point-read scaling.
     let start_8t = Instant::now();
     let mut reader_handles = Vec::new();
     for tid in 0..8usize {
@@ -617,7 +646,6 @@ async fn bench_warm_cold_reads_and_mvcc_snapshots(root: &std::path::Path) {
     LatencyStats::from_samples_ns(lat_8t, start_8t.elapsed())
         .print("6c. Warm point get 8t (1 KiB, hot 512-key subset)");
 
-    // O(1) MVCC snapshot open latency while 4 writer threads actively mutate keys.
     let stop = Arc::new(AtomicBool::new(false));
     let mut writer_handles = Vec::new();
     for w in 0..4usize {
@@ -654,6 +682,372 @@ async fn bench_warm_cold_reads_and_mvcc_snapshots(root: &std::path::Path) {
         h.join().expect("join writer");
     }
 
+    drop(storage);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn bench_partial_ordered_queue_and_graph_bfs(root: &std::path::Path) {
+    let dir = make_bench_dir(root, "idx_graph");
+    let storage =
+        RocksDbStorage::open(&dir, StorageConfig::default(), Arc::new(NoopPublisher))
+            .expect("open");
+
+    // Seed 10,000 tasks where 1,000 are active in the partial "ready_queue" index.
+    for i in 0..10_000u32 {
+        let idx = if i % 10 == 0 {
+            let prio = (i % 4) as u8;
+            let mut sort_key = Vec::with_capacity(5);
+            sort_key.push(prio);
+            sort_key.extend_from_slice(&i.to_be_bytes());
+            Some(IndexMutations {
+                ordered: vec![OrderedIndexEntry {
+                    index_id: "ready_queue".to_owned(),
+                    sort_key,
+                    summary: format!("task:{i}").into_bytes(),
+                }],
+                edges: Vec::new(),
+            })
+        } else {
+            None
+        };
+        storage
+            .put_indexed(
+                "work",
+                format!("task/{i:05}").as_bytes(),
+                b"task-payload",
+                Ack::Fast,
+                ExpectedVersion::Any,
+                idx.as_ref(),
+                None,
+            )
+            .expect("seed task");
+    }
+
+    let snap = storage.open_snapshot().expect("snap");
+    let q_opts = OrderedQueryOptions {
+        filter: OrderedKeyFilter::Prefix(vec![0u8]),
+        after_cursor: None,
+        limit: 32,
+        max_bytes: 256 * 1024,
+    };
+    let mut q_lats = Vec::with_capacity(5_000);
+    let t_start = Instant::now();
+    for _ in 0..5_000 {
+        let t0 = Instant::now();
+        let page = storage
+            .query_ordered_index(&snap, "work", "ready_queue", &q_opts)
+            .expect("ordered scan");
+        q_lats.push(t0.elapsed().as_nanos() as u64);
+        assert_eq!(page.entries.len(), 32);
+    }
+    LatencyStats::from_samples_ns(q_lats, t_start.elapsed())
+        .print("7. Partial ordered queue scan (top-32 / 10k tasks)");
+    drop(snap);
+
+    // Seed 2,000-node graph with out-degree 4.
+    let nodes = 2_000usize;
+    for u in 0..nodes {
+        let mut edges = Vec::with_capacity(4);
+        for d in 1..=4usize {
+            let v = (u * 3 + d * 17) % nodes;
+            edges.push(GraphEdgeEntry {
+                index_id: "deps".to_owned(),
+                src_id: format!("n{u:04}").into_bytes(),
+                rel_label: b"links".to_vec(),
+                dst_id: format!("n{v:04}").into_bytes(),
+                meta: b"w1".to_vec(),
+            });
+        }
+        storage
+            .put_indexed(
+                "graph",
+                format!("n{u:04}").as_bytes(),
+                b"node",
+                Ack::Fast,
+                ExpectedVersion::Any,
+                Some(&IndexMutations {
+                    ordered: Vec::new(),
+                    edges,
+                }),
+                None,
+            )
+            .expect("seed node");
+    }
+
+    let g_snap = storage.open_snapshot().expect("g_snap");
+    let bfs_opts = BfsOptions {
+        direction: GraphDirection::Out,
+        rel_filter: Some(b"links".to_vec()),
+        max_hops: 2,
+        max_nodes: 256,
+    };
+    let mut bfs_lats = Vec::with_capacity(2_000);
+    let b_start = Instant::now();
+    for i in 0..2_000usize {
+        let seed = format!("n{:04}", i % nodes);
+        let t0 = Instant::now();
+        let res = storage
+            .bfs_traverse(&g_snap, "graph", "deps", seed.as_bytes(), &bfs_opts)
+            .expect("bfs");
+        bfs_lats.push(t0.elapsed().as_nanos() as u64);
+        assert!(res.visited_nodes.len() >= 5);
+    }
+    LatencyStats::from_samples_ns(bfs_lats, b_start.elapsed())
+        .print("8. 2-hop graph BFS traversal (deg-4, 2k-node graph)");
+    drop(g_snap);
+
+    drop(storage);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn bench_tantivy_and_tier0_search(root: &std::path::Path) {
+    let dir = make_bench_dir(root, "tantivy");
+    let storage = Arc::new(
+        RocksDbStorage::open(&dir, StorageConfig::default(), Arc::new(NoopPublisher))
+            .expect("open"),
+    );
+    let engine = SearchEngine::open(
+        &dir,
+        Arc::clone(&storage) as Arc<dyn StorageEngine>,
+        SearchConfig {
+            commit_interval_ms: 60_000,
+            max_buffered_docs: 10_000,
+            max_overlay_docs: 16_384,
+            ..SearchConfig::default()
+        },
+    )
+    .expect("open search");
+
+    let num_docs = 5_000usize;
+    for i in 0..num_docs {
+        let topic = match i % 5 {
+            0 => "consensus storage durability replication",
+            1 => "routing pipeline backpressure scheduler",
+            2 => "graph adjacency traversal index",
+            3 => "security certificate mutual authentication",
+            _ => "telemetry latency histogram benchmark",
+        };
+        engine
+            .index_document(
+                SearchDocument {
+                    namespace: "corpus".to_owned(),
+                    doc_id: format!("doc/{i:05}"),
+                    kind: "article".to_owned(),
+                    title: format!("Membus Technical Note {i} ({topic})"),
+                    tags: vec![format!("grp{}", i % 10), "v2".to_owned()],
+                    body: format!(
+                        "Document {i} discusses {topic} with TokenMarker_{:04} and exact literal RefCode_X{i:04}.",
+                        i % 100
+                    ),
+                    visibility: SearchVisibility::Public,
+                },
+                Ack::Fast,
+            )
+            .expect("seed doc");
+    }
+    engine.flush_sync().expect("flush corpus");
+
+    // 9a. Tantivy BM25 search over disk-persisted segments.
+    let bm25_q = SearchQuery {
+        namespace: Some("corpus".to_owned()),
+        kind: Some("article".to_owned()),
+        query: "consensus durability".to_owned(),
+        mode: SearchMode::Bm25,
+        limit: 20,
+    };
+    let mut bm25_lats = Vec::with_capacity(1_000);
+    let t_bm25 = Instant::now();
+    for _ in 0..1_000 {
+        let t0 = Instant::now();
+        let page = engine.search(&bm25_q).expect("bm25");
+        bm25_lats.push(t0.elapsed().as_nanos() as u64);
+        assert_eq!(page.hits.len(), 20);
+    }
+    LatencyStats::from_samples_ns(bm25_lats, t_bm25.elapsed())
+        .print("9a. Tantivy BM25 search (5k docs, disk-persisted)");
+
+    // 9b. Tantivy case-sensitive literal trigram substring search.
+    let mut lit_lats = Vec::with_capacity(1_000);
+    let t_lit = Instant::now();
+    for i in 0..1_000usize {
+        let q = SearchQuery {
+            namespace: Some("corpus".to_owned()),
+            kind: None,
+            query: format!("RefCode_X{:04}", (i * 3) % num_docs),
+            mode: SearchMode::LiteralSubstring,
+            limit: 10,
+        };
+        let t0 = Instant::now();
+        let page = engine.search(&q).expect("literal");
+        lit_lats.push(t0.elapsed().as_nanos() as u64);
+        assert_eq!(page.hits.len(), 1);
+    }
+    LatencyStats::from_samples_ns(lit_lats, t_lit.elapsed())
+        .print("9b. Tantivy LiteralSubstring trigram search (5k docs)");
+
+    // 9c. 0 ms Tier-0 RAM overlay search-your-writes BEFORE Tantivy commit.
+    let mut t0_lats = Vec::with_capacity(200);
+    let t_overlay = Instant::now();
+    for i in 0..200usize {
+        let marker = format!("LiveInstantToken_{i:04}");
+        let start = Instant::now();
+        engine
+            .index_document(
+                SearchDocument {
+                    namespace: "corpus".to_owned(),
+                    doc_id: format!("live/{i:04}"),
+                    kind: "live".to_owned(),
+                    title: format!("Live {marker}"),
+                    tags: vec!["tier0".to_owned()],
+                    body: format!("immediate overlay payload {marker}"),
+                    visibility: SearchVisibility::Public,
+                },
+                Ack::Fast,
+            )
+            .expect("live index");
+        let page = engine
+            .search(&SearchQuery {
+                namespace: Some("corpus".to_owned()),
+                kind: Some("live".to_owned()),
+                query: marker,
+                mode: SearchMode::LiteralSubstring,
+                limit: 5,
+            })
+            .expect("live search");
+        t0_lats.push(start.elapsed().as_nanos() as u64);
+        assert_eq!(page.hits.len(), 1);
+    }
+    LatencyStats::from_samples_ns(t0_lats, t_overlay.elapsed())
+        .print("9c. Tier-0 RAM overlay 0ms index+search (pre-commit)");
+
+    drop(engine);
+    drop(storage);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+async fn bench_http2_and_websocket(root: &std::path::Path) {
+    let dir = make_bench_dir(root, "http_ws");
+    let signal_cfg = SignalConfig::default();
+    let ring = Arc::new(SignalRing::new(signal_cfg));
+    let storage = Arc::new(
+        RocksDbStorage::open(
+            &dir,
+            StorageConfig::default(),
+            Arc::clone(&ring) as Arc<dyn SignalPublisher>,
+        )
+        .expect("open"),
+    );
+    let broker = Arc::new(SignalBroker::new(
+        Arc::clone(&storage) as Arc<dyn StorageEngine>,
+        ring,
+        signal_cfg,
+    ));
+    let server = MembusServer::new(
+        Arc::clone(&storage) as Arc<dyn StorageEngine>,
+        broker,
+        ServerConfig::default(),
+    );
+    let http_handle = server
+        .bind_http("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        .await
+        .expect("bind http");
+    let Endpoint::Http(http_addr) = *http_handle.endpoint() else {
+        panic!("expected http endpoint");
+    };
+
+    for i in 0..256usize {
+        storage
+            .put(
+                "httpbench",
+                format!("k{i}").as_bytes(),
+                b"hello-http2-payload",
+                Ack::Fast,
+                ExpectedVersion::Any,
+            )
+            .expect("seed");
+    }
+
+    // 10a. HTTP/2 prior-knowledge multiplexed GETs (64 concurrent streams over 1 TCP conn).
+    let tcp = TcpStream::connect(http_addr).await.expect("connect h2");
+    let _ = tcp.set_nodelay(true);
+    let (h2_sender, h2_conn) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tcp))
+            .await
+            .expect("h2 handshake");
+    tokio::spawn(async move {
+        let _ = h2_conn.await;
+    });
+
+    let total_h2 = 2_560usize;
+    let concurrency = 64usize;
+    let per_task = total_h2 / concurrency;
+    let start_h2 = Instant::now();
+    let mut h2_tasks = Vec::with_capacity(concurrency);
+    for tid in 0..concurrency {
+        let mut sender = h2_sender.clone();
+        h2_tasks.push(tokio::spawn(async move {
+            let mut lats = Vec::with_capacity(per_task);
+            for r in 0..per_task {
+                let k = (tid * per_task + r) % 256;
+                let req = HyperRequest::builder()
+                    .method(Method::GET)
+                    .uri(format!("http://{http_addr}/v2/kv/httpbench/k{k}"))
+                    .body(Empty::<Bytes>::new())
+                    .expect("req");
+                let t0 = Instant::now();
+                let resp = sender.send_request(req).await.expect("h2 send");
+                assert_eq!(resp.status(), hyper::StatusCode::OK);
+                let _ = resp.into_body().collect().await.expect("body");
+                lats.push(t0.elapsed().as_nanos() as u64);
+            }
+            lats
+        }));
+    }
+    let mut h2_samples = Vec::with_capacity(total_h2);
+    for t in h2_tasks {
+        h2_samples.extend(t.await.expect("h2 join"));
+    }
+    LatencyStats::from_samples_ns(h2_samples, start_h2.elapsed())
+        .print("10a. Axum HTTP/2 (h2c) multiplexed GET (64 streams/1 conn)");
+
+    // 10b. WebSocket sequential put+get round-trips over `/v2/ws`.
+    let ws_url = format!("ws://{http_addr}/v2/ws");
+    let (ws_stream, _) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .expect("ws connect");
+    let (mut ws_tx, mut ws_rx) = ws_stream.split();
+    let ws_rounds = 1_000usize;
+    let mut ws_samples = Vec::with_capacity(ws_rounds);
+    let start_ws = Instant::now();
+    for i in 0..ws_rounds {
+        let t0 = Instant::now();
+        let put_msg = format!(
+            r#"{{"id":{},"op":"put","namespace":"wsbench","key_utf8":"k{i}","value_utf8":"v{i}"}}"#,
+            i * 2 + 1
+        );
+        ws_tx
+            .send(WsMessage::Text(put_msg.into()))
+            .await
+            .expect("ws send put");
+        let _ = ws_rx.next().await.expect("ws put resp").expect("ok");
+
+        let get_msg = format!(
+            r#"{{"id":{},"op":"get","namespace":"wsbench","key_utf8":"k{i}"}}"#,
+            i * 2 + 2
+        );
+        ws_tx
+            .send(WsMessage::Text(get_msg.into()))
+            .await
+            .expect("ws send get");
+        let _ = ws_rx.next().await.expect("ws get resp").expect("ok");
+        ws_samples.push(t0.elapsed().as_nanos() as u64);
+    }
+    LatencyStats::from_samples_ns(ws_samples, start_ws.elapsed())
+        .print("10b. Axum WebSocket put+get round-trip (/v2/ws)");
+    let _ = ws_tx.close().await;
+
+    http_handle.shutdown().await;
+    drop(server);
     drop(storage);
     let _ = std::fs::remove_dir_all(&dir);
 }
