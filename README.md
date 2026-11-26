@@ -1,153 +1,138 @@
-# Membus
+# Membus v2
 
-Membus is a local key/value resident and Rust library. The resident serves opaque
-values through `membus.kv/1`, with conditional writes, explicit OS or flush
-acknowledgments, bounded retry deduplication, immutable namespace snapshots,
-Windows change subscriptions, persisted timer schedules, and whole-chunk
-retirement. `membus::client` connects to an existing endpoint;
-`membus::indexed` adds declared append-only collections over that client.
-The package uses the Rust standard library and has no third-party crate dependencies.
+Membus v2 is a low-latency embedded and resident key/value, secondary-index,
+graph-adjacency, full-text search, multi-node replication, and signal-streaming
+engine built on multi-threaded RocksDB (`OptimisticTransactionDB`), embedded
+`Tantivy`, embedded `Zenoh`, a sharded in-memory signal ring with durable
+commit-log catch-up, and an Axum HTTP/2 + REST + WebSocket + SSE service plane.
 
-## Build and run
+## Unified Transport Boundary
 
-With Rust and Cargo installed, build from the repository root:
+- **Primary Client / Service Plane:** Axum HTTP/2 + HTTP/1.1 REST, Server-Sent
+  Events (`/v2/signals/{ns}/stream`), and bidirectional WebSocket (`/v2/ws`)
+  for local, remote, and polyglot (including pure-stdlib Python) clients.
+- **Node-to-Node Mesh Plane:** Embedded `Zenoh` (`src/mesh/`) over TCP and QUIC
+  (with optional `mesh-shm` Cargo feature for same-host shared memory) carrying
+  off-path live delta Pub/Sub, bounded gap catch-up queryables, and XOR
+  support-digest anti-entropy reconciliation.
+- **Transitional / Optional Binary Framing Plane:** The multiplexed `membus/2`
+  binary protocol over TCP (plaintext or TLS/mTLS) and Windows IOCP Named Pipes
+  remains available for direct Rust IPC callers and legacy tooling.
+
+## Modules
+
+- `src/types.rs` — Core domain types (`Ack`, `ExpectedVersion`, `StoredRecord`,
+  `ReadMode`, `ColdRef`, `WriteMutation`, `VersionGuard`, `IndexMutations`,
+  `SearchDocument`, `SearchQuery`, `LeaseGrant`, `LeaseInfo`,
+  `CollectionDescriptor`, `SignalEvent`, `ReplicatedDelta`, `ReplicationStamp`,
+  `MembusError`).
+- `src/storage/` — `StorageEngine` trait and `RocksDbStorage` over
+  `OptimisticTransactionDB` with 8 dedicated column families (`kv`, `log`,
+  `blob`, `idx_ord`, `idx_edge`, `idx_rev`, `lease`, `meta`), `BlobDB`
+  (>= 16 KiB with Zstd compression), atomic reverse-posting index maintenance,
+  namespace-scoped SHA-256 CAS blobs, O(1) MVCC snapshots, stateless keyset
+  pagination, deterministic LWW replicated apply, watermark-coordinated safe
+  log trimming, zero-downtime `Checkpoint` backups, WAL tailing, and bounded
+  atomic admission backpressure.
+- `src/index/` — Schema-agnostic order-preserving composite key codecs and
+  validation for declarative ordered secondary indexes (`idx_ord`),
+  bidirectional labeled graph edges (`idx_edge`, forward + reverse + bounded
+  multi-hop BFS up to 8 hops), atomic reverse-posting retraction (`idx_rev`),
+  and namespace-scoped CAS blobs (`blob`).
+- `src/auth/` — `AuthConfig` (`Disabled` | `Enforced`) with constant-time
+  bearer token verification, per-namespace and key-prefix ACL grants
+  (`Read`/`Write`/`Admin`) enforced across transports, plus atomic per-resource
+  fenced leases (`LeaseManager` over `lease` CF with CSPRNG tokens, monotonic
+  clock anchoring, and split `LeaseGrant` vs token-free `LeaseInfo` views).
+- `src/catalog/` — CAS-fenced versioned collection, store-profile, schema &
+  migration catalog (`CollectionCatalog` over `meta` CF) with SHA-256 schema
+  integrity verification, immutable version history, and explicit
+  `begin_migration` / `advance_migration_verification` / `commit_migration` /
+  `abort_migration` transitions.
+- `src/search/` — Embedded disk-persisted `Tantivy` (`MmapDirectory`) with
+  persisted `(epoch, last_indexed_seq)` checkpoint and deterministic `log` CF
+  replay on restart, strict `SearchVisibility` isolation (`Public`,
+  `MetadataOnly`, `Sealed`), field-weighted BM25 (`title` > `tags` > `body`),
+  case-sensitive Unicode trigram literal substring search with exact
+  verification, 0 ms Tier-0 RAM live delta overlay merged over committed
+  segments, and epoch-fenced prefix revocation.
+- `src/signals/` — Sharded per-namespace in-memory signal ring (`SignalRing`)
+  and `SignalBroker` supporting lossless `EachChange` (RAM-ring fast path with
+  seamless `log` CF catch-up and explicit `Gap` signaling on trimmed horizons)
+  and anti-starvation `LiveCoalesced` (per-key coalescing preserving the oldest
+  FIFO arrival ticket).
+- `src/mesh/` — Embedded `Zenoh` multi-node mesh (`MeshNode`) providing
+  off-path live delta Pub/Sub, bounded gap catch-up `Queryable`, deterministic
+  XOR support-digest anti-entropy `Queryable`, deterministic LWW tie-breaking
+  `(timestamp_ms, origin_node_id, origin_seq, value_sha256)`, strict loop
+  prevention, persisted peer watermarks in `meta` CF, and `SearchVisibility`
+  isolation (never transmitting `Sealed` plaintext).
+- `src/backup/` — Off-path zero-downtime RocksDB `Checkpoint` full backups with
+  canonical `manifest.json` per-file SHA-256 checksums, SHA-256-sealed
+  incremental delta archives exported from `log` CF, and clean-room restore
+  with full checksum verification, ordered delta replay, and deterministic
+  `Tantivy` search recovery.
+- `src/tiering/` — Hot/warm/cold archival (`TieringManager`, `ColdStore`,
+  `FileColdStore`) replacing eligible cold `kv` payloads with compact
+  `ColdRef` lineage tombstones (`RECORD_FLAG_COLD_REF`), transparent SHA-256-
+  verified hydration (`ReadMode::HotOnly` vs `ReadMode::HydrateCold`), explicit
+  `rehydrate_cold`, and watermark-safe log trimming (`safe_trim_log_before`).
+- `src/transport/` — Axum HTTP/2 + HTTP/1.1 REST, SSE, and WebSocket server
+  plus optional multiplexed binary TCP (plaintext & TLS/mTLS via `tokio-rustls`)
+  and Windows IOCP Named Pipe listeners sharing a single `ServerContext`.
+- `src/protocol/` & `src/client/` — Optional multiplexed `membus/2` binary
+  codec and pipelined async Rust client.
+- `src/cli/` — Resident and break-glass diagnostic CLI (`membus serve`,
+  `membus health`, `membus checkpoint`, `membus diag inspect`,
+  `membus diag verify`, `membus diag restore`).
+- `clients/python/` — Zero-dependency pure-stdlib Python 3.14+ client
+  (`membus_v2_client.py`) and end-to-end test suite targeting the HTTP/REST +
+  SSE surface.
+
+## Durability Semantics
+
+- `Ack::Fast` commits with `WriteOptions::set_sync(false)`: updates land
+  immediately in the RocksDB MemTable and OS WAL buffer, are immediately visible
+  to readers and Tier-0 search, and immediately wake signal subscribers. An
+  optional periodic background WAL sync reduces exposure, but `Ack::Fast` does
+  not guarantee survival across sudden power loss.
+- `Ack::Flush` commits with `WriteOptions::set_sync(true)`, participating in
+  RocksDB's native lock-free `WriteThread` leader-follower group commit across
+  concurrent writers.
+
+## CLI Usage
+
+Start a resident with the unified HTTP/2 + REST + WebSocket + SSE listener and
+optional embedded Zenoh mesh peering:
 
 ```text
-cargo build --release --offline --locked
+membus serve --data-dir <STATE_DIR> --http-listen 127.0.0.1:7480 --checkpoint-root <CHECKPOINT_ROOT>
+membus serve --data-dir <STATE_DIR> --http-listen 127.0.0.1:7480 --mesh-node-id node-a --mesh-listen tcp/127.0.0.1:7447 --mesh-connect tcp/127.0.0.1:7448
 ```
 
-Choose a state directory outside the source checkout and an explicit local pipe
-name. On Windows, for example (PowerShell):
+Optional transitional binary TCP (plaintext or TLS/mTLS) and Named Pipe listeners:
 
-```powershell
-$state = Join-Path $env:LOCALAPPDATA 'membus-state'
-.\target\release\membus.exe $state pipe '\\.\pipe\membus-example'
+```text
+membus serve --data-dir <STATE_DIR> --tcp 127.0.0.1:7420 --tls-cert <CERT_PEM> --tls-key <KEY_PEM> --tls-client-ca <CA_PEM> --auth-config <AUTH_JSON>
+membus serve --data-dir <STATE_DIR> --pipe \\.\pipe\membus-resident
 ```
 
-The server runs in the foreground. Keep its state directory across restarts.
-Another terminal can check transport and heartbeat together:
+Break-glass read-only / secondary diagnostics (safe against BOTH closed and live-open primary databases; never takes the primary write lock and never exposes secret lease tokens):
 
-```powershell
-.\target\release\membus.exe health '\\.\pipe\membus-example' --state-dir $state
+```text
+membus diag inspect --data-dir <STATE_DIR>
+membus diag verify --data-dir <STATE_DIR>
+membus diag restore --backup-dir <BACKUP_DIR> --target-dir <TARGET_DIR> [--delta <DELTA_BUNDLE_JSON>...]
 ```
 
-Set `$state` to the same directory in that terminal. Health requires
-`--state-dir`, so it always inspects the intended instance. For loopback tests, the server
-also accepts `membus STATE_DIR tcp 127.0.0.1:PORT`. Windows named pipes reject
-remote clients and grant access to the resident's current user and LocalSystem.
-Loopback TCP provides no application authentication. Endpoint selection and
-service supervision belong to the deployment; this repository does not register
-a service automatically. See [resident operation](docs/RESIDENT.md).
+## Pure-Stdlib Python Client
 
-## Native Rust client
+```python
+from clients.python.membus_v2_client import MembusClient
 
-Use this package as a path dependency, with the location selected by your build:
-
-```toml
-[dependencies]
-membus = { path = "../membus" }
+client = MembusClient("http://127.0.0.1:7480")
+client.put("app", "greeting", "hello")
+rec = client.get("app", "greeting")
+for msg in client.stream_signals("app", mode="each"):
+    print(msg.event, msg.data)
 ```
-
-This Windows example connects to the pipe above, writes an absent key with a
-caller-owned operation ID, and reads its committed value:
-
-```rust,no_run
-use membus::client::{Ack, Client, Deadline, MutationRequest, Options};
-use std::{path::Path, time::{Duration, Instant}};
-
-#[cfg(windows)]
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let deadline = Deadline {
-        unix_ms: membus::now_ms() + 2_000,
-        local: Instant::now() + Duration::from_secs(2),
-    };
-    let mut client = Client::connect_pipe(
-        Path::new(r"\\.\pipe\membus-example"),
-        Options::new("example-client", 65_536),
-        deadline.local,
-    )?;
-    let mut attempt = client.prepare(MutationRequest {
-        operation_id: "example-create-1".into(),
-        namespace: "example".into(),
-        key: "item/1".into(),
-        value: b"example-create-1: hello".to_vec(),
-        ack: Ack::Flush,
-        expected: Some(0),
-    })?;
-    // This one-shot example exits on error and drops its in-memory attempt.
-    // An uncertain outcome then requires deterministic-key reconciliation.
-    client.mutate(&mut attempt, deadline)?;
-    let value = client.get("example", "item/1", "example-read-1", Deadline {
-        unix_ms: membus::now_ms() + 2_000,
-        local: Instant::now() + Duration::from_secs(2),
-    })?;
-    println!("{value:?}");
-    Ok(())
-}
-#[cfg(not(windows))]
-fn main() {}
-```
-
-`Some(0)` means absent, `Some(version)` compares a committed revision, and
-`None` selects unconditional PUT. Choose a new operation ID for each intentional
-mutation. The example's fixed ID is for its one logical creation. The client
-never retries or reconnects automatically. The example exits on a mutation error,
-so it does not preserve the Attempt's in-memory retry context. An application
-handling recovery must retain the original attempt and uncertain result. If that
-context is lost, reconcile the deterministic key and embedded operation identity
-before choosing another send; preparing again does not restore the old retry
-window. See [Rust client usage and uncertainty](docs/RUST_CLIENT.md).
-
-## Documentation and checks
-
-- [Component ownership and runtime boundaries](docs/COMPONENTS.md)
-- [Instance clocks, deadlines and recovery windows](docs/CLOCK.md)
-- [Protocol, acknowledgments, refusals and snapshots](docs/KV1.md)
-- [Bounded immutable selected-view acquisition](docs/SELECTED-VIEW.md)
-- [Mutation retry comparators, encoding aliases and resource accounting](docs/RETRY_RETENTION.md)
-- [Recovered Flush prerequisites and historical backup limits](docs/RECOVERY_FLUSH.md)
-- [Recovery rename directory barriers](docs/RECOVERY-DIRECTORIES.md)
-- [Grouped append and flush behavior](docs/GROUPED-FLUSH.md)
-- [Change subscriptions and receiver responsibilities](docs/SUBSCRIPTIONS.md)
-- [Persisted timer wakes and crash boundaries](docs/TIMERS.md)
-- [Retention classes, retirement, replay and legacy import](docs/CHUNK-RETIREMENT.md)
-- [Unresolved catalogue append recovery](docs/CATALOGUE-APPEND-RECOVERY.md)
-- [Read-only retirement inspection](docs/RETIREMENT-INSPECTION.md)
-- [Indexed append-only collections](docs/INDEXED_COLLECTIONS.md)
-- [Receiving the Python SDK](docs/PYTHON_RECEIVING.md)
-- [Disk-backed values, bounded cache and cache policy](docs/VALUE_CACHE.md)
-
-The following guides distinguish current local behavior from proposed hosted
-service contracts; their gateways, adapters and distributed protocols are not
-implemented:
-
-- [External read-cache freshness and fill races](docs/CLIENT_CACHE.md)
-- [Complete-state backups, isolated recovery and restore lineage](docs/BACKUP_RECOVERY.md)
-- [Tenant admission and shared-resource boundaries](docs/TENANCY_BOUNDARY.md)
-- [Tenant offboarding and retained copies](docs/TENANT_LIFECYCLE.md)
-- [Remote storage capabilities and durability](docs/STORAGE_CAPABILITIES.md)
-- [Shard routing, uncertain dispatch and cutover](docs/SHARD_ROUTING.md)
-- [Durable delivery sources and progress checkpoints](docs/DURABLE_DELIVERY.md)
-- [Remote deadlines and timeout settlement](docs/DEADLINES.md)
-- [Service health and readiness evidence](docs/SERVICE_HEALTH.md)
-
-Rust checks use `cargo test --offline --locked`; Windows listener/forwarder tests
-need the explicit fixture inputs described in [RUST_CLIENT.md](docs/RUST_CLIENT.md).
-Tests create isolated state and some launch resident processes. Build and test
-commands here are usage instructions, not a claim that checks have run on your
-machine. `tests/resident_native.rs` supplies native resident process controls;
-the former `tests/resident.py` is retired. Historical design and review documents
-remain accessible through Git history.
-
-OS acknowledgment covers completed appends and process restart, not power loss.
-Flush acknowledgment additionally synchronizes the covering file; actual
-persistence still depends on filesystem and hardware behavior. Startup requires
-active recovered data-file synchronization before exposing values or retry
-outcomes; an on-disk acknowledgment byte alone does not prove achieved Flush.
-Already imported read-only legacy backups retain the historical limits described
-in [RECOVERY_FLUSH.md](docs/RECOVERY_FLUSH.md). Snapshots and
-change history are bounded. Subscriptions and timer wakes grant no lease,
-receiver receipt, or authority to execute an application effect. Committed values
-remain in chunk files with a bounded memory cache and cold reads by indexed
-offset. Replay rebuilds the index with an empty cache. Compressed archival tiers
-and replay index checkpoints are not implemented.
