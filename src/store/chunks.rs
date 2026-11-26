@@ -322,11 +322,12 @@ fn encode_bounded(r: &CatRecord) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 pub fn frame(magic: &[u8; 4], b: &[u8]) -> Vec<u8> {
-    let mut out = magic.to_vec();
-    out.extend((b.len() as u32).to_le_bytes());
-    out.extend((!(b.len() as u32)).to_le_bytes());
-    out.extend(crc32(b).to_le_bytes());
-    out.extend(b);
+    let mut out = Vec::with_capacity(16 + b.len());
+    out.extend_from_slice(magic);
+    out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(!(b.len() as u32)).to_le_bytes());
+    out.extend_from_slice(&crc32(b).to_le_bytes());
+    out.extend_from_slice(b);
     out
 }
 fn decode_payload(b: &[u8]) -> Result<CatRecord, u16> {
@@ -579,51 +580,14 @@ pub fn committed_records(records: Vec<CatRecord>) -> (Vec<CatRecord>, bool) {
     (out, incomplete)
 }
 
-/// One frame read from a log: Ok(Some(payload, frame_len)), Ok(None) for a torn tail (short header or short
-/// body), Err for interior corruption (magic, length complement, length bound or CRC of a complete frame).
-pub enum Frame {
-    Whole(Vec<u8>, u64),
-    Torn(&'static str),
-}
-pub fn read_frame_at(f: &mut File, magic: &[u8; 4], offset: u64, len: u64, name: &str) -> io::Result<Frame> {
-    capture_frame_at(f, magic, offset, len, name)?.validate(offset, name)
-}
-
-// Captured bytes remain opaque until their checksum is validated. Separating
-// cursor work from buffer work lets independent offsets share a read handle
-// without holding its cursor mutex across the checksum calculation.
-pub(crate) struct CapturedFrame(CapturedBody);
-enum CapturedBody {
-    Whole(Vec<u8>, u32),
-    Torn(&'static str),
-}
-impl CapturedFrame {
-    pub(crate) fn validate(self, offset: u64, name: &str) -> io::Result<Frame> {
-        match self.0 {
-            CapturedBody::Torn(reason) => Ok(Frame::Torn(reason)),
-            CapturedBody::Whole(bytes, expected) => {
-                #[cfg(test)]
-                crate::read_work_tests::work(1, bytes.len());
-                #[cfg(test)]
-                cold_validation_tests::before_validation();
-                if crc32(&bytes) != expected {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("interior-corrupt {name} offset {offset}: CRC"),
-                    ));
-                }
-                let frame_len = 16 + bytes.len() as u64;
-                Ok(Frame::Whole(bytes, frame_len))
-            }
-        }
-    }
-}
-pub(crate) fn capture_frame_at(f: &mut File, magic: &[u8; 4], offset: u64, len: u64, name: &str) -> io::Result<CapturedFrame> {
-    if len - offset < 16 {
-        return Ok(CapturedFrame(CapturedBody::Torn("short header")));
-    }
-    let mut head = [0; 16];
-    f.read_exact(&mut head)?;
+/// Validate a 16-byte log frame header (`magic`, length, inverted length, bound)
+/// and return `(payload_len, expected_crc)`.
+pub(crate) fn parse_frame_header(
+    head: &[u8; 16],
+    magic: &[u8; 4],
+    offset: u64,
+    name: &str,
+) -> io::Result<(usize, u32)> {
     if &head[0..4] != magic {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -643,14 +607,60 @@ pub(crate) fn capture_frame_at(f: &mut File, magic: &[u8; 4], offset: u64, len: 
             format!("interior-corrupt {name} offset {offset}: invalid chunk length"),
         ));
     }
-    if len - offset - 16 < n as u64 {
-        return Ok(CapturedFrame(CapturedBody::Torn("short body")));
+    let expected = u32::from_le_bytes(head[12..16].try_into().unwrap());
+    Ok((n, expected))
+}
+
+/// One frame read from a log: Whole(payload, frame_len), or Torn for a torn tail (short header or short
+/// body), or Err for interior corruption (magic, length complement, length bound or CRC of a complete frame).
+pub enum Frame {
+    Whole(Vec<u8>, u64),
+    Torn(&'static str),
+}
+pub fn read_frame_at(f: &mut File, magic: &[u8; 4], offset: u64, len: u64, name: &str) -> io::Result<Frame> {
+    let mut buf = Vec::new();
+    match read_frame_into(f, magic, offset, len, name, &mut buf)? {
+        BorrowedFrame::Torn(reason) => Ok(Frame::Torn(reason)),
+        BorrowedFrame::Whole(_, frame_len) => Ok(Frame::Whole(buf, frame_len)),
     }
-    let mut b = vec![0; n];
-    f.read_exact(&mut b)?;
-    Ok(CapturedFrame(CapturedBody::Whole(
-        b, u32::from_le_bytes(head[12..16].try_into().unwrap()),
-    )))
+}
+
+pub(crate) enum BorrowedFrame<'a> {
+    Whole(&'a [u8], u64),
+    Torn(&'static str),
+}
+/// Buffered frame reader reusing `scratch` across sequential log records.
+pub(crate) fn read_frame_into<'a, R: Read>(
+    r: &mut R,
+    magic: &[u8; 4],
+    offset: u64,
+    len: u64,
+    name: &str,
+    scratch: &'a mut Vec<u8>,
+) -> io::Result<BorrowedFrame<'a>> {
+    if len - offset < 16 {
+        return Ok(BorrowedFrame::Torn("short header"));
+    }
+    let mut head = [0u8; 16];
+    r.read_exact(&mut head)?;
+    let (n, expected) = parse_frame_header(&head, magic, offset, name)?;
+    if len - offset - 16 < n as u64 {
+        return Ok(BorrowedFrame::Torn("short body"));
+    }
+    scratch.resize(n, 0);
+    r.read_exact(scratch)?;
+    if crc32(scratch) != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("interior-corrupt {name} offset {offset}: CRC"),
+        ));
+    }
+    Ok(BorrowedFrame::Whole(scratch.as_slice(), 16 + n as u64))
+}
+
+#[cfg(test)]
+pub(crate) fn before_cold_validation() {
+    cold_validation_tests::before_validation();
 }
 
 #[cfg(test)]
@@ -1200,14 +1210,111 @@ pub fn list_chunk_files(dir: &Path) -> io::Result<Vec<(String, usize, u64, PathB
     Ok(out)
 }
 
+/// Compact chunk-holder set avoiding heap allocation when a key resides in one chunk.
+#[derive(Clone, Debug)]
+pub enum SmallHolders {
+    One(u64),
+    Many(BTreeSet<u64>),
+}
+pub enum SmallHoldersIter<'a> {
+    One(std::option::IntoIter<&'a u64>),
+    Many(std::collections::btree_set::Iter<'a, u64>),
+}
+impl<'a> Iterator for SmallHoldersIter<'a> {
+    type Item = &'a u64;
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::One(it) => it.next(),
+            Self::Many(it) => it.next(),
+        }
+    }
+}
+impl<'a> IntoIterator for &'a SmallHolders {
+    type Item = &'a u64;
+    type IntoIter = SmallHoldersIter<'a>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+impl SmallHolders {
+    pub fn insert(&mut self, chunk: u64) -> bool {
+        match self {
+            Self::One(existing) => {
+                if *existing == chunk {
+                    return false;
+                }
+                let first = *existing;
+                let mut set = BTreeSet::new();
+                set.insert(first);
+                set.insert(chunk);
+                *self = Self::Many(set);
+                true
+            }
+            Self::Many(set) => set.insert(chunk),
+        }
+    }
+    pub fn remove(&mut self, chunk: &u64) -> bool {
+        match self {
+            Self::One(existing) => {
+                if existing == chunk {
+                    *self = Self::Many(BTreeSet::new());
+                    true
+                } else {
+                    false
+                }
+            }
+            Self::Many(set) => {
+                let removed = set.remove(chunk);
+                if set.len() == 1 {
+                    let only = *set.iter().next().unwrap();
+                    *self = Self::One(only);
+                }
+                removed
+            }
+        }
+    }
+    pub fn retain<F: FnMut(&u64) -> bool>(&mut self, mut f: F) {
+        match self {
+            Self::One(existing) => {
+                if !f(existing) {
+                    *self = Self::Many(BTreeSet::new());
+                }
+            }
+            Self::Many(set) => {
+                set.retain(f);
+                if set.len() == 1 {
+                    let only = *set.iter().next().unwrap();
+                    *self = Self::One(only);
+                }
+            }
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::One(_) => false,
+            Self::Many(set) => set.is_empty(),
+        }
+    }
+    pub fn iter(&self) -> SmallHoldersIter<'_> {
+        match self {
+            Self::One(only) => SmallHoldersIter::One(Some(only).into_iter()),
+            Self::Many(set) => SmallHoldersIter::Many(set.iter()),
+        }
+    }
+}
+
 /// Holders: for each key, the retained chunks holding any of its records.
 #[derive(Default)]
 pub struct Holders {
-    pub map: HashMap<Key, BTreeSet<u64>>,
+    pub map: HashMap<Key, SmallHolders>,
 }
 impl Holders {
     pub fn add(&mut self, k: &Key, chunk: u64) {
-        self.map.entry(k.clone()).or_default().insert(chunk);
+        if let Some(s) = self.map.get_mut(k) {
+            s.insert(chunk);
+        } else {
+            self.map.insert(k.clone(), SmallHolders::One(chunk));
+        }
     }
     pub fn remove(&mut self, k: &Key, chunk: u64) {
         if let Some(s) = self.map.get_mut(k) {
@@ -1283,6 +1390,20 @@ impl ChunkIndexReservation {
             chunks: chunks.clone(),
             remaining: AtomicUsize::new(bytes),
         })
+    }
+
+    pub(crate) fn register_one(&self, id: u64, ns: &str, key: &str, version: u64, end: u64) {
+        let k = (ns.to_owned(), key.to_owned());
+        let mut chunks = self.chunks.lock().unwrap();
+        let before = chunks.index_bytes;
+        chunks.register(id, &k, version);
+        let registered = chunks.index_bytes - before;
+        let remaining = self.remaining.load(Ordering::Relaxed) - registered;
+        self.remaining.store(remaining, Ordering::Relaxed);
+        chunks.pending_index_bytes -= registered;
+        if let Some(info) = chunks.table.get_mut(&id) {
+            info.bytes = end;
+        }
     }
 
     pub(crate) fn register(&self, id: u64, records: Vec<(String, String, u64)>, end: u64) {
@@ -1373,12 +1494,13 @@ impl ChunkStore {
     }
     pub fn register(&mut self, id: u64, k: &Key, v: u64) {
         if let Some(c) = self.table.get_mut(&id) {
-            if !c.keys.contains_key(k) {
+            if let Some(e) = c.keys.get_mut(k) {
+                e.0 = e.0.min(v);
+                e.1 = e.1.max(v);
+            } else {
                 self.index_bytes += chunk_index_charge(k);
+                c.keys.insert(k.clone(), (v, v));
             }
-            let e = c.keys.entry(k.clone()).or_insert((v, v));
-            e.0 = e.0.min(v);
-            e.1 = e.1.max(v);
         }
         self.holders.add(k, id);
     }
@@ -1564,6 +1686,30 @@ mod tests {
         assert_eq!(p.classes().len(), 64);
         assert!(p.would_exceed("many", "x/", Class::expire(999_999)));
         assert!(!p.would_exceed("many", "y/", Class::LATEST));
+    }
+    #[test]
+    fn small_holders_transitions_one_many_one_empty() {
+        let mut h = Holders::default();
+        let k: Key = ("ns".into(), "k".into());
+        h.add(&k, 1);
+        assert!(matches!(h.map.get(&k), Some(SmallHolders::One(1))));
+        h.add(&k, 1);
+        assert!(matches!(h.map.get(&k), Some(SmallHolders::One(1))));
+        h.add(&k, 2);
+        assert!(matches!(h.map.get(&k), Some(SmallHolders::Many(_))));
+        h.add(&k, 3);
+        assert_eq!(h.others(&k, 2).collect::<Vec<_>>(), vec![1, 3]);
+        h.remove(&k, 2);
+        assert!(matches!(h.map.get(&k), Some(SmallHolders::Many(_))));
+        h.remove(&k, 1);
+        assert!(matches!(h.map.get(&k), Some(SmallHolders::One(3))));
+        h.map.get_mut(&k).unwrap().retain(|id| *id != 3);
+        assert!(h.map.get(&k).unwrap().is_empty());
+        h.map.retain(|_, s| !s.is_empty());
+        assert!(!h.map.contains_key(&k));
+        h.add(&k, 9);
+        h.remove(&k, 9);
+        assert!(!h.map.contains_key(&k));
     }
 }
 

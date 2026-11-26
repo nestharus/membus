@@ -217,9 +217,18 @@ fn funded_4161_guard_max_value_inspection_has_bounded_hash_scratch_without_body_
     }
     let oversized = vec![0; membus::MAX_FRAME / 3];
     assert!(BorrowedOriginal::from_bytes(&oversized).is_err());
+    let (_, probe) = measured(|| {
+        let mut v = Vec::<u8>::with_capacity(64);
+        v.push(1);
+        drop(std::hint::black_box(v));
+    });
     assert!(
-        allocations.count > 0,
-        "the retained existing SHA helper uses temporary heap storage"
+        probe.count > 0 && probe.remaining == 0,
+        "counting allocator hook must observe heap allocations: {probe:?}"
+    );
+    assert_eq!(
+        allocations.count, 0,
+        "stack-buffered SHA-256 inspection performs zero heap allocations"
     );
     println!("public inspection: guards=4161 selected-value={} original_budget_before_after={} retained_version=1",membus::MAX_VALUE,used);
 }

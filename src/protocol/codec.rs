@@ -68,29 +68,57 @@ pub const ATOMIC_POPULATION: u8 = 30;
 pub const SNAPSHOT_REQUIRE_COMPLETE: u8 = 31;
 /// Additive selected-view acquisition; HELLO and existing operations are unchanged.
 pub const SNAPSHOT_OPEN_SELECTED: u8 = 32;
-const fn crc32_table() -> [u32; 256] {
-    let mut table = [0; 256];
-    let mut index = 0;
-    while index < table.len() {
-        let mut remainder = index as u32;
-        let mut round = 0;
-        while round < 8 {
-            remainder = (remainder >> 1) ^ if remainder & 1 != 0 { 0xedb8_8320 } else { 0 };
-            round += 1;
+const fn make_crc32_slice8() -> [[u32; 256]; 8] {
+    let mut table = [[0u32; 256]; 8];
+    let mut i = 0;
+    while i < 256 {
+        let mut c = i as u32;
+        let mut r = 0;
+        while r < 8 {
+            c = (c >> 1) ^ if c & 1 != 0 { 0xedb8_8320 } else { 0 };
+            r += 1;
         }
-        table[index] = remainder;
-        index += 1;
+        table[0][i] = c;
+        i += 1;
+    }
+    let mut s = 1;
+    while s < 8 {
+        let mut i = 0;
+        while i < 256 {
+            let prev = table[s - 1][i];
+            table[s][i] = (prev >> 8) ^ table[0][(prev & 0xff) as usize];
+            i += 1;
+        }
+        s += 1;
     }
     table
 }
-// One immutable table, evaluated at compile time and shared by every caller.
-static CRC32_TABLE: [u32; 256] = crc32_table();
-pub fn crc32(bytes: &[u8]) -> u32 {
-    let mut c = !0u32;
-    for &b in bytes {
-        c = (c >> 8) ^ CRC32_TABLE[((c as u8) ^ b) as usize];
+// One immutable slicing-by-8 table, evaluated at compile time and shared by every caller.
+static CRC32_SLICE8: [[u32; 256]; 8] = make_crc32_slice8();
+
+/// Streaming IEEE CRC-32 update (pass `!0u32` initially and invert the final state with `!c`).
+pub(crate) fn crc32_update(mut c: u32, mut bytes: &[u8]) -> u32 {
+    while bytes.len() >= 8 {
+        let lo = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) ^ c;
+        let hi = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        c = CRC32_SLICE8[7][(lo & 0xff) as usize]
+            ^ CRC32_SLICE8[6][((lo >> 8) & 0xff) as usize]
+            ^ CRC32_SLICE8[5][((lo >> 16) & 0xff) as usize]
+            ^ CRC32_SLICE8[4][((lo >> 24) & 0xff) as usize]
+            ^ CRC32_SLICE8[3][(hi & 0xff) as usize]
+            ^ CRC32_SLICE8[2][((hi >> 8) & 0xff) as usize]
+            ^ CRC32_SLICE8[1][((hi >> 16) & 0xff) as usize]
+            ^ CRC32_SLICE8[0][((hi >> 24) & 0xff) as usize];
+        bytes = &bytes[8..];
     }
-    !c
+    for &b in bytes {
+        c = (c >> 8) ^ CRC32_SLICE8[0][((c as u8) ^ b) as usize];
+    }
+    c
+}
+
+pub fn crc32(bytes: &[u8]) -> u32 {
+    !crc32_update(!0u32, bytes)
 }
 pub fn lp(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend((bytes.len() as u32).to_le_bytes());
@@ -276,18 +304,56 @@ pub(crate) fn parse_record_view(b: &[u8]) -> Result<RecordView<'_>, u16> {
         at,
     })
 }
+/// Exact encoded payload length of `mutation_bytes(m, ..)` without heap allocation.
+pub(crate) fn mutation_encoded_len(m: &Mutation) -> usize {
+    42 + m.ns.len() + m.key.len() + m.op_id.len() + m.bytes.len()
+}
+fn write_mutation_body(out: &mut Vec<u8>, m: &Mutation, version: u64, at: u64) {
+    out.extend_from_slice(&at.to_le_bytes());
+    out.extend_from_slice(&version.to_le_bytes());
+    out.push(m.ack);
+    out.push(m.remove as u8);
+    lp(out, m.ns.as_bytes());
+    lp(out, m.key.as_bytes());
+    lp(out, m.op_id.as_bytes());
+    out.extend_from_slice(&m.expected.unwrap_or(u64::MAX).to_le_bytes());
+    lp(out, &m.bytes);
+}
 pub(crate) fn mutation_bytes(m: &Mutation, version: u64, at: u64) -> Vec<u8> {
-    let mut b = Vec::new();
-    b.extend(at.to_le_bytes());
-    b.extend(version.to_le_bytes());
-    b.push(m.ack);
-    b.push(m.remove as u8);
-    lp(&mut b, m.ns.as_bytes());
-    lp(&mut b, m.key.as_bytes());
-    lp(&mut b, m.op_id.as_bytes());
-    b.extend(m.expected.unwrap_or(u64::MAX).to_le_bytes());
-    lp(&mut b, &m.bytes);
+    let mut b = Vec::with_capacity(mutation_encoded_len(m));
+    write_mutation_body(&mut b, m, version, at);
     b
+}
+/// Streaming SHA-256 over canonical `mutation_bytes(m, 0, 0)` with zero heap allocations.
+pub(crate) fn fingerprint_mutation(m: &Mutation) -> [u8; 32] {
+    let mut hash = crate::store::hash::Sha256::new();
+    hash.update(&[0u8; 16]);
+    hash.update(&[m.ack, m.remove as u8]);
+    hash.update(&(m.ns.len() as u32).to_le_bytes());
+    hash.update(m.ns.as_bytes());
+    hash.update(&(m.key.len() as u32).to_le_bytes());
+    hash.update(m.key.as_bytes());
+    hash.update(&(m.op_id.len() as u32).to_le_bytes());
+    hash.update(m.op_id.as_bytes());
+    hash.update(&m.expected.unwrap_or(u64::MAX).to_le_bytes());
+    hash.update(&(m.bytes.len() as u32).to_le_bytes());
+    hash.update(&m.bytes);
+    hash.finish()
+}
+/// Encode a complete `MBK1` mutation frame in a single allocation.
+pub(crate) fn encode_mbk1_mutation(m: &Mutation, version: u64, at: u64) -> Vec<u8> {
+    let payload_len = mutation_encoded_len(m);
+    let len_u32 = payload_len as u32;
+    let mut out = Vec::with_capacity(16 + payload_len);
+    out.extend_from_slice(b"MBK1");
+    out.extend_from_slice(&len_u32.to_le_bytes());
+    out.extend_from_slice(&(!len_u32).to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    write_mutation_body(&mut out, m, version, at);
+    debug_assert_eq!(out.len(), 16 + payload_len);
+    let sum = crc32(&out[16..]);
+    out[12..16].copy_from_slice(&sum.to_le_bytes());
+    out
 }
 pub(crate) fn parse_mutation(
     c: &mut Cursor<'_>,

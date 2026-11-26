@@ -1,10 +1,9 @@
 //! Store admission, policy publication, committed reads and mutation completion.
 use crate::append_owner::Append;
 use crate::chunks;
-use crate::codec::crc32;
-use crate::codec::mutation_bytes;
-use crate::codec::MAX_ID;
-use crate::codec::MAX_VALUE;
+use crate::codec::{
+    encode_mbk1_mutation, fingerprint_mutation, mutation_encoded_len, MAX_ID, MAX_VALUE,
+};
 use crate::routing::stripe;
 use crate::routing::ClassReservation;
 use crate::timers;
@@ -121,16 +120,65 @@ pub(crate) type Key = (String, String);
 pub(crate) type Committed = BTreeMap<Key, Arc<crate::value_disk::Entry>>;
 pub(crate) fn index_charge(k: &Key) -> usize { 512 + 4 * (k.0.len() + k.1.len()) }
 pub(crate) fn dedup_charge(k: &Key) -> usize { 264 + 3 * (k.0.len() + k.1.len()) }
-pub(crate) struct ColdReader<'a>(&'a (std::sync::Mutex<usize>, std::sync::Condvar));
+/// Byte-weighted cold-decode admission keeping concurrent transient buffers within `memory_margin()`.
+/// Large frames (> half margin) stay capped at 2 concurrent decodes; smaller frames scale up to 16.
+pub(crate) struct ColdDecodeLimiter {
+    state: std::sync::Mutex<(usize, usize)>,
+    ready: std::sync::Condvar,
+    budget: usize,
+    max_slots: usize,
+}
+impl ColdDecodeLimiter {
+    pub(crate) fn new(memory_margin: usize) -> Self {
+        Self {
+            state: std::sync::Mutex::new((0, 0)),
+            ready: std::sync::Condvar::new(),
+            budget: memory_margin.max(2),
+            max_slots: 16,
+        }
+    }
+    pub(crate) fn acquire(&self, frame_bytes: usize) -> ColdReader<'_> {
+        let half = (self.budget / 2).max(1);
+        let charge = if frame_bytes > half {
+            half
+        } else {
+            frame_bytes.max(64 * 1024).min(half)
+        };
+        let mut guard = self.state.lock().unwrap();
+        while guard.0 > 0
+            && (guard.0 >= self.max_slots || guard.1.saturating_add(charge) > self.budget)
+        {
+            guard = self.ready.wait(guard).unwrap();
+        }
+        guard.0 += 1;
+        guard.1 = guard.1.saturating_add(charge);
+        ColdReader {
+            limiter: self,
+            charge,
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn active(&self) -> usize {
+        self.state.lock().unwrap().0
+    }
+}
+pub(crate) struct ColdReader<'a> {
+    limiter: &'a ColdDecodeLimiter,
+    charge: usize,
+}
 impl Drop for ColdReader<'_> {
-    fn drop(&mut self) { *self.0.0.lock().unwrap() -= 1; self.0.1.notify_one(); }
+    fn drop(&mut self) {
+        let mut guard = self.limiter.state.lock().unwrap();
+        guard.0 -= 1;
+        guard.1 -= self.charge;
+        drop(guard);
+        self.limiter.ready.notify_all();
+    }
 }
 pub(crate) fn fingerprint(m: &Mutation) -> [u8; 32] {
     // The durable representation remains complete. Only the in-memory retry
     // comparator is compact; replay derives the same digest from retained records.
-    let mut hash = chunks::Sha256::new();
-    hash.update(&mutation_bytes(m, 0, 0));
-    hash.finish()
+    fingerprint_mutation(m)
 }
 pub(crate) fn dedup_identity(m: &Mutation) -> Key {
     // The existing policy target key carries its caller namespace; retain the literal operation ID.
@@ -142,11 +190,8 @@ pub(crate) fn dedup_identity(m: &Mutation) -> Key {
     (ns.to_owned(), m.op_id.clone())
 }
 impl Store {
-    pub(crate) fn cold_reader(&self) -> ColdReader<'_> {
-        let mut readers = self.cold_readers.0.lock().unwrap();
-        while *readers >= 2 { readers = self.cold_readers.1.wait(readers).unwrap(); }
-        *readers += 1;
-        ColdReader(&self.cold_readers)
+    pub(crate) fn cold_reader(&self, frame_bytes: usize) -> ColdReader<'_> {
+        self.cold_readers.acquire(frame_bytes)
     }
     /// The instance clock, shared by recovery and server runtime owners.
     pub fn clock(&self) -> &chunks::Clock { &self.clock }
@@ -180,7 +225,7 @@ impl Store {
         if _load.is_some() {
             if let Some(v) = self.cache.after_miss(entry.version) { return Ok(v); }
         }
-        let _reader = self.cold_reader();
+        let _reader = self.cold_reader(entry.location.record_len as usize);
         self.cache.cold();
         let value = self.read_entry_uncached(ns, key, entry)?;
         if self.scan_usage.released.swap(false, Ordering::AcqRel)
@@ -644,7 +689,7 @@ impl Store {
         let id = dedup_identity(&m);
         let fp = fingerprint(&m);
         let log_index = stripe(&m.ns, &m.key);
-        let representation_bytes = mutation_bytes(&m, 0, 0).len();
+        let representation_bytes = mutation_encoded_len(&m);
         let disk_bytes = if m.ack == 0 {
             0
         } else {
@@ -828,12 +873,7 @@ impl Store {
         let result = if m.ack == 0 {
             Ok(0)
         } else {
-            let b = mutation_bytes(&m, version, at);
-            let mut record = b"MBK1".to_vec();
-            record.extend((b.len() as u32).to_le_bytes());
-            record.extend((!(b.len() as u32)).to_le_bytes());
-            record.extend(crc32(&b).to_le_bytes());
-            record.extend(b);
+            let record = encode_mbk1_mutation(&m, version, at);
             let (done, completion) = mpsc::channel();
             match self.appenders[log_index]
                 .sender
@@ -867,6 +907,7 @@ impl Store {
             self.cache.insert(value.clone(), label, policy, true, self.config.cache_bytes, &entry.cacheable);
             (m.ns != timers::NS).then_some(value)
         });
+        drop(committed);
         let outcome = if result.is_ok() {
             Outcome {
                 code: 0,

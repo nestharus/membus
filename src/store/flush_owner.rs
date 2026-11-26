@@ -89,7 +89,7 @@ impl FlushOwner {
             interval: config.flush_ms,
             seams: TestSeam::for_flush(config),
             pending: VecDeque::new(),
-            last: None,
+            last_by_sink: HashMap::new(),
             covered: HashMap::new(),
             sync_failed: [false; 4],
         };
@@ -115,7 +115,8 @@ pub(crate) struct FlushOwner {
     interval: u64,
     seams: TestSeam,
     pending: VecDeque<FlushWait>,
-    last: Option<u64>,
+    // Per-sink last sync monotonic timestamp so independent stripes flush without cross-sink sleep.
+    last_by_sink: HashMap<usize, u64>,
     // Keyed by sink: a sync covers the earlier complete appends of its own file.
     covered: HashMap<usize, u64>,
     sync_failed: [bool; 4],
@@ -130,7 +131,7 @@ impl FlushOwner {
             interval,
             seams,
             mut pending,
-            mut last,
+            mut last_by_sink,
             mut covered,
             mut sync_failed,
         } = self;
@@ -161,6 +162,7 @@ impl FlushOwner {
             // A retired sink is removed only after Store pending operations have settled. A late
             // notice for a merely closed sink still needs its synced extent and remains present.
             covered.retain(|sink, _| flush_route.sink(*sink).is_some());
+            last_by_sink.retain(|sink, _| flush_route.sink(*sink).is_some());
             seams.coverage_retained(covered.len());
             let mut gather = true;
             if pending.is_empty() {
@@ -176,19 +178,6 @@ impl FlushOwner {
                         }
                     },
                     Err(_) => break,
-                }
-                // The gather window closes on elapsed time; bounds are enforced
-                // when selecting each handle's covering group below.
-                let until = clock.mono_ms().saturating_add(if gather { interval } else { 0 });
-                while clock.mono_ms() < until {
-                    let left = until.saturating_sub(clock.mono_ms());
-                    match flush_recv.recv_timeout(Duration::from_millis(left)) {
-                        Ok(w) => match settle(&w, &covered, &sync_failed) {
-                            Some(r) => finish_flush(w, r, &flush_outstanding),
-                            None => pending.push_back(w),
-                        },
-                        Err(_) => break,
-                    }
                 }
             }
             while let Ok(w) = flush_recv.try_recv() {
@@ -206,10 +195,82 @@ impl FlushOwner {
                 }
             }
             pending = waiting;
-            let Some(front) = pending.front() else {
+            if pending.is_empty() {
                 continue;
+            }
+            // Pick the first ready sink (delay == 0) in FIFO order; if every queued sink is
+            // still inside its own per-sink gather spacing, wait once until the earliest sink
+            // is ready (or an arrival on an unthrottled/newly-opened sink wakes us sooner).
+            let now = clock.mono_ms();
+            let sink_delay = |sink: usize, allow_spacing: bool, last: &HashMap<usize, u64>| -> u64 {
+                if !allow_spacing {
+                    return 0;
+                }
+                last.get(&sink).map_or(0, |&previous| {
+                    interval.saturating_sub(now.saturating_sub(previous))
+                })
             };
-            let sink = front.stripe;
+            let mut selected_sink = pending.front().unwrap().stripe;
+            let mut min_delay = sink_delay(selected_sink, gather, &last_by_sink);
+            if min_delay > 0 {
+                for w in pending.iter().skip(1) {
+                    let d = sink_delay(w.stripe, gather, &last_by_sink);
+                    if d < min_delay {
+                        min_delay = d;
+                        selected_sink = w.stripe;
+                        if d == 0 {
+                            break;
+                        }
+                    }
+                }
+            }
+            if min_delay > 0 {
+                let mut deadline = std::time::Instant::now() + Duration::from_millis(min_delay);
+                let mut until_mono = now.saturating_add(min_delay);
+                loop {
+                    if clock.mono_ms() >= until_mono {
+                        break;
+                    }
+                    let left = deadline.saturating_duration_since(std::time::Instant::now());
+                    if left.is_zero() {
+                        break;
+                    }
+                    match flush_recv.recv_timeout(left) {
+                        Ok(w) => match settle(&w, &covered, &sync_failed) {
+                            Some(r) => finish_flush(w, r, &flush_outstanding),
+                            None => {
+                                let arrived_sink = w.stripe;
+                                pending.push_back(w);
+                                let arrived_now = clock.mono_ms();
+                                let arrived_delay =
+                                    last_by_sink.get(&arrived_sink).map_or(0, |&prev| {
+                                        interval.saturating_sub(arrived_now.saturating_sub(prev))
+                                    });
+                                if arrived_delay == 0 {
+                                    selected_sink = arrived_sink;
+                                    break;
+                                }
+                                let arrived_deadline = std::time::Instant::now()
+                                    + Duration::from_millis(arrived_delay);
+                                if arrived_deadline < deadline {
+                                    deadline = arrived_deadline;
+                                    until_mono = arrived_now.saturating_add(arrived_delay);
+                                    selected_sink = arrived_sink;
+                                }
+                            }
+                        },
+                        Err(mpsc::RecvTimeoutError::Timeout)
+                        | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+                while let Ok(w) = flush_recv.try_recv() {
+                    match settle(&w, &covered, &sync_failed) {
+                        Some(r) => finish_flush(w, r, &flush_outstanding),
+                        None => pending.push_back(w),
+                    }
+                }
+            }
+            let sink = selected_sink;
             let mut group = Vec::new();
             let mut bytes = 0;
             let mut retained = VecDeque::new();
@@ -225,11 +286,8 @@ impl FlushOwner {
                 }
             }
             pending = retained;
-            if let Some(previous) = last.filter(|_| gather) {
-                let delay = interval.saturating_sub(clock.mono_ms().saturating_sub(previous));
-                if delay > 0 {
-                    std::thread::sleep(Duration::from_millis(delay));
-                }
+            if group.is_empty() {
+                continue;
             }
             let (stripe, log) = match flush_route.sink(sink) {
                 Some((stripe, Some(log), _)) => (stripe, log),
@@ -245,10 +303,10 @@ impl FlushOwner {
             };
             let (file, through) = {
                 let log = log.lock().unwrap();
-                (log.file.try_clone(), log.bytes)
+                (log.flush_handle.clone(), log.bytes)
             };
-            let result = file.and_then(|f| seams.sync_selected_file(&f));
-            last = Some(clock.mono_ms());
+            let result = seams.sync_selected_file(&file);
+            last_by_sink.insert(sink, clock.mono_ms());
             if result.is_ok() {
                 let c = covered.entry(sink).or_insert(0);
                 *c = (*c).max(through);

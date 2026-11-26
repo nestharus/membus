@@ -53,6 +53,42 @@ pub fn open_read_only_exclusive(path: &Path) -> io::Result<File> {
     OpenOptions::new().read(true).open(path)
 }
 
+/// Lock-free positioned file reader using `FileExt::read_exact_at` (`pread`) on Unix.
+#[derive(Debug)]
+pub struct PositionedReader {
+    #[cfg(unix)]
+    file: File,
+    #[cfg(not(unix))]
+    file: std::sync::Mutex<File>,
+}
+
+impl PositionedReader {
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let file = File::open(path)?;
+        Ok(Self {
+            #[cfg(unix)]
+            file,
+            #[cfg(not(unix))]
+            file: std::sync::Mutex::new(file),
+        })
+    }
+
+    pub fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            self.file.read_exact_at(buf, offset)
+        }
+        #[cfg(not(unix))]
+        {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut file = self.file.lock().unwrap();
+            file.seek(SeekFrom::Start(offset))?;
+            file.read_exact(buf)
+        }
+    }
+}
+
 /// On non-Windows, remove copied owner.lock inside a fresh fenced recovery working copy.
 pub fn prepare_quarantined_lock(
     target: &Path,

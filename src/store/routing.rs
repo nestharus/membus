@@ -1,9 +1,10 @@
 //! Stripe and class routing, chunk rotation, sink identity and fencing.
 use crate::chunks::{self, ChunkIndexReservation};
-use crate::codec::crc32;
 use crate::log_io::{append_to, sync_chunk_directory};
+use crate::codec::crc32_update;
 use crate::store::Flags;
 use crate::test_seam::TestSeam;
+use crate::value_disk::ChunkReader;
 use crate::Class;
 use crate::Config;
 use crate::Log;
@@ -89,7 +90,7 @@ impl Route for FixedRoute {
     }
 }
 pub(crate) struct OpenChunk {
-    pub(crate) reader: Arc<Mutex<std::fs::File>>,
+    pub(crate) reader: Arc<ChunkReader>,
     pub(crate) id: u64,
     pub(crate) log: Arc<Mutex<Log>>,
     pub(crate) opened_mono: u64,
@@ -148,8 +149,9 @@ impl ChunkRouter {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
-        let reader = Arc::new(Mutex::new(std::fs::File::open(&path)?));
+        let file = Arc::new(OpenOptions::new().create(true).append(true).open(&path)?);
+        let flush_handle = Arc::new(OpenOptions::new().write(true).open(&path)?);
+        let reader = Arc::new(ChunkReader::open(&path)?);
         // Persist the file name before its class-directory name, before a route
         // or first frame can yield a successful acknowledgement. On failure,
         // retain the durable Open and empty file for the ordinary replay path.
@@ -180,6 +182,7 @@ impl ChunkRouter {
         drop(cs);
         let log = Arc::new(Mutex::new(Log {
             file,
+            flush_handle,
             bytes: 0,
             flushes: 0,
             write_calls: 0,
@@ -207,7 +210,7 @@ impl ChunkRouter {
             if l.poisoned {
                 return Err(io::Error::other("poisoned chunk stays open for replay"));
             }
-            (l.file.try_clone()?, l.bytes, l.write_calls, l.flushes)
+            (l.flush_handle.clone(), l.bytes, l.write_calls, l.flushes)
         };
         let synced = TestSeam::sync_closing_chunk(&file, self.fail_sync);
         if let Err(e) = synced {
@@ -293,12 +296,23 @@ impl Route for ChunkRouter {
     ) -> (io::Result<()>, usize, u64) {
         let chunk_index = chunk_index.expect("chunk append must own an index reservation");
         let payload = &record[16..];
-        let records = match crate::atomic::route_records(payload) {
-            Ok(rows) if !rows.is_empty()=>rows,
-            _=>return (Err(io::Error::other("unroutable record")),0,0),
+        let atomic = crate::atomic::is_envelope(payload);
+        let mut envelope_records = None;
+        let (ns, key, single_version) = if atomic {
+            let rows = match crate::atomic::route_records(payload) {
+                Ok(rows) if !rows.is_empty() => rows,
+                _ => return (Err(io::Error::other("unroutable record")), 0, 0),
+            };
+            let first_v = rows[0].2;
+            envelope_records = Some(rows);
+            let first = &envelope_records.as_ref().unwrap()[0];
+            (first.0.as_str(), first.1.as_str(), first_v)
+        } else {
+            match crate::codec::parse_record_view(payload) {
+                Ok(view) => (view.ns, view.key, view.version),
+                Err(_) => return (Err(io::Error::other("unroutable record")), 0, 0),
+            }
         };
-        let (ns,key,_) = &records[0];
-        let atomic=crate::atomic::is_envelope(payload);
         let (class, policy, _selection) = {
             let mut counts = self.class_reservations.lock().unwrap();
             let (class, policy) = self.policies.read().unwrap().resolve(ns, key);
@@ -352,7 +366,7 @@ impl Route for ChunkRouter {
         drop(log);
         if result.is_err() {
             self.fence(stripe);
-        } else {
+        } else if let Some(records) = envelope_records {
             let mut locations = self.locations.lock().unwrap();
             for (index, (_, _, version)) in records.iter().enumerate() {
                 locations.insert(
@@ -362,11 +376,24 @@ impl Route for ChunkRouter {
                         file: c.reader.clone(),
                         offset: end - record.len() as u64,
                         record_len: record.len() as u64,
-                        subrecord: atomic.then_some(index as u16),
+                        subrecord: Some(index as u16),
                     },
                 );
             }
+            drop(locations);
             chunk_index.register(c.id, records, end);
+        } else {
+            self.locations.lock().unwrap().insert(
+                single_version,
+                crate::value_disk::Location {
+                    class,
+                    file: c.reader.clone(),
+                    offset: end - record.len() as u64,
+                    record_len: record.len() as u64,
+                    subrecord: None,
+                },
+            );
+            chunk_index.register_one(c.id, ns, key, single_version, end);
         }
         (result, c.id as usize, end)
     }
@@ -383,10 +410,10 @@ impl Route for ChunkRouter {
 }
 
 pub(crate) fn stripe(ns: &str, key: &str) -> usize {
-    let mut b = ns.as_bytes().to_vec();
-    b.push(0);
-    b.extend(key.as_bytes());
-    crc32(&b) as usize % 4
+    let c = crc32_update(!0u32, ns.as_bytes());
+    let c = crc32_update(c, &[0]);
+    let c = crc32_update(c, key.as_bytes());
+    (!c) as usize % 4
 }
 
 #[cfg(test)]

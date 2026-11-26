@@ -330,57 +330,125 @@ fn oversized_gate_metadata_charge_is_included_in_bypass() {
 }
 #[test]
 fn oversized_gate_bypass_still_has_two_global_decode_slots() {
-    let f = Fixture::new("oversize-slots");
-    let s = bounded_store(&f, 1024);
-    let version = sized_put(&s, "large", "seed-large", 8192, 7);
-    let entry = s
-        .committed
-        .read()
-        .unwrap()
-        .get(&("ledger".into(), "large".into()))
-        .unwrap()
-        .clone();
-    let blocked = entry.location.file.lock().unwrap();
-    let before = s.cache_stats();
-    let start = Arc::new(Barrier::new(4));
-    let workers: Vec<_> = (0..3)
-        .map(|_| {
-            let s = s.clone();
-            let start = start.clone();
-            std::thread::spawn(move || {
-                start.wait();
-                s.get_handle_result("ledger", "large").unwrap().unwrap()
-            })
-        })
-        .collect();
-    start.wait();
-    let until = Instant::now() + Duration::from_secs(5);
-    while (s.cache_stats().misses - before.misses < 3
-        || s.cache_stats().cold_reads - before.cold_reads < 2)
-        && Instant::now() < until
+    // Part A: large frames (> memory_margin() / 2) remain capped at 2 global decode slots.
     {
-        std::thread::yield_now();
+        let f = Fixture::new("oversize-slots-large");
+        let s = Arc::new(
+            Store::open(
+                &f.0,
+                Config {
+                    capacity: 1024 * 1024, // memory_margin = 128 KiB, half = 64 KiB
+                    cache_bytes: 1024,
+                    signal_bytes: 0,
+                    cache_rules: Vec::new(),
+                    tick_ms: 3_600_000,
+                    retire_ms: 3_600_000,
+                    clock: Some(crate::ManualClock::new(now_ms())),
+                    cache_policy: CachePolicy {
+                        initial_ttl: 0,
+                        active_ttl: 60_000,
+                        ..CachePolicy::default()
+                    },
+                    ..Config::default()
+                },
+            )
+            .unwrap(),
+        );
+        let size = 70 * 1024;
+        let version = sized_put(&s, "large", "seed-large", size, 7);
+        let entry = s
+            .committed
+            .read()
+            .unwrap()
+            .get(&("ledger".into(), "large".into()))
+            .unwrap()
+            .clone();
+        let blocked = entry.location.file.lock().unwrap();
+        let before = s.cache_stats();
+        let start = Arc::new(Barrier::new(4));
+        let workers: Vec<_> = (0..3)
+            .map(|_| {
+                let s = s.clone();
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    s.get_handle_result("ledger", "large").unwrap().unwrap()
+                })
+            })
+            .collect();
+        start.wait();
+        let until = Instant::now() + Duration::from_secs(5);
+        while (s.cache_stats().misses - before.misses < 3
+            || s.cache_stats().cold_reads - before.cold_reads < 2)
+            && Instant::now() < until
+        {
+            std::thread::yield_now();
+        }
+        let waiting = s.cache_stats();
+        let active = s.cold_readers.active();
+        drop(blocked);
+        for worker in workers {
+            let v = worker.join().unwrap();
+            assert_eq!(v.version, version);
+            assert_eq!(v.bytes, vec![7; size]);
+        }
+        println!(
+            "oversized-large readers=3 active_before_io_release={active} cold_started={}",
+            waiting.cold_reads - before.cold_reads
+        );
+        assert_eq!(waiting.misses - before.misses, 3);
+        assert_eq!(
+            active, 2,
+            "large frames (> half memory_margin) must keep the two-slot decode cap"
+        );
+        assert_eq!(waiting.cold_reads - before.cold_reads, 2);
+        let after = s.cache_stats();
+        assert_eq!(after.entries, 0);
+        assert_eq!(after.cold_reads - before.cold_reads, 3);
+        assert_eq!(after.coalesced_reads, before.coalesced_reads);
     }
-    let waiting = s.cache_stats();
-    let active = *s.cold_readers.0.lock().unwrap();
-    drop(blocked);
-    for worker in workers {
-        let v = worker.join().unwrap();
-        assert_eq!(v.version, version);
-        assert_eq!(v.bytes, vec![7; 8192]);
+    // Part B: small frames scale concurrently within memory_margin() up to 8+ parallel readers.
+    {
+        let f = Fixture::new("oversize-slots-small-parallel");
+        let s = bounded_store(&f, 1024);
+        let version = sized_put(&s, "small-uncached", "seed-small", 8192, 9);
+        let entry = s
+            .committed
+            .read()
+            .unwrap()
+            .get(&("ledger".into(), "small-uncached".into()))
+            .unwrap()
+            .clone();
+        let blocked = entry.location.file.lock().unwrap();
+        let before = s.cache_stats();
+        let start = Arc::new(Barrier::new(9));
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let s = s.clone();
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    s.get_handle_result("ledger", "small-uncached").unwrap().unwrap()
+                })
+            })
+            .collect();
+        start.wait();
+        let until = Instant::now() + Duration::from_secs(5);
+        while s.cold_readers.active() < 8 && Instant::now() < until {
+            std::thread::yield_now();
+        }
+        let active = s.cold_readers.active();
+        let waiting = s.cache_stats();
+        drop(blocked);
+        for worker in workers {
+            let v = worker.join().unwrap();
+            assert_eq!(v.version, version);
+            assert_eq!(v.bytes, vec![9; 8192]);
+        }
+        assert_eq!(
+            active, 8,
+            "small frames within memory_margin() must admit concurrent cold decodes"
+        );
+        assert_eq!(waiting.cold_reads - before.cold_reads, 8);
     }
-    println!(
-        "oversized readers=3 active_before_io_release={active} cold_started={}",
-        waiting.cold_reads - before.cold_reads
-    );
-    assert_eq!(waiting.misses - before.misses, 3);
-    assert_eq!(
-        active, 2,
-        "bypass must use both available slots and retain the global limit"
-    );
-    assert_eq!(waiting.cold_reads - before.cold_reads, 2);
-    let after = s.cache_stats();
-    assert_eq!(after.entries, 0);
-    assert_eq!(after.cold_reads - before.cold_reads, 3);
-    assert_eq!(after.coalesced_reads, before.coalesced_reads);
 }

@@ -185,7 +185,7 @@ fn storage_observation<T>(store: &Store, result: &io::Result<T>) {
     }
 }
 fn interpret(store: &Store, location: &Location, mut charge: FrameCharge) -> io::Result<Arc<InterpretedFrame>> {
-    let _reader = store.cold_reader();
+    let _reader = store.cold_reader(location.record_len as usize);
     store.cache.cold();
     let encoded = location.whole_payload()?;
     let mut members = Vec::new();

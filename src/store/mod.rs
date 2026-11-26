@@ -75,7 +75,8 @@ pub struct Outcome {
     pub ack: u8,
 }
 pub struct Log {
-    pub(crate) file: File,
+    pub(crate) file: Arc<File>,
+    pub(crate) flush_handle: Arc<File>,
     pub bytes: u64,
     pub flushes: u64,
     pub write_calls: u64,
@@ -233,7 +234,7 @@ pub struct Store {
     pub(crate) capture_waiters: AtomicUsize,
     pub(crate) committed: Arc<RwLock<state::Committed>>,
     pub(crate) cache: Arc<cache::Cache>,
-    pub(crate) cold_readers: (Mutex<usize>, Condvar),
+    pub(crate) cold_readers: state::ColdDecodeLimiter,
     pub(crate) read_usage: Arc<read_cohort::ReadUsage>,
     pub(crate) scans: Arc<Mutex<ScanState>>,
     pub(crate) scan_usage: Arc<ScanUsage>,
@@ -419,7 +420,9 @@ impl Store {
             fail_sync: config.fail_sync,
         });
         let (appenders, flush_owner) = start_routed_owners(router.clone(), 4, &config, clock.clone());
-        let committed = Arc::new(RwLock::new(committed.into_iter().collect::<state::Committed>()));
+        let mut committed_vec: Vec<_> = committed.into_iter().collect();
+        committed_vec.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let committed = Arc::new(RwLock::new(committed_vec.into_iter().collect::<state::Committed>()));
         let cache = Arc::new(cache::Cache::new(&config, clock.clone()));
         cache.trim(state.available_memory(config.capacity, 0, config.memory_margin(),
             chunks.lock().unwrap().managed_index_bytes(),
@@ -461,7 +464,7 @@ impl Store {
             capture_waiters: AtomicUsize::new(0),
             committed,
             cache,
-            cold_readers: (Mutex::new(0), Condvar::new()),
+            cold_readers: state::ColdDecodeLimiter::new(config.memory_margin()),
             read_usage: Arc::new(read_cohort::ReadUsage::default()),
             scans,
             scan_usage: Arc::new(ScanUsage::default()),

@@ -158,7 +158,7 @@
             (snapshot,value)
         })};
         let limit=Instant::now()+Duration::from_secs(2);
-        while *s.cold_readers.0.lock().unwrap()==0 { assert!(Instant::now()<limit);std::thread::yield_now(); }
+        while s.cold_readers.active()==0 { assert!(Instant::now()<limit);std::thread::yield_now(); }
         let (tx,rx)=mpsc::channel();
         let writer={let s=s.clone();std::thread::spawn(move|| {let o=s.mutate(mutation("hot","hot-put"));tx.send(o).unwrap();})};
         let completed=rx.recv_timeout(Duration::from_secs(2));

@@ -161,6 +161,190 @@ pub fn open_read_only_exclusive(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
+/// Lock-free positioned file reader backed by a single `FILE_FLAG_OVERLAPPED` handle.
+///
+/// Opens with `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE` so active readers
+/// and snapshots never block chunk appends or file retirement unlinks. Each calling thread
+/// reuses one RAII manual-reset event across calls, avoiding per-read handle creation.
+#[derive(Debug)]
+pub struct PositionedReader {
+    file: File,
+}
+
+impl PositionedReader {
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .share_mode(7) // FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+            .custom_flags(0x4000_0000) // FILE_FLAG_OVERLAPPED
+            .open(path)?;
+        Ok(Self { file })
+    }
+
+    pub fn read_exact_at(&self, buf: &mut [u8], mut offset: u64) -> io::Result<()> {
+        use std::cell::RefCell;
+
+        #[repr(C)]
+        struct Overlapped {
+            internal: usize,
+            internal_high: usize,
+            offset: u32,
+            offset_high: u32,
+            h_event: *mut c_void,
+        }
+        struct EventHandle(*mut c_void);
+        impl Drop for EventHandle {
+            fn drop(&mut self) {
+                #[link(name = "kernel32")]
+                extern "system" {
+                    fn CloseHandle(h: *mut c_void) -> i32;
+                }
+                if !self.0.is_null() {
+                    unsafe {
+                        CloseHandle(self.0);
+                    }
+                }
+            }
+        }
+        const STATUS_PENDING: usize = 0x103;
+        const ERROR_HANDLE_EOF: i32 = 38;
+        const ERROR_IO_INCOMPLETE: i32 = 996;
+        const ERROR_IO_PENDING: i32 = 997;
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn CreateEventW(
+                attr: *mut c_void,
+                manual_reset: i32,
+                initial_state: i32,
+                name: *const u16,
+            ) -> *mut c_void;
+            fn ResetEvent(h: *mut c_void) -> i32;
+            fn ReadFile(
+                handle: *mut c_void,
+                buffer: *mut c_void,
+                len: u32,
+                read: *mut u32,
+                overlapped: *mut Overlapped,
+            ) -> i32;
+            fn GetOverlappedResult(
+                handle: *mut c_void,
+                overlapped: *mut Overlapped,
+                transferred: *mut u32,
+                wait: i32,
+            ) -> i32;
+            fn CancelIoEx(handle: *mut c_void, overlapped: *mut Overlapped) -> i32;
+        }
+        thread_local! {
+            static READ_EVENT: RefCell<Option<EventHandle>> = const { RefCell::new(None) };
+        }
+        if buf.is_empty() {
+            return Ok(());
+        }
+        let handle = self.file.as_raw_handle();
+        READ_EVENT.with(|slot| {
+            let mut guard = slot.borrow_mut();
+            let event = match guard.as_ref() {
+                Some(ev) => ev.0,
+                None => {
+                    let ev = unsafe {
+                        CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null())
+                    };
+                    if ev.is_null() {
+                        return Err(io::Error::last_os_error());
+                    }
+                    *guard = Some(EventHandle(ev));
+                    ev
+                }
+            };
+            let mut pos = 0usize;
+            while pos < buf.len() {
+                if unsafe { ResetEvent(event) } == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                let remaining = &mut buf[pos..];
+                let want = remaining.len().min(u32::MAX as usize) as u32;
+                let mut ov = Overlapped {
+                    internal: 0,
+                    internal_high: 0,
+                    offset: offset as u32,
+                    offset_high: (offset >> 32) as u32,
+                    h_event: event,
+                };
+                let ok = unsafe {
+                    ReadFile(
+                        handle,
+                        remaining.as_mut_ptr().cast(),
+                        want,
+                        std::ptr::null_mut(),
+                        &mut ov,
+                    )
+                };
+                if ok == 0 {
+                    let err = io::Error::last_os_error();
+                    match err.raw_os_error() {
+                        Some(ERROR_IO_PENDING) => {}
+                        Some(ERROR_HANDLE_EOF) => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "unexpected EOF in positioned read",
+                            ));
+                        }
+                        _ => return Err(err),
+                    }
+                }
+                let mut transferred = 0u32;
+                if unsafe { GetOverlappedResult(handle, &mut ov, &mut transferred, 1) } == 0 {
+                    let err = io::Error::last_os_error();
+                    // Never unwind stack OVERLAPPED or caller buffer while kernel IRP is still live.
+                    if err.raw_os_error() == Some(ERROR_IO_INCOMPLETE)
+                        || unsafe { std::ptr::read_volatile(&ov.internal) } == STATUS_PENDING
+                    {
+                        unsafe {
+                            CancelIoEx(handle, &mut ov);
+                        }
+                        let mut drained = 0u32;
+                        loop {
+                            let done = unsafe {
+                                GetOverlappedResult(handle, &mut ov, &mut drained, 1)
+                            };
+                            if done != 0 {
+                                break;
+                            }
+                            let drain_err = io::Error::last_os_error();
+                            let still_pending =
+                                drain_err.raw_os_error() == Some(ERROR_IO_INCOMPLETE)
+                                    || unsafe { std::ptr::read_volatile(&ov.internal) }
+                                        == STATUS_PENDING;
+                            if !still_pending {
+                                break;
+                            }
+                        }
+                    }
+                    if err.raw_os_error() == Some(ERROR_HANDLE_EOF) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "unexpected EOF in positioned read",
+                        ));
+                    }
+                    return Err(err);
+                }
+                if transferred == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "short positioned read",
+                    ));
+                }
+                offset = offset
+                    .checked_add(transferred as u64)
+                    .ok_or_else(|| io::Error::other("positioned read offset overflow"))?;
+                pos += transferred as usize;
+            }
+            Ok(())
+        })
+    }
+}
+
 /// Windows owner.lock uses share_mode(0), so a copied file needs no pre-removal.
 pub fn prepare_quarantined_lock(
     _target: &Path,

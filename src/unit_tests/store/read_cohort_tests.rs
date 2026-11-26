@@ -5,9 +5,9 @@ use super::*;
 use std::{
     cell::RefCell,
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io::{Seek, SeekFrom, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
         Barrier, Condvar, RwLock,
@@ -84,7 +84,7 @@ fn payload(first: u64, ack: u8) -> Vec<u8> {
     assert_eq!(request.to_bytes(), b);
     atomic::envelope_bytes(&request, first, 1_000_000)
 }
-fn entries(file: Arc<Mutex<File>>, offset: u64, len: usize, first: u64, ack: u8) -> Vec<((String,String),Arc<value_disk::Entry>)> {
+fn entries(file: Arc<value_disk::ChunkReader>, offset: u64, len: usize, first: u64, ack: u8) -> Vec<((String,String),Arc<value_disk::Entry>)> {
     expected().into_iter().enumerate().map(|(i,(key,value))| {
         let m = Mutation { ns: "n".into(), key: key.into(), op_id: "authored".into(), deadline: 0,
             ack, expected: None, remove: value.is_none(), bytes: value.unwrap_or_default() };
@@ -96,9 +96,13 @@ fn fixture(label: &str) -> (PathBuf, Arc<Store>, usize) {
     let path = fixture_path(label);
     fs::create_dir(&path).unwrap();
     let encoded = chunks::frame(b"MBK1", &payload(10,2));
-    let mut file = OpenOptions::new().read(true).write(true).create_new(true).open(path.join("authored.frame")).unwrap();
-    file.write_all(&encoded).unwrap(); file.flush().unwrap();
-    let committed = Arc::new(RwLock::new(entries(Arc::new(Mutex::new(file)),0,encoded.len(),10,2).into_iter().collect::<BTreeMap<_,_>>()));
+    let frame_path = path.join("authored.frame");
+    {
+        let mut file = OpenOptions::new().read(true).write(true).create_new(true).open(&frame_path).unwrap();
+        file.write_all(&encoded).unwrap(); file.flush().unwrap();
+    }
+    let reader = Arc::new(value_disk::ChunkReader::open(&frame_path).unwrap());
+    let committed = Arc::new(RwLock::new(entries(reader,0,encoded.len(),10,2).into_iter().collect::<BTreeMap<_,_>>()));
     let config = Config { capacity: 2*1024*1024, cache_bytes: 0, signal_bytes: 0, snapshot_bytes: 1024*1024,
         snapshot_ttl_ms: 1000, clock: Some(chunks::ManualClock::new(1_000_000)), cache_rules: vec![], ..Config::default() };
     let clock = chunks::Clock::new(config.clock.clone());
@@ -125,7 +129,7 @@ fn fixture(label: &str) -> (PathBuf, Arc<Store>, usize) {
     let s=Arc::new(Store {clock:clock.clone(),timers:timers::State::restore(&HashMap::new()).unwrap(),
         signals:signals::Hub::new(1,&config,clock),capture_metrics:std::array::from_fn(|_|AtomicU64::new(0)),
         capture_visits:AtomicUsize::new(0),capture_waiters:AtomicUsize::new(0),committed,cache,
-        cold_readers:(Mutex::new(0),Condvar::new()),
+        cold_readers:store::state::ColdDecodeLimiter::new(config.memory_margin()),
         read_usage:Arc::new(read_cohort::ReadUsage::default()),
         scans:Arc::new(Mutex::new(ScanState {next:1,snapshots:HashMap::new()})),scan_usage:Arc::new(ScanUsage::default()),
         subscription_released: Default::default(), scan_reaper:None,ticker:None,state,done:Condvar::new(),maint,router,chunks,policies,next_issued,flags,path:path.clone(),
@@ -142,8 +146,10 @@ fn exact(key: &str, v: &Value, first: u64, ack: u8) {
 }
 fn live() -> impl Iterator<Item=&'static str> { expected().into_iter().filter(|(_,v)|v.is_some()).map(|(k,_)|k) }
 fn entry(s: &Store,key: &str) -> Arc<value_disk::Entry> { s.committed.read().unwrap().get(&("n".into(),key.into())).unwrap().clone() }
-fn rewrite(e: &value_disk::Entry, bytes: &[u8]) {
-    let mut f=e.location.file.lock().unwrap(); f.seek(SeekFrom::Start(e.location.offset)).unwrap();
+fn rewrite(path: &Path, e: &value_disk::Entry, bytes: &[u8]) {
+    let _guard = e.location.file.lock().unwrap();
+    let mut f = OpenOptions::new().write(true).open(path.join("authored.frame")).unwrap();
+    f.seek(SeekFrom::Start(e.location.offset)).unwrap();
     f.write_all(bytes).unwrap(); f.flush().unwrap();
 }
 fn scan_usage(s: &Store) -> (usize,usize) { (s.scan_usage.count.load(Ordering::Acquire),s.scan_usage.bytes.load(Ordering::Acquire)) }
@@ -220,8 +226,9 @@ fn finite_budget_refuses_before_capture_and_reacquires_after_evicted_lease() {
     let too_small=s.read_cohort(charge+511).unwrap();reset();assert!(too_small.try_get("n","id/1").is_err());
     assert_eq!(counts(),[0;4]);assert!(!s.storage_error());drop(too_small);
     let c=s.read_cohort(charge+512).unwrap();let value=c.try_get("n","id/1").unwrap().unwrap();
-    let frame=chunks::frame(b"MBK1",&payload(100,1));let mut file=OpenOptions::new().read(true).write(true).create_new(true).open(path.join("second.frame")).unwrap();
-    file.write_all(&frame).unwrap();let replacement=entries(Arc::new(Mutex::new(file)),0,frame.len(),100,1);
+    let frame=chunks::frame(b"MBK1",&payload(100,1));let second_path=path.join("second.frame");
+    {let mut file=OpenOptions::new().read(true).write(true).create_new(true).open(&second_path).unwrap();file.write_all(&frame).unwrap();}
+    let replacement=entries(Arc::new(value_disk::ChunkReader::open(&second_path).unwrap()),0,frame.len(),100,1);
     s.committed.write().unwrap().extend(replacement);c.clear();let before=counts();
     assert!(c.try_get("n","source/1").is_err());assert_eq!(counts(),before);drop(value);
     exact("source/1",&c.try_get("n","source/1").unwrap().unwrap(),100,1);
@@ -284,12 +291,13 @@ fn revisions_offsets_and_file_handles_never_alias_snapshot_old_revision() {
     let (path,s,f)=fixture("identities");let (token,view)=s.snapshot_open("n").unwrap();
     let c=s.read_cohort(256*1024).unwrap();exact("id/1",&c.try_get("n","id/1").unwrap().unwrap(),10,2);
     let old=entry(&s,"id/1");let frame=chunks::frame(b"MBK1",&payload(100,1));assert_eq!(frame.len(),f);
-    {let mut file=old.location.file.lock().unwrap();file.seek(SeekFrom::Start(f as u64)).unwrap();file.write_all(&frame).unwrap();}
+    {let _guard=old.location.file.lock().unwrap();let mut file=OpenOptions::new().write(true).open(path.join("authored.frame")).unwrap();file.seek(SeekFrom::Start(f as u64)).unwrap();file.write_all(&frame).unwrap();file.flush().unwrap();}
     s.committed.write().unwrap().extend(entries(old.location.file.clone(),f as u64,f,100,1));
     exact("id/1",&c.try_get("n","id/1").unwrap().unwrap(),100,1);
-    let mut file=OpenOptions::new().read(true).write(true).create_new(true).open(path.join("different.frame")).unwrap();
-    let third=chunks::frame(b"MBK1",&payload(200,2));file.write_all(&third).unwrap();
-    s.committed.write().unwrap().extend(entries(Arc::new(Mutex::new(file)),0,f,200,2));
+    let diff_path=path.join("different.frame");
+    {let mut file=OpenOptions::new().read(true).write(true).create_new(true).open(&diff_path).unwrap();
+    let third=chunks::frame(b"MBK1",&payload(200,2));file.write_all(&third).unwrap();}
+    s.committed.write().unwrap().extend(entries(Arc::new(value_disk::ChunkReader::open(&diff_path).unwrap()),0,f,200,2));
     exact("id/1",&c.try_get("n","id/1").unwrap().unwrap(),200,2);
     for (key,row) in &view.rows {exact(key,&row.load(&s,"n",key).unwrap(),10,2);}
     let tomb=entry(&s,"deleted");assert!(c.try_get("n","deleted").unwrap().is_none());
@@ -298,13 +306,13 @@ fn revisions_offsets_and_file_handles_never_alias_snapshot_old_revision() {
 }
 #[test]
 fn corruption_after_eviction_revalidates_and_errors_stay_sticky() {
-    let (_,s,f)=fixture("revalidate");let e=entry(&s,"id/1");let original=chunks::frame(b"MBK1",&payload(10,2));
+    let (path,s,f)=fixture("revalidate");let e=entry(&s,"id/1");let original=chunks::frame(b"MBK1",&payload(10,2));
     let c=s.read_cohort(128*1024).unwrap();c.try_get("n","id/1").unwrap();c.clear();reset();
     let mut corrupt=original.clone();let at=corrupt.windows(6).position(|b|b==[0,255,128,b'\n',b'"',1]).unwrap();
-    corrupt[at]^=1;rewrite(&e,&corrupt);
+    corrupt[at]^=1;rewrite(&path,&e,&corrupt);
     for _ in 0..2 {assert!(c.try_get("n","id/1").is_err());}
     assert_eq!(counts(),[2*f,2*(f-16),0,0]);assert!(s.storage_error());
-    rewrite(&e,&original);exact("id/1",&c.try_get("n","id/1").unwrap().unwrap(),10,2);
+    rewrite(&path,&e,&original);exact("id/1",&c.try_get("n","id/1").unwrap().unwrap(),10,2);
     assert!(s.storage_error());assert_eq!(counts(),[3*f,3*(f-16),1,9]);drop(c);assert_eq!(s.read_cohort_bytes(),0);
 }
 #[test]
@@ -314,15 +322,17 @@ fn equal_offset_extent_and_revision_on_different_files_keep_exact_bytes() {
     let mut body=payload(10,2);let old=0x0102030405060708u64.to_le_bytes();let new=0x8877665544332211u64.to_le_bytes();
     let at=body.windows(8).position(|b|b==old).unwrap();body[at..at+8].copy_from_slice(&new);
     let frame=chunks::frame(b"MBK1",&body);assert_eq!(frame.len(),f);
-    let mut file=OpenOptions::new().read(true).write(true).create_new(true).open(path.join("equal.frame")).unwrap();file.write_all(&frame).unwrap();
-    s.committed.write().unwrap().extend(entries(Arc::new(Mutex::new(file)),0,f,10,2));
+    let equal_path=path.join("equal.frame");
+    {let mut file=OpenOptions::new().read(true).write(true).create_new(true).open(&equal_path).unwrap();file.write_all(&frame).unwrap();}
+    s.committed.write().unwrap().extend(entries(Arc::new(value_disk::ChunkReader::open(&equal_path).unwrap()),0,f,10,2));
     assert_eq!(c.try_get("n","source/1").unwrap().unwrap().bytes,new);
 }
 #[test]
 fn interleaved_snapshot_frames_each_decode_once_under_their_scan_charge() {
     let (path,s,f)=fixture("interleaved");let frame=chunks::frame(b"MBK1",&payload(100,1));
-    let mut file=OpenOptions::new().read(true).write(true).create_new(true).open(path.join("interleaved.frame")).unwrap();file.write_all(&frame).unwrap();
-    let replacement=entries(Arc::new(Mutex::new(file)),0,f,100,1);
+    let interleaved_path=path.join("interleaved.frame");
+    {let mut file=OpenOptions::new().read(true).write(true).create_new(true).open(&interleaved_path).unwrap();file.write_all(&frame).unwrap();}
+    let replacement=entries(Arc::new(value_disk::ChunkReader::open(&interleaved_path).unwrap()),0,f,100,1);
     s.committed.write().unwrap().extend(replacement.into_iter().filter(|(k,_)|k.1.starts_with("source/")||k.1=="row/b"));
     let (token,view)=s.snapshot_open("n").unwrap();reset();
     for (key,row) in &view.rows {exact(key,&row.load(&s,"n",key).unwrap(),
@@ -333,9 +343,9 @@ fn interleaved_snapshot_frames_each_decode_once_under_their_scan_charge() {
 #[test]
 fn malformed_unselected_peer_and_tail_refuse_without_partial_installation() {
     for tail in [false,true] {
-        let (_,s,_)=fixture(if tail {"bad-tail"}else{"bad-peer"});let e=entry(&s,"id/1");let mut body=payload(10,2);
+        let (path,s,_)=fixture(if tail {"bad-tail"}else{"bad-peer"});let e=entry(&s,"id/1");let mut body=payload(10,2);
         if tail {body.push(99);} else {let key=b"deleted";let at=body.windows(key.len()).rposition(|p|p==key).unwrap();body[at+key.len()]=3;}
-        let frame=chunks::frame(b"MBK1",&body);rewrite(&e,&frame);
+        let frame=chunks::frame(b"MBK1",&body);rewrite(&path,&e,&frame);
         if tail { let replacement=entries(e.location.file.clone(),0,frame.len(),10,2);s.committed.write().unwrap().extend(replacement); }
         let c=s.read_cohort(128*1024).unwrap();assert!(c.try_get("n","id/1").is_err());assert!(s.storage_error());
         assert!(c.frame.lock().unwrap().is_none());assert_eq!(c.budget.used.load(Ordering::Acquire),512);
@@ -360,9 +370,10 @@ fn singleton_codec_and_snapshot_cache_share_payload_with_retained_charge() {
     let m=Mutation {ns:"single".into(),key:"key".into(),op_id:"one".into(),deadline:0,
         ack:1,expected:None,bytes:vec![0,128,255,11,0,77],remove:false};
     let frame=chunks::frame(b"MBK1",&codec::mutation_bytes(&m,500,1_000_000));
-    let mut file=OpenOptions::new().read(true).write(true).create_new(true).open(path.join("single.frame")).unwrap();file.write_all(&frame).unwrap();
+    let single_path=path.join("single.frame");
+    {let mut file=OpenOptions::new().read(true).write(true).create_new(true).open(&single_path).unwrap();file.write_all(&frame).unwrap();}
     let e=Arc::new(value_disk::Entry::new(&m,500,value_disk::Location {class:Class::FOREVER,
-        file:Arc::new(Mutex::new(file)),offset:0,record_len:frame.len() as u64,subrecord:None}));
+        file:Arc::new(value_disk::ChunkReader::open(&single_path).unwrap()),offset:0,record_len:frame.len() as u64,subrecord:None}));
     s.committed.write().unwrap().clear();s.committed.write().unwrap().insert((m.ns.clone(),m.key.clone()),e);
     let s=Arc::get_mut(&mut s).unwrap();s.config.cache_bytes=8192;
     s.cache=Arc::new(cache::Cache::new(&s.config,s.clock.clone()));s.trim_cache(&s.state.lock().unwrap());

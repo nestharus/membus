@@ -126,9 +126,9 @@ impl Snapshot {
     }
 
     fn load_bounded_envelope(&self, store: &Store, target: &SnapshotValue) -> Result<crate::ReadValue, u16> {
-        let _reader = store.cold_reader();
-        store.cache.cold();
         let location = &target.entry.location;
+        let _reader = store.cold_reader(location.record_len as usize);
+        store.cache.cold();
         let encoded = location.whole_payload().map_err(|_| 16u16)?;
         let envelope = crate::atomic::decode_envelope(&encoded).map_err(|_| 16u16)?;
         let request = envelope.request;

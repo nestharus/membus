@@ -69,7 +69,7 @@ pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
 pub(crate) fn write_record(log: &mut Log, mut bytes: &[u8]) -> io::Result<()> {
     while !bytes.is_empty() {
         log.write_calls += 1;
-        match log.file.write(bytes) {
+        match (&*log.file).write(bytes) {
             Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "append")),
             Ok(n) => {
                 log.bytes += n as u64;

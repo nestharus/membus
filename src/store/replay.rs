@@ -6,9 +6,11 @@ mod clock_tests;
 #[path = "../unit_tests/replay/heartbeat_tests.rs"]
 mod heartbeat_tests;
 use crate::chunks;
+#[cfg(test)]
 use crate::codec::crc32;
 use crate::codec::mutation_bytes;
 use crate::codec::parse_record;
+use crate::codec::parse_record_view;
 use crate::codec::MAX_ID;
 use crate::log_io::sync_file;
 use crate::routing::stripe;
@@ -21,6 +23,7 @@ use crate::store::Meta;
 use crate::store::State;
 use crate::test_seam::TestSeam;
 use crate::timers;
+use crate::value_disk::{ChunkReader, Entry, Location};
 use crate::Class;
 use crate::Config;
 use crate::Mutation;
@@ -33,12 +36,32 @@ use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io;
+use std::io::BufReader;
 use std::io::Read;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+
+const REPLAY_BUF_BYTES: usize = 256 * 1024;
+
+fn dedup_identity_parts(ns: &str, key: &str, op_id: &str) -> Key {
+    let ns = if ns == POLICY_NS {
+        key.split_once('\0').map_or(ns, |(ns, _)| ns)
+    } else {
+        ns
+    };
+    (ns.to_owned(), op_id.to_owned())
+}
+
+/// SHA-256 over canonical `mutation_bytes(m, 0, 0)` directly from a validated MBK1 payload slice.
+fn fingerprint_record_slice(b: &[u8]) -> [u8; 32] {
+    let mut hash = chunks::Sha256::new();
+    hash.update(&[0u8; 16]);
+    hash.update(&b[16..]);
+    hash.finish()
+}
 
 fn recovery_sync(path: &Path, config: &Config) -> io::Result<()> {
     if config.fail_recovery_sync {
@@ -100,6 +123,203 @@ struct Replayed {
     storage_errors: Vec<String>,
     cat_last_ms: u64,
 }
+struct ChunkReplayTask {
+    id: u64,
+    stripe: usize,
+    class: Class,
+    path: PathBuf,
+    open_at_crash: bool,
+}
+
+struct ChunkReplayOutput {
+    stripe: usize,
+    bytes: u64,
+    next: u64,
+    records: u64,
+    horizons_applied: u64,
+    truncate: Option<(PathBuf, u64)>,
+    truncation_report: Option<(String, u64, u64, String)>,
+    keys: HashMap<Key, (u64, u64)>,
+    committed: HashMap<Key, Arc<Entry>>,
+    dedup: HashMap<Key, Dedup>,
+}
+
+type ChunkReplayOutcome = (ChunkReplayOutput, Option<io::Error>);
+
+fn replay_chunk_buffered(
+    task: &ChunkReplayTask,
+    horizons: &HashMap<Key, u64>,
+    config: &Config,
+    now: u64,
+    scratch: &mut Vec<u8>,
+) -> ChunkReplayOutcome {
+    let mut out = ChunkReplayOutput {
+        stripe: task.stripe,
+        bytes: 0,
+        next: 1,
+        records: 0,
+        horizons_applied: 0,
+        truncate: None,
+        truncation_report: None,
+        keys: HashMap::new(),
+        committed: HashMap::new(),
+        dedup: HashMap::new(),
+    };
+    let result = (|| -> io::Result<()> {
+        let f = File::open(&task.path)?;
+        let len = f.metadata()?.len();
+        let mut buffered = BufReader::with_capacity(REPLAY_BUF_BYTES, f);
+        let reader = Arc::new(ChunkReader::open(&task.path)?);
+        let name = task.path.display().to_string();
+        let mut offset = 0u64;
+        while offset < len {
+            match chunks::read_frame_into(&mut buffered, b"MBK1", offset, len, &name, scratch)? {
+                chunks::BorrowedFrame::Torn(reason) => {
+                    if !task.open_at_crash {
+                        return Err(corrupt(format!(
+                            "interior-corrupt {name} offset {offset}: torn tail in a closed chunk"
+                        )));
+                    }
+                    out.truncate = Some((task.path.clone(), offset));
+                    out.truncation_report =
+                        Some((name.clone(), offset, len - offset, reason.into()));
+                    break;
+                }
+                chunks::BorrowedFrame::Whole(b, n) => {
+                    if crate::atomic::is_envelope(b) {
+                        // Validate the complete envelope before projecting even one entry.
+                        let e = crate::atomic::decode_envelope(b).map_err(|_| {
+                            corrupt(format!(
+                                "interior-corrupt {name} offset {offset}: atomic envelope"
+                            ))
+                        })?;
+                        if crate::atomic::envelope_stripe(e.request.namespace()) != task.stripe
+                            || task.class != Class::FOREVER
+                        {
+                            return Err(corrupt(format!(
+                                "interior-corrupt {name} offset {offset}: atomic route/class"
+                            )));
+                        }
+                        let next = e
+                            .first
+                            .checked_add(e.request.change_count() as u64)
+                            .ok_or_else(|| corrupt("atomic revision overflow".into()))?;
+                        out.next = out.next.max(next);
+                        for (i, m) in e.request.mutations().enumerate() {
+                            let v = e.first + i as u64;
+                            let k = (m.ns.clone(), m.key.clone());
+                            if let Some(bounds) = out.keys.get_mut(&k) {
+                                bounds.0 = bounds.0.min(v);
+                                bounds.1 = bounds.1.max(v);
+                            } else {
+                                out.keys.insert(k.clone(), (v, v));
+                            }
+                            if horizons.get(&k).is_some_and(|h| v <= *h) {
+                                out.horizons_applied += 1;
+                            } else if out.committed.get(&k).is_none_or(|old| old.version < v) {
+                                let location = Location {
+                                    class: Class::FOREVER,
+                                    file: reader.clone(),
+                                    offset,
+                                    record_len: n,
+                                    subrecord: Some(i as u16),
+                                };
+                                out.committed.insert(k, Arc::new(Entry::new(&m, v, location)));
+                            }
+                        }
+                        if now.saturating_sub(e.at) <= config.retry_ms {
+                            out.dedup.insert(
+                                (
+                                    e.request.namespace().into(),
+                                    e.request.operation_id().into(),
+                                ),
+                                Dedup {
+                                    fingerprint: e.request.fingerprint(),
+                                    at: e.at,
+                                    until_mono: 0,
+                                    replayed_chunk: task.id,
+                                    outcome: Some(Outcome {
+                                        code: 0,
+                                        version: e.first,
+                                        ack: e.request.requested_ack().byte(),
+                                    }),
+                                },
+                            );
+                        }
+                        out.records += e.request.change_count() as u64;
+                        out.bytes += n;
+                    } else {
+                        let view = parse_record_view(b).map_err(|_| {
+                            corrupt(format!("interior-corrupt {name} offset {offset}: payload"))
+                        })?;
+                        if stripe(view.ns, view.key) != task.stripe {
+                            return Err(corrupt(format!(
+                                "interior-corrupt {name} offset {offset}: wrong stripe"
+                            )));
+                        }
+                        let next = record_successor(view.version, &name, offset)?;
+                        out.next = out.next.max(next);
+                        out.records += 1;
+                        out.bytes += n;
+                        let k = (view.ns.to_owned(), view.key.to_owned());
+                        if let Some(bounds) = out.keys.get_mut(&k) {
+                            bounds.0 = bounds.0.min(view.version);
+                            bounds.1 = bounds.1.max(view.version);
+                        } else {
+                            out.keys.insert(k.clone(), (view.version, view.version));
+                        }
+                        if horizons.get(&k).is_some_and(|h| view.version <= *h) {
+                            out.horizons_applied += 1;
+                        } else {
+                            if out.committed.get(&k).is_none_or(|old| old.version < view.version) {
+                                let location = Location {
+                                    class: task.class,
+                                    file: reader.clone(),
+                                    offset,
+                                    record_len: n,
+                                    subrecord: None,
+                                };
+                                out.committed.insert(
+                                    k,
+                                    Arc::new(Entry::from_view(
+                                        view.version,
+                                        view.ack,
+                                        view.remove,
+                                        view.bytes.len(),
+                                        location,
+                                    )),
+                                );
+                            }
+                            if now.saturating_sub(view.at) <= config.retry_ms
+                                && !timers::is_progress(view.ns, view.key)
+                            {
+                                out.dedup.insert(
+                                    dedup_identity_parts(view.ns, view.key, view.op_id),
+                                    Dedup {
+                                        fingerprint: fingerprint_record_slice(b),
+                                        at: view.at,
+                                        until_mono: 0,
+                                        replayed_chunk: task.id,
+                                        outcome: Some(Outcome {
+                                            code: 0,
+                                            version: view.version,
+                                            ack: view.ack,
+                                        }),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    offset += n;
+                }
+            }
+        }
+        Ok(())
+    })();
+    out.keys.shrink_to_fit();
+    (out, result.err())
+}
+
 impl Replayed {
     /// Snapshot the population observed so far, including on partial replay failure.
     fn observe_populations(&mut self) {
@@ -116,34 +336,43 @@ impl Replayed {
             }
         }
     }
-    #[allow(clippy::too_many_arguments)]
-    fn apply(&mut self, m: Mutation, v: u64, at: u64, chunk: u64, now: u64, config: &Config, location: crate::value_disk::Location) {
-        let k = (m.ns.clone(), m.key.clone());
-        if self.committed.get(&k).is_none_or(|old| old.version < v) {
-            self.committed.insert(
-                k.clone(),
-                Arc::new(crate::value_disk::Entry::new(&m, v, location)),
-            );
-            self.chunk_of.insert(k, chunk);
+    fn merge_chunk_output(&mut self, id: u64, out: ChunkReplayOutput, replace_keys: bool) {
+        self.next = self.next.max(out.next);
+        self.report.stripes[out.stripe].records += out.records;
+        self.report.stripes[out.stripe].bytes += out.bytes;
+        self.report.stripes[out.stripe].horizons_applied += out.horizons_applied;
+        if let Some(t) = out.truncate {
+            self.truncate.push(t);
         }
-        if now.saturating_sub(at) <= config.retry_ms && !timers::is_progress(&m.ns, &m.key) {
-            self.dedup.insert(
-                dedup_identity(&m),
-                Dedup {
-                    fingerprint: fingerprint(&m),
-                    at,
-                    until_mono: 0, // Anchored to the instance clock after replay/import validation.
-                    replayed_chunk: chunk,
-                    outcome: Some(Outcome {
-                        code: 0,
-                        version: v,
-                        ack: m.ack,
-                    }),
-                },
-            );
+        if let Some(tr) = out.truncation_report {
+            self.report.stripes[out.stripe].truncations.push(tr);
         }
+        for k in out.keys.keys() {
+            self.chunks.holders.add(k, id);
+        }
+        if let Some(info) = self.chunks.table.get_mut(&id) {
+            if replace_keys {
+                info.keys = out.keys;
+            } else {
+                for (k, (lo, hi)) in out.keys {
+                    if let Some(bounds) = info.keys.get_mut(&k) {
+                        bounds.0 = bounds.0.min(lo);
+                        bounds.1 = bounds.1.max(hi);
+                    } else {
+                        info.keys.insert(k, (lo, hi));
+                    }
+                }
+            }
+        }
+        for (k, entry) in out.committed {
+            if self.committed.get(&k).is_none_or(|old| old.version < entry.version) {
+                self.chunk_of.insert(k.clone(), id);
+                self.committed.insert(k, entry);
+            }
+        }
+        self.dedup.extend(out.dedup);
     }
-    /// Replay one log file. `open_at_crash` allows a torn tail to be truncated; otherwise it refuses start.
+    /// Replay one log file through the shared buffered chunk replay core.
     #[expect(
         clippy::too_many_arguments,
         reason = "Preserve the established file replay boundary."
@@ -158,82 +387,22 @@ impl Replayed {
         config: &Config,
         now: u64,
     ) -> io::Result<u64> {
-        let mut f = File::open(p)?;
-        let reader = Arc::new(std::sync::Mutex::new(File::open(p)?));
-        let len = f.metadata()?.len();
-        let name = p.display().to_string();
-        let mut offset = 0u64;
-        while offset < len {
-            match chunks::read_frame_at(&mut f, b"MBK1", offset, len, &name)? {
-                chunks::Frame::Torn(reason) => {
-                    if !open_at_crash {
-                        return Err(corrupt(format!(
-                            "interior-corrupt {name} offset {offset}: torn tail in a closed chunk"
-                        )));
-                    }
-                    self.truncate.push((p.to_owned(), offset));
-                    self.report.stripes[si].truncations.push((
-                        name.clone(),
-                        offset,
-                        len - offset,
-                        reason.into(),
-                    ));
-                    break;
-                }
-                chunks::Frame::Whole(b, n) => {
-                    if crate::atomic::is_envelope(&b) {
-                        // Validate the complete envelope before projecting even one entry.
-                        let e=crate::atomic::decode_envelope(&b).map_err(|_|corrupt(format!("interior-corrupt {name} offset {offset}: atomic envelope")))?;
-                        if crate::atomic::envelope_stripe(e.request.namespace())!=si
-                            || self.chunks.table.get(&chunk).is_none_or(|c|c.class!=Class::FOREVER) {
-                            return Err(corrupt(format!("interior-corrupt {name} offset {offset}: atomic route/class")));
-                        }
-                        self.next=self.next.max(e.first.checked_add(e.request.change_count() as u64).ok_or_else(||corrupt("atomic revision overflow".into()))?);
-                        for (i,m) in e.request.mutations().enumerate() {
-                            let v=e.first+i as u64;let k=(m.ns.clone(),m.key.clone());self.chunks.register(chunk,&k,v);
-                            if horizons.get(&k).is_some_and(|h|v<=*h) {self.report.stripes[si].horizons_applied+=1;}
-                            else {self.apply(m,v,e.at,chunk,now,config,crate::value_disk::Location {
-                                class:Class::FOREVER,file:reader.clone(),offset,record_len:n,subrecord:Some(i as u16),
-                            });}
-                        }
-                        if now.saturating_sub(e.at)<=config.retry_ms {
-                            self.dedup.insert((e.request.namespace().into(),e.request.operation_id().into()),Dedup {
-                                fingerprint:e.request.fingerprint(),at:e.at,until_mono:0,replayed_chunk:chunk,
-                                outcome:Some(Outcome {code:0,version:e.first,ack:e.request.requested_ack().byte()}),
-                            });
-                        }
-                        self.report.stripes[si].records+=e.request.change_count() as u64;
-                        self.report.stripes[si].bytes+=n;
-                    } else {
-                    let (m, v, at) = parse_record(&b).map_err(|_| {
-                        corrupt(format!("interior-corrupt {name} offset {offset}: payload"))
-                    })?;
-                    if stripe(&m.ns, &m.key) != si {
-                        return Err(corrupt(format!(
-                            "interior-corrupt {name} offset {offset}: wrong stripe"
-                        )));
-                    }
-                    let next = record_successor(v, &name, offset)?;
-                    let k = (m.ns.clone(), m.key.clone());
-                    self.chunks.register(chunk, &k, v);
-                    self.report.stripes[si].records += 1;
-                    self.report.stripes[si].bytes += n;
-                    self.next = self.next.max(next);
-                    if horizons.get(&k).is_some_and(|h| v <= *h) {
-                        // Anti-resurrection: a retired newer version's horizon hides this older one.
-                        self.report.stripes[si].horizons_applied += 1;
-                    } else {
-                        self.apply(m, v, at, chunk, now, config, crate::value_disk::Location {
-                            class: self.chunks.table.get(&chunk).map_or(Class::FOREVER, |c| c.class),
-                            file: reader.clone(), offset, record_len: n, subrecord:None,
-                        });
-                    }
-                    }
-                    offset += n;
-                }
-            }
+        let class = self.chunks.table.get(&chunk).map_or(Class::FOREVER, |c| c.class);
+        let task = ChunkReplayTask {
+            id: chunk,
+            stripe: si,
+            class,
+            path: p.to_owned(),
+            open_at_crash,
+        };
+        let mut scratch = Vec::new();
+        let (out, err) = replay_chunk_buffered(&task, horizons, config, now, &mut scratch);
+        let bytes = out.bytes;
+        self.merge_chunk_output(chunk, out, false);
+        if let Some(e) = err {
+            return Err(e);
         }
-        Ok(offset)
+        Ok(bytes)
     }
 }
 /// The legacy stripe logs a folder holds: the state root before the import, legacy-<epoch>/ after it.
@@ -287,53 +456,65 @@ fn read_legacy(files: &[(usize, PathBuf)], config: &Config, now: u64) -> io::Res
         torn: Vec::new(),
         records: 0,
     };
+    let mut scratch = Vec::new();
     for (si, p) in files {
-        let mut f = File::open(p)?;
-        let reader = Arc::new(std::sync::Mutex::new(File::open(p)?));
+        let f = File::open(p)?;
         let len = f.metadata()?.len();
+        let mut buffered = BufReader::with_capacity(REPLAY_BUF_BYTES, f);
+        let reader = Arc::new(ChunkReader::open(p)?);
         let name = p.display().to_string();
         let mut offset = 0u64;
         while offset < len {
-            match chunks::read_frame_at(&mut f, b"MBK1", offset, len, &name)? {
-                chunks::Frame::Torn(_) => {
+            match chunks::read_frame_into(&mut buffered, b"MBK1", offset, len, &name, &mut scratch)? {
+                chunks::BorrowedFrame::Torn(_) => {
                     l.torn.push((name.clone(), offset, len - offset));
                     break;
                 }
-                chunks::Frame::Whole(b, n) => {
-                    let (m, v, at) = parse_record(&b).map_err(|_| {
+                chunks::BorrowedFrame::Whole(b, n) => {
+                    let view = parse_record_view(b).map_err(|_| {
                         corrupt(format!("interior-corrupt {name} offset {offset}: payload"))
                     })?;
-                    if stripe(&m.ns, &m.key) != *si {
+                    if stripe(view.ns, view.key) != *si {
                         return Err(corrupt(format!(
                             "interior-corrupt {name} offset {offset}: wrong stripe"
                         )));
                     }
-                    l.next = l.next.max(record_successor(v, &name, offset)?);
-                    let k = (m.ns.clone(), m.key.clone());
-                    if l.committed.get(&k).is_none_or(|old| old.version < v) {
-                        let location = crate::value_disk::Location {
-                            class: Class::FOREVER, file: reader.clone(), offset, record_len: n, subrecord:None,
+                    l.next = l.next.max(record_successor(view.version, &name, offset)?);
+                    let k = (view.ns.to_owned(), view.key.to_owned());
+                    if l.committed.get(&k).is_none_or(|old| old.version < view.version) {
+                        let location = Location {
+                            class: Class::FOREVER,
+                            file: reader.clone(),
+                            offset,
+                            record_len: n,
+                            subrecord: None,
                         };
                         l.committed.insert(
                             k.clone(),
-                            Arc::new(crate::value_disk::Entry::new(&m, v, location.clone())),
+                            Arc::new(Entry::from_view(
+                                view.version,
+                                view.ack,
+                                view.remove,
+                                view.bytes.len(),
+                                location.clone(),
+                            )),
                         );
-                        l.latest.insert(k, (v, *si, location));
+                        l.latest.insert(k, (view.version, *si, location));
                     }
-                    if now.saturating_sub(at) <= config.retry_ms
-                        && !timers::is_progress(&m.ns, &m.key)
+                    if now.saturating_sub(view.at) <= config.retry_ms
+                        && !timers::is_progress(view.ns, view.key)
                     {
                         l.dedup.insert(
-                            dedup_identity(&m),
+                            dedup_identity_parts(view.ns, view.key, view.op_id),
                             Dedup {
-                                fingerprint: fingerprint(&m),
-                                at,
+                                fingerprint: fingerprint_record_slice(b),
+                                at: view.at,
                                 until_mono: 0,
                                 replayed_chunk: chunks::LEGACY_CHUNK,
                                 outcome: Some(Outcome {
                                     code: 0,
-                                    version: v,
-                                    ack: m.ack,
+                                    version: view.version,
+                                    ack: view.ack,
                                 }),
                             },
                         );
@@ -404,11 +585,7 @@ impl ImportWriter {
         policy: &str,
         payload: &[u8],
     ) -> io::Result<()> {
-        let mut record = b"MBK1".to_vec();
-        record.extend((payload.len() as u32).to_le_bytes());
-        record.extend((!(payload.len() as u32)).to_le_bytes());
-        record.extend(crc32(payload).to_le_bytes());
-        record.extend(payload);
+        let record = chunks::frame(b"MBK1", payload);
         if self
             .open
             .get(&(stripe, class))
@@ -1119,52 +1296,132 @@ fn replay_into(
         .copied()
         .filter(|id| *id != chunks::LEGACY_CHUNK)
         .collect();
+    let mut by_stripe: [Vec<ChunkReplayTask>; 4] = std::array::from_fn(|_| Vec::new());
+    for &id in &ids {
+        let c = &rp.chunks.table[&id];
+        if matches!(c.state, ChunkState::Open | ChunkState::Closed) && c.path.exists() {
+            by_stripe[c.stripe].push(ChunkReplayTask {
+                id,
+                stripe: c.stripe,
+                class: c.class,
+                path: c.path.clone(),
+                open_at_crash: c.state == ChunkState::Open,
+            });
+        }
+    }
+    let active_stripes = by_stripe.iter().filter(|q| !q.is_empty()).count();
+    let mut replayed_chunks: HashMap<u64, ChunkReplayOutcome> = HashMap::new();
+    if active_stripes <= 1 {
+        let mut scratch = Vec::new();
+        for queue in &by_stripe {
+            for task in queue {
+                let res = replay_chunk_buffered(task, &horizon_map, config, now, &mut scratch);
+                let failed = res.1.is_some();
+                replayed_chunks.insert(task.id, res);
+                if failed {
+                    break;
+                }
+            }
+        }
+    } else {
+        let per_stripe: Vec<Vec<(u64, ChunkReplayOutcome)>> = std::thread::scope(|s| {
+                let handles: Vec<_> = by_stripe
+                    .iter()
+                    .filter(|q| !q.is_empty())
+                    .map(|queue| {
+                        let horizons_ref = &horizon_map;
+                        s.spawn(move || {
+                            let mut scratch = Vec::new();
+                            let mut local = Vec::with_capacity(queue.len());
+                            for task in queue {
+                                let res = replay_chunk_buffered(
+                                    task,
+                                    horizons_ref,
+                                    config,
+                                    now,
+                                    &mut scratch,
+                                );
+                                let failed = res.1.is_some();
+                                local.push((task.id, res));
+                                if failed {
+                                    break;
+                                }
+                            }
+                            local
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+        for batch in per_stripe {
+            for (id, res) in batch {
+                replayed_chunks.insert(id, res);
+            }
+        }
+    }
+    let key_cap = replayed_chunks
+        .values()
+        .map(|(o, _)| o.keys.len())
+        .sum::<usize>()
+        .min(config.index_cap);
+    let committed_cap = replayed_chunks
+        .values()
+        .map(|(o, _)| o.committed.len())
+        .sum::<usize>()
+        .min(config.index_cap);
+    let dedup_cap = replayed_chunks
+        .values()
+        .map(|(o, _)| o.dedup.len())
+        .sum::<usize>()
+        .min(config.dedup_cap);
+    rp.chunks.holders.map.reserve(key_cap);
+    rp.committed.reserve(committed_cap);
+    rp.chunk_of.reserve(committed_cap);
+    rp.dedup.reserve(dedup_cap);
     for id in ids {
-        let c = rp.chunks.table[&id].clone();
-        match c.state {
-            ChunkState::Retired => rp.report.stripes[c.stripe].retired_skipped += 1,
+        let (state, stripe_idx, path, recorded_bytes) = {
+            let c = &rp.chunks.table[&id];
+            (c.state, c.stripe, c.path.clone(), c.bytes)
+        };
+        match state {
+            ChunkState::Retired => rp.report.stripes[stripe_idx].retired_skipped += 1,
             ChunkState::Retiring => {
                 // Finished at start; its records were already out of the index when it began retiring.
-                let len = fs::metadata(&c.path).map(|m| m.len()).unwrap_or(0);
+                let len = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                 rp.persisted += len;
                 if let Some(info) = rp.chunks.table.get_mut(&id) {
                     info.bytes = len;
                 }
             }
             ChunkState::Open | ChunkState::Closed => {
-                if !c.path.exists() {
-                    if c.state == ChunkState::Open {
+                let Some((out, err)) = replayed_chunks.remove(&id) else {
+                    if state == ChunkState::Open {
                         // The open record was flushed and the crash came before the file: an empty chunk.
                         rp.report.empty_closed.push(id);
                         continue;
                     }
                     rp.storage_errors.push(format!(
                         "chunk file missing with no retiring record: {}",
-                        c.path.display()
+                        path.display()
                     ));
                     continue;
+                };
+                let bytes = out.bytes;
+                let out_stripe = out.stripe;
+                rp.merge_chunk_output(id, out, true);
+                if let Some(e) = err {
+                    return Err(e);
                 }
-                let open_at_crash = c.state == ChunkState::Open;
-                let n = rp.replay_file(
-                    &c.path,
-                    c.stripe,
-                    id,
-                    open_at_crash,
-                    &horizon_map,
-                    config,
-                    now,
-                )?;
-                rp.report.stripes[c.stripe].chunks += 1;
-                if !open_at_crash && n != c.bytes {
+                rp.report.stripes[out_stripe].chunks += 1;
+                if state == ChunkState::Closed && bytes != recorded_bytes {
                     return Err(corrupt(format!(
-                        "interior-corrupt {}: closed chunk holds {n} bytes, its close recorded {}",
-                        c.path.display(),
-                        c.bytes
+                        "interior-corrupt {}: closed chunk holds {bytes} bytes, its close recorded {recorded_bytes}",
+                        path.display()
                     )));
                 }
-                rp.persisted += n;
+                rp.persisted += bytes;
                 if let Some(info) = rp.chunks.table.get_mut(&id) {
-                    info.bytes = n;
+                    info.bytes = bytes;
                 }
             }
         }
@@ -1380,8 +1637,34 @@ pub(crate) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
     recovered.extend(legacy_files(path).into_iter().map(|(_, p)| p));
     recovered.sort();
     recovered.dedup();
-    for p in recovered {
-        if let Err(e) = recovery_sync(&p, config) {
+    if recovered.len() <= 1 || config.fail_recovery_sync {
+        for p in &recovered {
+            if let Err(e) = recovery_sync(p, config) {
+                return Err(refuse(e, rp.report.clone()));
+            }
+        }
+    } else {
+        let workers = recovered.len().min(4);
+        let chunk_size = recovered.len().div_ceil(workers);
+        let errors: Vec<Option<io::Error>> = std::thread::scope(|s| {
+            let handles: Vec<_> = recovered
+                .chunks(chunk_size)
+                .map(|slice| {
+                    s.spawn(move || {
+                        let mut out = Vec::with_capacity(slice.len());
+                        for p in slice {
+                            out.push(recovery_sync(p, config).err());
+                        }
+                        out
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap())
+                .collect()
+        });
+        if let Some(e) = errors.into_iter().flatten().next() {
             return Err(refuse(e, rp.report.clone()));
         }
     }
@@ -1535,8 +1818,9 @@ pub(crate) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
     }
     rp.report.expiry_degraded = cs.degraded.clone();
     flags.expiry_degraded.store(cs.degraded.is_some(), Ordering::SeqCst);
-    cs.summaries.expire(cleanup_utc, config.summary_ms);
-    cs.recount_index_bytes();
+    if cs.summaries.expire(cleanup_utc, config.summary_ms) != 0 {
+        cs.recount_index_bytes();
+    }
     // A tombstone no other retained chunk holds a record of leaves the index at start (5.3).
     let mut tomb_candidates = HashSet::new();
     let tombs: Vec<Key> = committed
@@ -1555,20 +1839,18 @@ pub(crate) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
             tomb_candidates.insert(k);
         }
     }
-    let metadata: HashMap<_, _> = committed
-        .iter()
-        .map(|(k, v)| {
-            (
-                k.clone(),
-                Meta {
-                    version: v.version,
-                    tombstone: v.tombstone,
-                    bytes: crate::store::index_charge(k),
-                    chunk: rp.chunk_of.get(k).copied().unwrap_or(0),
-                },
-            )
-        })
-        .collect();
+    let mut metadata = HashMap::with_capacity(committed.len());
+    for (k, v) in &committed {
+        metadata.insert(
+            k.clone(),
+            Meta {
+                version: v.version,
+                tombstone: v.tombstone,
+                bytes: crate::store::index_charge(k),
+                chunk: rp.chunk_of.get(k).copied().unwrap_or(0),
+            },
+        );
+    }
     // The namespace count is live keys; the index count adds tombstones and expiry summaries (5.3).
     let mut namespace_counts = HashMap::new();
     for ((ns, _), m) in metadata.iter() {
@@ -1593,8 +1875,11 @@ pub(crate) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
     }
     let dedup_entries = dedup.len();
     let dedup_bytes: usize = dedup.keys().map(crate::store::dedup_charge).sum();
-    let mut expiry: Vec<_> = dedup.iter().map(|(k, d)| (k.clone(), d.until_mono)).collect();
-    expiry.sort_by_key(|(_, at)| *at);
+    let mut expiry = Vec::with_capacity(dedup.len());
+    for (k, d) in &dedup {
+        expiry.push((k.clone(), d.until_mono));
+    }
+    expiry.sort_unstable_by_key(|(_, at)| *at);
     // Later failures describe the final projection, after tombstone/summary and
     // retry cleanup, rather than the earlier replay snapshot.
     rp.report.keys = keys;
@@ -1671,3 +1956,230 @@ pub(crate) fn recover(path: &Path, config: &Config) -> io::Result<Recovered> {
 #[cfg(test)]
 #[path = "../unit_tests/replay/durability_tests.rs"]
 mod durability_tests;
+
+#[cfg(test)]
+mod parallel_replay_tests {
+    use crate::atomic::{AtomicAck, FinalChange};
+    use crate::{Class, Config, ManualClock, Mutation, Store};
+    use std::fs::{self, OpenOptions};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::path::PathBuf;
+
+    fn test_dir(label: &str) -> PathBuf {
+        let base = PathBuf::from(
+            std::env::var_os("MEMBUS_TEST_OUTPUT").unwrap_or_else(|| ".test-output".into()),
+        );
+        fs::create_dir_all(&base).unwrap();
+        fs::canonicalize(base)
+            .unwrap()
+            .join(format!("parallel-replay-{label}-{}-{}", std::process::id(), crate::now_ms()))
+    }
+
+    #[test]
+    fn parallel_replay_preserves_envelopes_horizons_truncation_and_corruption() {
+        let dir = test_dir("full");
+        let clock = ManualClock::new(10_000_000);
+        let config = Config {
+            chunk_bytes: 4096,
+            rotation_ms: 100,
+            retry_ms: 10,
+            tick_ms: 3_600_000,
+            retire_ms: 3_600_000,
+            clock: Some(clock.clone()),
+            ..Config::default()
+        };
+        let mut expected = std::collections::BTreeMap::<String, (u64, Vec<u8>)>::new();
+        let expired_key = "exp/k0";
+        {
+            let store = Store::open(&dir, config.clone()).unwrap();
+            assert_eq!(
+                store
+                    .set_policy("expns", "", Some(Class::expire(20)), 20_000_000)
+                    .code,
+                0
+            );
+            // Write an expiring key, rotate, and retire to produce an anti-resurrection horizon.
+            let exp_put = store.mutate(Mutation {
+                ns: "expns".into(),
+                key: expired_key.into(),
+                op_id: "exp-1".into(),
+                deadline: 20_000_000,
+                ack: 1,
+                expected: None,
+                bytes: vec![0xee; 256],
+                remove: false,
+            });
+            assert_eq!(exp_put.code, 0);
+            clock.advance(200);
+            store.tick();
+            clock.advance(200);
+            store.retirement_pass();
+            assert_eq!(store.get_status("expns", expired_key), (1, 0));
+
+            // Write 64 scalar keys across all 4 stripes and multiple rotated chunks.
+            for i in 0..64u32 {
+                let key = format!("row/{i:03}");
+                let bytes = vec![(i % 251) as u8; 512];
+                let o = store.mutate(Mutation {
+                    ns: "mix".into(),
+                    key: key.clone(),
+                    op_id: format!("scalar-init-{i}"),
+                    deadline: 20_000_000,
+                    ack: 1,
+                    expected: None,
+                    bytes: bytes.clone(),
+                    remove: false,
+                });
+                assert_eq!(o.code, 0);
+                expected.insert(key, (o.version, bytes));
+            }
+            // Publish an atomic envelope in namespace "mix" updating keys whose scalar stripes
+            // differ from envelope_stripe("mix").
+            let req = store
+                .capture_namespace_funded("mix", 256 * 1024)
+                .unwrap()
+                .prepare(
+                    "atomic-xstripe",
+                    AtomicAck::Os,
+                    vec![
+                        FinalChange::put("row/000", vec![0xaa; 300]),
+                        FinalChange::put("row/001", vec![0xbb; 300]),
+                        FinalChange::put("row/002", vec![0xcc; 300]),
+                        FinalChange::put("row/003", vec![0xdd; 300]),
+                    ],
+                )
+                .unwrap();
+            let ao = store.publish_atomic(&req, 20_000_000).unwrap();
+            assert_eq!(ao.code, 0);
+            expected.insert("row/000".into(), (ao.version, vec![0xaa; 300]));
+            expected.insert("row/001".into(), (ao.version + 1, vec![0xbb; 300]));
+            expected.insert("row/002".into(), (ao.version + 2, vec![0xcc; 300]));
+            expected.insert("row/003".into(), (ao.version + 3, vec![0xdd; 300]));
+            // Overwrite one of the atomically updated keys with a newer scalar record on its own stripe.
+            let o = store.mutate(Mutation {
+                ns: "mix".into(),
+                key: "row/002".into(),
+                op_id: "scalar-after-atomic".into(),
+                deadline: 20_000_000,
+                ack: 1,
+                expected: None,
+                bytes: vec![0x55; 400],
+                remove: false,
+            });
+            assert_eq!(o.code, 0);
+            expected.insert("row/002".into(), (o.version, vec![0x55; 400]));
+        }
+        // Append a 7-byte torn tail to an open chunk (before reopening closes open chunks).
+        let forever_dir = dir.join("chunks/forever");
+        let open_chunk = {
+            let store = Store::open(&dir, config.clone()).unwrap();
+            // Write one new key to create a fresh open chunk, then close the Store.
+            let o = store.mutate(Mutation {
+                ns: "mix".into(),
+                key: "row/004".into(),
+                op_id: "tail-open".into(),
+                deadline: 20_000_000,
+                ack: 1,
+                expected: None,
+                bytes: vec![0x77; 128],
+                remove: false,
+            });
+            assert_eq!(o.code, 0);
+            expected.insert("row/004".into(), (o.version, vec![0x77; 128]));
+            let open_row = store
+                .chunk_rows()
+                .into_iter()
+                .find(|r| r.3 == "Open")
+                .unwrap();
+            forever_dir.join(format!("{}-{}.log", open_row.1, open_row.0))
+        };
+        {
+            let mut f = OpenOptions::new().append(true).open(&open_chunk).unwrap();
+            f.write_all(b"MBK1\x01\x00\x00").unwrap();
+            f.flush().unwrap();
+        }
+        // Reopen: parallel replay must truncate the torn tail and recover every key identically.
+        let closed_chunk_path = {
+            let reopened = Store::open(&dir, config.clone()).unwrap();
+            let report = reopened.replay_report();
+            assert_eq!(
+                report.stripes.iter().map(|s| s.truncations.len()).sum::<usize>(),
+                1,
+                "torn tail on open chunk must be truncated"
+            );
+            assert!(
+                report.stripes.iter().filter(|s| s.chunks > 0).count() == 4,
+                "test fixture must exercise all 4 stripes in parallel"
+            );
+            assert_eq!(reopened.get_status("expns", expired_key), (1, 0));
+            for (k, (v, bytes)) in &expected {
+                let got = reopened.try_get("mix", k).unwrap().unwrap();
+                assert_eq!((got.version, &got.bytes), (*v, bytes), "key {k}");
+            }
+            let closed_row = reopened
+                .chunk_rows()
+                .into_iter()
+                .find(|r| r.3 == "Closed" && r.4 > 32)
+                .unwrap();
+            forever_dir.join(format!("{}-{}.log", closed_row.1, closed_row.0))
+        };
+        // Corrupt 1 byte inside a closed chunk: parallel replay must refuse startup with InvalidData.
+        {
+            let mut f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&closed_chunk_path)
+                .unwrap();
+            f.seek(SeekFrom::Start(20)).unwrap();
+            f.write_all(&[0xff]).unwrap();
+            f.flush().unwrap();
+        }
+        let err = Store::open(&dir, config).err().expect("corrupt closed chunk must refuse startup");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replay_large_value_chunks_bound_key_map_capacity() {
+        let dir = test_dir("large-chunk-cap");
+        let config = Config {
+            chunk_bytes: 2 * 1024 * 1024,
+            tick_ms: 3_600_000,
+            retire_ms: 3_600_000,
+            ..Config::default()
+        };
+        {
+            let store = Store::open(&dir, config.clone()).unwrap();
+            for i in 0..4u8 {
+                let o = store.mutate(Mutation {
+                    ns: "blobs".into(),
+                    key: format!("big-{i}"),
+                    op_id: format!("big-op-{i}"),
+                    deadline: crate::now_ms() + 30_000,
+                    ack: 1,
+                    expected: None,
+                    bytes: vec![i + 1; 1024 * 1024],
+                    remove: false,
+                });
+                assert_eq!(o.code, 0);
+            }
+        }
+        let reopened = Store::open(&dir, config).unwrap();
+        let chunks = reopened.chunks.lock().unwrap();
+        assert!(!chunks.table.is_empty());
+        for info in chunks.table.values() {
+            if !info.keys.is_empty() {
+                assert!(
+                    info.keys.capacity() <= 32,
+                    "large-value chunk {} retained oversized key map capacity={} for len={}",
+                    info.id,
+                    info.keys.capacity(),
+                    info.keys.len()
+                );
+            }
+        }
+        drop(chunks);
+        drop(reopened);
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
