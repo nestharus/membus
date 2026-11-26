@@ -470,6 +470,35 @@ fn raw_request_validation_and_reply_budget_refuse_before_open() {
     s.snapshot_release("n", token).unwrap();
 }
 
+#[test]
+fn opcode_31_refuses_selected_view_tokens_as_ineligible_for_complete_query() {
+    let f = Fixture::new();
+    let s = Arc::new(Store::open(&f.0, config()).unwrap());
+    put(&s, "pick/a", b"one");
+    put(&s, "z", b"two");
+    let (mut c, _) = connect(&s, Fault::None, true);
+    let view = c
+        .snapshot_open_selected(
+            "ledger",
+            Selection::Prefix("pick/"),
+            budget(),
+            "acquire",
+            d(),
+        )
+        .unwrap();
+    assert!(matches!(
+        c.snapshot_require_complete("ledger", &view.snapshot, "require-complete", d()),
+        Err(Error::Refused(r)) if r.code == 16
+    ));
+    c.snapshot_release("ledger", &view.snapshot, "release", d())
+        .unwrap();
+    let whole = c.snapshot_open("ledger", "whole", d()).unwrap();
+    c.snapshot_require_complete("ledger", &whole, "require-complete-whole", d())
+        .unwrap();
+    c.snapshot_release("ledger", &whole, "release-whole", d())
+        .unwrap();
+}
+
 #[cfg(windows)]
 #[test]
 fn package_resident_selected_operation_preserves_capture_across_pipe_mutation() {

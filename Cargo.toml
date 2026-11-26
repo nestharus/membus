@@ -8,3 +8,5 @@ edition = "2021"
 [features]
 # Explicit test binary only; ordinary release has no sync markers.
 sync-witness = []
+# Explicit test binary only; enables env-triggered pause/import fault seams.
+test-seams = []

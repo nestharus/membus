@@ -86,8 +86,9 @@ idle-immediate and overlapping notice classification and reuse of covered
 extents. These are available controls, not a performance certification.
 
 `MEMBUS_TEST_PAUSE_PARTIAL` and `MEMBUS_TEST_PAUSE_SYNC` are path-valued pause
-seams; leave them unset during operation. The latter marks worker entry before
-sync. The optional Cargo feature `sync-witness` brackets actual Windows
+seams enabled only in test builds or with the optional Cargo feature `test-seams`;
+ordinary releases omit them. The latter marks worker entry before sync. The
+optional Cargo feature `sync-witness` brackets actual Windows
 FlushFileBuffers with entering/returned markers selected by
 `MEMBUS_SYNC_WITNESS`. Ordinary releases omit that feature's marker code.
 The feature's `.calls` diagnostic also records the actual handle target, extent

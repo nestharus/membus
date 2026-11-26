@@ -1,10 +1,13 @@
 # Atomic original inspection and domain custody
 
 `AtomicRequest::inspect()` borrows every original field: namespace, stable
-operation ID, provider epoch and monotonic horizon, the complete ordered
-key/revision population, requested Ack, and every ordered final put/remove with
-its exact value bytes. The projection cannot mutate the original. MAR1 encoding,
-decoding, persistence and publication remain the existing provider operations.
+operation ID, provider epoch and monotonic horizon, the captured population guard
+(`PopulationGuardView::Enumerable` for complete ordered `MAR1` key/revision
+populations, or `PopulationGuardView::Digest` for compact `MAR2` count, SHA-256
+digest and capture limits), requested Ack, and every ordered final put/remove with
+its exact value bytes. The projection cannot mutate the original. MAR1 and MAR2
+encoding, decoding, persistence and publication remain the existing provider
+operations.
 
 Inspection and decoding supply no proof that the domain's typed planner produced
 an original. A request could be syntactically valid while violating the domain's

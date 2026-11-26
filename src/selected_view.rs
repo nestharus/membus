@@ -259,7 +259,9 @@ impl Store {
             rows,
             selection: Some(selection.into()),
             cursor_hash: RandomState::new(),
-            complete: true,
+            // Selected views capture only a prefix/range subset, never whole-namespace
+            // complete-query eligibility.
+            complete: false,
             bounded_load: None,
             _charge: reservation,
         });

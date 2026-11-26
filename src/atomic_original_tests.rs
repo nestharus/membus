@@ -103,7 +103,7 @@ fn complete_inspection_conserves_four_records_guards_ack_and_original_bytes() {
     assert_eq!((v.epoch, v.expires_mono), (19, 1200));
     assert_eq!(
         v.population,
-        &[("allocator".into(), 81), ("unrelated".into(), 75)]
+        PopulationGuardView::Enumerable(&[("allocator".into(), 81), ("unrelated".into(), 75)])
     );
     assert_eq!(v.requested_ack, AtomicAck::Flush);
     assert_eq!(v.changes.len(), 4);
@@ -286,4 +286,48 @@ fn same_instance_encoding_remove_empty_value_and_os_ack_are_unchanged() {
         Some(Vec::new())
     );
     assert_eq!(r.to_bytes(), recovered.original().to_bytes());
+}
+
+#[test]
+fn mar2_inspection_exposes_compact_population_digest_instead_of_empty_slice() {
+    let limits = crate::atomic_population::PopulationLimits {
+        max_keys: 16,
+        max_capture_bytes: 1 << 20,
+        max_changes: 8,
+        max_original_bytes: 64 * 1024,
+    };
+    let (count, digest) =
+        crate::atomic_population::population_digest([("a", 1u64), ("b", 2u64)].into_iter());
+    let guard = crate::atomic_population::PopulationGuard {
+        count,
+        digest,
+        limits,
+    };
+    let request = AtomicRequest::prepare_bounded(
+        "authored-queue",
+        "bounded-op",
+        19,
+        1200,
+        &guard,
+        AtomicAck::Flush,
+        vec![FinalChange::put("a", b"next".to_vec())],
+    )
+    .unwrap();
+    let inspected = request.inspect();
+    assert_eq!(
+        inspected.population,
+        PopulationGuardView::Digest {
+            count: 2,
+            digest,
+            limits,
+        }
+    );
+    let bytes = request.to_bytes();
+    assert!(bytes.starts_with(b"MAR2"));
+    assert_eq!(
+        BorrowedOriginal::from_bytes(&bytes).err(),
+        Some(PublicationError::Invalid)
+    );
+    let decoded = AtomicRequest::from_bytes(&bytes).unwrap();
+    assert_eq!(decoded.inspect().population, inspected.population);
 }

@@ -331,7 +331,12 @@ impl Store {
         Ok((token, snapshot))
     }
     pub(super) fn snapshot_require_complete(&self, ns: &str, token: &[u8]) -> Result<(), u16> {
-        if self.snapshot_get(ns, token)?.complete { Ok(()) } else { Err(16) }
+        let snapshot = self.snapshot_get(ns, token)?;
+        if snapshot.complete && snapshot.selection.is_none() {
+            Ok(())
+        } else {
+            Err(16)
+        }
     }
     pub(super) fn snapshot_get(&self, ns: &str, token: &[u8]) -> Result<Arc<Snapshot>, u16> {
         if token.len() != 16 {

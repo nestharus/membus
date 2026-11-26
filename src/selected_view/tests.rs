@@ -925,3 +925,21 @@ fn failure_after_pinning_returns_the_entire_store_reservation_and_entry_referenc
     clean(&s);
     assert_eq!(Arc::strong_count(&entry), refs);
 }
+
+#[test]
+fn selected_view_is_ineligible_for_snapshot_require_complete() {
+    let f = Fixture::new();
+    let s = Store::open(&f.0, config()).unwrap();
+    seed(&s);
+    for selection in [Selection::Prefix("keep/"), Selection::Prefix("")] {
+        let view = s
+            .snapshot_open_selected("ledger", selection, budget())
+            .unwrap();
+        assert_eq!(s.snapshot_require_complete("ledger", &view.snapshot), Err(16));
+        s.snapshot_release("ledger", &view.snapshot).unwrap();
+    }
+    let (whole, _) = s.snapshot_open("ledger").unwrap();
+    assert_eq!(s.snapshot_require_complete("ledger", &whole), Ok(()));
+    s.snapshot_release("ledger", &whole).unwrap();
+    clean(&s);
+}

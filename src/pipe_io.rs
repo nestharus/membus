@@ -46,6 +46,99 @@ impl Drop for Event {
         }
     }
 }
+
+trait Completion {
+    fn wait(&mut self, timeout: u32) -> u32;
+    fn error(&self) -> io::Error;
+    fn cancel(&mut self);
+    fn result(&mut self, wait: bool) -> Result<usize, (io::Error, u32)>;
+}
+
+struct NativeCompletion<'a> {
+    pipe: Handle,
+    event: Handle,
+    operation: &'a mut Overlapped,
+}
+
+impl Completion for NativeCompletion<'_> {
+    fn wait(&mut self, timeout: u32) -> u32 {
+        unsafe { WaitForSingleObject(self.event, timeout) }
+    }
+    fn error(&self) -> io::Error {
+        io::Error::last_os_error()
+    }
+    fn cancel(&mut self) {
+        unsafe {
+            CancelIoEx(self.pipe, self.operation);
+        }
+    }
+    fn result(&mut self, wait: bool) -> Result<usize, (io::Error, u32)> {
+        let mut done = 0;
+        if unsafe { GetOverlappedResult(self.pipe, self.operation, &mut done, i32::from(wait)) }
+            == 0
+        {
+            Err((io::Error::last_os_error(), done))
+        } else {
+            Ok(done as usize)
+        }
+    }
+}
+
+fn cancel_and_drain(api: &mut impl Completion) -> Result<usize, (io::Error, u32)> {
+    api.cancel();
+    // Cancellation requests do not release kernel ownership. A blocking lookup
+    // may still report ERROR_IO_INCOMPLETE (996); never unwind the caller's
+    // buffer, OVERLAPPED or event handle while kernel I/O is still in flight.
+    loop {
+        match api.result(true) {
+            Err((err, _)) if err.raw_os_error() == Some(996) => continue,
+            terminal => return terminal,
+        }
+    }
+}
+
+fn complete(api: &mut impl Completion, pending: bool, timeout: u32) -> io::Result<usize> {
+    if pending {
+        let wait = api.wait(timeout);
+        if wait != 0 {
+            // Save a failed wait's error before cancellation changes last-error.
+            let wait_err = if wait == u32::MAX {
+                Some(api.error())
+            } else {
+                None
+            };
+            // Keep event, OVERLAPPED and buffer alive until the kernel is done.
+            let drained = cancel_and_drain(api);
+            if let Some(err) = wait_err {
+                return Err(err);
+            }
+            if wait == 258 {
+                // Completion may race cancellation: never discard consumed bytes.
+                return match drained {
+                    Ok(done) => Ok(done),
+                    Err((_, done)) if done != 0 => Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "cancelled I/O consumed bytes",
+                    )),
+                    Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "pipe idle timeout")),
+                };
+            }
+            return Err(io::Error::other("unexpected pipe wait result"));
+        }
+    }
+    match api.result(false) {
+        Ok(done) => Ok(done),
+        Err((err, _)) => {
+            if err.raw_os_error() == Some(996) {
+                // A signaled event or immediate submission success is not a substitute
+                // for terminal completion; drain before unwinding stack state.
+                let _ = cancel_and_drain(api);
+            }
+            Err(err)
+        }
+    }
+}
+
 pub struct Pipe {
     file: File,
     idle_ms: u32,
@@ -79,7 +172,6 @@ impl Pipe {
             event: event.0,
         };
         let h = self.file.as_raw_handle();
-        let mut done = 0;
         let ok = unsafe {
             match kind {
                 0 => ReadFile(
@@ -100,10 +192,15 @@ impl Pipe {
             }
         };
         if ok != 0 {
-            if kind < 2 && unsafe { GetOverlappedResult(h, &mut operation, &mut done, 0) } == 0 {
-                return Err(io::Error::last_os_error());
+            if kind >= 2 {
+                return Ok(0);
             }
-            return Ok(done as usize);
+            let mut completion = NativeCompletion {
+                pipe: h,
+                event: event.0,
+                operation: &mut operation,
+            };
+            return complete(&mut completion, false, self.idle_ms);
         }
         let error = io::Error::last_os_error();
         if kind >= 2 && error.raw_os_error() == Some(535) {
@@ -112,31 +209,16 @@ impl Pipe {
         if error.raw_os_error() != Some(997) {
             return Err(error);
         }
-        let wait = unsafe {
-            WaitForSingleObject(event.0, if kind == 2 { u32::MAX } else { self.idle_ms })
+        let mut completion = NativeCompletion {
+            pipe: h,
+            event: event.0,
+            operation: &mut operation,
         };
-        if wait != 0 {
-            // Keep event, OVERLAPPED and buffer alive until the kernel is done.
-            let completed = unsafe {
-                CancelIoEx(h, &mut operation);
-                GetOverlappedResult(h, &mut operation, &mut done, 1)
-            };
-            // Completion may race cancellation: never discard consumed bytes.
-            if completed != 0 {
-                return Ok(done as usize);
-            }
-            if done != 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::Interrupted,
-                    "cancelled I/O consumed bytes",
-                ));
-            }
-            return Err(io::Error::new(io::ErrorKind::TimedOut, "pipe idle timeout"));
-        }
-        if unsafe { GetOverlappedResult(h, &mut operation, &mut done, 0) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(done as usize)
+        complete(
+            &mut completion,
+            true,
+            if kind == 2 { u32::MAX } else { self.idle_ms },
+        )
     }
     pub fn connect(&mut self) -> io::Result<()> {
         self.operation(std::ptr::null_mut(), 0, 2).map(|_| ())
@@ -276,5 +358,138 @@ mod tests {
         let mut buf = [0u8; 8];
         let err = server.read(&mut buf).unwrap_err();
         assert_ne!(err.kind(), io::ErrorKind::TimedOut);
+    }
+
+    mod cancel_drain_tests {
+        use super::*;
+        use std::collections::VecDeque;
+
+        enum Step {
+            Wait(u32, u32),
+            Cancel,
+            Result(bool, Result<usize, (i32, u32)>),
+        }
+
+        struct Script {
+            steps: VecDeque<Step>,
+            pending: bool,
+        }
+
+        impl Script {
+            fn new(steps: Vec<Step>) -> Self {
+                Self {
+                    steps: steps.into(),
+                    pending: true,
+                }
+            }
+            fn settled(&self) {
+                assert!(
+                    !self.pending,
+                    "returned while kernel still owns operation and buffer"
+                );
+                assert!(self.steps.is_empty(), "unused scripted steps remaining");
+            }
+        }
+
+        impl Completion for Script {
+            fn wait(&mut self, timeout: u32) -> u32 {
+                let Step::Wait(expected, outcome) = self.steps.pop_front().expect("wait step")
+                else {
+                    panic!("unexpected wait");
+                };
+                assert_eq!(timeout, expected);
+                outcome
+            }
+            fn error(&self) -> io::Error {
+                io::Error::from_raw_os_error(6)
+            }
+            fn cancel(&mut self) {
+                assert!(self.pending, "cancel after terminal completion");
+                assert!(matches!(self.steps.pop_front(), Some(Step::Cancel)));
+            }
+            fn result(&mut self, wait: bool) -> Result<usize, (io::Error, u32)> {
+                let Step::Result(expected, outcome) = self.steps.pop_front().expect("result step")
+                else {
+                    panic!("unexpected result");
+                };
+                assert_eq!(wait, expected);
+                if !matches!(outcome, Err((996, _))) {
+                    self.pending = false;
+                }
+                outcome.map_err(|(code, done)| (io::Error::from_raw_os_error(code), done))
+            }
+        }
+
+        #[test]
+        fn timeout_drains_repeated_io_incomplete_before_returning() {
+            let mut api = Script::new(vec![
+                Step::Wait(50, 258),
+                Step::Cancel,
+                Step::Result(true, Err((996, 0))),
+                Step::Result(true, Err((996, 0))),
+                Step::Result(true, Err((995, 0))),
+            ]);
+            let err = complete(&mut api, true, 50).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+            api.settled();
+        }
+
+        #[test]
+        fn timeout_preserves_raced_completion_after_io_incomplete_drain() {
+            let mut api = Script::new(vec![
+                Step::Wait(50, 258),
+                Step::Cancel,
+                Step::Result(true, Err((996, 0))),
+                Step::Result(true, Ok(11)),
+            ]);
+            assert_eq!(complete(&mut api, true, 50).unwrap(), 11);
+            api.settled();
+        }
+
+        #[test]
+        fn timeout_reports_interrupted_when_cancelled_io_consumed_bytes() {
+            let mut api = Script::new(vec![
+                Step::Wait(50, 258),
+                Step::Cancel,
+                Step::Result(true, Err((996, 0))),
+                Step::Result(true, Err((995, 4))),
+            ]);
+            let err = complete(&mut api, true, 50).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+            api.settled();
+        }
+
+        #[test]
+        fn signaled_or_immediate_io_incomplete_cancels_and_drains() {
+            for pending in [false, true] {
+                let mut steps = Vec::new();
+                if pending {
+                    steps.push(Step::Wait(50, 0));
+                }
+                steps.extend([
+                    Step::Result(false, Err((996, 0))),
+                    Step::Cancel,
+                    Step::Result(true, Err((996, 0))),
+                    Step::Result(true, Err((995, 0))),
+                ]);
+                let mut api = Script::new(steps);
+                let err = complete(&mut api, pending, 50).unwrap_err();
+                assert_eq!(err.raw_os_error(), Some(996));
+                api.settled();
+            }
+        }
+
+        #[test]
+        fn failed_wait_preserves_original_error_across_cancel_drain() {
+            let mut api = Script::new(vec![
+                Step::Wait(50, u32::MAX),
+                Step::Cancel,
+                Step::Result(true, Err((996, 0))),
+                Step::Result(true, Err((995, 0))),
+            ]);
+            let err = complete(&mut api, true, 50).unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(6));
+            api.settled();
+        }
     }
 }

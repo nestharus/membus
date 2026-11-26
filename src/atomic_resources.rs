@@ -156,7 +156,8 @@ pub struct BorrowedOriginal<'a> {
     change_count: usize,
 }
 impl<'a> BorrowedOriginal<'a> {
-    /// Borrow an exact, enumerable MAR1 original.
+    /// Borrow an exact, enumerable MAR1 original; rejects compact MAR2 originals.
+    /// Use `AtomicRequest::from_bytes` to decode either MAR1 or MAR2.
     pub fn from_bytes(bytes: &'a [u8]) -> Result<Self, PublicationError> {
         if bytes.get(..4) != Some(b"MAR1") {
             return Err(PublicationError::Invalid);

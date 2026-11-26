@@ -9,9 +9,10 @@ paging and release. It performs no automatic retry or new capture.
 On the default KV1 connection, opcode **31 SNAPSHOT_REQUIRE_COMPLETE** uses the
 existing request prefix followed by a length-prefixed 16-byte snapshot token.
 Success has an empty payload. Refusal 16 means the captured population is
-ineligible for a complete query. Refusal 20 means the token is absent, expired,
-released or from another epoch. Refusal 21 means the token has the wrong length
-or belongs to a different namespace.
+ineligible for a complete query (including degraded store state at capture or a
+partial `SelectedView` opened via opcode 32). Refusal 20 means the token is
+absent, expired, released or from another epoch. Refusal 21 means the token has
+the wrong length or belongs to a different namespace.
 Older providers and connections that selected finite hints through affirmative
 `MSH2` discovery refuse with unsupported (2). The typed Rust method requires
 the default profile and negotiated scans before sending. A caller must retain

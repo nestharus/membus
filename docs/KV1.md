@@ -53,9 +53,15 @@ Identity suffixes select additive discovery vocabulary:
 
 Keep `;scans=1` last when combining features. The resident gates subscription
 control (16..19) and timers (21..23) on their negotiated features. Scans are
-advertised through refusal vocabulary; retirement operations (24..27) are
-additive calls, with unsupported (2) on older implementations. See
-[subscriptions](SUBSCRIPTIONS.md) and [timers](TIMERS.md) for extensions.
+advertised through refusal vocabulary; retirement operations (24..27), atomic
+publication/population operations (28..30), snapshot completeness verification
+(31), and bounded selected-view acquisition (32) are additive calls, with
+unsupported (2) on older implementations. Including `;subscription-contract=2`
+with `;subscribe=1` switches connection opcodes 28..30 to finite-hint controls
+(`FINITE_CREATE`, `FINITE_RENEW`, `FINITE_CANCEL`) and disables atomic wire
+operations and opcode 31 on that connection. See [subscriptions](SUBSCRIPTIONS.md),
+[timers](TIMERS.md), [finite hints](FINITE-HINTS.md), [atomic wire](ATOMIC-WIRE.md),
+[snapshot integrity](SNAPSHOT-INTEGRITY.md), and [selected view](SELECTED-VIEW.md).
 Identity and tokens do not authenticate application actors.
 
 See [tenant admission](TENANCY_BOUNDARY.md) for the proposed hosted boundary:
@@ -225,7 +231,11 @@ values. Value pages load selected payloads outside that lock and pin their Arc
 handles once per view; keys-only pages load no payloads. Later
 changes, expiry or file retirement do not alter that view. Several
 queries/connections can share a token in the same namespace and epoch. Separate
-captures may see different revisions. There are no multi-key write transactions.
+captures may see different revisions. Ordinary `PUT`, `CONDITIONAL_PUT`,
+`REMOVE` and `BATCH` operations are not multi-key write transactions; conditional
+whole-namespace atomic publication uses additive opcodes 28..30 with `MAW1`
+replies (`MAR1`/`MAR2` originals), described in [ATOMIC-PUBLICATION.md](ATOMIC-PUBLICATION.md),
+[ATOMIC-WIRE.md](ATOMIC-WIRE.md) and [ATOMIC-POPULATION.md](ATOMIC-POPULATION.md).
 
 | Opcode | Suffix | Successful payload |
 |---|---|---|
@@ -318,6 +328,17 @@ reserving part for maintenance; [RESIDENT.md](RESIDENT.md) lists options.
 Opcodes 16..19 manage [subscriptions](SUBSCRIPTIONS.md), and 21..23 manage
 [timers](TIMERS.md). Opcodes 24..27 set/get retention policy, inspect key expiry
 status and return HEALTH2, as described in [CHUNK-RETIREMENT.md](CHUNK-RETIREMENT.md).
+On the default connection profile, opcodes 28..30 (`ATOMIC_CAPTURE`,
+`ATOMIC_PUBLISH`, `ATOMIC_POPULATION`) carry whole-namespace atomic capture and
+conditional publication using `MAW1` response envelopes inside status code 0
+(see [ATOMIC-WIRE.md](ATOMIC-WIRE.md) and [ATOMIC-POPULATION.md](ATOMIC-POPULATION.md)),
+opcode 31 (`SNAPSHOT_REQUIRE_COMPLETE`) verifies whole-namespace complete-query
+eligibility (refusing partial selected-view tokens with code 16; see
+[SNAPSHOT-INTEGRITY.md](SNAPSHOT-INTEGRITY.md)), and opcode 32
+(`SNAPSHOT_OPEN_SELECTED`) acquires a budgeted prefix/range selected view (see
+[SELECTED-VIEW.md](SELECTED-VIEW.md)). On a `;subscribe=1;subscription-contract=2`
+connection, opcodes 28..30 select finite-hint controls and opcode 31 returns
+unsupported (2) (see [FINITE-HINTS.md](FINITE-HINTS.md)).
 Neither change transport nor timer status establishes receipt, lease authority
 or useful application completion. Indexed publication/query semantics are in
 [INDEXED_COLLECTIONS.md](INDEXED_COLLECTIONS.md).

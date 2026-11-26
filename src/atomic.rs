@@ -32,14 +32,28 @@ pub use result_inspection::{
     RetryRetention, RESULT_INSPECTION_SCRATCH_BYTES,
 };
 
-/// Complete borrowed original, including the whole captured guard population.
+/// Whole-population guard captured by an atomic original.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PopulationGuardView<'a> {
+    /// Exact enumerable MAR1 key/revision population.
+    Enumerable(&'a [(String, u64)]),
+    /// Compact MAR2 whole-population SHA-256 digest and capture limits.
+    Digest {
+        count: u32,
+        digest: [u8; 32],
+        limits: crate::atomic_population::PopulationLimits,
+    },
+}
+
+/// Complete borrowed original, including its captured guard representation
+/// (`MAR1` enumerable population or `MAR2` compact population digest).
 /// Inspection and successful decoding establish no domain-original provenance.
 pub struct AtomicInspection<'a> {
     pub namespace: &'a str,
     pub operation_id: &'a str,
     pub epoch: u64,
     pub expires_mono: u64,
-    pub population: &'a [(String, u64)],
+    pub population: PopulationGuardView<'a>,
     pub requested_ack: AtomicAck,
     pub changes: &'a [FinalChange],
 }
@@ -281,12 +295,20 @@ impl OriginalEncoding<'_> {
 
 impl AtomicRequest {
     pub fn inspect(&self) -> AtomicInspection<'_> {
+        let population = match &self.data.population.guard {
+            Some(guard) => PopulationGuardView::Digest {
+                count: guard.count,
+                digest: guard.digest,
+                limits: guard.limits,
+            },
+            None => PopulationGuardView::Enumerable(&self.data.population.rows),
+        };
         AtomicInspection {
             namespace: &self.data.namespace,
             operation_id: &self.data.operation_id,
             epoch: self.data.epoch,
             expires_mono: self.data.expires_mono,
-            population: &self.data.population.rows,
+            population,
             requested_ack: self.data.ack,
             changes: &self.data.changes,
         }
@@ -368,6 +390,8 @@ impl AtomicRequest {
                 .map(|c| 9 + c.key.len() + c.value.as_ref().map_or(0, Vec::len))
                 .sum::<usize>()
     }
+    /// Decode an owned original from canonical `MAR1` (enumerable) or `MAR2`
+    /// (compact population digest) bytes.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, PublicationError> {
         let borrowed = BorrowedOriginal::from_canonical_bytes(bytes)?;
         // Compatibility convenience: a bounded per-original account whose

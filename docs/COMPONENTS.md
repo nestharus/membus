@@ -17,15 +17,29 @@ have distinct state, execution lifetimes or protocols.
 | `snapshots` | Snapshot registry and scans | Epoch-bound tokens, namespace rows, retained-resource charge, query-bound paging cursor and an independent TTL reaper. |
 | `heartbeat` | Health field and resident reporting adapter | `Health2` key/value representation and the heartbeat line consumed by fleet reporting. |
 | `store` | Admission, publication and the Store operation facade | Pending/committed metadata, namespace/quota accounting, retry outcomes, class/policy ordering and mutation completion. |
-| `chunks` | Durable catalogue and chunk bookkeeping | Catalogue framing, class policies, chunk state table, holders, summaries and replay report format. |
-| `signals` | Subscription hub | Subscription registry, bounded change history, delivery state and a worker thread. |
-| `timers` | Persisted schedules and timer owner | Restored schedule/progress state, control protocol, wake producer and explicit owner shutdown. |
+| `chunks` | Durable catalogue, chunk bookkeeping, and shared store utilities | Catalogue framing, class policies, chunk state table, holders, summaries, `Clock`/`ManualClock`, `Sha256`, and `ReplayReport`. |
+| `cache` | Bounded resident value cache | Admission, eviction, policy rules, expiry buckets, and cold-read coordination. |
+| `value_disk` | Immutable disk-entry metadata and payload locations | `Entry` records, frame/subrecord locators, and identity verification. |
+| `read_cohort` | Read-backing reservations and snapshot workspaces | `ReadCohort`, `ReadValue`, and bounded cold-read backing charges. |
+| `selected_view` | Budgeted prefix/range selected-view acquisition | Two-pass committed-index measurement/pinning, `SelectedView`, and `CapturedSelection` (marked ineligible for whole-namespace `SNAPSHOT_REQUIRE_COMPLETE`). |
+| `atomic` (+ `atomic_resources`, `atomic_population`, `atomic_original`, `atomic_result`, `atomic_wire`, `atomic/captured_backing`, `atomic/custody`) | Whole-namespace conditional atomic publication | `NamespaceView`, `PopulationView`, `AtomicRequest` (`MAR1`/`MAR2`), `AtomicInspection`/`PopulationGuardView`, `MAW1` wire framing, original custody recovery, and read-only result inspection. |
+| `namespace_reserve` | Namespace reservation records | Bounded namespace reservation tracking and expiry under store admission. |
+| `recovery_image` | Stopped-store recovery image capture and verification | `capture_stopped`, `capture.complete` manifests, funded image validation, and read-only inspection. |
+| `serving_authority` | Explicit serving-authority boundary types | Authoritative serving-grant checks decoupled from raw store epochs. |
+| `receiving` | Receiving placement descriptors | `DurablePlacement` validation for storage-receiving workflows. |
+| `signals` (+ `subscription_contract`, `subscription_resources`) | Subscription hub and finite-hint contracts | Subscription registry, bounded change history, delivery worker, `MSH2` finite-hint discovery/controls, and subscription resource accounting. |
+| `timers` (`pub use timers::Owner as ResidentWorkers`) | Persisted schedules and resident worker supervision | Restored schedule/progress state, timer control protocol, wake producer, heartbeat thread supervision, and `ResidentDispatch` shutdown/join settlement. |
+| `resident_dispatch` | Wire dispatch gate for resident servers | Active request tracking and quiescent shutdown coordination. |
 | `client` | Native Rust client | Connection/transport state, negotiation, caller-owned attempts and deadlines. |
-| `client::m3` (`client_m3.rs`) | Typed scans and subscriptions | Snapshot/cursor association, scan pages, change frames and subscription tokens/status. |
+| `client::m3` (`client_m3.rs`) | Typed scans and subscriptions | Snapshot/cursor association, scan pages, completeness checks, change frames and subscription tokens/status. |
+| `client_policy` | Typed retention-policy client | `POLICY_GET` and `POLICY_SET` request framing and validation. |
+| `client_selected` | Typed selected-view client | `SNAPSHOT_OPEN_SELECTED` (opcode 32) framing and response bounds checks. |
+| `client_finite` | Typed finite-hint client | `MSH2` finite-hint negotiation and opcodes 28..30 control helpers. |
 | `client::timer_client` (`client_timers.rs`) | Typed timer client | Timer attempts, generation/epoch association, schedule/envelope framing and uncertainty. |
 | `client::listener` (`client_listener.rs`, Windows) | Change listener | Owned receiving pipe, buffered frame state, deadlines, cancellation and reset/drain lifecycle. |
 | `indexed` | Append-only collections over the client | Declared schema, deterministic keys, append receipt and scan protocol. |
-| `pipe_io` (Windows) | Resident pipe transport | Owned pipe/event handles, overlapped I/O, cancellation and drain protocol. |
+| `pipe_io` (Windows) | Resident pipe transport | Owned pipe/event handles, overlapped I/O, cancellation and `ERROR_IO_INCOMPLETE` (`996`) drain protocol. |
+| `cli` & `bin/storage-receive` | Resident CLI parser and storage-receiving driver | Effect-free CLI argument validation for `membus` and standalone receiving verification binary. |
 
 The resident executable retains transport acceptance, command handling and the
 heartbeat producer; its `qualification` module retains stopped-state inspection.

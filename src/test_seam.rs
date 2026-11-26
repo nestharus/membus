@@ -1,6 +1,7 @@
 //! Named instrumentation points for owner delays, notifications, gates and failures.
 use crate::log_io::sync_file;
 use crate::Config;
+#[cfg(any(test, feature = "test-seams"))]
 use std::fs;
 use std::fs::File;
 use std::io;
@@ -110,7 +111,14 @@ impl TestSeam {
         }
     }
     pub(super) fn partial_append_requested(config: &Config) -> bool {
-        config.fail_partial_append || std::env::var_os("MEMBUS_TEST_PAUSE_PARTIAL").is_some()
+        #[cfg(any(test, feature = "test-seams"))]
+        {
+            config.fail_partial_append || std::env::var_os("MEMBUS_TEST_PAUSE_PARTIAL").is_some()
+        }
+        #[cfg(not(any(test, feature = "test-seams")))]
+        {
+            config.fail_partial_append
+        }
     }
     pub(super) fn sync_closing_chunk(file: &File, fail_sync: bool) -> io::Result<()> {
         if fail_sync {
@@ -120,11 +128,14 @@ impl TestSeam {
         }
     }
     // Test-only kill checkpoints, enabled explicitly by a path-valued environment
-    // variable. The marker proves the process reached the injection point.
+    // variable when built for tests or with `--features test-seams`.
     pub(super) fn checkpoint(name: &str) {
+        #[cfg(any(test, feature = "test-seams"))]
         if let Some(path) = std::env::var_os(name) {
             let _ = fs::write(path, b"reached");
             std::thread::sleep(Duration::from_secs(40));
         }
+        #[cfg(not(any(test, feature = "test-seams")))]
+        let _ = name;
     }
 }

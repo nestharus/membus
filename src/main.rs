@@ -270,7 +270,7 @@ fn start_server(command: cli::Server) -> io::Result<()> {
         idle_ms,
         heartbeat_ms,
     } = command;
-    // Test seam (T11 on a production copy): the import leaves one key out, so its check refuses the switch.
+    #[cfg(any(test, feature = "test-seams"))]
     if env::var_os("MEMBUS_TEST_IMPORT_DIFFERENCE").is_some() {
         config.import_inject_difference = true;
     }
