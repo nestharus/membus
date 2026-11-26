@@ -7,8 +7,9 @@ use std::time::Duration;
 
 use crate::index::{BfsOptions, NeighborQueryOptions, OrderedQueryOptions};
 use crate::types::{
-    Ack, BfsResult, CommitResult, ExpectedVersion, IndexMutations, IndexedMutation, LogScanPage,
-    MembusError, NeighborPage, OrderedIndexPage, ScanOptions, ScanPage, SearchLogOp, SearchLogPage,
+    Ack, BfsResult, CommitResult, DeltaLogPage, ExpectedVersion, IndexMutations, IndexedMutation,
+    LogScanPage, LogWatermark, MembusError, NeighborPage, OrderedIndexPage, ReplicatedApplyResult,
+    ReplicatedDelta, ReplicationStamp, ScanOptions, ScanPage, SearchLogOp, SearchLogPage,
     SignalEvent, StoredRecord, VersionGuard, WalBatch, WriteMutation, DEFAULT_MAX_VALUE_BYTES,
 };
 
@@ -99,12 +100,15 @@ impl Default for StorageConfig {
 
 /// Core storage engine contract implemented by [`RocksDbStorage`].
 pub trait StorageEngine: Send + Sync {
+    fn data_dir(&self) -> Option<&Path>;
     fn epoch(&self) -> u64;
     fn latest_seq(&self) -> u64;
     fn log_horizon_seq(&self) -> u64;
     fn rocksdb_latest_sequence(&self) -> u64;
     fn in_flight_ops(&self) -> usize;
     fn in_flight_bytes(&self) -> usize;
+    /// Current monotonic HLC timestamp in milliseconds.
+    fn hlc_now_ms(&self) -> u64;
 
     fn get(&self, namespace: &str, key: &[u8]) -> Result<Option<StoredRecord>, MembusError>;
     fn get_many(
@@ -121,6 +125,56 @@ pub trait StorageEngine: Send + Sync {
         ack: Ack,
         expected: ExpectedVersion,
     ) -> Result<CommitResult, MembusError>;
+
+    /// Put a record with explicit header `flags` (e.g. during backup delta replay),
+    /// optionally preserving existing secondary index postings untouched.
+    #[allow(clippy::too_many_arguments)]
+    fn put_with_flags(
+        &self,
+        namespace: &str,
+        key: &[u8],
+        value: &[u8],
+        flags: u8,
+        preserve_indexes: bool,
+        ack: Ack,
+        expected: ExpectedVersion,
+    ) -> Result<CommitResult, MembusError>;
+
+    /// Atomically transition a record between hot bytes and a compact `ColdRef` tombstone:
+    /// - Bitwise sets or clears `RECORD_FLAG_COLD_REF` only (preserving other flag bits)
+    /// - Preserves original logical `timestamp_ms`, LWW stamp, and secondary indexes
+    /// - Emits NO signal events and marks the `CF_LOG` delta `is_tier_swap = true` so
+    ///   it is never broadcast over the mesh.
+    #[allow(clippy::too_many_arguments)]
+    fn tier_swap_record(
+        &self,
+        namespace: &str,
+        key: &[u8],
+        new_value: &[u8],
+        set_cold_flag: bool,
+        logical_value_sha256: [u8; 32],
+        ack: Ack,
+        expected: ExpectedVersion,
+    ) -> Result<CommitResult, MembusError>;
+
+    /// Atomically apply one replicated delta under deterministic LWW tie-breaking
+    /// (`(timestamp_ms, origin_node_id, origin_seq, value_sha256)`), advancing the
+    /// monotonic HLC and persisting `origin_stamp` in `CF_LOG` for transitive relay.
+    fn apply_replicated_delta(
+        &self,
+        local_node_id: &str,
+        delta: &ReplicatedDelta,
+        ack: Ack,
+    ) -> Result<ReplicatedApplyResult, MembusError>;
+
+    /// Atomically append replicated standalone search ops (e.g. `index_document`,
+    /// `delete_document`, `revoke_search_prefix`), deduplicated by `(origin_node_id, origin_seq)`.
+    fn append_replicated_search_ops(
+        &self,
+        origin_stamp: &ReplicationStamp,
+        ops: &[SearchLogOp],
+        ack: Ack,
+    ) -> Result<ReplicatedApplyResult, MembusError>;
 
     #[allow(clippy::too_many_arguments)]
     fn put_indexed(
@@ -258,7 +312,19 @@ pub trait StorageEngine: Send + Sync {
         limit: usize,
     ) -> Result<SearchLogPage, MembusError>;
 
+    fn scan_deltas_after(
+        &self,
+        after_seq: u64,
+        limit: usize,
+    ) -> Result<DeltaLogPage, MembusError>;
+
     fn trim_log_before(&self, keep_from_seq: u64) -> Result<(), MembusError>;
+
+    /// List active consumer log watermarks persisted in `CF_META` (search, backup, mesh).
+    fn list_log_watermarks(&self) -> Result<Vec<LogWatermark>, MembusError>;
+
+    /// Coordinate log trimming against active search, backup, and mesh watermarks unless `force == true`.
+    fn safe_trim_log_before(&self, keep_from_seq: u64, force: bool) -> Result<(), MembusError>;
 
     fn meta_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, MembusError>;
     fn meta_put(&self, key: &[u8], value: &[u8], sync: bool) -> Result<(), MembusError>;

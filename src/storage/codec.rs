@@ -1,15 +1,21 @@
 use crate::types::{
-    validate_namespace, MembusError, RecordMeta, SearchDocument, SearchLogOp, SearchVisibility,
-    SignalEvent, SignalKind, StoredRecord,
+    validate_namespace, IndexMutations, LogMutationDelta, MembusError, MutationOp, RecordMeta,
+    ReplicationStamp, SearchDocument, SearchLogOp, SearchVisibility, SignalEvent, SignalKind,
+    StoredRecord,
 };
 
 const RECORD_MAGIC: u8 = 0x4D;
 const RECORD_FORMAT_V2: u8 = 2;
 pub const RECORD_HEADER_LEN: usize = 24;
 
+/// Record header flag indicating the `CF_KV` value bytes encode a compact [`crate::types::ColdRef`]
+/// lineage tombstone rather than raw hot user bytes.
+pub const RECORD_FLAG_COLD_REF: u8 = 0x01;
+
 const LOG_MAGIC: u8 = 0x4C;
 const LOG_FORMAT_V2: u8 = 2;
 const LOG_FORMAT_V3: u8 = 3;
+const LOG_FORMAT_V4: u8 = 4;
 const LOG_HEADER_LEN: usize = 26;
 
 /// Domain prefix separating legacy unscoped raw blobs from namespace-scoped CAS blobs in `CF_BLOB`.
@@ -109,6 +115,17 @@ pub fn next_key_after(key: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Compute the canonical CRC32 checksum for a `kv` record header + value payload.
+pub fn compute_record_crc32(version: u64, flags: u8, ts_ms: u64, value: &[u8]) -> u32 {
+    let prefix = [RECORD_MAGIC, RECORD_FORMAT_V2, flags, 0u8];
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&prefix);
+    hasher.update(&version.to_be_bytes());
+    hasher.update(&ts_ms.to_be_bytes());
+    hasher.update(value);
+    hasher.finalize()
+}
+
 /// Encode a `kv` value with a compact 24-byte checksummed record header.
 ///
 /// Layout:
@@ -125,13 +142,7 @@ pub fn encode_record(version: u64, flags: u8, ts_ms: u64, value: &[u8]) -> Vec<u
     let prefix = [RECORD_MAGIC, RECORD_FORMAT_V2, flags, 0u8];
     let version_bytes = version.to_be_bytes();
     let ts_bytes = ts_ms.to_be_bytes();
-
-    let mut hasher = crc32fast::Hasher::new();
-    hasher.update(&prefix);
-    hasher.update(&version_bytes);
-    hasher.update(&ts_bytes);
-    hasher.update(value);
-    let crc = hasher.finalize();
+    let crc = compute_record_crc32(version, flags, ts_ms, value);
 
     out.extend_from_slice(&prefix);
     out.extend_from_slice(&crc.to_be_bytes());
@@ -220,6 +231,35 @@ pub fn encode_log_entry(epoch: u64, seq: u64, events: &[SignalEvent]) -> Vec<u8>
     encode_log_entry_with_search(epoch, seq, events, &[])
 }
 
+/// Encode a commit log entry storing signal events, standalone search ops, and full
+/// replication/backup deltas (`LOG_FORMAT_V4`).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_log_entry_v4(
+    epoch: u64,
+    seq: u64,
+    ts_ms: u64,
+    replicated: bool,
+    events: &[SignalEvent],
+    standalone_search_ops: &[SearchLogOp],
+    mutations: &[LogMutationDelta],
+    standalone_origin: Option<&ReplicationStamp>,
+) -> Vec<u8> {
+    let mut body = Vec::with_capacity(64 + events.len() * 64 + mutations.len() * 64);
+    encode_log_body_events(epoch, seq, events, &mut body);
+    body.extend_from_slice(&(standalone_search_ops.len() as u32).to_be_bytes());
+    for op in standalone_search_ops {
+        encode_search_log_op(op, &mut body);
+    }
+    body.push(u8::from(replicated));
+    body.extend_from_slice(&ts_ms.to_be_bytes());
+    body.extend_from_slice(&(mutations.len() as u32).to_be_bytes());
+    for m in mutations {
+        encode_log_mutation_delta(m, &mut body);
+    }
+    encode_opt_replication_stamp(standalone_origin, &mut body);
+    finalize_log_entry(LOG_FORMAT_V4, &body)
+}
+
 /// Encode a commit log entry storing both signal events and optional search mutations.
 pub fn encode_log_entry_with_search(
     epoch: u64,
@@ -232,19 +272,18 @@ pub fn encode_log_entry_with_search(
     } else {
         LOG_FORMAT_V3
     };
-    let body_capacity: usize = events
-        .iter()
-        .map(|ev| {
-            1 + 8
-                + 2
-                + ev.namespace.len()
-                + 4
-                + ev.key.len()
-                + 1
-                + ev.value_hint.as_ref().map_or(0, |h| 4 + h.len())
-        })
-        .sum();
-    let mut body = Vec::with_capacity(24 + body_capacity);
+    let mut body = Vec::with_capacity(32 + events.len() * 64);
+    encode_log_body_events(epoch, seq, events, &mut body);
+    if format_ver == LOG_FORMAT_V3 {
+        body.extend_from_slice(&(search_ops.len() as u32).to_be_bytes());
+        for op in search_ops {
+            encode_search_log_op(op, &mut body);
+        }
+    }
+    finalize_log_entry(format_ver, &body)
+}
+
+fn encode_log_body_events(epoch: u64, seq: u64, events: &[SignalEvent], body: &mut Vec<u8>) {
     body.extend_from_slice(&epoch.to_be_bytes());
     body.extend_from_slice(&seq.to_be_bytes());
     body.extend_from_slice(&(events.len() as u32).to_be_bytes());
@@ -264,24 +303,177 @@ pub fn encode_log_entry_with_search(
             None => body.push(0),
         }
     }
-    if format_ver == LOG_FORMAT_V3 {
-        body.extend_from_slice(&(search_ops.len() as u32).to_be_bytes());
-        for op in search_ops {
-            encode_search_log_op(op, &mut body);
-        }
-    }
+}
 
+fn finalize_log_entry(format_ver: u8, body: &[u8]) -> Vec<u8> {
     let mut hasher = crc32fast::Hasher::new();
     hasher.update(&[LOG_MAGIC, format_ver]);
-    hasher.update(&body);
+    hasher.update(body);
     let crc = hasher.finalize();
 
     let mut out = Vec::with_capacity(6 + body.len());
     out.push(LOG_MAGIC);
     out.push(format_ver);
     out.extend_from_slice(&crc.to_be_bytes());
-    out.extend_from_slice(&body);
+    out.extend_from_slice(body);
     out
+}
+
+fn encode_opt_replication_stamp(stamp: Option<&ReplicationStamp>, out: &mut Vec<u8>) {
+    match stamp {
+        Some(s) => {
+            out.push(1);
+            out.extend_from_slice(&s.timestamp_ms.to_be_bytes());
+            out.extend_from_slice(&(s.origin_node_id.len() as u16).to_be_bytes());
+            out.extend_from_slice(s.origin_node_id.as_bytes());
+            out.extend_from_slice(&s.origin_seq.to_be_bytes());
+            out.extend_from_slice(&s.value_sha256);
+        }
+        None => out.push(0),
+    }
+}
+
+fn decode_opt_replication_stamp(cur: &mut &[u8]) -> Result<Option<ReplicationStamp>, MembusError> {
+    match read_u8(cur)? {
+        0 => Ok(None),
+        1 => {
+            let timestamp_ms = read_u64(cur)?;
+            let nid_len = read_u16(cur)? as usize;
+            let nid_bytes = read_slice(cur, nid_len)?;
+            let origin_node_id = std::str::from_utf8(nid_bytes)
+                .map_err(|err| MembusError::Corruption(format!("stamp utf8 error: {err}")))?
+                .to_owned();
+            let origin_seq = read_u64(cur)?;
+            let sha_slice = read_slice(cur, 32)?;
+            let mut value_sha256 = [0u8; 32];
+            value_sha256.copy_from_slice(sha_slice);
+            Ok(Some(ReplicationStamp {
+                timestamp_ms,
+                origin_node_id,
+                origin_seq,
+                value_sha256,
+            }))
+        }
+        other => Err(MembusError::Corruption(format!(
+            "invalid replication stamp tag: {other}"
+        ))),
+    }
+}
+
+fn encode_log_mutation_delta(delta: &LogMutationDelta, out: &mut Vec<u8>) {
+    match &delta.op {
+        MutationOp::Put { value } => {
+            out.push(1);
+            out.push(delta.flags);
+            let meta_bits =
+                u8::from(delta.preserve_indexes) | (u8::from(delta.is_tier_swap) << 1);
+            out.push(meta_bits);
+            out.extend_from_slice(&(delta.namespace.len() as u16).to_be_bytes());
+            out.extend_from_slice(delta.namespace.as_bytes());
+            out.extend_from_slice(&(delta.key.len() as u32).to_be_bytes());
+            out.extend_from_slice(&delta.key);
+            out.extend_from_slice(&(value.len() as u32).to_be_bytes());
+            out.extend_from_slice(value);
+        }
+        MutationOp::Remove => {
+            out.push(2);
+            out.push(delta.flags);
+            let meta_bits =
+                u8::from(delta.preserve_indexes) | (u8::from(delta.is_tier_swap) << 1);
+            out.push(meta_bits);
+            out.extend_from_slice(&(delta.namespace.len() as u16).to_be_bytes());
+            out.extend_from_slice(delta.namespace.as_bytes());
+            out.extend_from_slice(&(delta.key.len() as u32).to_be_bytes());
+            out.extend_from_slice(&delta.key);
+        }
+    }
+    match &delta.indexes {
+        Some(idx) if !idx.is_empty() => {
+            let encoded = serde_json::to_vec(idx).unwrap_or_default();
+            out.push(1);
+            out.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+            out.extend_from_slice(&encoded);
+        }
+        _ => out.push(0),
+    }
+    match &delta.search_op {
+        Some(op) => {
+            out.push(1);
+            encode_search_log_op(op, out);
+        }
+        None => out.push(0),
+    }
+    encode_opt_replication_stamp(delta.origin_stamp.as_ref(), out);
+}
+
+fn decode_log_mutation_delta(cur: &mut &[u8]) -> Result<LogMutationDelta, MembusError> {
+    let tag = read_u8(cur)?;
+    let flags = read_u8(cur)?;
+    let meta_bits = read_u8(cur)?;
+    if (meta_bits & !0x03) != 0 {
+        return Err(MembusError::Corruption(format!(
+            "invalid log delta meta_bits: 0x{meta_bits:02x}"
+        )));
+    }
+    let preserve_indexes = (meta_bits & 0x01) != 0;
+    let is_tier_swap = (meta_bits & 0x02) != 0;
+    let ns_len = read_u16(cur)? as usize;
+    let ns_bytes = read_slice(cur, ns_len)?;
+    let namespace = std::str::from_utf8(ns_bytes)
+        .map_err(|err| MembusError::Corruption(format!("log delta utf8 error: {err}")))?
+        .to_owned();
+    let key_len = read_u32(cur)? as usize;
+    let key = read_slice(cur, key_len)?.to_vec();
+    let op = match tag {
+        1 => {
+            let val_len = read_u32(cur)? as usize;
+            let value = read_slice(cur, val_len)?.to_vec();
+            MutationOp::Put { value }
+        }
+        2 => MutationOp::Remove,
+        other => {
+            return Err(MembusError::Corruption(format!(
+                "unknown log delta op tag: {other}"
+            )));
+        }
+    };
+    let indexes = match read_u8(cur)? {
+        0 => None,
+        1 => {
+            let idx_len = read_u32(cur)? as usize;
+            let idx_bytes = read_slice(cur, idx_len)?;
+            let parsed: IndexMutations = serde_json::from_slice(idx_bytes).map_err(|err| {
+                MembusError::Corruption(format!("corrupt index mutations in log delta: {err}"))
+            })?;
+            Some(parsed)
+        }
+        other => {
+            return Err(MembusError::Corruption(format!(
+                "invalid log delta indexes tag: {other}"
+            )));
+        }
+    };
+    let search_op = match read_u8(cur)? {
+        0 => None,
+        1 => Some(decode_search_log_op(cur)?),
+        other => {
+            return Err(MembusError::Corruption(format!(
+                "invalid log delta search_op tag: {other}"
+            )));
+        }
+    };
+    let origin_stamp = decode_opt_replication_stamp(cur)?;
+    Ok(LogMutationDelta {
+        namespace,
+        key,
+        op,
+        flags,
+        preserve_indexes,
+        is_tier_swap,
+        indexes,
+        search_op,
+        origin_stamp,
+    })
 }
 
 /// Decode and CRC-verify signal events from a `CF_LOG` commit entry.
@@ -290,10 +482,57 @@ pub fn decode_log_entry(raw: &[u8]) -> Result<Vec<SignalEvent>, MembusError> {
     Ok(events)
 }
 
-/// Decode and CRC-verify `(epoch, seq, events, search_ops)` from a `CF_LOG` entry.
+/// Decode and CRC-verify `(epoch, seq, events, all_search_ops)` from a `CF_LOG` entry.
+///
+/// Combines per-mutation `search_op`s (in exact mutation order) followed by any standalone
+/// search ops so `SearchEngine` restart replay sees every committed search op in order.
 pub fn decode_log_entry_full(
     raw: &[u8],
 ) -> Result<(u64, u64, Vec<SignalEvent>, Vec<SearchLogOp>), MembusError> {
+    let decoded = decode_log_entry_all(raw)?;
+    let mut all_search_ops = Vec::with_capacity(
+        decoded.search_ops.len()
+            + decoded
+                .mutations
+                .iter()
+                .filter(|m| m.search_op.is_some())
+                .count(),
+    );
+    for m in &decoded.mutations {
+        if let Some(op) = &m.search_op {
+            all_search_ops.push(op.clone());
+        }
+    }
+    all_search_ops.extend(decoded.search_ops);
+    Ok((decoded.epoch, decoded.seq, decoded.events, all_search_ops))
+}
+
+/// Decode and CRC-verify a full [`crate::types::LogDeltaEntry`] from a `CF_LOG` entry.
+pub fn decode_log_entry_delta(raw: &[u8]) -> Result<crate::types::LogDeltaEntry, MembusError> {
+    let decoded = decode_log_entry_all(raw)?;
+    Ok(crate::types::LogDeltaEntry {
+        seq: decoded.seq,
+        epoch: decoded.epoch,
+        ts_ms: decoded.ts_ms,
+        replicated: decoded.replicated,
+        mutations: decoded.mutations,
+        search_ops: decoded.search_ops,
+        standalone_origin: decoded.standalone_origin,
+    })
+}
+
+struct DecodedLogEntry {
+    epoch: u64,
+    seq: u64,
+    ts_ms: u64,
+    replicated: bool,
+    events: Vec<SignalEvent>,
+    search_ops: Vec<SearchLogOp>,
+    mutations: Vec<LogMutationDelta>,
+    standalone_origin: Option<ReplicationStamp>,
+}
+
+fn decode_log_entry_all(raw: &[u8]) -> Result<DecodedLogEntry, MembusError> {
     if raw.len() < LOG_HEADER_LEN {
         return Err(MembusError::Corruption(format!(
             "log entry shorter than {LOG_HEADER_LEN} bytes: {}",
@@ -301,7 +540,11 @@ pub fn decode_log_entry_full(
         )));
     }
     let format_ver = raw[1];
-    if raw[0] != LOG_MAGIC || (format_ver != LOG_FORMAT_V2 && format_ver != LOG_FORMAT_V3) {
+    if raw[0] != LOG_MAGIC
+        || (format_ver != LOG_FORMAT_V2
+            && format_ver != LOG_FORMAT_V3
+            && format_ver != LOG_FORMAT_V4)
+    {
         return Err(MembusError::Corruption(format!(
             "unexpected log entry magic/version: 0x{:02x}/{format_ver}",
             raw[0]
@@ -359,12 +602,33 @@ pub fn decode_log_entry_full(
     }
 
     let mut search_ops = Vec::new();
-    if format_ver == LOG_FORMAT_V3 {
+    if format_ver == LOG_FORMAT_V3 || format_ver == LOG_FORMAT_V4 {
         let op_count = read_u32(&mut cur)? as usize;
         search_ops.reserve(op_count.min(cur.len()).min(256));
         for _ in 0..op_count {
             search_ops.push(decode_search_log_op(&mut cur)?);
         }
+    }
+
+    let mut ts_ms = 0u64;
+    let mut replicated = false;
+    let mut mutations = Vec::new();
+    let mut standalone_origin = None;
+    if format_ver == LOG_FORMAT_V4 {
+        let rep_flag = read_u8(&mut cur)?;
+        if rep_flag > 1 {
+            return Err(MembusError::Corruption(format!(
+                "invalid log delta replicated flag: {rep_flag}"
+            )));
+        }
+        replicated = rep_flag == 1;
+        ts_ms = read_u64(&mut cur)?;
+        let mut_count = read_u32(&mut cur)? as usize;
+        mutations.reserve(mut_count.min(cur.len()).min(256));
+        for _ in 0..mut_count {
+            mutations.push(decode_log_mutation_delta(&mut cur)?);
+        }
+        standalone_origin = decode_opt_replication_stamp(&mut cur)?;
     }
 
     if !cur.is_empty() {
@@ -373,7 +637,16 @@ pub fn decode_log_entry_full(
             cur.len()
         )));
     }
-    Ok((epoch, seq, events, search_ops))
+    Ok(DecodedLogEntry {
+        epoch,
+        seq,
+        ts_ms,
+        replicated,
+        events,
+        search_ops,
+        mutations,
+        standalone_origin,
+    })
 }
 
 fn encode_search_log_op(op: &SearchLogOp, out: &mut Vec<u8>) {

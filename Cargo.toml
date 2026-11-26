@@ -5,6 +5,10 @@ edition = "2021"
 rust-version = "1.85"
 description = "Low-latency RocksDB-backed key/value resident, declarative indexes, embedded Tantivy search, signal ring, and multiplexed RPC/HTTP/WS/mTLS engine"
 
+[features]
+default = []
+mesh-shm = ["zenoh/shared-memory"]
+
 [dependencies]
 axum = { version = "0.8.8", features = ["http2", "ws"] }
 base64 = "0.22.1"
@@ -26,6 +30,7 @@ tokio = { version = "1.52.3", features = ["rt-multi-thread", "net", "io-util", "
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12", "logging"] }
 tower = "0.5.3"
 tokio-stream = "0.1.19"
+zenoh = { version = "=1.9.0", default-features = false, features = ["transport_tcp", "transport_quic"] }
 
 [dev-dependencies]
 http-body-util = "0.1.3"

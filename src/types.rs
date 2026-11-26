@@ -55,6 +55,116 @@ pub struct RecordMeta {
     pub crc32: u32,
 }
 
+/// Read policy controlling how hot vs cold-tiered records are returned.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReadMode {
+    /// Return only the bytes stored in hot `CF_KV` without performing cold-tier I/O.
+    #[default]
+    HotOnly,
+    /// Transparently hydrate `ColdRef` tombstones from the configured `ColdStore`,
+    /// verifying SHA-256 on every read and failing closed with `MembusError::Corruption`.
+    HydrateCold,
+}
+
+/// Compact deterministic lineage tombstone stored in hot `CF_KV` when a record's
+/// value payload has been archived to a cold tier (`RECORD_FLAG_COLD_REF`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColdRef {
+    pub cold_sha256: [u8; 32],
+    pub original_bytes: u64,
+    pub archived_at_ms: u64,
+    pub tier_uri: String,
+    pub lineage_seq: u64,
+}
+
+/// Single mutation delta recorded durably in `CF_LOG` (`LOG_FORMAT_V4`) for
+/// incremental backup replay and off-path multi-node mesh replication.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogMutationDelta {
+    pub namespace: String,
+    pub key: Vec<u8>,
+    pub op: MutationOp,
+    pub flags: u8,
+    #[serde(default)]
+    pub preserve_indexes: bool,
+    #[serde(default)]
+    pub is_tier_swap: bool,
+    pub indexes: Option<IndexMutations>,
+    #[serde(default)]
+    pub search_op: Option<SearchLogOp>,
+    #[serde(default)]
+    pub origin_stamp: Option<ReplicationStamp>,
+}
+
+/// Full committed log record decoded from `CF_LOG` for backup & mesh replication.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogDeltaEntry {
+    pub seq: u64,
+    pub epoch: u64,
+    pub ts_ms: u64,
+    pub replicated: bool,
+    pub mutations: Vec<LogMutationDelta>,
+    /// Standalone search ops not paired with a specific KV mutation
+    /// (e.g. `index_document`, `delete_document`, `revoke_search_prefix`).
+    pub search_ops: Vec<SearchLogOp>,
+    /// Original replication stamp when this entry is a replicated standalone search commit.
+    #[serde(default)]
+    pub standalone_origin: Option<ReplicationStamp>,
+}
+
+/// Paginated delta log scan result reporting the exact contiguous sequence scanned through.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeltaLogPage {
+    pub entries: Vec<LogDeltaEntry>,
+    pub scanned_through_seq: u64,
+}
+
+/// Deterministic LWW ordering stamp for replicated multi-node convergence.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicationStamp {
+    pub timestamp_ms: u64,
+    pub origin_node_id: String,
+    pub origin_seq: u64,
+    pub value_sha256: [u8; 32],
+}
+
+impl ReplicationStamp {
+    /// Total deterministic LWW comparison tuple:
+    /// `(timestamp_ms, origin_node_id, origin_seq, value_sha256)`.
+    pub fn cmp_lww(&self, other: &Self) -> std::cmp::Ordering {
+        self.timestamp_ms
+            .cmp(&other.timestamp_ms)
+            .then_with(|| self.origin_node_id.cmp(&other.origin_node_id))
+            .then_with(|| self.origin_seq.cmp(&other.origin_seq))
+            .then_with(|| self.value_sha256.cmp(&other.value_sha256))
+    }
+}
+
+/// One replicated key/search delta exchanged between mesh peers.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicatedDelta {
+    pub stamp: ReplicationStamp,
+    pub namespace: String,
+    pub key: Vec<u8>,
+    pub op: MutationOp,
+    pub indexes: Option<IndexMutations>,
+    pub search_op: Option<SearchLogOp>,
+}
+
+/// Outcome of applying a replicated delta under deterministic LWW rules.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicatedApplyResult {
+    pub applied: bool,
+    pub local_seq: Option<u64>,
+}
+
+/// Named active consumer watermark consulted by safe log-trimming.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogWatermark {
+    pub name: String,
+    pub seq: u64,
+}
+
 /// A decoded record returned from point reads or keyset scans.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredRecord {

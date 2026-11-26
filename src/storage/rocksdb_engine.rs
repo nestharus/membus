@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::mem::ManuallyDrop;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::{self, JoinHandle};
@@ -24,8 +24,8 @@ use crate::index::{
 };
 use crate::storage::admission::AdmissionGate;
 use crate::storage::codec::{
-    decode_kv_key, decode_log_entry, decode_log_entry_full, decode_log_seq, decode_record,
-    decode_record_parts, encode_cas_blob_key, encode_kv_key, encode_log_entry_with_search,
+    decode_kv_key, decode_log_entry, decode_log_entry_delta, decode_log_entry_full, decode_log_seq,
+    decode_record, decode_record_parts, encode_cas_blob_key, encode_kv_key, encode_log_entry_v4,
     encode_log_seq, encode_raw_blob_key, kv_prefix_in_domain, kv_prefix_transform, next_key_after,
 };
 use crate::storage::{
@@ -34,15 +34,91 @@ use crate::storage::{
 };
 use crate::types::{
     now_unix_ms, sanitize_search_log_op, validate_key, validate_namespace, validate_value, Ack,
-    BfsResult, CommitResult, ExpectedVersion, GraphDirection, GraphEdgeRecord, IndexMutations,
-    IndexedMutation, LogScanPage, MembusError, MutationOp, NeighborPage, OrderedIndexHit,
-    OrderedIndexPage, ScanOptions, ScanPage, SearchLogOp, SearchLogPage, SearchLogRecord,
-    SignalEvent, SignalKind, StoredRecord, VersionGuard, WalBatch, WriteMutation,
+    BfsResult, CommitResult, DeltaLogPage, ExpectedVersion, GraphDirection, GraphEdgeRecord,
+    IndexMutations, IndexedMutation, LogMutationDelta, LogScanPage, LogWatermark, MembusError,
+    MutationOp, NeighborPage, OrderedIndexHit, OrderedIndexPage, ReplicatedApplyResult,
+    ReplicatedDelta, ReplicationStamp, ScanOptions, ScanPage, SearchLogOp, SearchLogPage,
+    SearchLogRecord, SignalEvent, SignalKind, StoredRecord, VersionGuard, WalBatch, WriteMutation,
 };
 
 const META_KEY_EPOCH: &[u8] = b"db_epoch";
 const META_KEY_LOG_HORIZON: &[u8] = b"log_horizon_seq";
+const META_KEY_SEARCH_CHECKPOINT: &[u8] = b"search:checkpoint";
+const META_KEY_BACKUP_LAST_SEQ: &[u8] = b"backup:last_seq";
+const META_KEY_MESH_PUB_SEQ: &[u8] = b"mesh:pub_seq";
+const META_PREFIX_MESH_LWW: &[u8] = b"mesh:lww:";
+const META_PREFIX_MESH_LOCAL_LWW: &[u8] = b"mesh:local_lww:";
+const META_PREFIX_MESH_TOMB: &[u8] = b"mesh:tomb:";
+const META_PREFIX_MESH_PEER: &[u8] = b"mesh:peer:";
+const META_PREFIX_MESH_SEARCH_SEEN: &[u8] = b"mesh:search_seen:";
 static EPOCH_ENTROPY_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct StoredLwwRecord {
+    local_applied_seq: u64,
+    stamp: ReplicationStamp,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct StoredLocalLwwRecord {
+    applied_seq: u64,
+    logical_seq: u64,
+    ts_ms: u64,
+    value_sha256: [u8; 32],
+}
+
+/// Monotonic in-process Hybrid Logical Clock (millisecond precision) ensuring causal
+/// local writes always advance past observed remote timestamps even under negative clock skew.
+struct HlcClock {
+    last_ms: AtomicU64,
+}
+
+impl HlcClock {
+    fn new(initial_ms: u64) -> Self {
+        Self {
+            last_ms: AtomicU64::new(initial_ms.max(now_unix_ms())),
+        }
+    }
+
+    fn current(&self) -> u64 {
+        self.last_ms.load(Ordering::Acquire).max(now_unix_ms())
+    }
+
+    /// Advance the clock for a new local write: `max(wall_ms, prev + 1)`.
+    fn tick(&self) -> u64 {
+        let wall = now_unix_ms();
+        let mut prev = self.last_ms.load(Ordering::Acquire);
+        loop {
+            let next = wall.max(prev.saturating_add(1));
+            match self.last_ms.compare_exchange_weak(
+                prev,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return next,
+                Err(actual) => prev = actual,
+            }
+        }
+    }
+
+    /// Observe a remote peer's timestamp so any subsequent local `tick()` is strictly greater.
+    fn observe(&self, remote_ts_ms: u64) {
+        let floor = remote_ts_ms.max(now_unix_ms());
+        let mut prev = self.last_ms.load(Ordering::Acquire);
+        while floor > prev {
+            match self.last_ms.compare_exchange_weak(
+                prev,
+                floor,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => prev = actual,
+            }
+        }
+    }
+}
 
 /// Owned, `'static` handle to an O(1) MVCC RocksDB snapshot.
 ///
@@ -212,11 +288,13 @@ impl Drop for BackgroundWalSync {
 
 /// Multi-threaded RocksDB storage engine backed by `OptimisticTransactionDB`.
 pub struct RocksDbStorage {
+    data_dir: PathBuf,
     db: Arc<OptimisticTransactionDB>,
     config: StorageConfig,
     epoch: u64,
     log_horizon: AtomicU64,
     trim_lock: FastMutex<()>,
+    hlc: HlcClock,
     sequencer: Arc<PublishSequencer>,
     admission: AdmissionGate,
     _bg_sync: Option<BackgroundWalSync>,
@@ -276,7 +354,7 @@ impl RocksDbStorage {
                 .map_err(|err| MembusError::Storage(format!("rocksdb open failed: {err}")))?;
         let db = Arc::new(db);
 
-        let (epoch, log_horizon_seq, last_log_seq) = {
+        let (epoch, log_horizon_seq, last_log_seq, last_log_ts) = {
             let meta_cf = db
                 .cf_handle(CF_META)
                 .ok_or_else(|| MembusError::Storage("missing meta column family".to_owned()))?;
@@ -306,8 +384,8 @@ impl RocksDbStorage {
             let log_cf = db
                 .cf_handle(CF_LOG)
                 .ok_or_else(|| MembusError::Storage("missing log column family".to_owned()))?;
-            let last_log_seq = read_last_log_seq(&db, &log_cf)?;
-            (epoch, log_horizon_seq, last_log_seq)
+            let (last_log_seq, last_log_ts) = read_last_log_seq_and_ts(&db, &log_cf)?;
+            (epoch, log_horizon_seq, last_log_seq, last_log_ts)
         };
         let initial_seq = last_log_seq.max(log_horizon_seq);
 
@@ -320,11 +398,13 @@ impl RocksDbStorage {
         let sequencer = Arc::new(PublishSequencer::new(initial_seq, publisher));
 
         Ok(Self {
+            data_dir: path.to_path_buf(),
             db,
             config,
             epoch,
             log_horizon: AtomicU64::new(log_horizon_seq),
             trim_lock: FastMutex::new(()),
+            hlc: HlcClock::new(last_log_ts),
             sequencer,
             admission,
             _bg_sync: bg_sync,
@@ -428,6 +508,8 @@ impl RocksDbStorage {
         namespace: &str,
         key: &[u8],
         op: MutationOp,
+        flags: u8,
+        preserve_indexes: bool,
         ack: Ack,
         expected: ExpectedVersion,
         indexes: Option<&IndexMutations>,
@@ -464,6 +546,7 @@ impl RocksDbStorage {
 
         let kv_cf = self.cf(CF_KV)?;
         let log_cf = self.cf(CF_LOG)?;
+        let meta_cf = self.cf(CF_META)?;
         let idx_ord_cf = self.cf(CF_IDX_ORD)?;
         let idx_edge_cf = self.cf(CF_IDX_EDGE)?;
         let idx_rev_cf = self.cf(CF_IDX_REV)?;
@@ -497,36 +580,45 @@ impl RocksDbStorage {
                     verify_expected_version(namespace, key, expected, actual_version)?;
                 }
 
-                let applied_indexes = match &op {
-                    MutationOp::Put { .. } => indexes,
-                    MutationOp::Remove => None,
-                };
-                apply_index_mutations_in_tx(
-                    &tx,
-                    &read_opts,
-                    &idx_ord_cf,
-                    &idx_edge_cf,
-                    &idx_rev_cf,
-                    namespace,
-                    key,
-                    &enc_key,
-                    applied_indexes,
-                )?;
+                if !preserve_indexes {
+                    let applied_indexes = match &op {
+                        MutationOp::Put { .. } => indexes,
+                        MutationOp::Remove => None,
+                    };
+                    apply_index_mutations_in_tx(
+                        &tx,
+                        &read_opts,
+                        &idx_ord_cf,
+                        &idx_edge_cf,
+                        &idx_rev_cf,
+                        namespace,
+                        key,
+                        &enc_key,
+                        applied_indexes,
+                    )?;
+                }
             }
 
             let ticket = self.sequencer.reserve();
             let seq = ticket.seq();
-            let ts_ms = now_unix_ms();
+            let ts_ms = self.hlc.tick();
 
             let (kind, value_hint) = match &op {
                 MutationOp::Put { value } => {
-                    let encoded_val = crate::storage::codec::encode_record(seq, 0, ts_ms, value);
+                    let encoded_val =
+                        crate::storage::codec::encode_record(seq, flags, ts_ms, value);
                     tx.put_cf(&kv_cf, &enc_key, &encoded_val)
                         .map_err(map_tx_err)?;
                     (SignalKind::Put, self.build_value_hint(value))
                 }
                 MutationOp::Remove => {
                     tx.delete_cf(&kv_cf, &enc_key).map_err(map_tx_err)?;
+                    let tomb_key = encode_prefixed_key(META_PREFIX_MESH_TOMB, &enc_key);
+                    let mut tomb_val = [0u8; 16];
+                    tomb_val[..8].copy_from_slice(&seq.to_be_bytes());
+                    tomb_val[8..16].copy_from_slice(&ts_ms.to_be_bytes());
+                    tx.put_cf(&meta_cf, &tomb_key, tomb_val)
+                        .map_err(map_tx_err)?;
                     (SignalKind::Delete, None)
                 }
             };
@@ -541,8 +633,30 @@ impl RocksDbStorage {
                 value_hint,
             };
             let events = vec![event];
-            let search_ops: Vec<SearchLogOp> = sanitized_search_op.iter().cloned().collect();
-            let encoded_log = encode_log_entry_with_search(self.epoch, seq, &events, &search_ops);
+            let delta = LogMutationDelta {
+                namespace: namespace.to_owned(),
+                key: key.to_vec(),
+                op: op.clone(),
+                flags,
+                preserve_indexes,
+                is_tier_swap: false,
+                indexes: match &op {
+                    MutationOp::Put { .. } => indexes.cloned(),
+                    MutationOp::Remove => None,
+                },
+                search_op: sanitized_search_op.clone(),
+                origin_stamp: None,
+            };
+            let encoded_log = encode_log_entry_v4(
+                self.epoch,
+                seq,
+                ts_ms,
+                false,
+                &events,
+                &[],
+                &[delta],
+                None,
+            );
             tx.put_cf(&log_cf, encode_log_seq(seq), &encoded_log)
                 .map_err(map_tx_err)?;
 
@@ -567,9 +681,55 @@ impl RocksDbStorage {
             "unconditional write exceeded optimistic retry limit under contention".to_owned(),
         ))
     }
+    fn trim_log_before_locked(&self, keep_from_seq: u64) -> Result<(), MembusError> {
+        if keep_from_seq <= 1 {
+            return Ok(());
+        }
+        let max_keep_from = self.latest_seq().saturating_add(1);
+        if keep_from_seq > max_keep_from {
+            return Err(MembusError::InvalidArgument(format!(
+                "keep_from_seq {keep_from_seq} exceeds latest committed horizon {max_keep_from}"
+            )));
+        }
+        let new_horizon = keep_from_seq.saturating_sub(1);
+        let current_horizon = self.log_horizon.load(Ordering::Acquire);
+        if new_horizon <= current_horizon {
+            return Ok(());
+        }
+
+        // Persist the new horizon BEFORE removing log records so a crash mid-trim
+        // never silently hides trimmed sequence numbers.
+        let meta_cf = self.cf(CF_META)?;
+        let mut sync_wo = WriteOptions::default();
+        sync_wo.set_sync(true);
+        self.db
+            .put_cf_opt(
+                &meta_cf,
+                META_KEY_LOG_HORIZON,
+                new_horizon.to_be_bytes(),
+                &sync_wo,
+            )
+            .map_err(map_rocksdb_err)?;
+        self.log_horizon.store(new_horizon, Ordering::Release);
+
+        let log_cf = self.cf(CF_LOG)?;
+        self.db
+            .delete_range_cf_opt(
+                &log_cf,
+                encode_log_seq(0),
+                encode_log_seq(keep_from_seq),
+                &sync_wo,
+            )
+            .map_err(map_rocksdb_err)?;
+        Ok(())
+    }
 }
 
 impl StorageEngine for RocksDbStorage {
+    fn data_dir(&self) -> Option<&Path> {
+        Some(&self.data_dir)
+    }
+
     fn epoch(&self) -> u64 {
         self.epoch
     }
@@ -592,6 +752,10 @@ impl StorageEngine for RocksDbStorage {
 
     fn in_flight_bytes(&self) -> usize {
         self.admission.in_flight_bytes()
+    }
+
+    fn hlc_now_ms(&self) -> u64 {
+        self.hlc.current()
     }
 
     fn get(&self, namespace: &str, key: &[u8]) -> Result<Option<StoredRecord>, MembusError> {
@@ -639,6 +803,554 @@ impl StorageEngine for RocksDbStorage {
         self.put_indexed(namespace, key, value, ack, expected, None, None)
     }
 
+    fn put_with_flags(
+        &self,
+        namespace: &str,
+        key: &[u8],
+        value: &[u8],
+        flags: u8,
+        preserve_indexes: bool,
+        ack: Ack,
+        expected: ExpectedVersion,
+    ) -> Result<CommitResult, MembusError> {
+        self.execute_single_mutation(
+            namespace,
+            key,
+            MutationOp::Put {
+                value: value.to_vec(),
+            },
+            flags,
+            preserve_indexes,
+            ack,
+            expected,
+            None,
+            None,
+        )
+    }
+
+    fn tier_swap_record(
+        &self,
+        namespace: &str,
+        key: &[u8],
+        new_value: &[u8],
+        set_cold_flag: bool,
+        logical_value_sha256: [u8; 32],
+        ack: Ack,
+        expected: ExpectedVersion,
+    ) -> Result<CommitResult, MembusError> {
+        validate_namespace(namespace)?;
+        validate_key(key)?;
+        validate_value(new_value, self.config.max_value_bytes)?;
+
+        let estimated_bytes = namespace
+            .len()
+            .saturating_add(key.len())
+            .saturating_add(new_value.len())
+            .saturating_add(128);
+        let _permit = self.admission.try_acquire(estimated_bytes)?;
+
+        let kv_cf = self.cf(CF_KV)?;
+        let log_cf = self.cf(CF_LOG)?;
+        let meta_cf = self.cf(CF_META)?;
+        let enc_key = encode_kv_key(namespace, key);
+        let lww_key = encode_prefixed_key(META_PREFIX_MESH_LWW, &enc_key);
+        let local_lww_key = encode_prefixed_key(META_PREFIX_MESH_LOCAL_LWW, &enc_key);
+
+        let mut write_opts = WriteOptions::default();
+        write_opts.set_sync(ack == Ack::Flush);
+        let mut tx_opts = OptimisticTransactionOptions::default();
+        tx_opts.set_snapshot(true);
+
+        let tx = self.db.transaction_opt(&write_opts, &tx_opts);
+        let (old_meta, prev_lww, prev_local_lww) = {
+            let tx_snap = tx.snapshot();
+            let mut read_opts = ReadOptions::default();
+            read_opts.set_snapshot(&tx_snap);
+
+            let current = tx
+                .get_pinned_for_update_cf_opt(&kv_cf, &enc_key, true, &read_opts)
+                .map_err(map_tx_err)?;
+            let Some(raw) = current else {
+                verify_expected_version(namespace, key, expected, None)?;
+                return Err(MembusError::NotFound(
+                    "tier_swap_record target key does not exist".to_owned(),
+                ));
+            };
+            let (meta, _old_val) = decode_record_parts(raw.as_ref())?;
+            verify_expected_version(namespace, key, expected, Some(meta.version))?;
+
+            let lww = tx
+                .get_pinned_for_update_cf_opt(&meta_cf, &lww_key, true, &read_opts)
+                .map_err(map_tx_err)?
+                .map(|r| {
+                    serde_json::from_slice::<StoredLwwRecord>(r.as_ref()).map_err(|err| {
+                        MembusError::Corruption(format!("corrupt mesh lww record: {err}"))
+                    })
+                })
+                .transpose()?;
+            let local_lww = tx
+                .get_pinned_for_update_cf_opt(&meta_cf, &local_lww_key, true, &read_opts)
+                .map_err(map_tx_err)?
+                .map(|r| {
+                    serde_json::from_slice::<StoredLocalLwwRecord>(r.as_ref()).map_err(|err| {
+                        MembusError::Corruption(format!("corrupt mesh local_lww record: {err}"))
+                    })
+                })
+                .transpose()?;
+            (meta, lww, local_lww)
+        };
+
+        let new_flags = if set_cold_flag {
+            old_meta.flags | crate::storage::codec::RECORD_FLAG_COLD_REF
+        } else {
+            old_meta.flags & !crate::storage::codec::RECORD_FLAG_COLD_REF
+        };
+
+        let ticket = self.sequencer.reserve();
+        let seq = ticket.seq();
+
+        // Preserve original logical timestamp (`old_meta.ts_ms`) and bitwise-update ONLY cold flag.
+        let encoded_val =
+            crate::storage::codec::encode_record(seq, new_flags, old_meta.ts_ms, new_value);
+        tx.put_cf(&kv_cf, &enc_key, &encoded_val)
+            .map_err(map_tx_err)?;
+
+        // Preserve original LWW stamp so tier archival/rehydration NEVER changes LWW precedence.
+        if let Some(mut stored) = prev_lww.filter(|r| r.local_applied_seq == old_meta.version) {
+            stored.local_applied_seq = seq;
+            let bytes = serde_json::to_vec(&stored).map_err(|err| {
+                MembusError::Storage(format!("encode mesh lww record failed: {err}"))
+            })?;
+            tx.put_cf(&meta_cf, &lww_key, &bytes).map_err(map_tx_err)?;
+        } else {
+            let next_local_lww = match prev_local_lww.filter(|r| r.applied_seq == old_meta.version)
+            {
+                Some(mut existing) => {
+                    existing.applied_seq = seq;
+                    existing
+                }
+                None => StoredLocalLwwRecord {
+                    applied_seq: seq,
+                    logical_seq: old_meta.version,
+                    ts_ms: old_meta.ts_ms,
+                    value_sha256: logical_value_sha256,
+                },
+            };
+            let bytes = serde_json::to_vec(&next_local_lww).map_err(|err| {
+                MembusError::Storage(format!("encode mesh local_lww record failed: {err}"))
+            })?;
+            tx.put_cf(&meta_cf, &local_lww_key, &bytes)
+                .map_err(map_tx_err)?;
+        }
+
+        // Emit ZERO signal events and tag `is_tier_swap = true, preserve_indexes = true`
+        // so mesh replication ignores local tiering while backup replay preserves indexes.
+        let delta = LogMutationDelta {
+            namespace: namespace.to_owned(),
+            key: key.to_vec(),
+            op: MutationOp::Put {
+                value: new_value.to_vec(),
+            },
+            flags: new_flags,
+            preserve_indexes: true,
+            is_tier_swap: true,
+            indexes: None,
+            search_op: None,
+            origin_stamp: None,
+        };
+        let encoded_log = encode_log_entry_v4(
+            self.epoch,
+            seq,
+            old_meta.ts_ms,
+            false,
+            &[],
+            &[],
+            &[delta],
+            None,
+        );
+        tx.put_cf(&log_cf, encode_log_seq(seq), &encoded_log)
+            .map_err(map_tx_err)?;
+
+        tx.commit().map_err(map_tx_err)?;
+        ticket.commit(Vec::new());
+
+        Ok(CommitResult {
+            seq,
+            epoch: self.epoch,
+            versions: vec![seq],
+        })
+    }
+
+    fn apply_replicated_delta(
+        &self,
+        local_node_id: &str,
+        delta: &ReplicatedDelta,
+        ack: Ack,
+    ) -> Result<ReplicatedApplyResult, MembusError> {
+        if local_node_id.is_empty() || delta.stamp.origin_node_id.is_empty() {
+            return Err(MembusError::InvalidArgument(
+                "replication node_id must not be empty".to_owned(),
+            ));
+        }
+        validate_namespace(&delta.namespace)?;
+        validate_key(&delta.key)?;
+        if let Some(idx_muts) = &delta.indexes {
+            validate_index_mutations(idx_muts, self.config.max_value_bytes)?;
+        }
+        let sanitized_search_op = match &delta.search_op {
+            Some(op) => Some(sanitize_search_log_op(op)?),
+            None => None,
+        };
+        let payload_bytes = match &delta.op {
+            MutationOp::Put { value } => {
+                validate_value(value, self.config.max_value_bytes)?;
+                let actual_hash: [u8; 32] = Sha256::digest(value).into();
+                if actual_hash != delta.stamp.value_sha256 {
+                    return Err(MembusError::Corruption(
+                        "replicated delta value_sha256 mismatch".to_owned(),
+                    ));
+                }
+                value.len()
+            }
+            MutationOp::Remove => {
+                if delta.stamp.value_sha256 != [0u8; 32] {
+                    return Err(MembusError::Corruption(
+                        "replicated remove delta must carry zero value_sha256".to_owned(),
+                    ));
+                }
+                0
+            }
+        };
+
+        // Observe remote timestamp in local monotonic HLC so any subsequent causal local
+        // write gets a strictly higher timestamp even under negative clock skew.
+        self.hlc.observe(delta.stamp.timestamp_ms);
+
+        let estimated_bytes = delta
+            .namespace
+            .len()
+            .saturating_add(delta.key.len())
+            .saturating_add(payload_bytes)
+            .saturating_add(delta.indexes.as_ref().map_or(0, estimate_index_bytes))
+            .saturating_add(
+                sanitized_search_op
+                    .as_ref()
+                    .map_or(0, estimate_search_op_bytes),
+            )
+            .saturating_add(128);
+        let _permit = self.admission.try_acquire(estimated_bytes)?;
+
+        let kv_cf = self.cf(CF_KV)?;
+        let log_cf = self.cf(CF_LOG)?;
+        let meta_cf = self.cf(CF_META)?;
+        let idx_ord_cf = self.cf(CF_IDX_ORD)?;
+        let idx_edge_cf = self.cf(CF_IDX_EDGE)?;
+        let idx_rev_cf = self.cf(CF_IDX_REV)?;
+        let enc_key = encode_kv_key(&delta.namespace, &delta.key);
+        let lww_key = encode_prefixed_key(META_PREFIX_MESH_LWW, &enc_key);
+        let local_lww_key = encode_prefixed_key(META_PREFIX_MESH_LOCAL_LWW, &enc_key);
+        let tomb_key = encode_prefixed_key(META_PREFIX_MESH_TOMB, &enc_key);
+
+        let mut write_opts = WriteOptions::default();
+        write_opts.set_sync(ack == Ack::Flush);
+        let mut tx_opts = OptimisticTransactionOptions::default();
+        tx_opts.set_snapshot(true);
+
+        for attempt in 0..32 {
+            let tx = self.db.transaction_opt(&write_opts, &tx_opts);
+            {
+                let tx_snap = tx.snapshot();
+                let mut read_opts = ReadOptions::default();
+                read_opts.set_snapshot(&tx_snap);
+
+                let kv_raw = tx
+                    .get_pinned_for_update_cf_opt(&kv_cf, &enc_key, true, &read_opts)
+                    .map_err(map_tx_err)?;
+                let lww_raw = tx
+                    .get_pinned_for_update_cf_opt(&meta_cf, &lww_key, true, &read_opts)
+                    .map_err(map_tx_err)?;
+                let local_lww_raw = tx
+                    .get_pinned_for_update_cf_opt(&meta_cf, &local_lww_key, true, &read_opts)
+                    .map_err(map_tx_err)?;
+                let tomb_raw = tx
+                    .get_pinned_for_update_cf_opt(&meta_cf, &tomb_key, true, &read_opts)
+                    .map_err(map_tx_err)?;
+
+                let mut current_local_seq = 0u64;
+                let mut current_stamp: Option<ReplicationStamp> = None;
+
+                if let Some(raw) = lww_raw {
+                    let stored: StoredLwwRecord =
+                        serde_json::from_slice(raw.as_ref()).map_err(|err| {
+                            MembusError::Corruption(format!("corrupt mesh lww record: {err}"))
+                        })?;
+                    current_local_seq = stored.local_applied_seq;
+                    current_stamp = Some(stored.stamp);
+                }
+
+                let local_lww_parsed = match local_lww_raw {
+                    Some(raw) => Some(
+                        serde_json::from_slice::<StoredLocalLwwRecord>(raw.as_ref()).map_err(
+                            |err| {
+                                MembusError::Corruption(format!(
+                                    "corrupt mesh local_lww record: {err}"
+                                ))
+                            },
+                        )?,
+                    ),
+                    None => None,
+                };
+
+                if let Some(raw) = kv_raw {
+                    let (meta, val) = decode_record_parts(raw.as_ref())?;
+                    if meta.version > current_local_seq {
+                        current_local_seq = meta.version;
+                        if let Some(local_lww) =
+                            local_lww_parsed.filter(|r| r.applied_seq == meta.version)
+                        {
+                            current_stamp = Some(ReplicationStamp {
+                                timestamp_ms: local_lww.ts_ms,
+                                origin_node_id: local_node_id.to_owned(),
+                                origin_seq: local_lww.logical_seq,
+                                value_sha256: local_lww.value_sha256,
+                            });
+                        } else {
+                            current_stamp = Some(ReplicationStamp {
+                                timestamp_ms: meta.ts_ms,
+                                origin_node_id: local_node_id.to_owned(),
+                                origin_seq: meta.version,
+                                value_sha256: Sha256::digest(val).into(),
+                            });
+                        }
+                    }
+                }
+
+                if let Some(raw) = tomb_raw {
+                    let bytes = raw.as_ref();
+                    if bytes.len() != 16 {
+                        return Err(MembusError::Corruption(
+                            "corrupt mesh tombstone metadata".to_owned(),
+                        ));
+                    }
+                    let tomb_seq = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
+                    let tomb_ts = u64::from_be_bytes(bytes[8..16].try_into().unwrap());
+                    if tomb_seq > current_local_seq {
+                        current_stamp = Some(ReplicationStamp {
+                            timestamp_ms: tomb_ts,
+                            origin_node_id: local_node_id.to_owned(),
+                            origin_seq: tomb_seq,
+                            value_sha256: [0u8; 32],
+                        });
+                    }
+                }
+
+                if let Some(cur) = &current_stamp {
+                    if delta.stamp.cmp_lww(cur) != std::cmp::Ordering::Greater {
+                        return Ok(ReplicatedApplyResult {
+                            applied: false,
+                            local_seq: None,
+                        });
+                    }
+                }
+
+                let applied_indexes = match &delta.op {
+                    MutationOp::Put { .. } => delta.indexes.as_ref(),
+                    MutationOp::Remove => None,
+                };
+                apply_index_mutations_in_tx(
+                    &tx,
+                    &read_opts,
+                    &idx_ord_cf,
+                    &idx_edge_cf,
+                    &idx_rev_cf,
+                    &delta.namespace,
+                    &delta.key,
+                    &enc_key,
+                    applied_indexes,
+                )?;
+            }
+
+            let ticket = self.sequencer.reserve();
+            let seq = ticket.seq();
+            let ts_ms = delta.stamp.timestamp_ms;
+
+            let (kind, value_hint) = match &delta.op {
+                MutationOp::Put { value } => {
+                    let encoded_val = crate::storage::codec::encode_record(seq, 0, ts_ms, value);
+                    tx.put_cf(&kv_cf, &enc_key, &encoded_val)
+                        .map_err(map_tx_err)?;
+                    (SignalKind::Put, self.build_value_hint(value))
+                }
+                MutationOp::Remove => {
+                    tx.delete_cf(&kv_cf, &enc_key).map_err(map_tx_err)?;
+                    (SignalKind::Delete, None)
+                }
+            };
+
+            let lww_val = serde_json::to_vec(&StoredLwwRecord {
+                local_applied_seq: seq,
+                stamp: delta.stamp.clone(),
+            })
+            .map_err(|err| MembusError::Storage(format!("encode mesh lww record failed: {err}")))?;
+            tx.put_cf(&meta_cf, &lww_key, &lww_val)
+                .map_err(map_tx_err)?;
+
+            let event = SignalEvent {
+                seq,
+                epoch: self.epoch,
+                namespace: delta.namespace.clone(),
+                key: delta.key.clone(),
+                version: seq,
+                kind,
+                value_hint,
+            };
+            let events = vec![event];
+            let log_delta = LogMutationDelta {
+                namespace: delta.namespace.clone(),
+                key: delta.key.clone(),
+                op: delta.op.clone(),
+                flags: 0,
+                preserve_indexes: false,
+                is_tier_swap: false,
+                indexes: match &delta.op {
+                    MutationOp::Put { .. } => delta.indexes.clone(),
+                    MutationOp::Remove => None,
+                },
+                search_op: sanitized_search_op.clone(),
+                origin_stamp: Some(delta.stamp.clone()),
+            };
+            let encoded_log = encode_log_entry_v4(
+                self.epoch,
+                seq,
+                ts_ms,
+                true,
+                &events,
+                &[],
+                &[log_delta],
+                None,
+            );
+            tx.put_cf(&log_cf, encode_log_seq(seq), &encoded_log)
+                .map_err(map_tx_err)?;
+
+            match tx.commit().map_err(map_tx_err) {
+                Ok(()) => {
+                    ticket.commit(events);
+                    return Ok(ReplicatedApplyResult {
+                        applied: true,
+                        local_seq: Some(seq),
+                    });
+                }
+                Err(MembusError::TxConflict(_)) if attempt + 1 < 32 => continue,
+                Err(err) => return Err(err),
+            }
+        }
+
+        Err(MembusError::TxConflict(
+            "replicated delta exceeded optimistic retry limit under contention".to_owned(),
+        ))
+    }
+
+    fn append_replicated_search_ops(
+        &self,
+        origin_stamp: &ReplicationStamp,
+        ops: &[SearchLogOp],
+        ack: Ack,
+    ) -> Result<ReplicatedApplyResult, MembusError> {
+        if origin_stamp.origin_node_id.is_empty() {
+            return Err(MembusError::InvalidArgument(
+                "origin_node_id must not be empty".to_owned(),
+            ));
+        }
+        if ops.is_empty() {
+            return Ok(ReplicatedApplyResult {
+                applied: false,
+                local_seq: None,
+            });
+        }
+        let mut sanitized = Vec::with_capacity(ops.len());
+        let mut total_bytes = 64usize;
+        for op in ops {
+            let s = sanitize_search_log_op(op)?;
+            total_bytes = total_bytes.saturating_add(estimate_search_op_bytes(&s));
+            sanitized.push(s);
+        }
+        if total_bytes > self.config.max_value_bytes {
+            return Err(MembusError::InvalidArgument(format!(
+                "replicated search ops size {total_bytes} exceeds max_value_bytes {}",
+                self.config.max_value_bytes
+            )));
+        }
+        self.hlc.observe(origin_stamp.timestamp_ms);
+        let _permit = self.admission.try_acquire(total_bytes)?;
+
+        let log_cf = self.cf(CF_LOG)?;
+        let meta_cf = self.cf(CF_META)?;
+        let dedup_key = encode_prefixed_key(
+            META_PREFIX_MESH_SEARCH_SEEN,
+            format!(
+                "{}:{}:{}",
+                origin_stamp.origin_node_id, origin_stamp.origin_seq, origin_stamp.timestamp_ms
+            )
+            .as_bytes(),
+        );
+
+        let mut wo = WriteOptions::default();
+        wo.set_sync(ack == Ack::Flush);
+        let mut tx_opts = OptimisticTransactionOptions::default();
+        tx_opts.set_snapshot(true);
+
+        for attempt in 0..16 {
+            let tx = self.db.transaction_opt(&wo, &tx_opts);
+            {
+                let tx_snap = tx.snapshot();
+                let mut read_opts = ReadOptions::default();
+                read_opts.set_snapshot(&tx_snap);
+                if tx
+                    .get_pinned_for_update_cf_opt(&meta_cf, &dedup_key, true, &read_opts)
+                    .map_err(map_tx_err)?
+                    .is_some()
+                {
+                    return Ok(ReplicatedApplyResult {
+                        applied: false,
+                        local_seq: None,
+                    });
+                }
+            }
+            let ticket = self.sequencer.reserve();
+            let seq = ticket.seq();
+            tx.put_cf(&meta_cf, &dedup_key, seq.to_be_bytes())
+                .map_err(map_tx_err)?;
+            let encoded_log = encode_log_entry_v4(
+                self.epoch,
+                seq,
+                origin_stamp.timestamp_ms,
+                true,
+                &[],
+                &sanitized,
+                &[],
+                Some(origin_stamp),
+            );
+            tx.put_cf(&log_cf, encode_log_seq(seq), &encoded_log)
+                .map_err(map_tx_err)?;
+
+            match tx.commit().map_err(map_tx_err) {
+                Ok(()) => {
+                    ticket.commit(Vec::new());
+                    return Ok(ReplicatedApplyResult {
+                        applied: true,
+                        local_seq: Some(seq),
+                    });
+                }
+                Err(MembusError::TxConflict(_)) if attempt + 1 < 16 => continue,
+                Err(err) => return Err(err),
+            }
+        }
+
+        Err(MembusError::TxConflict(
+            "replicated search ops exceeded optimistic retry limit".to_owned(),
+        ))
+    }
+
     fn put_indexed(
         &self,
         namespace: &str,
@@ -655,6 +1367,8 @@ impl StorageEngine for RocksDbStorage {
             MutationOp::Put {
                 value: value.to_vec(),
             },
+            0,
+            false,
             ack,
             expected,
             indexes,
@@ -684,6 +1398,8 @@ impl StorageEngine for RocksDbStorage {
             namespace,
             key,
             MutationOp::Remove,
+            0,
+            false,
             ack,
             expected,
             None,
@@ -730,7 +1446,8 @@ impl StorageEngine for RocksDbStorage {
         }
 
         let mut seen_targets: HashSet<(&str, &[u8])> = HashSet::with_capacity(mutations.len());
-        let mut sanitized_search_ops: Vec<SearchLogOp> = Vec::new();
+        let mut sanitized_per_mutation: Vec<Option<SearchLogOp>> =
+            Vec::with_capacity(mutations.len());
         for item in mutations {
             let mutation = &item.mutation;
             validate_namespace(&mutation.namespace)?;
@@ -745,11 +1462,15 @@ impl StorageEngine for RocksDbStorage {
                 validate_index_mutations(idx_muts, self.config.max_value_bytes)?;
                 total_bytes = total_bytes.saturating_add(estimate_index_bytes(idx_muts));
             }
-            if let Some(op) = &item.search_op {
-                let sanitized = sanitize_search_log_op(op)?;
-                total_bytes = total_bytes.saturating_add(estimate_search_op_bytes(&sanitized));
-                sanitized_search_ops.push(sanitized);
-            }
+            let sanitized_op = match &item.search_op {
+                Some(op) => {
+                    let s = sanitize_search_log_op(op)?;
+                    total_bytes = total_bytes.saturating_add(estimate_search_op_bytes(&s));
+                    Some(s)
+                }
+                None => None,
+            };
+            sanitized_per_mutation.push(sanitized_op);
             let payload_len = match &mutation.op {
                 MutationOp::Put { value } => {
                     validate_value(value, self.config.max_value_bytes)?;
@@ -765,6 +1486,7 @@ impl StorageEngine for RocksDbStorage {
 
         let kv_cf = self.cf(CF_KV)?;
         let log_cf = self.cf(CF_LOG)?;
+        let meta_cf = self.cf(CF_META)?;
         let idx_ord_cf = self.cf(CF_IDX_ORD)?;
         let idx_edge_cf = self.cf(CF_IDX_EDGE)?;
         let idx_rev_cf = self.cf(CF_IDX_REV)?;
@@ -822,12 +1544,13 @@ impl StorageEngine for RocksDbStorage {
 
         let ticket = self.sequencer.reserve();
         let seq = ticket.seq();
-        let ts_ms = now_unix_ms();
+        let ts_ms = self.hlc.tick();
 
         let mut events = Vec::with_capacity(mutations.len());
         let mut versions = Vec::with_capacity(mutations.len());
+        let mut delta_mutations = Vec::with_capacity(mutations.len());
 
-        for item in mutations {
+        for (item, sanitized_op) in mutations.iter().zip(sanitized_per_mutation) {
             let mutation = &item.mutation;
             let enc_key = encode_kv_key(&mutation.namespace, &mutation.key);
             let (kind, value_hint) = match &mutation.op {
@@ -839,6 +1562,12 @@ impl StorageEngine for RocksDbStorage {
                 }
                 MutationOp::Remove => {
                     tx.delete_cf(&kv_cf, &enc_key).map_err(map_tx_err)?;
+                    let tomb_key = encode_prefixed_key(META_PREFIX_MESH_TOMB, &enc_key);
+                    let mut tomb_val = [0u8; 16];
+                    tomb_val[..8].copy_from_slice(&seq.to_be_bytes());
+                    tomb_val[8..16].copy_from_slice(&ts_ms.to_be_bytes());
+                    tx.put_cf(&meta_cf, &tomb_key, tomb_val)
+                        .map_err(map_tx_err)?;
                     (SignalKind::Delete, None)
                 }
             };
@@ -852,10 +1581,32 @@ impl StorageEngine for RocksDbStorage {
                 kind,
                 value_hint,
             });
+            delta_mutations.push(LogMutationDelta {
+                namespace: mutation.namespace.clone(),
+                key: mutation.key.clone(),
+                op: mutation.op.clone(),
+                flags: 0,
+                preserve_indexes: false,
+                is_tier_swap: false,
+                indexes: match &mutation.op {
+                    MutationOp::Put { .. } => item.indexes.clone(),
+                    MutationOp::Remove => None,
+                },
+                search_op: sanitized_op,
+                origin_stamp: None,
+            });
         }
 
-        let encoded_log =
-            encode_log_entry_with_search(self.epoch, seq, &events, &sanitized_search_ops);
+        let encoded_log = encode_log_entry_v4(
+            self.epoch,
+            seq,
+            ts_ms,
+            false,
+            &events,
+            &[],
+            &delta_mutations,
+            None,
+        );
         tx.put_cf(&log_cf, encode_log_seq(seq), &encoded_log)
             .map_err(map_tx_err)?;
 
@@ -1532,7 +2283,16 @@ impl StorageEngine for RocksDbStorage {
 
         let ticket = self.sequencer.reserve();
         let seq = ticket.seq();
-        let encoded_log = encode_log_entry_with_search(self.epoch, seq, &[], &[sanitized]);
+        let encoded_log = encode_log_entry_v4(
+            self.epoch,
+            seq,
+            self.hlc.tick(),
+            false,
+            &[],
+            &[sanitized],
+            &[],
+            None,
+        );
         tx.put_cf(&log_cf, encode_log_seq(seq), &encoded_log)
             .map_err(map_tx_err)?;
         tx.commit().map_err(map_tx_err)?;
@@ -1619,6 +2379,76 @@ impl StorageEngine for RocksDbStorage {
         let scanned_through_seq = if hit_limit { last_seen_seq } else { upper_seq };
         Ok(SearchLogPage {
             records,
+            scanned_through_seq,
+        })
+    }
+
+    fn scan_deltas_after(
+        &self,
+        after_seq: u64,
+        limit: usize,
+    ) -> Result<DeltaLogPage, MembusError> {
+        if limit == 0 {
+            return Err(MembusError::InvalidArgument(
+                "scan_deltas_after limit must be > 0".to_owned(),
+            ));
+        }
+        let horizon_before = self.log_horizon.load(Ordering::Acquire);
+        if after_seq < horizon_before {
+            return Err(MembusError::Gap {
+                earliest_available_seq: horizon_before.saturating_add(1),
+                current_epoch: self.epoch,
+            });
+        }
+
+        let upper_seq = self.sequencer.published_seq();
+        if after_seq >= upper_seq {
+            return Ok(DeltaLogPage {
+                entries: Vec::new(),
+                scanned_through_seq: after_seq,
+            });
+        }
+
+        let log_cf = self.cf(CF_LOG)?;
+        let start_key = encode_log_seq(after_seq.saturating_add(1));
+        let mut read_opts = ReadOptions::default();
+        read_opts.fill_cache(false);
+
+        let iter = self.db.iterator_cf_opt(
+            &log_cf,
+            read_opts,
+            IteratorMode::From(&start_key, Direction::Forward),
+        );
+
+        let mut entries = Vec::new();
+        let mut last_seen_seq = after_seq;
+        let mut hit_limit = false;
+
+        for (entries_read, item) in iter.enumerate() {
+            let (raw_k, raw_v) = item.map_err(map_rocksdb_err)?;
+            let seq = decode_log_seq(&raw_k)?;
+            if seq > upper_seq {
+                break;
+            }
+            if entries_read >= limit {
+                hit_limit = true;
+                break;
+            }
+            entries.push(decode_log_entry_delta(&raw_v)?);
+            last_seen_seq = seq;
+        }
+
+        let horizon_after = self.log_horizon.load(Ordering::Acquire);
+        if after_seq < horizon_after {
+            return Err(MembusError::Gap {
+                earliest_available_seq: horizon_after.saturating_add(1),
+                current_epoch: self.epoch,
+            });
+        }
+
+        let scanned_through_seq = if hit_limit { last_seen_seq } else { upper_seq };
+        Ok(DeltaLogPage {
+            entries,
             scanned_through_seq,
         })
     }
@@ -1766,46 +2596,76 @@ impl StorageEngine for RocksDbStorage {
 
     fn trim_log_before(&self, keep_from_seq: u64) -> Result<(), MembusError> {
         let _trim_guard = self.trim_lock.lock();
+        self.trim_log_before_locked(keep_from_seq)
+    }
+
+    fn list_log_watermarks(&self) -> Result<Vec<LogWatermark>, MembusError> {
+        let mut watermarks = Vec::new();
+
+        for (name, key) in [
+            ("search:checkpoint", META_KEY_SEARCH_CHECKPOINT),
+            ("backup:last_seq", META_KEY_BACKUP_LAST_SEQ),
+            ("mesh:pub_seq", META_KEY_MESH_PUB_SEQ),
+        ] {
+            if let Some(raw) = self.meta_get(key)? {
+                let (ep, seq) = decode_epoch_seq_meta(&raw).ok_or_else(|| {
+                    MembusError::Corruption(format!(
+                        "corrupt log watermark '{name}': expected 16 bytes, got {}",
+                        raw.len()
+                    ))
+                })?;
+                if ep == self.epoch {
+                    watermarks.push(LogWatermark {
+                        name: name.to_owned(),
+                        seq,
+                    });
+                }
+            }
+        }
+
+        for (k, v) in self.meta_scan_prefix(META_PREFIX_MESH_PEER)? {
+            let peer_name = String::from_utf8_lossy(&k).into_owned();
+            let json: serde_json::Value = serde_json::from_slice(&v).map_err(|err| {
+                MembusError::Corruption(format!(
+                    "corrupt mesh peer watermark '{peer_name}': {err}"
+                ))
+            })?;
+            // Only outbound acknowledgments (sequences pulled/acked by the peer from OUR log)
+            // constrain trimming of OUR local `CF_LOG`.
+            if let (Some(local_ep), Some(outbound_seq)) = (
+                json.get("local_epoch").and_then(|x| x.as_u64()),
+                json.get("outbound_acked_seq").and_then(|x| x.as_u64()),
+            ) {
+                if local_ep == self.epoch {
+                    watermarks.push(LogWatermark {
+                        name: peer_name,
+                        seq: outbound_seq,
+                    });
+                }
+            }
+        }
+
+        Ok(watermarks)
+    }
+
+    fn safe_trim_log_before(&self, keep_from_seq: u64, force: bool) -> Result<(), MembusError> {
+        let _trim_guard = self.trim_lock.lock();
         if keep_from_seq <= 1 {
             return Ok(());
         }
-        let max_keep_from = self.latest_seq().saturating_add(1);
-        if keep_from_seq > max_keep_from {
-            return Err(MembusError::InvalidArgument(format!(
-                "keep_from_seq {keep_from_seq} exceeds latest committed horizon {max_keep_from}"
-            )));
+        if !force {
+            let new_horizon = keep_from_seq.saturating_sub(1);
+            let watermarks = self.list_log_watermarks()?;
+            if let Some(blocking) = watermarks.iter().find(|wm| wm.seq < new_horizon) {
+                return Err(MembusError::Conflict {
+                    namespace: "_log_trim".to_owned(),
+                    key: blocking.name.as_bytes().to_vec(),
+                    expected: ExpectedVersion::Version(new_horizon),
+                    actual: Some(blocking.seq),
+                });
+            }
         }
-        let new_horizon = keep_from_seq.saturating_sub(1);
-        let current_horizon = self.log_horizon.load(Ordering::Acquire);
-        if new_horizon <= current_horizon {
-            return Ok(());
-        }
-
-        // Persist the new horizon BEFORE removing log records so a crash mid-trim
-        // never silently hides trimmed sequence numbers.
-        let meta_cf = self.cf(CF_META)?;
-        let mut sync_wo = WriteOptions::default();
-        sync_wo.set_sync(true);
-        self.db
-            .put_cf_opt(
-                &meta_cf,
-                META_KEY_LOG_HORIZON,
-                new_horizon.to_be_bytes(),
-                &sync_wo,
-            )
-            .map_err(map_rocksdb_err)?;
-        self.log_horizon.store(new_horizon, Ordering::Release);
-
-        let log_cf = self.cf(CF_LOG)?;
-        self.db
-            .delete_range_cf_opt(
-                &log_cf,
-                encode_log_seq(0),
-                encode_log_seq(keep_from_seq),
-                &sync_wo,
-            )
-            .map_err(map_rocksdb_err)?;
-        Ok(())
+        self.trim_log_before_locked(keep_from_seq)
     }
 
     fn create_checkpoint(&self, dest_dir: &Path) -> Result<u64, MembusError> {
@@ -2116,15 +2976,19 @@ fn verify_expected_version(
     }
 }
 
-fn read_last_log_seq(
+fn read_last_log_seq_and_ts(
     db: &OptimisticTransactionDB,
     log_cf: &Arc<rocksdb::BoundColumnFamily<'_>>,
-) -> Result<u64, MembusError> {
+) -> Result<(u64, u64), MembusError> {
     let mut iter = db.iterator_cf(log_cf, IteratorMode::End);
     match iter.next() {
-        Some(Ok((key, _))) => decode_log_seq(&key),
+        Some(Ok((key, val))) => {
+            let seq = decode_log_seq(&key)?;
+            let ts = decode_log_entry_delta(&val).map(|e| e.ts_ms).unwrap_or(0);
+            Ok((seq, ts))
+        }
         Some(Err(err)) => Err(map_rocksdb_err(err)),
-        None => Ok(0),
+        None => Ok((0, 0)),
     }
 }
 
@@ -2147,6 +3011,22 @@ fn generate_unique_epoch() -> u64 {
     } else {
         mixed
     }
+}
+
+fn encode_prefixed_key(prefix: &[u8], suffix: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(prefix.len() + suffix.len());
+    out.extend_from_slice(prefix);
+    out.extend_from_slice(suffix);
+    out
+}
+
+fn decode_epoch_seq_meta(raw: &[u8]) -> Option<(u64, u64)> {
+    if raw.len() != 16 {
+        return None;
+    }
+    let epoch = u64::from_be_bytes(raw[0..8].try_into().ok()?);
+    let seq = u64::from_be_bytes(raw[8..16].try_into().ok()?);
+    Some((epoch, seq))
 }
 
 fn decode_u64_meta(bytes: &[u8], name: &str) -> Result<u64, MembusError> {

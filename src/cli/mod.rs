@@ -1,10 +1,14 @@
+pub mod diag;
+
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::auth::AuthConfig;
+use crate::cli::diag::{parse_diag_args, run_diag, DiagCommand};
 use crate::client::Client;
+use crate::mesh::{MeshConfig, MeshNode};
 use crate::search::{SearchConfig, SearchEngine};
 use crate::signals::{SignalBroker, SignalConfig, SignalRing};
 use crate::storage::{RocksDbStorage, SignalPublisher, StorageConfig, StorageEngine};
@@ -30,6 +34,7 @@ pub enum Command {
         connect: Box<ClientConnectArgs>,
         dest_dir: PathBuf,
     },
+    Diag(DiagCommand),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -46,6 +51,10 @@ pub struct ServeArgs {
     pub max_in_flight_ops: Option<usize>,
     pub max_in_flight_bytes: Option<usize>,
     pub max_in_flight_per_conn: Option<usize>,
+    pub mesh_node_id: Option<String>,
+    pub mesh_cluster: Option<String>,
+    pub mesh_listen: Vec<String>,
+    pub mesh_connect: Vec<String>,
 }
 
 /// Parse command-line arguments (excluding argv[0]) into a typed [`Command`].
@@ -62,6 +71,7 @@ where
         "serve" => parse_serve(&raw[1..]),
         "health" => parse_health(&raw[1..]),
         "checkpoint" => parse_checkpoint(&raw[1..]),
+        "diag" => Ok(Command::Diag(parse_diag_args(&raw[1..])?)),
         "-h" | "--help" | "help" => Err(MembusError::InvalidArgument(usage_text().to_owned())),
         other => Err(MembusError::InvalidArgument(format!(
             "unknown subcommand '{other}'\n\n{}",
@@ -76,6 +86,9 @@ pub async fn execute(cmd: Command) -> Result<(), MembusError> {
         Command::Serve(args) => run_serve(*args).await,
         Command::Health(connect) => run_health(*connect).await,
         Command::Checkpoint { connect, dest_dir } => run_checkpoint(*connect, dest_dir).await,
+        Command::Diag(diag_cmd) => tokio::task::spawn_blocking(move || run_diag(diag_cmd))
+            .await
+            .map_err(|err| MembusError::Storage(format!("diag task failed: {err}")))?,
     }
 }
 
@@ -195,10 +208,35 @@ async fn run_serve(args: ServeArgs) -> Result<(), MembusError> {
         }
         handles.push(handle);
     }
+
+    let mesh_node = if let Some(node_id) = args.mesh_node_id {
+        let mut mesh_cfg = MeshConfig {
+            node_id,
+            listen_endpoints: args.mesh_listen,
+            connect_endpoints: args.mesh_connect,
+            ..Default::default()
+        };
+        if let Some(cluster) = args.mesh_cluster {
+            mesh_cfg.cluster_prefix = cluster;
+        }
+        let node = MeshNode::start(
+            mesh_cfg,
+            Arc::clone(&storage) as Arc<dyn StorageEngine>,
+            Some(Arc::clone(&search)),
+        )
+        .await?;
+        println!("mesh node_id={}", node.node_id());
+        Some(node)
+    } else {
+        None
+    };
     let _ = std::io::stdout().flush();
 
     tokio::signal::ctrl_c().await?;
 
+    if let Some(node) = mesh_node {
+        let _ = node.shutdown().await;
+    }
     for handle in handles {
         handle.shutdown().await;
     }
@@ -244,6 +282,10 @@ fn parse_serve(args: &[String]) -> Result<Command, MembusError> {
     let mut max_in_flight_ops: Option<usize> = None;
     let mut max_in_flight_bytes: Option<usize> = None;
     let mut max_in_flight_per_conn: Option<usize> = None;
+    let mut mesh_node_id: Option<String> = None;
+    let mut mesh_cluster: Option<String> = None;
+    let mut mesh_listen: Vec<String> = Vec::new();
+    let mut mesh_connect: Vec<String> = Vec::new();
 
     let mut idx = 0;
     while idx < args.len() {
@@ -313,6 +355,22 @@ fn parse_serve(args: &[String]) -> Result<Command, MembusError> {
                     "--max-in-flight-per-conn",
                 )?);
             }
+            "--mesh-node-id" => {
+                idx += 1;
+                mesh_node_id = Some(require_arg(args, idx, "--mesh-node-id")?.to_owned());
+            }
+            "--mesh-cluster" => {
+                idx += 1;
+                mesh_cluster = Some(require_arg(args, idx, "--mesh-cluster")?.to_owned());
+            }
+            "--mesh-listen" => {
+                idx += 1;
+                mesh_listen.push(require_arg(args, idx, "--mesh-listen")?.to_owned());
+            }
+            "--mesh-connect" => {
+                idx += 1;
+                mesh_connect.push(require_arg(args, idx, "--mesh-connect")?.to_owned());
+            }
             other => {
                 return Err(MembusError::InvalidArgument(format!(
                     "unexpected serve option '{other}'"
@@ -360,6 +418,10 @@ fn parse_serve(args: &[String]) -> Result<Command, MembusError> {
         max_in_flight_ops,
         max_in_flight_bytes,
         max_in_flight_per_conn,
+        mesh_node_id,
+        mesh_cluster,
+        mesh_listen,
+        mesh_connect,
     })))
 }
 
@@ -538,5 +600,5 @@ fn parse_usize(val: &str, flag: &str) -> Result<usize, MembusError> {
 }
 
 fn usage_text() -> &'static str {
-    "Usage:\n  membus serve --data-dir <PATH> [--tcp <ADDR>] [--pipe <PIPE_NAME>] [--http-listen <ADDR>] [--tls-cert <PEM> --tls-key <PEM> [--tls-client-ca <PEM>]] [--auth-config <JSON>] [--checkpoint-root <DIR>] [--max-in-flight-ops <N>] [--max-in-flight-bytes <N>] [--max-in-flight-per-conn <N>]\n  membus health (--tcp <ADDR> | --pipe <PIPE_NAME>) [--token <TOKEN>] [--tls-ca <PEM> [--tls-server-name <NAME>] [--tls-cert <PEM> --tls-key <PEM>]]\n  membus checkpoint (--tcp <ADDR> | --pipe <PIPE_NAME>) --dest <RELATIVE_DIR> [--token <TOKEN>] [--tls-ca <PEM> [--tls-server-name <NAME>] [--tls-cert <PEM> --tls-key <PEM>]]"
+    "Usage:\n  membus serve --data-dir <PATH> [--http-listen <ADDR>] [--tcp <ADDR>] [--pipe <PIPE_NAME>] [--tls-cert <PEM> --tls-key <PEM> [--tls-client-ca <PEM>]] [--auth-config <JSON>] [--checkpoint-root <DIR>] [--mesh-node-id <ID> [--mesh-cluster <PREFIX>] [--mesh-listen <ENDPOINT>] [--mesh-connect <ENDPOINT>]] [--max-in-flight-ops <N>] [--max-in-flight-bytes <N>] [--max-in-flight-per-conn <N>]\n  membus health (--tcp <ADDR> | --pipe <PIPE_NAME>) [--token <TOKEN>] [--tls-ca <PEM> [--tls-server-name <NAME>] [--tls-cert <PEM> --tls-key <PEM>]]\n  membus checkpoint (--tcp <ADDR> | --pipe <PIPE_NAME>) --dest <RELATIVE_DIR> [--token <TOKEN>] [--tls-ca <PEM> [--tls-server-name <NAME>] [--tls-cert <PEM> --tls-key <PEM>]]\n  membus diag inspect --data-dir <PATH>\n  membus diag verify --data-dir <PATH>\n  membus diag restore --backup-dir <DIR> --target-dir <DIR> [--delta <FILE>...]"
 }
