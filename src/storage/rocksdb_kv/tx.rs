@@ -12,13 +12,13 @@ use crate::storage::codec::{
     decode_record_parts, encode_kv_key, encode_log_entry_v4, encode_log_seq, encode_record,
 };
 use crate::storage::constants::{
-    encode_prefixed_key, CF_IDX_EDGE, CF_IDX_ORD, CF_IDX_REV, CF_KV, CF_LOG, CF_META,
+    encode_prefixed_key, CF_IDX_EDGE, CF_IDX_ORD, CF_IDX_REV, CF_KV, CF_LEASE, CF_LOG, CF_META,
 };
 use crate::storage::mesh_replication::META_PREFIX_MESH_TOMB;
 use crate::storage::rocksdb_kv::helpers::{
     encode_idempotency_key, encode_idempotency_ord_key, estimate_search_op_bytes, map_rocksdb_err,
-    map_tx_err, validate_idempotency_context, verify_expected_version, StoredIdempotencyRecord,
-    META_PREFIX_IDEM_ORD,
+    map_tx_err, validate_idempotency_context, verify_expected_version, verify_lease_guard_bytes,
+    StoredIdempotencyRecord, META_PREFIX_IDEM_ORD,
 };
 use crate::storage::rocksdb_kv::index_apply::{
     apply_index_mutations_in_tx, validate_and_estimate_indexes, IndexCfHandles, IndexTarget,
@@ -26,8 +26,8 @@ use crate::storage::rocksdb_kv::index_apply::{
 use crate::storage::rocksdb_kv::state::RocksDbStorage;
 use crate::types::{
     sanitize_search_log_op, validate_key, validate_namespace, validate_value, Ack, CommitResult,
-    ExpectedVersion, IdempotencyContext, IndexMutations, IndexedMutation, LogMutationDelta,
-    MembusError, MutationOp, SearchLogOp, SignalEvent, SignalKind, VersionGuard,
+    ExpectedVersion, IdempotencyContext, IndexMutations, IndexedMutation, LeaseGuard,
+    LogMutationDelta, MembusError, MutationOp, SearchLogOp, SignalEvent, SignalKind, VersionGuard,
 };
 
 /// Parameters for a single-key transactional mutation.
@@ -232,16 +232,32 @@ impl RocksDbStorage {
         ack: Ack,
         idempotency: Option<&IdempotencyContext>,
     ) -> Result<(CommitResult, bool), MembusError> {
-        let validated = self.validate_tx_batch(guards, mutations, idempotency)?;
+        self.commit_indexed_tx_idempotent_with_leases_impl(guards, &[], mutations, ack, idempotency)
+    }
+
+    pub(crate) fn commit_indexed_tx_idempotent_with_leases_impl(
+        &self,
+        guards: &[VersionGuard],
+        lease_guards: &[LeaseGuard],
+        mutations: &[IndexedMutation],
+        ack: Ack,
+        idempotency: Option<&IdempotencyContext>,
+    ) -> Result<(CommitResult, bool), MembusError> {
+        let validated = self.validate_tx_batch(guards, lease_guards, mutations, idempotency)?;
         let _permit = self.admission.try_acquire(validated.total_bytes)?;
 
         let kv_cf = self.cf(CF_KV)?;
+        let lease_cf = self.cf(CF_LEASE)?;
         let log_cf = self.cf(CF_LOG)?;
         let meta_cf = self.cf(CF_META)?;
         let idx_ord_cf = self.cf(CF_IDX_ORD)?;
         let idx_edge_cf = self.cf(CF_IDX_EDGE)?;
         let idx_rev_cf = self.cf(CF_IDX_REV)?;
         let idem_lookup_key = idempotency.map(encode_idempotency_key);
+        let encoded_lease_keys: Vec<Vec<u8>> = lease_guards
+            .iter()
+            .map(|lg| encode_kv_key(&lg.namespace, lg.resource.as_bytes()))
+            .collect();
 
         let mut write_opts = WriteOptions::default();
         write_opts.set_sync(ack == Ack::Flush);
@@ -250,6 +266,14 @@ impl RocksDbStorage {
 
         let max_attempts = if idempotency.is_some() { 16 } else { 1 };
         for attempt in 0..max_attempts {
+            // Serialize lease-guarded transactions against concurrent acquire/renew/release
+            // in canonical ascending stripe order, held through commit or abort.
+            let _lease_stripe_guards = if encoded_lease_keys.is_empty() {
+                Vec::new()
+            } else {
+                self.lock_lease_stripes(&encoded_lease_keys)
+            };
+
             let tx = self.db.transaction_opt(&write_opts, &tx_opts);
             {
                 let tx_snap = tx.snapshot();
@@ -265,6 +289,16 @@ impl RocksDbStorage {
                     ack,
                 )? {
                     return Ok((replayed, true));
+                }
+
+                if !lease_guards.is_empty() {
+                    let lease_now_ms = self.monotonic_now_ms_impl();
+                    for (lg, enc_lease_key) in lease_guards.iter().zip(encoded_lease_keys.iter()) {
+                        let current_lease = tx
+                            .get_pinned_for_update_cf_opt(&lease_cf, enc_lease_key, true, &read_opts)
+                            .map_err(map_tx_err)?;
+                        verify_lease_guard_bytes(current_lease.as_deref(), lg, lease_now_ms)?;
+                    }
                 }
 
                 let idx_cfs = IndexCfHandles {
@@ -383,6 +417,7 @@ impl RocksDbStorage {
     fn validate_tx_batch(
         &self,
         guards: &[VersionGuard],
+        lease_guards: &[LeaseGuard],
         mutations: &[IndexedMutation],
         idempotency: Option<&IdempotencyContext>,
     ) -> Result<ValidatedTxBatch, MembusError> {
@@ -399,6 +434,23 @@ impl RocksDbStorage {
             validate_namespace(&guard.namespace)?;
             validate_key(&guard.key)?;
             total_bytes = total_bytes.saturating_add(guard.namespace.len() + guard.key.len());
+        }
+        for lg in lease_guards {
+            validate_namespace(&lg.namespace)?;
+            validate_key(lg.resource.as_bytes())?;
+            validate_key(lg.holder.as_bytes())?;
+            if lg.generation == 0 {
+                return Err(MembusError::InvalidArgument(
+                    "lease_guard generation must be >= 1".to_owned(),
+                ));
+            }
+            if lg.token.is_empty() {
+                return Err(MembusError::InvalidArgument(
+                    "lease_guard token must not be empty".to_owned(),
+                ));
+            }
+            total_bytes = total_bytes
+                .saturating_add(lg.namespace.len() + lg.resource.len() + lg.holder.len());
         }
         let mut seen_targets: HashSet<(&str, &[u8])> = HashSet::with_capacity(mutations.len());
         let mut sanitized_per_mutation = Vec::with_capacity(mutations.len());

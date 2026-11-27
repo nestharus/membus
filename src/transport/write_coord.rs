@@ -3,9 +3,9 @@ use std::sync::Arc;
 use crate::search::SearchEngine;
 use crate::storage::StorageEngine;
 use crate::types::{
-    Ack, ExpectedVersion, IdempotencyContext, IndexMutations, IndexedMutation, MembusError,
-    ReplicatedApplyResult, ReplicatedDelta, SearchDocument, SearchLogOp, SearchSyncStatus,
-    VersionGuard,
+    Ack, ExpectedVersion, IdempotencyContext, IndexMutations, IndexedMutation, LeaseGuard,
+    MembusError, ReplicatedApplyResult, ReplicatedDelta, SearchDocument, SearchLogOp,
+    SearchSyncStatus, VersionGuard,
 };
 
 pub use crate::types::CoordinatedCommit;
@@ -116,8 +116,33 @@ pub(crate) fn coordinated_commit_indexed_tx_idempotent(
     ack: Ack,
     idempotency: Option<&IdempotencyContext>,
 ) -> Result<CoordinatedCommit, MembusError> {
-    let (commit, replayed) =
-        storage.commit_indexed_tx_idempotent(guards, &mutations, ack, idempotency)?;
+    coordinated_commit_indexed_tx_idempotent_with_leases(
+        storage,
+        search,
+        guards,
+        &[],
+        mutations,
+        ack,
+        idempotency,
+    )
+}
+
+pub(crate) fn coordinated_commit_indexed_tx_idempotent_with_leases(
+    storage: &Arc<dyn StorageEngine>,
+    search: Option<&Arc<SearchEngine>>,
+    guards: &[VersionGuard],
+    lease_guards: &[LeaseGuard],
+    mutations: Vec<IndexedMutation>,
+    ack: Ack,
+    idempotency: Option<&IdempotencyContext>,
+) -> Result<CoordinatedCommit, MembusError> {
+    let (commit, replayed) = storage.commit_indexed_tx_idempotent_with_leases(
+        guards,
+        lease_guards,
+        &mutations,
+        ack,
+        idempotency,
+    )?;
     let mut search_sync = SearchSyncStatus::Synced;
     if !replayed {
         if let Some(engine) = search {

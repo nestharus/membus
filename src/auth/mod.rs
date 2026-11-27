@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::Instant;
 
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
@@ -7,10 +6,13 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use crate::storage::codec::encode_kv_key;
+use crate::storage::rocksdb_kv::helpers::{
+    decode_lease_record, encode_lease_record, lease_matches_active, LeaseRecord,
+};
 use crate::storage::StorageEngine;
 use crate::types::{
-    now_unix_ms, validate_key, validate_namespace, AuthMode, LeaseGrant, LeaseInfo, MembusError,
-    Permission, Principal,
+    validate_key, validate_namespace, AuthMode, LeaseGrant, LeaseInfo, MembusError, Permission,
+    Principal,
 };
 
 /// Maximum permitted lease TTL (24 hours).
@@ -208,15 +210,6 @@ fn permission_satisfied(granted: &[Permission], required: Permission) -> bool {
     granted.contains(&required) || granted.contains(&Permission::Admin)
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct LeaseRecord {
-    holder: String,
-    generation: u64,
-    token: String,
-    expires_at_ms: u64,
-    released: bool,
-}
-
 /// Per-resource atomic fenced lease manager backed by `lease` CF (`OptimisticTransactionDB`).
 ///
 /// In-process lease timing is anchored monotonically to prevent NTP/wall-clock jumps from
@@ -225,8 +218,6 @@ struct LeaseRecord {
 pub struct LeaseManager {
     storage: Arc<dyn StorageEngine>,
     rng: SystemRandom,
-    boot_wall_ms: u64,
-    boot_instant: Instant,
 }
 
 impl LeaseManager {
@@ -234,15 +225,12 @@ impl LeaseManager {
         Self {
             storage,
             rng: SystemRandom::new(),
-            boot_wall_ms: now_unix_ms(),
-            boot_instant: Instant::now(),
         }
     }
 
-    /// Monotonically advancing millisecond clock anchored to wall-clock time at startup.
-    fn monotonic_now_ms(&self) -> u64 {
-        let elapsed_ms = u64::try_from(self.boot_instant.elapsed().as_millis()).unwrap_or(u64::MAX);
-        self.boot_wall_ms.saturating_add(elapsed_ms)
+    /// Monotonically advancing millisecond clock shared with storage-level `T_L` lease checks.
+    pub fn monotonic_now_ms(&self) -> u64 {
+        self.storage.monotonic_now_ms()
     }
 
     fn generate_lease_token(&self) -> Result<String, MembusError> {
@@ -530,24 +518,6 @@ fn validate_lease_inputs(
     Ok(())
 }
 
-fn lease_matches_active(
-    rec: &LeaseRecord,
-    holder: &str,
-    generation: u64,
-    token: &str,
-    now_ms: u64,
-) -> bool {
-    if rec.released || rec.expires_at_ms <= now_ms {
-        return false;
-    }
-    if rec.holder != holder || rec.generation != generation {
-        return false;
-    }
-    let a: [u8; 32] = Sha256::digest(rec.token.as_bytes()).into();
-    let b: [u8; 32] = Sha256::digest(token.as_bytes()).into();
-    bool::from(a.ct_eq(&b))
-}
-
 fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -556,14 +526,4 @@ fn hex_encode(bytes: &[u8]) -> String {
         out.push(HEX[(b & 0x0f) as usize] as char);
     }
     out
-}
-
-fn encode_lease_record(rec: &LeaseRecord) -> Result<Vec<u8>, MembusError> {
-    serde_json::to_vec(rec)
-        .map_err(|err| MembusError::Storage(format!("failed to encode lease record: {err}")))
-}
-
-fn decode_lease_record(bytes: &[u8]) -> Result<LeaseRecord, MembusError> {
-    serde_json::from_slice(bytes)
-        .map_err(|err| MembusError::Corruption(format!("corrupt lease record: {err}")))
 }

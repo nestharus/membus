@@ -97,6 +97,32 @@ pub struct VersionGuard {
     pub expected: ExpectedVersion,
 }
 
+/// An atomic lease precondition checked inside a scoped transaction (`T_L`).
+///
+/// Verified against `CF_LEASE` under RocksDB optimistic conflict detection and the
+/// resident's monotonic lease clock in the same atomic commit as all KV mutations,
+/// eliminating TOCTOU windows between `validate_lease` and `commit_tx`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseGuard {
+    pub namespace: String,
+    pub resource: String,
+    pub holder: String,
+    pub generation: u64,
+    pub token: String,
+}
+
+impl LeaseGuard {
+    pub fn from_grant(grant: &crate::types::LeaseGrant) -> Self {
+        Self {
+            namespace: grant.namespace.clone(),
+            resource: grant.resource.clone(),
+            holder: grant.holder.clone(),
+            generation: grant.generation,
+            token: grant.token.clone(),
+        }
+    }
+}
+
 /// Single key mutation payload inside a transaction.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MutationOp {

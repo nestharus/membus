@@ -6,10 +6,10 @@ use crate::storage::admission::AdmissionConfig;
 use crate::storage::snapshot::OwnedSnapshot;
 use crate::types::{
     Ack, BfsResult, CommitResult, DeltaLogPage, ExpectedVersion, IdempotencyContext,
-    IndexMutations, IndexedMutation, LogScanPage, LogWatermark, MembusError, NeighborPage,
-    OrderedIndexPage, ReplicatedApplyResult, ReplicatedDelta, ReplicationStamp, ScanOptions,
-    ScanPage, SearchLogOp, SearchLogPage, StoredRecord, VersionGuard, WalBatch, WriteMutation,
-    DEFAULT_MAX_IDEMPOTENCY_ENTRIES, DEFAULT_MAX_VALUE_BYTES,
+    IndexMutations, IndexedMutation, LeaseGuard, LogScanPage, LogWatermark, MembusError,
+    NeighborPage, OrderedIndexPage, ReplicatedApplyResult, ReplicatedDelta, ReplicationStamp,
+    ScanOptions, ScanPage, SearchLogOp, SearchLogPage, StoredRecord, VersionGuard, WalBatch,
+    WriteMutation, DEFAULT_MAX_IDEMPOTENCY_ENTRIES, DEFAULT_MAX_VALUE_BYTES,
 };
 
 pub use crate::storage::publisher::{NoopPublisher, SignalPublisher};
@@ -89,6 +89,13 @@ pub trait StorageEngine: Send + Sync {
     }
     /// Current monotonic HLC timestamp in milliseconds.
     fn hlc_now_ms(&self) -> u64;
+
+    /// Monotonically advancing millisecond clock anchored to wall-clock time at engine startup.
+    /// Shared by [`crate::auth::LeaseManager`] and lease-guarded transactions (`T_L`) so expiry
+    /// checks at the serialized admission point cannot drift or be spoofed by callers.
+    fn monotonic_now_ms(&self) -> u64 {
+        crate::types::now_unix_ms()
+    }
 
     fn get(&self, namespace: &str, key: &[u8]) -> Result<Option<StoredRecord>, MembusError>;
     fn get_many(
@@ -265,6 +272,25 @@ pub trait StorageEngine: Send + Sync {
             ));
         }
         Ok((self.commit_indexed_tx(guards, mutations, ack)?, false))
+    }
+
+    /// Atomically commit a multi-key indexed transaction with both KV [`VersionGuard`]s
+    /// and [`LeaseGuard`]s (`T_L`) verified under the engine's monotonic lease clock
+    /// and per-resource lease serialization inside the same WAL-flushed transaction.
+    fn commit_indexed_tx_idempotent_with_leases(
+        &self,
+        guards: &[VersionGuard],
+        lease_guards: &[LeaseGuard],
+        mutations: &[IndexedMutation],
+        ack: Ack,
+        idempotency: Option<&IdempotencyContext>,
+    ) -> Result<(CommitResult, bool), MembusError> {
+        if !lease_guards.is_empty() {
+            return Err(MembusError::InvalidArgument(
+                "lease-guarded transactions are not supported by this storage backend".to_owned(),
+            ));
+        }
+        self.commit_indexed_tx_idempotent(guards, mutations, ack, idempotency)
     }
 
     fn open_snapshot(&self) -> Result<OwnedSnapshot, MembusError>;

@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex as FastMutex;
 use rocksdb::{
@@ -41,13 +41,14 @@ use crate::storage::snapshot::{OwnedSnapshot, SnapshotAdmissionGate};
 use crate::storage::wal_sync::BackgroundWalSync;
 use crate::types::{
     Ack, BfsResult, CommitResult, DeltaLogPage, ExpectedVersion, IdempotencyContext,
-    IndexMutations, IndexedMutation, LogScanPage, LogWatermark, MembusError, MutationOp,
-    NeighborPage, OrderedIndexPage, ReplicatedApplyResult, ReplicatedDelta, ReplicationStamp,
-    ScanOptions, ScanPage, SearchLogOp, SearchLogPage, StoredRecord, VersionGuard, WalBatch,
-    WriteMutation,
+    IndexMutations, IndexedMutation, LeaseGuard, LogScanPage, LogWatermark, MembusError,
+    MutationOp, NeighborPage, OrderedIndexPage, ReplicatedApplyResult, ReplicatedDelta,
+    ReplicationStamp, ScanOptions, ScanPage, SearchLogOp, SearchLogPage, StoredRecord,
+    VersionGuard, WalBatch, WriteMutation,
 };
 
 pub use state::RocksDbStorage;
+use state::LEASE_LOCK_STRIPES;
 
 static EPOCH_ENTROPY_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -101,6 +102,9 @@ impl RocksDbStorage {
             log_horizon: AtomicU64::new(log_horizon_seq),
             trim_lock: FastMutex::new(()),
             idem_prune_lock: FastMutex::new(()),
+            lease_stripes: (0..LEASE_LOCK_STRIPES).map(|_| FastMutex::new(())).collect(),
+            boot_wall_ms: crate::types::now_unix_ms(),
+            boot_instant: Instant::now(),
             idempotency_entry_count: AtomicUsize::new(initial_idem_count),
             hlc: HlcClock::new(last_log_ts),
             sequencer: Arc::new(PublishSequencer::new(initial_seq, publisher)),
@@ -372,6 +376,10 @@ impl StorageEngine for RocksDbStorage {
         self.hlc.current()
     }
 
+    fn monotonic_now_ms(&self) -> u64 {
+        self.monotonic_now_ms_impl()
+    }
+
     fn get(&self, namespace: &str, key: &[u8]) -> Result<Option<StoredRecord>, MembusError> {
         self.get_impl(namespace, key)
     }
@@ -583,6 +591,23 @@ impl StorageEngine for RocksDbStorage {
         idempotency: Option<&IdempotencyContext>,
     ) -> Result<(CommitResult, bool), MembusError> {
         self.commit_indexed_tx_idempotent_impl(guards, mutations, ack, idempotency)
+    }
+
+    fn commit_indexed_tx_idempotent_with_leases(
+        &self,
+        guards: &[VersionGuard],
+        lease_guards: &[LeaseGuard],
+        mutations: &[IndexedMutation],
+        ack: Ack,
+        idempotency: Option<&IdempotencyContext>,
+    ) -> Result<(CommitResult, bool), MembusError> {
+        self.commit_indexed_tx_idempotent_with_leases_impl(
+            guards,
+            lease_guards,
+            mutations,
+            ack,
+            idempotency,
+        )
     }
 
     fn open_snapshot(&self) -> Result<OwnedSnapshot, MembusError> {

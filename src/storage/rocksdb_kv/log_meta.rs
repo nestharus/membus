@@ -596,6 +596,7 @@ impl RocksDbStorage {
     ) -> Result<(), MembusError> {
         validate_key(key)?;
         validate_value(new_value, self.config.max_value_bytes)?;
+        let _stripe_guard = self.lock_lease_stripe(key);
         let lease_cf = self.cf(CF_LEASE)?;
         let mut wo = WriteOptions::default();
         wo.set_sync(true);

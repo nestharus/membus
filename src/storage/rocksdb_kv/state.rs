@@ -1,9 +1,10 @@
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::Arc;
 use std::time::Instant;
 
-use parking_lot::Mutex as FastMutex;
+use parking_lot::{Mutex as FastMutex, MutexGuard as FastMutexGuard};
 use rocksdb::{BoundColumnFamily, OptimisticTransactionDB};
 
 use crate::storage::admission::AdmissionGate;
@@ -17,6 +18,10 @@ use crate::storage::snapshot::{OwnedSnapshot, SnapshotAdmissionGate};
 use crate::storage::wal_sync::BackgroundWalSync;
 use crate::types::MembusError;
 
+/// Number of lock stripes serializing per-resource `CF_LEASE` mutations against
+/// lease-guarded transactions (`T_L`) in canonical ascending stripe order.
+pub(crate) const LEASE_LOCK_STRIPES: usize = 64;
+
 /// Multi-threaded RocksDB storage engine backed by `OptimisticTransactionDB`.
 pub struct RocksDbStorage {
     pub(crate) data_dir: PathBuf,
@@ -26,6 +31,9 @@ pub struct RocksDbStorage {
     pub(crate) log_horizon: AtomicU64,
     pub(crate) trim_lock: FastMutex<()>,
     pub(crate) idem_prune_lock: FastMutex<()>,
+    pub(crate) lease_stripes: Vec<FastMutex<()>>,
+    pub(crate) boot_wall_ms: u64,
+    pub(crate) boot_instant: Instant,
     pub(crate) idempotency_entry_count: AtomicUsize,
     pub(crate) hlc: HlcClock,
     pub(crate) sequencer: Arc<PublishSequencer>,
@@ -101,5 +109,40 @@ impl RocksDbStorage {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn monotonic_now_ms_impl(&self) -> u64 {
+        let elapsed_ms = u64::try_from(self.boot_instant.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.boot_wall_ms.saturating_add(elapsed_ms)
+    }
+
+    pub(crate) fn lease_stripe_index(encoded_lease_key: &[u8]) -> usize {
+        // FNV-1a 64-bit hash for deterministic, fast lock-stripe partitioning.
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in encoded_lease_key {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+        (h as usize) % LEASE_LOCK_STRIPES
+    }
+
+    pub(crate) fn lock_lease_stripe(&self, encoded_lease_key: &[u8]) -> FastMutexGuard<'_, ()> {
+        self.lease_stripes[Self::lease_stripe_index(encoded_lease_key)].lock()
+    }
+
+    /// Acquire lease-serialization locks for all referenced lease keys in canonical
+    /// ascending stripe-index order (deadlock-free for multi-lease transactions).
+    pub(crate) fn lock_lease_stripes(
+        &self,
+        encoded_lease_keys: &[Vec<u8>],
+    ) -> Vec<FastMutexGuard<'_, ()>> {
+        let mut indices = BTreeSet::new();
+        for key in encoded_lease_keys {
+            indices.insert(Self::lease_stripe_index(key));
+        }
+        indices
+            .into_iter()
+            .map(|idx| self.lease_stripes[idx].lock())
+            .collect()
     }
 }

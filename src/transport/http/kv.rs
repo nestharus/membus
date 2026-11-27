@@ -19,12 +19,12 @@ use crate::transport::http::state::{
     parse_role_epoch_header, HttpError, HttpState,
 };
 use crate::transport::write_coord::{
-    coordinated_commit_indexed_tx_idempotent, coordinated_put_indexed, coordinated_remove_indexed,
-    CoordinatedPutArgs, CoordinatedRemoveArgs,
+    coordinated_commit_indexed_tx_idempotent_with_leases, coordinated_put_indexed,
+    coordinated_remove_indexed, CoordinatedPutArgs, CoordinatedRemoveArgs,
 };
 use crate::types::{
     Ack, AuthMode, ExpectedVersion, IdempotencyContext, IndexMutations, IndexedMutation,
-    MembusError, Permission, ScanOptions, ScanPage, SearchLogOp, VersionGuard,
+    LeaseGuard, MembusError, Permission, ScanOptions, ScanPage, SearchLogOp, VersionGuard,
 };
 
 fn lookup_commit_ts_ms(storage: &dyn StorageEngine, seq: u64) -> Option<u64> {
@@ -38,10 +38,18 @@ fn lookup_commit_ts_ms(storage: &dyn StorageEngine, seq: u64) -> Option<u64> {
         .map(|e| e.ts_ms)
 }
 
-fn tx_namespace_scope(guards: &[VersionGuard], mutations: &[IndexedMutation]) -> String {
-    let mut namespaces: Vec<&str> = Vec::with_capacity(guards.len() + mutations.len());
+fn tx_namespace_scope(
+    guards: &[VersionGuard],
+    lease_guards: &[LeaseGuard],
+    mutations: &[IndexedMutation],
+) -> String {
+    let mut namespaces: Vec<&str> =
+        Vec::with_capacity(guards.len() + lease_guards.len() + mutations.len());
     for g in guards {
         namespaces.push(g.namespace.as_str());
+    }
+    for lg in lease_guards {
+        namespaces.push(lg.namespace.as_str());
     }
     for m in mutations {
         namespaces.push(m.mutation.namespace.as_str());
@@ -103,6 +111,7 @@ fn fingerprint_kv_delete(
 
 fn fingerprint_tx(
     guards: &[VersionGuard],
+    lease_guards: &[LeaseGuard],
     mutations: &[IndexedMutation],
 ) -> Result<[u8; 32], MembusError> {
     let mut h = Sha256::new();
@@ -111,6 +120,25 @@ fn fingerprint_tx(
         .map_err(|err| MembusError::Storage(format!("fingerprint encode failed: {err}")))?;
     h.update((body.len() as u32).to_be_bytes());
     h.update(&body);
+    if !lease_guards.is_empty() {
+        // Hash non-secret lease identity tuples only; never persist or hash raw lease tokens.
+        h.update(b"membus:idem:tx_lease_guards:v1\0");
+        let lease_ids: Vec<(&str, &str, &str, u64)> = lease_guards
+            .iter()
+            .map(|lg| {
+                (
+                    lg.namespace.as_str(),
+                    lg.resource.as_str(),
+                    lg.holder.as_str(),
+                    lg.generation,
+                )
+            })
+            .collect();
+        let lease_bytes = serde_json::to_vec(&lease_ids)
+            .map_err(|err| MembusError::Storage(format!("lease fingerprint encode failed: {err}")))?;
+        h.update((lease_bytes.len() as u32).to_be_bytes());
+        h.update(&lease_bytes);
+    }
     Ok(h.finalize().into())
 }
 
@@ -310,6 +338,8 @@ pub(super) struct HttpTxReq {
     ack: Ack,
     #[serde(default)]
     guards: Vec<VersionGuard>,
+    #[serde(default)]
+    lease_guards: Vec<LeaseGuard>,
     mutations: Vec<IndexedMutation>,
 }
 
@@ -325,6 +355,14 @@ pub(super) async fn handle_tx(
             .ctx
             .auth
             .authorize(principal.as_ref(), &g.namespace, &g.key, Permission::Read)?;
+    }
+    for lg in &req.lease_guards {
+        state.ctx.auth.authorize(
+            principal.as_ref(),
+            &lg.namespace,
+            lg.resource.as_bytes(),
+            Permission::Write,
+        )?;
     }
     for m in &req.mutations {
         state.ctx.auth.authorize(
@@ -355,11 +393,15 @@ pub(super) async fn handle_tx(
     };
     let idempotency = match idem_key {
         Some(k) => Some(IdempotencyContext {
-            scope_namespace: tx_namespace_scope(&req.guards, &req.mutations),
+            scope_namespace: tx_namespace_scope(&req.guards, &req.lease_guards, &req.mutations),
             principal_id,
             is_tx: true,
             key: k,
-            request_fingerprint_sha256: fingerprint_tx(&req.guards, &req.mutations)?,
+            request_fingerprint_sha256: fingerprint_tx(
+                &req.guards,
+                &req.lease_guards,
+                &req.mutations,
+            )?,
         }),
         None => None,
     };
@@ -368,10 +410,11 @@ pub(super) async fn handle_tx(
     let search = state.ctx.search.clone();
     let (coord, commit_ts_ms) = tokio::task::spawn_blocking(move || {
         let _fence = ctx.acquire_client_write_fence(role_epoch)?;
-        let coord = coordinated_commit_indexed_tx_idempotent(
+        let coord = coordinated_commit_indexed_tx_idempotent_with_leases(
             &storage,
             search.as_ref(),
             &req.guards,
+            &req.lease_guards,
             req.mutations,
             req.ack,
             idempotency.as_ref(),

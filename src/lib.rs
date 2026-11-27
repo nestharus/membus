@@ -53,7 +53,7 @@ pub use types::{
     sanitize_search_log_op, Ack, AclGrant, AuthMode, BfsResult, ColdRef, CollectionDescriptor,
     CommitResult, CompatibilityMode, DeltaLogPage, ExpectedVersion, GraphDirection,
     GraphEdgeEntry, GraphEdgeRecord, HealthStatus, IdempotencyContext, IndexKind, IndexMutations,
-    IndexSpec, IndexedMutation, LeaseGrant, LeaseInfo, LogDeltaEntry, LogMutationDelta,
+    IndexSpec, IndexedMutation, LeaseGrant, LeaseGuard, LeaseInfo, LogDeltaEntry, LogMutationDelta,
     LogScanPage, LogWatermark, MembusError, MigrationState, MutationOp, NamespaceParityDigest,
     NeighborPage, OrderedIndexEntry, OrderedIndexHit, OrderedIndexPage, ParityDigestMode,
     Permission, Principal, ReadMode, RecordMeta, ReplicatedApplyResult, ReplicatedDelta,

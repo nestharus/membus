@@ -1,10 +1,11 @@
 use rocksdb::ErrorKind;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 use crate::types::{
-    validate_namespace, ExpectedVersion, IdempotencyContext, MembusError, ScanOptions, SearchLogOp,
-    MAX_IDEMPOTENCY_KEY_BYTES,
+    validate_namespace, ExpectedVersion, IdempotencyContext, LeaseGuard, MembusError, ScanOptions,
+    SearchLogOp, MAX_IDEMPOTENCY_KEY_BYTES,
 };
 
 pub(crate) const META_KEY_EPOCH: &[u8] = b"db_epoch";
@@ -167,4 +168,81 @@ pub(crate) fn map_tx_err(err: rocksdb::Error) -> MembusError {
         ErrorKind::InvalidArgument => MembusError::InvalidArgument(err.into_string()),
         _ => MembusError::Storage(err.into_string()),
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct LeaseRecord {
+    pub(crate) holder: String,
+    pub(crate) generation: u64,
+    pub(crate) token: String,
+    pub(crate) expires_at_ms: u64,
+    pub(crate) released: bool,
+}
+
+pub(crate) fn encode_lease_record(rec: &LeaseRecord) -> Result<Vec<u8>, MembusError> {
+    serde_json::to_vec(rec)
+        .map_err(|err| MembusError::Storage(format!("failed to encode lease record: {err}")))
+}
+
+pub(crate) fn decode_lease_record(bytes: &[u8]) -> Result<LeaseRecord, MembusError> {
+    serde_json::from_slice(bytes)
+        .map_err(|err| MembusError::Corruption(format!("corrupt lease record: {err}")))
+}
+
+pub(crate) fn lease_matches_active(
+    rec: &LeaseRecord,
+    holder: &str,
+    generation: u64,
+    token: &str,
+    now_ms: u64,
+) -> bool {
+    if rec.released || rec.expires_at_ms <= now_ms {
+        return false;
+    }
+    if rec.holder != holder || rec.generation != generation {
+        return false;
+    }
+    let a: [u8; 32] = Sha256::digest(rec.token.as_bytes()).into();
+    let b: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+    bool::from(a.ct_eq(&b))
+}
+
+/// Verify an atomic [`LeaseGuard`] against raw `CF_LEASE` record bytes inside a transaction.
+///
+/// Rejects absent, released, or expired leases with [`MembusError::NotFound`] and active
+/// mismatched leases (wrong holder, generation, or secret token) with [`MembusError::LeaseHeld`].
+/// Never embeds secret token material in error messages.
+pub(crate) fn verify_lease_guard_bytes(
+    raw: Option<&[u8]>,
+    guard: &LeaseGuard,
+    now_ms: u64,
+) -> Result<(), MembusError> {
+    let Some(bytes) = raw else {
+        return Err(MembusError::NotFound(format!(
+            "lease '{}' does not exist",
+            guard.resource
+        )));
+    };
+    let rec = decode_lease_record(bytes)?;
+    if rec.released {
+        return Err(MembusError::NotFound(format!(
+            "lease '{}' is inactive (already released at generation {})",
+            guard.resource, rec.generation
+        )));
+    }
+    if rec.expires_at_ms <= now_ms {
+        return Err(MembusError::NotFound(format!(
+            "lease '{}' is inactive (expired at generation {})",
+            guard.resource, rec.generation
+        )));
+    }
+    if !lease_matches_active(&rec, &guard.holder, guard.generation, &guard.token, now_ms) {
+        return Err(MembusError::LeaseHeld {
+            resource: guard.resource.clone(),
+            holder: rec.holder,
+            generation: rec.generation,
+            expires_at_ms: rec.expires_at_ms,
+        });
+    }
+    Ok(())
 }
