@@ -5,8 +5,8 @@ use crate::protocol::{Request, Response};
 use crate::transport::connection::state::{ConnectionState, SnapshotReservationGuard};
 use crate::transport::helpers::run_blocking_query;
 use crate::transport::write_coord::{
-    coordinated_commit_indexed_tx, coordinated_put_indexed, coordinated_remove_indexed,
-    CoordinatedPutArgs, CoordinatedRemoveArgs,
+    coordinated_commit_indexed_tx, coordinated_commit_indexed_tx_idempotent_with_leases,
+    coordinated_put_indexed, coordinated_remove_indexed, CoordinatedPutArgs, CoordinatedRemoveArgs,
 };
 use crate::types::MembusError;
 
@@ -219,6 +219,37 @@ pub(super) async fn dispatch_tx(conn: &Arc<ConnectionState>, req: Request) -> Re
             .unwrap_or_else(|e| {
                 Err(MembusError::Storage(format!(
                     "commit_indexed_tx failed: {e}"
+                )))
+            });
+            match result {
+                Ok(coord) => Response::Commit(coord.commit),
+                Err(e) => Response::Error(e),
+            }
+        }
+        Request::CommitIndexedTxWithLeases {
+            ack,
+            guards,
+            lease_guards,
+            mutations,
+        } => {
+            let ctx = conn.ctx.clone();
+            let search = conn.ctx.search.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let _fence = ctx.acquire_client_write_fence(None)?;
+                coordinated_commit_indexed_tx_idempotent_with_leases(
+                    &storage,
+                    search.as_ref(),
+                    &guards,
+                    &lease_guards,
+                    mutations,
+                    ack,
+                    None,
+                )
+            })
+            .await
+            .unwrap_or_else(|e| {
+                Err(MembusError::Storage(format!(
+                    "commit_indexed_tx_with_leases failed: {e}"
                 )))
             });
             match result {

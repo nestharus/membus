@@ -543,3 +543,109 @@ async fn http_v2_tx_lease_guards_idempotency_and_rejection() {
 
     bound.shutdown().await;
 }
+
+#[tokio::test]
+async fn binary_client_commit_indexed_tx_with_leases_enforces_fencing_and_auth() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let signal_cfg = SignalConfig::default();
+    let ring = Arc::new(SignalRing::new(signal_cfg));
+    let storage = Arc::new(
+        RocksDbStorage::open(
+            dir.path(),
+            StorageConfig::default(),
+            Arc::clone(&ring) as Arc<dyn SignalPublisher>,
+        )
+        .expect("open storage"),
+    );
+    let broker = Arc::new(SignalBroker::new(
+        Arc::clone(&storage) as Arc<dyn StorageEngine>,
+        ring,
+        signal_cfg,
+    ));
+    let server = MembusServer::new(
+        Arc::clone(&storage) as Arc<dyn StorageEngine>,
+        broker,
+        ServerConfig::default(),
+    );
+    let bound = server
+        .bind_tcp("127.0.0.1:0".parse().expect("addr"))
+        .await
+        .expect("bind tcp");
+    let client = membus::Client::connect(bound.endpoint())
+        .await
+        .expect("connect");
+
+    let grant = client
+        .acquire_lease("slots", "req/bin-1", "worker-1", 60_000)
+        .await
+        .expect("acquire");
+    let guard = LeaseGuard::from_grant(&grant);
+
+    // 1. Valid lease guard commits cleanly over binary protocol.
+    let commit = client
+        .commit_indexed_tx_with_leases(
+            vec![],
+            vec![guard.clone()],
+            vec![put_mutation("slots", b"req/bin-1/ack", b"ok-1")],
+            Ack::Flush,
+        )
+        .await
+        .expect("valid binary lease-guarded tx");
+    assert_eq!(commit.versions.len(), 1);
+    assert_eq!(
+        client
+            .get("slots", b"req/bin-1/ack")
+            .await
+            .unwrap()
+            .unwrap()
+            .value,
+        b"ok-1"
+    );
+
+    // 2. Wrong token aborts atomically.
+    let mut bad_guard = guard.clone();
+    bad_guard.token = "0".repeat(64);
+    let err = client
+        .commit_indexed_tx_with_leases(
+            vec![],
+            vec![bad_guard],
+            vec![put_mutation("slots", b"req/bin-1/ack", b"bad-token")],
+            Ack::Flush,
+        )
+        .await
+        .expect_err("wrong token must fail");
+    assert!(matches!(err, MembusError::LeaseHeld { .. }));
+
+    // 3. Released lease aborts atomically and leaves KV untouched.
+    client
+        .release_lease(
+            &grant.namespace,
+            &grant.resource,
+            &grant.holder,
+            grant.generation,
+            &grant.token,
+        )
+        .await
+        .expect("release");
+    let err = client
+        .commit_indexed_tx_with_leases(
+            vec![],
+            vec![guard],
+            vec![put_mutation("slots", b"req/bin-1/ack", b"after-release")],
+            Ack::Flush,
+        )
+        .await
+        .expect_err("released lease must fail");
+    assert!(matches!(err, MembusError::NotFound(_)));
+    assert_eq!(
+        client
+            .get("slots", b"req/bin-1/ack")
+            .await
+            .unwrap()
+            .unwrap()
+            .value,
+        b"ok-1"
+    );
+
+    bound.shutdown().await;
+}

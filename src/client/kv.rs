@@ -1,7 +1,7 @@
 use crate::protocol::{Request, Response};
 use crate::types::{
-    Ack, CommitResult, ExpectedVersion, IndexMutations, IndexedMutation, MembusError, ScanOptions,
-    ScanPage, SearchLogOp, StoredRecord, VersionGuard, WriteMutation,
+    Ack, CommitResult, ExpectedVersion, IndexMutations, IndexedMutation, LeaseGuard, MembusError,
+    ScanOptions, ScanPage, SearchLogOp, StoredRecord, VersionGuard, WriteMutation,
 };
 
 use super::core::Client;
@@ -181,6 +181,30 @@ impl Client {
             Response::Error(e) => Err(e),
             other => Err(MembusError::Protocol(format!(
                 "unexpected response for commit_indexed_tx: {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn commit_indexed_tx_with_leases(
+        &self,
+        guards: Vec<VersionGuard>,
+        lease_guards: Vec<LeaseGuard>,
+        mutations: Vec<IndexedMutation>,
+        ack: Ack,
+    ) -> Result<CommitResult, MembusError> {
+        let resp = self
+            .call(Request::CommitIndexedTxWithLeases {
+                ack,
+                guards,
+                lease_guards,
+                mutations,
+            })
+            .await?;
+        match resp {
+            Response::Commit(c) => Ok(c),
+            Response::Error(e) => Err(e),
+            other => Err(MembusError::Protocol(format!(
+                "unexpected response for commit_indexed_tx_with_leases: {other:?}"
             ))),
         }
     }

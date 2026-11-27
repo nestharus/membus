@@ -245,9 +245,9 @@ async fn dispatch_unary(
         | Request::PutIndexed { .. }
         | Request::Remove { .. }
         | Request::RemoveIndexed { .. } => kv::dispatch_kv_rw(conn, req).await,
-        Request::CommitTx { .. } | Request::CommitIndexedTx { .. } => {
-            kv::dispatch_tx(conn, req).await
-        }
+        Request::CommitTx { .. }
+        | Request::CommitIndexedTx { .. }
+        | Request::CommitIndexedTxWithLeases { .. } => kv::dispatch_tx(conn, req).await,
         Request::OpenSnapshot
         | Request::CloseSnapshot { .. }
         | Request::ScanPrefix { .. }

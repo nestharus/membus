@@ -4,11 +4,11 @@ use serde::{Deserialize, Serialize};
 use crate::index::{BfsOptions, NeighborQueryOptions, OrderedQueryOptions};
 use crate::types::{
     sanitize_score, Ack, BfsResult, CollectionDescriptor, CommitResult, ExpectedVersion,
-    HealthStatus, IndexMutations, IndexedMutation, LeaseGrant, LeaseInfo, MembusError, MutationOp,
-    NamespaceParityDigest, NeighborPage, OrderedIndexPage, ParityDigestMode, RecordMeta,
-    ReplicatedApplyResult, ReplicatedDelta, ScanOptions, ScanPage, SearchDocument, SearchLogOp,
-    SearchPage, SearchQuery, SignalEvent, SignalKind, SlotRole, SlotRoleState, StoredRecord,
-    VersionGuard, WriteMutation,
+    HealthStatus, IndexMutations, IndexedMutation, LeaseGrant, LeaseGuard, LeaseInfo, MembusError,
+    MutationOp, NamespaceParityDigest, NeighborPage, OrderedIndexPage, ParityDigestMode,
+    RecordMeta, ReplicatedApplyResult, ReplicatedDelta, ScanOptions, ScanPage, SearchDocument,
+    SearchLogOp, SearchPage, SearchQuery, SignalEvent, SignalKind, SlotRole, SlotRoleState,
+    StoredRecord, VersionGuard, WriteMutation,
 };
 
 const OP_GET: u8 = 1;
@@ -60,6 +60,7 @@ const OP_CONTRACT_MIGRATION: u8 = 46;
 const OP_NAMESPACE_DIGEST: u8 = 47;
 const OP_TRANSITION_SLOT_ROLE: u8 = 48;
 const OP_APPLY_REPLICATED_DELTA: u8 = 49;
+const OP_COMMIT_INDEXED_TX_LEASED: u8 = 50;
 
 const RESP_GET: u8 = 1;
 const RESP_GET_MANY: u8 = 2;
@@ -201,6 +202,12 @@ pub enum Request {
     CommitIndexedTx {
         ack: Ack,
         guards: Vec<VersionGuard>,
+        mutations: Vec<IndexedMutation>,
+    },
+    CommitIndexedTxWithLeases {
+        ack: Ack,
+        guards: Vec<VersionGuard>,
+        lease_guards: Vec<LeaseGuard>,
         mutations: Vec<IndexedMutation>,
     },
     QueryOrderedIndex {
@@ -594,6 +601,24 @@ pub fn encode_request(req: &Request) -> Result<Bytes, MembusError> {
             buf.put_u8(OP_COMMIT_INDEXED_TX);
             buf.put_u8(*ack as u8);
             put_json(&mut buf, &(guards, mutations))?;
+        }
+        Request::CommitIndexedTxWithLeases {
+            ack,
+            guards,
+            lease_guards,
+            mutations,
+        } => {
+            if guards.len() > MAX_BATCH_ITEMS
+                || lease_guards.len() > MAX_BATCH_ITEMS
+                || mutations.len() > MAX_BATCH_ITEMS
+            {
+                return Err(MembusError::InvalidArgument(format!(
+                    "commit_indexed_tx_with_leases batch size exceeds maximum {MAX_BATCH_ITEMS}"
+                )));
+            }
+            buf.put_u8(OP_COMMIT_INDEXED_TX_LEASED);
+            buf.put_u8(*ack as u8);
+            put_json(&mut buf, &(guards, lease_guards, mutations))?;
         }
         Request::QueryOrderedIndex {
             namespace,
@@ -1087,6 +1112,28 @@ pub fn decode_request(raw: &[u8]) -> Result<Request, MembusError> {
             Request::CommitIndexedTx {
                 ack,
                 guards,
+                mutations,
+            }
+        }
+        OP_COMMIT_INDEXED_TX_LEASED => {
+            let ack = Ack::from_u8(take_u8(&mut cur)?)?;
+            let (guards, lease_guards, mutations): (
+                Vec<VersionGuard>,
+                Vec<LeaseGuard>,
+                Vec<IndexedMutation>,
+            ) = take_json(&mut cur)?;
+            if guards.len() > MAX_BATCH_ITEMS
+                || lease_guards.len() > MAX_BATCH_ITEMS
+                || mutations.len() > MAX_BATCH_ITEMS
+            {
+                return Err(MembusError::Protocol(format!(
+                    "commit_indexed_tx_with_leases batch size exceeds maximum {MAX_BATCH_ITEMS}"
+                )));
+            }
+            Request::CommitIndexedTxWithLeases {
+                ack,
+                guards,
+                lease_guards,
                 mutations,
             }
         }

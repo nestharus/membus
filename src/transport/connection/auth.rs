@@ -20,7 +20,8 @@ pub(super) fn authorize_request(
         | Request::Remove { .. }
         | Request::RemoveIndexed { .. }
         | Request::CommitTx { .. }
-        | Request::CommitIndexedTx { .. } => authorize_kv_tx_request(auth, principal, req),
+        | Request::CommitIndexedTx { .. }
+        | Request::CommitIndexedTxWithLeases { .. } => authorize_kv_tx_request(auth, principal, req),
         Request::OpenSnapshot
         | Request::CloseSnapshot { .. }
         | Request::Health
@@ -149,6 +150,40 @@ fn authorize_kv_tx_request(
             auth.require_authenticated(principal)?;
             for g in guards {
                 auth.authorize(principal, &g.namespace, &g.key, Permission::Read)?;
+            }
+            for m in mutations {
+                auth.authorize(
+                    principal,
+                    &m.mutation.namespace,
+                    &m.mutation.key,
+                    Permission::Write,
+                )?;
+                if let Some(idx) = &m.indexes {
+                    authorize_index_mutations(auth, principal, &m.mutation.namespace, idx)?;
+                }
+                if let Some(op) = &m.search_op {
+                    authorize_search_op(auth, principal, op)?;
+                }
+            }
+            Ok(())
+        }
+        Request::CommitIndexedTxWithLeases {
+            guards,
+            lease_guards,
+            mutations,
+            ..
+        } => {
+            auth.require_authenticated(principal)?;
+            for g in guards {
+                auth.authorize(principal, &g.namespace, &g.key, Permission::Read)?;
+            }
+            for lg in lease_guards {
+                auth.authorize(
+                    principal,
+                    &lg.namespace,
+                    lg.resource.as_bytes(),
+                    Permission::Write,
+                )?;
             }
             for m in mutations {
                 auth.authorize(
