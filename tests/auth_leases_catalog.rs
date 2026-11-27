@@ -412,6 +412,36 @@ async fn fenced_leases_acquire_conflict_renew_release_and_expiry_reclaim() {
         .release_lease("jobs", "shard-0", "worker-a", g1.generation, &g1.token)
         .await
         .expect("release");
+    // Releasing or renewing an already-released lease returns NotFound (never LeaseHeld with expires 0).
+    let second_release = client
+        .release_lease("jobs", "shard-0", "worker-a", g1.generation, &g1.token)
+        .await;
+    assert!(
+        matches!(second_release, Err(MembusError::NotFound(ref msg)) if msg.contains("already released")),
+        "expected NotFound for double release, got {second_release:?}"
+    );
+    let renew_released = client
+        .renew_lease("jobs", "shard-0", "worker-a", g1.generation, &g1.token, 5_000)
+        .await;
+    assert!(
+        matches!(renew_released, Err(MembusError::NotFound(ref msg)) if msg.contains("already released")),
+        "expected NotFound for renew after release, got {renew_released:?}"
+    );
+    // Foreign holder on an already-released lease also gets NotFound (never LeaseHeld or leaking prior holder).
+    let foreign_release_inactive = client
+        .release_lease("jobs", "shard-0", "worker-intruder", g1.generation, "bad-tok")
+        .await;
+    assert!(
+        matches!(foreign_release_inactive, Err(MembusError::NotFound(ref msg)) if msg.contains("already released") && !msg.contains("worker-a")),
+        "expected NotFound without prior holder leak for foreign release on released lease, got {foreign_release_inactive:?}"
+    );
+    let foreign_renew_inactive = client
+        .renew_lease("jobs", "shard-0", "worker-intruder", g1.generation, "bad-tok", 5_000)
+        .await;
+    assert!(
+        matches!(foreign_renew_inactive, Err(MembusError::NotFound(ref msg)) if msg.contains("already released") && !msg.contains("worker-a")),
+        "expected NotFound without prior holder leak for foreign renew on released lease, got {foreign_renew_inactive:?}"
+    );
     assert!(client
         .inspect_lease("jobs", "shard-0")
         .await
@@ -429,11 +459,54 @@ async fn fenced_leases_acquire_conflict_renew_release_and_expiry_reclaim() {
         .expect("acquire g2");
     assert_eq!(g2.generation, 2);
 
+    // Foreign release while active still returns LeaseHeld with live expires_at_ms > 0.
+    let foreign_release = client
+        .release_lease("jobs", "shard-0", "worker-a", g2.generation, "wrong-token")
+        .await;
+    assert!(matches!(
+        foreign_release,
+        Err(MembusError::LeaseHeld {
+            ref holder,
+            generation: 2,
+            expires_at_ms,
+            ..
+        }) if holder == "worker-b" && expires_at_ms > 0
+    ));
+
     tokio::time::sleep(Duration::from_millis(140)).await;
     assert!(!client
         .validate_lease("jobs", "shard-0", "worker-b", g2.generation, &g2.token)
         .await
         .expect("expired validate"));
+    // Releasing or renewing an expired lease returns NotFound (inactive/expired), never LeaseHeld.
+    let expired_release = client
+        .release_lease("jobs", "shard-0", "worker-b", g2.generation, &g2.token)
+        .await;
+    assert!(
+        matches!(expired_release, Err(MembusError::NotFound(ref msg)) if msg.contains("expired")),
+        "expected NotFound for expired release, got {expired_release:?}"
+    );
+    let expired_renew = client
+        .renew_lease("jobs", "shard-0", "worker-b", g2.generation, &g2.token, 5_000)
+        .await;
+    assert!(
+        matches!(expired_renew, Err(MembusError::NotFound(ref msg)) if msg.contains("expired")),
+        "expected NotFound for expired renew, got {expired_renew:?}"
+    );
+    let foreign_expired_release = client
+        .release_lease("jobs", "shard-0", "worker-intruder", g2.generation, "bad-tok")
+        .await;
+    assert!(
+        matches!(foreign_expired_release, Err(MembusError::NotFound(ref msg)) if msg.contains("expired") && !msg.contains("worker-b")),
+        "expected NotFound without prior holder leak for foreign release on expired lease, got {foreign_expired_release:?}"
+    );
+    let foreign_expired_renew = client
+        .renew_lease("jobs", "shard-0", "worker-intruder", g2.generation, "bad-tok", 5_000)
+        .await;
+    assert!(
+        matches!(foreign_expired_renew, Err(MembusError::NotFound(ref msg)) if msg.contains("expired") && !msg.contains("worker-b")),
+        "expected NotFound without prior holder leak for foreign renew on expired lease, got {foreign_expired_renew:?}"
+    );
 
     let g3 = client
         .acquire_lease("jobs", "shard-0", "worker-c", 5_000)
@@ -696,6 +769,100 @@ async fn inspect_lease_omits_secret_token_and_acquire_blocks_holder_echo_hijack(
         .await
         .expect("renew");
     assert_eq!(renewed.token, grant.token);
+
+    // HTTP active foreign contention on release & renew MUST return 409 {"error":"lease_held"}.
+    let foreign_release_body = serde_json::json!({
+        "namespace": "jobs",
+        "resource": "lock-1",
+        "holder": "worker-b",
+        "generation": grant.generation,
+        "token": "wrong-token"
+    })
+    .to_string();
+    let (st, body) = http1_call(
+        http_addr,
+        Method::POST,
+        "/v2/leases/release",
+        None,
+        Some(foreign_release_body),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "body={body}");
+    let err_json: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(err_json["error"], "lease_held");
+
+    let foreign_renew_body = serde_json::json!({
+        "namespace": "jobs",
+        "resource": "lock-1",
+        "holder": "worker-b",
+        "generation": grant.generation,
+        "token": "wrong-token",
+        "ttl_ms": 5000
+    })
+    .to_string();
+    let (st, body) = http1_call(
+        http_addr,
+        Method::POST,
+        "/v2/leases/renew",
+        None,
+        Some(foreign_renew_body),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "body={body}");
+    let err_json: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(err_json["error"], "lease_held");
+
+    // Release via HTTP, then verify inactive release & renew return 404 {"error":"not_found"}.
+    let valid_release_body = serde_json::json!({
+        "namespace": "jobs",
+        "resource": "lock-1",
+        "holder": "worker-a",
+        "generation": grant.generation,
+        "token": grant.token
+    })
+    .to_string();
+    let (st, body) = http1_call(
+        http_addr,
+        Method::POST,
+        "/v2/leases/release",
+        None,
+        Some(valid_release_body.clone()),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "body={body}");
+
+    let (st, body) = http1_call(
+        http_addr,
+        Method::POST,
+        "/v2/leases/release",
+        None,
+        Some(valid_release_body),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "body={body}");
+    let err_json: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(err_json["error"], "not_found");
+
+    let inactive_renew_body = serde_json::json!({
+        "namespace": "jobs",
+        "resource": "lock-1",
+        "holder": "worker-a",
+        "generation": grant.generation,
+        "token": grant.token,
+        "ttl_ms": 5000
+    })
+    .to_string();
+    let (st, body) = http1_call(
+        http_addr,
+        Method::POST,
+        "/v2/leases/renew",
+        None,
+        Some(inactive_renew_body),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "body={body}");
+    let err_json: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(err_json["error"], "not_found");
 
     drop(client);
     tcp_handle.shutdown().await;

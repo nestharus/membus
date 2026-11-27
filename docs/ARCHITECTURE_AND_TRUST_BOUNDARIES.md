@@ -134,17 +134,39 @@ Tantivy (`SearchEngine`) is a **derived secondary projection**:
   error is logged explicitly to `stderr` and causes `membus serve` to exit with a **non-zero**
   exit code rather than silently reporting success.
 
+### Idempotent Tombstone Semantics for `DELETE /v2/kv/{ns}/{key}`
+
+- Issuing `DELETE /v2/kv/{ns}/{key}` with the default `expected: "Any"` (or binary `remove` with
+  `ExpectedVersion::Any`) is **deliberately idempotent** even when the target key is already
+  absent: the operation succeeds with `200 OK`, commits a monotonic `CF_LOG` deletion delta and
+  mesh tombstone timestamp (`mesh:tomb:`) at a new sequence number, and returns a `CommitResult`.
+  This guarantees deterministic LWW delete propagation across nodes and retry-safe cleanup.
+- Callers that require strict compare-and-delete (rejecting a missing or concurrently modified
+  key with `409 Conflict`) MUST supply an explicit `expected: { "Version": <v> }` precondition.
+- Conversely, lease release (`POST /v2/leases/release`, JSON body) and renewal
+  (`POST /v2/leases/renew`, JSON body) return `404 not_found` when a lease does not exist,
+  has already been released, or has expired, and `409 lease_held` only when the lease is actively
+  held with a non-zero live expiration deadline and the caller's `(holder, generation, token)`
+  does not match.
+
 ## 6. Storage Module Decomposition and `OwnedSnapshot` Safety
 
-`src/storage/` isolates each storage concern into a dedicated module:
+`src/storage/` isolates each storage concern into a strictly acyclic set of modules:
 
+- `constants.rs` — Pure leaf column-family names (`CF_KV`..`CF_META`, `ALL_COLUMN_FAMILIES`) and
+  key-prefix concatenation helpers.
+- `publisher.rs` — Commit-order signal callback boundary (`SignalPublisher`, `NoopPublisher`).
+- `contract.rs` — Core storage engine contracts (`StorageEngine`, `StorageConfig`, `MetaCasGuard`,
+  `RawKeyValue`).
 - `hlc.rs` — Monotonic Hybrid Logical Clock.
 - `wal_sync.rs` — Periodic background WAL flusher with observable error counting.
 - `sequencer.rs` — Strict contiguous commit-sequence publication gate.
 - `snapshot.rs` — Global `SnapshotAdmissionGate` and `OwnedSnapshot` (isolating the sole
   `unsafe` lifetime-extension block with explicit `ManuallyDrop` drop-order guarantees so
   the RocksDB snapshot handle always drops strictly before `Arc<OptimisticTransactionDB>`).
-- `mesh_replication.rs` — Deterministic LWW replicated delta application, deduplicated
-  replicated search ops, and local tier-swap lineage transitions.
-- `rocksdb_kv.rs` — `RocksDbStorage` lifecycle, transactional KV/index/graph/blob/log/meta/lease
-  operations, safe watermark-coordinated log trimming, and checkpoints.
+- `mesh_replication.rs` — Replication metadata key prefixes and node-ID validation helpers.
+- `rocksdb_kv/` — `RocksDbStorage` lifecycle (`mod.rs`, `state.rs`), stateless validation/error
+  helpers (`helpers.rs`), secondary index application (`index_apply.rs`), optimistic
+  KV/index/idempotent transactions (`tx.rs`), snapshot scans and graph queries (`query.rs`),
+  blob/log/meta/lease/checkpoint operations (`log_meta.rs`), and LWW replicated delta + tier-swap
+  transitions (`replication.rs`).

@@ -3,22 +3,12 @@ use std::sync::Arc;
 use crate::search::SearchEngine;
 use crate::storage::StorageEngine;
 use crate::types::{
-    Ack, CommitResult, ExpectedVersion, IdempotencyContext, IndexMutations, IndexedMutation,
-    MembusError, ReplicatedApplyResult, ReplicatedDelta, SearchDocument, SearchLogOp,
-    SearchSyncStatus, VersionGuard,
+    Ack, ExpectedVersion, IdempotencyContext, IndexMutations, IndexedMutation, MembusError,
+    ReplicatedApplyResult, ReplicatedDelta, SearchDocument, SearchLogOp, SearchSyncStatus,
+    VersionGuard,
 };
 
-/// Result of an authoritative storage write paired with its secondary search synchronization state.
-///
-/// Once RocksDB commits authoritatively, secondary search-index ingestion failures NEVER
-/// convert the write into a client-visible rejection; instead they are logged, counted,
-/// marked dirty for `CF_LOG` catch-up replay, and reported as [`SearchSyncStatus::Deferred`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CoordinatedCommit {
-    pub commit: CommitResult,
-    pub search_sync: SearchSyncStatus,
-    pub idempotent_replay: bool,
-}
+pub use crate::types::CoordinatedCommit;
 
 /// Result of applying a replicated delta paired with echo-loop and secondary search status.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -28,50 +18,47 @@ pub struct CoordinatedReplicatedApply {
     pub search_sync: SearchSyncStatus,
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Parameters for a coordinated KV put with optional secondary index, search, and idempotency metadata.
+pub(crate) struct CoordinatedPutArgs<'a> {
+    pub namespace: &'a str,
+    pub key: &'a [u8],
+    pub value: &'a [u8],
+    pub ack: Ack,
+    pub expected: ExpectedVersion,
+    pub indexes: Option<&'a IndexMutations>,
+    pub search_op: Option<SearchLogOp>,
+    pub idempotency: Option<&'a IdempotencyContext>,
+}
+
+/// Parameters for a coordinated KV removal with optional secondary search and idempotency metadata.
+pub(crate) struct CoordinatedRemoveArgs<'a> {
+    pub namespace: &'a str,
+    pub key: &'a [u8],
+    pub ack: Ack,
+    pub expected: ExpectedVersion,
+    pub search_op: Option<SearchLogOp>,
+    pub idempotency: Option<&'a IdempotencyContext>,
+}
+
 pub(crate) fn coordinated_put_indexed(
     storage: &Arc<dyn StorageEngine>,
     search: Option<&Arc<SearchEngine>>,
-    namespace: &str,
-    key: &[u8],
-    value: &[u8],
-    ack: Ack,
-    expected: ExpectedVersion,
-    indexes: Option<&IndexMutations>,
-    search_op: Option<SearchLogOp>,
-) -> Result<CoordinatedCommit, MembusError> {
-    coordinated_put_indexed_idempotent(
-        storage, search, namespace, key, value, ack, expected, indexes, search_op, None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn coordinated_put_indexed_idempotent(
-    storage: &Arc<dyn StorageEngine>,
-    search: Option<&Arc<SearchEngine>>,
-    namespace: &str,
-    key: &[u8],
-    value: &[u8],
-    ack: Ack,
-    expected: ExpectedVersion,
-    indexes: Option<&IndexMutations>,
-    search_op: Option<SearchLogOp>,
-    idempotency: Option<&IdempotencyContext>,
+    args: CoordinatedPutArgs<'_>,
 ) -> Result<CoordinatedCommit, MembusError> {
     let (commit, replayed) = storage.put_indexed_idempotent(
-        namespace,
-        key,
-        value,
-        ack,
-        expected,
-        indexes,
-        search_op.as_ref(),
-        idempotency,
+        args.namespace,
+        args.key,
+        args.value,
+        args.ack,
+        args.expected,
+        args.indexes,
+        args.search_op.as_ref(),
+        args.idempotency,
     )?;
     let search_sync = if replayed {
         SearchSyncStatus::Synced
     } else {
-        match (search, search_op) {
+        match (search, args.search_op) {
             (Some(engine), Some(op)) => ingest_or_defer(engine, commit.seq, 0, commit.epoch, op),
             _ => SearchSyncStatus::Synced,
         }
@@ -86,40 +73,20 @@ pub(crate) fn coordinated_put_indexed_idempotent(
 pub(crate) fn coordinated_remove_indexed(
     storage: &Arc<dyn StorageEngine>,
     search: Option<&Arc<SearchEngine>>,
-    namespace: &str,
-    key: &[u8],
-    ack: Ack,
-    expected: ExpectedVersion,
-    search_op: Option<SearchLogOp>,
-) -> Result<CoordinatedCommit, MembusError> {
-    coordinated_remove_indexed_idempotent(
-        storage, search, namespace, key, ack, expected, search_op, None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn coordinated_remove_indexed_idempotent(
-    storage: &Arc<dyn StorageEngine>,
-    search: Option<&Arc<SearchEngine>>,
-    namespace: &str,
-    key: &[u8],
-    ack: Ack,
-    expected: ExpectedVersion,
-    search_op: Option<SearchLogOp>,
-    idempotency: Option<&IdempotencyContext>,
+    args: CoordinatedRemoveArgs<'_>,
 ) -> Result<CoordinatedCommit, MembusError> {
     let (commit, replayed) = storage.remove_indexed_idempotent(
-        namespace,
-        key,
-        ack,
-        expected,
-        search_op.as_ref(),
-        idempotency,
+        args.namespace,
+        args.key,
+        args.ack,
+        args.expected,
+        args.search_op.as_ref(),
+        args.idempotency,
     )?;
     let search_sync = if replayed {
         SearchSyncStatus::Synced
     } else {
-        match (search, search_op) {
+        match (search, args.search_op) {
             (Some(engine), Some(op)) => ingest_or_defer(engine, commit.seq, 0, commit.epoch, op),
             _ => SearchSyncStatus::Synced,
         }

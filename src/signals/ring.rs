@@ -6,7 +6,7 @@ use parking_lot::RwLock;
 use tokio::sync::Notify;
 
 use crate::signals::live_coalesced::CoalescingInbox;
-use crate::storage::SignalPublisher;
+use crate::storage::publisher::SignalPublisher;
 use crate::types::SignalEvent;
 
 const SHARD_COUNT: usize = 64;

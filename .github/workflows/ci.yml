@@ -54,5 +54,145 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Validate semantic-profile.json and semantic-baseline.json invariants
+        run: |
+          python3 - <<'PY'
+          import json
+          import math
+          import pathlib
+          import re
+          import sys
+
+          HOST_PATH_RE = re.compile(r"(?i)(?<![A-Za-z0-9_])[A-Z]:[/\\]")
+          ALLOWED_PROFILE_KEYS = {
+              "schema_version",
+              "domain_vocabulary",
+              "cohesive_data_globs",
+              "flat_dispatcher_globs",
+              "test_globs",
+              "ignore_globs",
+              "layers",
+              "strata",
+              "allowed_edges",
+              "forbidden_bypasses",
+              "budgets",
+          }
+          REQUIRED_BUDGET_KEYS = (
+              "max_hotspot_score",
+              "max_prod_fn_loc",
+              "max_blanket_suppressions",
+              "max_scc_count",
+              "max_bypass_count",
+              "max_smeared_write_count",
+              "max_phantom_coupling_count",
+          )
+
+          profile_path = pathlib.Path("semantic-profile.json")
+          baseline_path = pathlib.Path("semantic-baseline.json")
+          for p in (profile_path, baseline_path):
+              if not p.is_file():
+                  sys.exit(f"ERROR: missing required file {p}")
+              raw = p.read_text(encoding="utf-8")
+              if HOST_PATH_RE.search(raw):
+                  sys.exit(f"ERROR: host-specific drive path found in {p}")
+
+          profile = json.loads(profile_path.read_text(encoding="utf-8"))
+          baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+
+          unknown_keys = set(profile.keys()) - ALLOWED_PROFILE_KEYS
+          if unknown_keys:
+              sys.exit(f"ERROR: unknown semantic-profile.json keys: {sorted(unknown_keys)}")
+          if "layers" in profile and "strata" in profile:
+              sys.exit("ERROR: semantic-profile.json must not specify both 'layers' and 'strata'")
+          if profile.get("schema_version") != 1:
+              sys.exit(f"ERROR: unexpected schema_version: {profile.get('schema_version')!r}")
+
+          layers = profile.get("layers") or profile.get("strata") or []
+          if not isinstance(layers, list) or not layers:
+              sys.exit("ERROR: semantic-profile.json must declare non-empty layers")
+          layer_names = set()
+          for idx, layer in enumerate(layers):
+              if not isinstance(layer, dict):
+                  sys.exit(f"ERROR: layer[{idx}] must be an object")
+              if set(layer.keys()) != {"name", "globs"}:
+                  sys.exit(f"ERROR: layer[{idx}] must declare exact keys ['globs', 'name'], got {sorted(layer.keys())}")
+              name = layer.get("name")
+              globs = layer.get("globs")
+              if not isinstance(name, str) or not name.strip():
+                  sys.exit(f"ERROR: layer[{idx}].name must be a non-empty string")
+              if not isinstance(globs, list) or not globs or not all(isinstance(g, str) and g.strip() for g in globs):
+                  sys.exit(f"ERROR: layer '{name}' must declare non-empty string globs")
+              if name in layer_names:
+                  sys.exit(f"ERROR: duplicate layer name '{name}'")
+              layer_names.add(name)
+
+          for field in ("allowed_edges", "forbidden_bypasses"):
+              edges = profile.get(field) or []
+              if not isinstance(edges, list):
+                  sys.exit(f"ERROR: {field} must be a list")
+              for idx, edge in enumerate(edges):
+                  if not isinstance(edge, dict):
+                      sys.exit(f"ERROR: {field}[{idx}] must be an object")
+                  if set(edge.keys()) != {"from", "to"}:
+                      sys.exit(f"ERROR: {field}[{idx}] must declare exact keys ['from', 'to'], got {sorted(edge.keys())}")
+                  src = edge.get("from")
+                  dst = edge.get("to")
+                  if src not in layer_names or dst not in layer_names:
+                      sys.exit(f"ERROR: {field}[{idx}] references undeclared layer: {src!r} -> {dst!r}")
+
+          budgets = profile.get("budgets")
+          if not isinstance(budgets, dict):
+              sys.exit("ERROR: semantic-profile.json must declare budgets object")
+          if set(budgets.keys()) != set(REQUIRED_BUDGET_KEYS):
+              sys.exit(f"ERROR: budgets must declare exactly {list(REQUIRED_BUDGET_KEYS)}, got {sorted(budgets.keys())}")
+          hs = budgets["max_hotspot_score"]
+          if not isinstance(hs, (int, float)) or isinstance(hs, bool) or not math.isfinite(hs) or hs < 1.0:
+              sys.exit(f"ERROR: max_hotspot_score must be finite >= 1.0, got {hs!r}")
+          for key in REQUIRED_BUDGET_KEYS[1:]:
+              val = budgets[key]
+              if not isinstance(val, int) or isinstance(val, bool) or val < 0:
+                  sys.exit(f"ERROR: budget '{key}' must be a non-negative integer, got {val!r}")
+          for zero_key in ("max_scc_count", "max_blanket_suppressions", "max_smeared_write_count"):
+              if budgets[zero_key] != 0:
+                  sys.exit(f"ERROR: budget '{zero_key}' must remain 0, got {budgets[zero_key]!r}")
+
+          if baseline.get("repo_label") != "membus":
+              sys.exit(f"ERROR: semantic-baseline.json repo_label must be 'membus', got {baseline.get('repo_label')!r}")
+          summary = baseline.get("summary") or {}
+          baseline_budgets = ((baseline.get("profile") or {}).get("budgets"))
+          if baseline_budgets != budgets:
+              sys.exit("ERROR: semantic-baseline.json profile.budgets drifted from semantic-profile.json")
+          if summary.get("top_hotspot_score", float("inf")) > budgets["max_hotspot_score"]:
+              sys.exit("ERROR: baseline top_hotspot_score exceeds budget")
+          if summary.get("scc_count", 1) > budgets["max_scc_count"]:
+              sys.exit("ERROR: baseline scc_count exceeds budget")
+          if summary.get("blanket_suppressions", 1) > budgets["max_blanket_suppressions"]:
+              sys.exit("ERROR: baseline blanket_suppressions exceeds budget")
+          if summary.get("smeared_write_count", 1) > budgets["max_smeared_write_count"]:
+              sys.exit("ERROR: baseline smeared_write_count exceeds budget")
+          if summary.get("bypass_count", 10**9) > budgets["max_bypass_count"]:
+              sys.exit("ERROR: baseline bypass_count exceeds budget")
+          if summary.get("phantom_coupling_count", 10**9) > budgets["max_phantom_coupling_count"]:
+              sys.exit("ERROR: baseline phantom_coupling_count exceeds budget")
+
+          prod_files = [
+              f for f in (baseline.get("files") or [])
+              if f.get("role") == "production" and f.get("dampening_factor", 1.0) >= 1.0
+          ]
+          max_fn = max((f.get("max_fn_loc", 0) for f in prod_files), default=0)
+          if max_fn > budgets["max_prod_fn_loc"]:
+              sys.exit(f"ERROR: baseline max_prod_fn_loc {max_fn} exceeds budget {budgets['max_prod_fn_loc']}")
+
+          print(
+              f"OK: semantic profile & baseline valid "
+              f"(top_hotspot={summary['top_hotspot_score']}, max_fn={max_fn}, "
+              f"sccs={summary['scc_count']}, bypasses={summary['bypass_count']}, "
+              f"phantom={summary['phantom_coupling_count']})"
+          )
+          PY
+
       - name: Python stdlib client E2E tests
         run: python3 -m unittest discover -s clients/python -p "test_*.py" -v
+
+      - name: Python OCI registry GC unit tests
+        run: python3 -m unittest scripts/test_registry_gc.py -v

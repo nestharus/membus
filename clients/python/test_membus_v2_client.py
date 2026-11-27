@@ -502,6 +502,44 @@ class MembusPythonClientEndToEndTest(unittest.TestCase):
                 new_role="active",
             )
 
+    def test_08_direct_spec_from_file_location_without_sys_path(self) -> None:
+        """Loading membus_v2_client.py directly via spec_from_file_location works with clients/python off sys.path."""
+        import importlib.util
+
+        client_file = pathlib.Path(__file__).resolve().parent / "membus_v2_client.py"
+        client_dir = str(client_file.parent)
+        saved_path = list(sys.path)
+        saved_mods = {
+            k: sys.modules.pop(k)
+            for k in list(sys.modules)
+            if k in ("membus_v2_client", "membus_control", "membus_protocol")
+            or k.startswith("_membus_v2_sibling_")
+        }
+        try:
+            sys.path[:] = [p for p in sys.path if os.path.abspath(p or ".") != os.path.abspath(client_dir)]
+            spec = importlib.util.spec_from_file_location("standalone_membus_client", client_file)
+            assert spec is not None and spec.loader is not None
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            # Confirm sys.path was NOT mutated.
+            self.assertNotIn(client_dir, sys.path)
+            standalone_client = mod.MembusClient(self.client.base_url)
+            health = standalone_client.health()
+            self.assertGreaterEqual(int(health["epoch"]), 1)
+            # Verify shared MembusError class identity across client and control mixin.
+            with self.assertRaises(mod.MembusError) as ctx:
+                standalone_client.release_lease(
+                    mod.LeaseGrant("ns_missing", "res_missing", "h", 1, "tok", 0)
+                )
+            self.assertEqual(ctx.exception.status, 404)
+            self.assertEqual(ctx.exception.code, "not_found")
+        finally:
+            sys.path[:] = saved_path
+            for k in list(sys.modules):
+                if k.startswith("_membus_v2_sibling_") or k == "standalone_membus_client":
+                    sys.modules.pop(k, None)
+            sys.modules.update(saved_mods)
+
 
 if __name__ == "__main__":
     unittest.main()

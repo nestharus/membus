@@ -350,6 +350,64 @@ async fn execute_fenced_slot_swap(
     let primary_client = runtime.client_for(old_primary);
     let candidate_client = runtime.client_for(candidate);
 
+    let (primary_health, candidate_health) =
+        verify_swap_preconditions(&primary_client, &candidate_client, old_primary, candidate, timeout)
+            .await?;
+
+    let fenced_old = fence_outgoing_primary(
+        runtime,
+        &primary_client,
+        old_primary,
+        primary_health.role_epoch,
+        candidate_health.role_epoch,
+        timeout,
+    )
+    .await?;
+
+    let post_fence_ctx = PostFenceContext {
+        runtime,
+        primary_client: &primary_client,
+        candidate_client: &candidate_client,
+        old_primary,
+        fenced_old_epoch: fenced_old.role_epoch,
+        candidate_epoch: candidate_health.role_epoch,
+        timeout,
+    };
+
+    drain_and_verify_post_fence_parity(&post_fence_ctx, namespaces, mode).await?;
+
+    let promoted = promote_candidate_slot(&post_fence_ctx, candidate).await?;
+
+    let new_primary_seq = candidate_client
+        .health(timeout)
+        .await
+        .map(|h| h.latest_seq)
+        .unwrap_or(candidate_health.latest_seq);
+
+    runtime.commit_topology_swap(
+        candidate,
+        promoted.role_epoch,
+        fenced_old.role_epoch,
+        new_primary_seq,
+        true,
+    );
+
+    Ok(FencedSwapOutcome {
+        previous_primary: old_primary,
+        new_primary: candidate,
+        new_primary_epoch: promoted.role_epoch,
+        new_shadow_epoch: fenced_old.role_epoch,
+        parity_verified: true,
+    })
+}
+
+async fn verify_swap_preconditions(
+    primary_client: &UpstreamClient,
+    candidate_client: &UpstreamClient,
+    old_primary: SlotId,
+    candidate: SlotId,
+    timeout: Duration,
+) -> Result<(crate::types::HealthStatus, crate::types::HealthStatus), AdminError> {
     let primary_health = primary_client
         .health(timeout)
         .await
@@ -378,310 +436,254 @@ async fn execute_fenced_slot_swap(
             ),
         ));
     }
+    Ok((primary_health, candidate_health))
+}
 
-    // Stage 4a: Fence outgoing Primary FIRST (`Active -> Shadow`).
-    // On uncertain transport failure, probe Primary health to reconcile actual role/epoch.
-    let fenced_old = match primary_client
-        .transition_role(SlotRole::Active, primary_health.role_epoch, SlotRole::Shadow, timeout)
+async fn fence_outgoing_primary(
+    runtime: &RouterRuntime,
+    primary_client: &UpstreamClient,
+    old_primary: SlotId,
+    primary_epoch: u64,
+    candidate_epoch: u64,
+    timeout: Duration,
+) -> Result<crate::types::SlotRoleState, AdminError> {
+    match primary_client
+        .transition_role(SlotRole::Active, primary_epoch, SlotRole::Shadow, timeout)
         .await
     {
-        Ok(st) => st,
+        Ok(st) => Ok(st),
         Err(fence_err) => match primary_client.health(timeout).await {
             Ok(h) if h.slot_role == SlotRole::Shadow => {
-                runtime.update_role_epochs(h.role_epoch, candidate_health.role_epoch);
-                crate::types::SlotRoleState {
+                runtime.update_role_epochs(h.role_epoch, candidate_epoch);
+                Ok(crate::types::SlotRoleState {
                     role: SlotRole::Shadow,
                     role_epoch: h.role_epoch,
-                }
+                })
             }
             Ok(h) if h.slot_role == SlotRole::Active => {
-                runtime.update_role_epochs(h.role_epoch, candidate_health.role_epoch);
-                return Err(map_membus_error(fence_err));
+                runtime.update_role_epochs(h.role_epoch, candidate_epoch);
+                Err(map_membus_error(fence_err))
             }
             Ok(other) => {
                 runtime.mark_parity_dirty();
-                runtime.update_role_epochs(other.role_epoch, candidate_health.role_epoch);
-                return Err(admin_error(
+                runtime.update_role_epochs(other.role_epoch, candidate_epoch);
+                Err(admin_error(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "fence_uncertain_degraded",
                     format!(
                         "outgoing primary {old_primary} fence failed ({fence_err}) and reported unexpected role '{}'",
                         other.slot_role.as_str()
                     ),
-                ));
+                ))
             }
             Err(probe_err) => {
                 runtime.mark_parity_dirty();
-                return Err(admin_error(
+                Err(admin_error(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "fence_uncertain_degraded",
                     format!(
                         "outgoing primary {old_primary} fence failed ({fence_err}) and health probe failed ({probe_err})"
                     ),
-                ));
+                ))
             }
         },
-    };
+    }
+}
 
-    // Drain any final writes committed immediately prior to fencing.
-    let start_seq = runtime.topology_snapshot().catchup_start_seq();
-    let (_, _, cursor, touched_tail, saw_standalone_search) = match runtime
+struct PostFenceContext<'a> {
+    runtime: &'a RouterRuntime,
+    primary_client: &'a UpstreamClient,
+    candidate_client: &'a UpstreamClient,
+    old_primary: SlotId,
+    fenced_old_epoch: u64,
+    candidate_epoch: u64,
+    timeout: Duration,
+}
+
+async fn drain_and_verify_post_fence_parity(
+    ctx: &PostFenceContext<'_>,
+    namespaces: &[String],
+    mode: ParityDigestMode,
+) -> Result<(), AdminError> {
+    let start_seq = ctx.runtime.topology_snapshot().catchup_start_seq();
+    let (_, _, cursor, touched_tail, saw_standalone_search) = match ctx
+        .runtime
         .replay_updates_until_caught_up(
-            &primary_client,
-            &candidate_client,
-            old_primary,
-            candidate_health.role_epoch,
+            ctx.primary_client,
+            ctx.candidate_client,
+            ctx.old_primary,
+            ctx.candidate_epoch,
             start_seq,
-            timeout,
+            ctx.timeout,
         )
         .await
     {
         Ok(res) => res,
         Err(err) => {
-            runtime.mark_parity_dirty();
-            return Err(
-                compensate_restore_primary(
-                    runtime,
-                    &primary_client,
-                    fenced_old.role_epoch,
-                    candidate_health.role_epoch,
-                    map_membus_error(err),
-                    timeout,
-                )
-                .await,
-            );
+            ctx.runtime.mark_parity_dirty();
+            return Err(compensate_restore_primary(ctx, map_membus_error(err)).await);
         }
     };
 
     if saw_standalone_search {
-        runtime.mark_parity_dirty();
-        return Err(
-            compensate_restore_primary(
-                runtime,
-                &primary_client,
-                fenced_old.role_epoch,
-                candidate_health.role_epoch,
-                admin_error(
-                    StatusCode::CONFLICT,
-                    "unreplicated_search_ops",
-                    "swap aborted after fencing: standalone search_ops require manual sync"
-                        .to_owned(),
-                ),
-                timeout,
-            )
-            .await,
+        ctx.runtime.mark_parity_dirty();
+        let err = admin_error(
+            StatusCode::CONFLICT,
+            "unreplicated_search_ops",
+            "swap aborted after fencing: standalone search_ops require manual sync".to_owned(),
         );
+        return Err(compensate_restore_primary(ctx, err).await);
     }
 
-    // Confirm tail catch-up actually reached fenced Primary's final `latest_seq`.
-    let fenced_health = match primary_client.health(timeout).await {
+    let fenced_health = match ctx.primary_client.health(ctx.timeout).await {
         Ok(h) => h,
         Err(err) => {
-            runtime.mark_parity_dirty();
-            return Err(
-                compensate_restore_primary(
-                    runtime,
-                    &primary_client,
-                    fenced_old.role_epoch,
-                    candidate_health.role_epoch,
-                    map_membus_error(err),
-                    timeout,
-                )
-                .await,
-            );
+            ctx.runtime.mark_parity_dirty();
+            return Err(compensate_restore_primary(ctx, map_membus_error(err)).await);
         }
     };
     if cursor < fenced_health.latest_seq {
-        runtime.mark_parity_dirty();
-        return Err(
-            compensate_restore_primary(
-                runtime,
-                &primary_client,
-                fenced_old.role_epoch,
-                candidate_health.role_epoch,
-                admin_error(
-                    StatusCode::CONFLICT,
-                    "catchup_incomplete",
-                    format!(
-                        "swap aborted after fencing: tail catchup reached seq {cursor} < fenced primary latest_seq {}",
-                        fenced_health.latest_seq
-                    ),
-                ),
-                timeout,
-            )
-            .await,
+        ctx.runtime.mark_parity_dirty();
+        let err = admin_error(
+            StatusCode::CONFLICT,
+            "catchup_incomplete",
+            format!(
+                "swap aborted after fencing: tail catchup reached seq {cursor} < fenced primary latest_seq {}",
+                fenced_health.latest_seq
+            ),
         );
+        return Err(compensate_restore_primary(ctx, err).await);
     }
 
-    // Re-verify post-fence parity across declared + tail-touched namespaces.
-    let all_namespaces = runtime.discover_namespaces(namespaces, &touched_tail).await;
-    match runtime.verify_parity(&all_namespaces, mode, None).await {
-        Ok(report) if report.matched => {}
+    let all_namespaces = ctx.runtime.discover_namespaces(namespaces, &touched_tail).await;
+    match ctx.runtime.verify_parity(&all_namespaces, mode, None).await {
+        Ok(report) if report.matched => Ok(()),
         Ok(_) => {
-            runtime.mark_parity_dirty();
-            return Err(
-                compensate_restore_primary(
-                    runtime,
-                    &primary_client,
-                    fenced_old.role_epoch,
-                    candidate_health.role_epoch,
-                    admin_error(
-                        StatusCode::CONFLICT,
-                        "parity_mismatch",
-                        "swap aborted after fencing: post-fence parity digest mismatch; restored outgoing primary"
-                            .to_owned(),
-                    ),
-                    timeout,
-                )
-                .await,
+            ctx.runtime.mark_parity_dirty();
+            let err = admin_error(
+                StatusCode::CONFLICT,
+                "parity_mismatch",
+                "swap aborted after fencing: post-fence parity digest mismatch; restored outgoing primary"
+                    .to_owned(),
             );
+            Err(compensate_restore_primary(ctx, err).await)
         }
         Err(err) => {
-            runtime.mark_parity_dirty();
-            return Err(
-                compensate_restore_primary(
-                    runtime,
-                    &primary_client,
-                    fenced_old.role_epoch,
-                    candidate_health.role_epoch,
-                    map_membus_error(err),
-                    timeout,
-                )
-                .await,
-            );
+            ctx.runtime.mark_parity_dirty();
+            Err(compensate_restore_primary(ctx, map_membus_error(err)).await)
         }
     }
+}
 
-    // Stage 4b: Promote Candidate (`Shadow -> Active`).
-    let promoted = match candidate_client
-        .transition_role(SlotRole::Shadow, candidate_health.role_epoch, SlotRole::Active, timeout)
+async fn promote_candidate_slot(
+    ctx: &PostFenceContext<'_>,
+    candidate: SlotId,
+) -> Result<crate::types::SlotRoleState, AdminError> {
+    match ctx
+        .candidate_client
+        .transition_role(SlotRole::Shadow, ctx.candidate_epoch, SlotRole::Active, ctx.timeout)
         .await
     {
-        Ok(st) => st,
-        Err(promo_err) => {
-            // Probe Candidate health FIRST to prevent dual-Active split-brain!
-            match candidate_client.health(timeout).await {
-                Ok(h) if h.slot_role == SlotRole::Active => crate::types::SlotRoleState {
-                    role: SlotRole::Active,
-                    role_epoch: h.role_epoch,
-                },
-                Ok(h) if h.slot_role == SlotRole::Shadow => {
-                    return Err(
-                        compensate_restore_primary(
-                            runtime,
-                            &primary_client,
-                            fenced_old.role_epoch,
-                            h.role_epoch,
-                            map_membus_error(promo_err),
-                            timeout,
-                        )
-                        .await,
-                    );
-                }
-                Ok(other) => {
-                    runtime.mark_parity_dirty();
-                    runtime.update_role_epochs(fenced_old.role_epoch, other.role_epoch);
-                    return Err(admin_error(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "ambiguous_promotion_degraded",
-                        format!(
-                            "candidate {candidate} promotion failed ({promo_err}) and reported unexpected role '{}'; refusing to re-promote {old_primary} to prevent split-brain",
-                            other.slot_role.as_str()
-                        ),
-                    ));
-                }
-                Err(probe_err) => {
-                    runtime.mark_parity_dirty();
-                    runtime.update_role_epochs(fenced_old.role_epoch, candidate_health.role_epoch);
-                    return Err(admin_error(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "ambiguous_promotion_degraded",
-                        format!(
-                            "candidate {candidate} promotion failed ({promo_err}) and health probe failed ({probe_err}); refusing to re-promote {old_primary} to prevent dual-Active split-brain"
-                        ),
-                    ));
-                }
+        Ok(st) => Ok(st),
+        Err(promo_err) => match ctx.candidate_client.health(ctx.timeout).await {
+            Ok(h) if h.slot_role == SlotRole::Active => Ok(crate::types::SlotRoleState {
+                role: SlotRole::Active,
+                role_epoch: h.role_epoch,
+            }),
+            Ok(h) if h.slot_role == SlotRole::Shadow => {
+                let comp_ctx = PostFenceContext {
+                    runtime: ctx.runtime,
+                    primary_client: ctx.primary_client,
+                    candidate_client: ctx.candidate_client,
+                    old_primary: ctx.old_primary,
+                    fenced_old_epoch: ctx.fenced_old_epoch,
+                    candidate_epoch: h.role_epoch,
+                    timeout: ctx.timeout,
+                };
+                Err(compensate_restore_primary(&comp_ctx, map_membus_error(promo_err)).await)
             }
-        }
-    };
-
-    let new_primary_seq = candidate_client
-        .health(timeout)
-        .await
-        .map(|h| h.latest_seq)
-        .unwrap_or(candidate_health.latest_seq);
-
-    runtime.commit_topology_swap(
-        candidate,
-        promoted.role_epoch,
-        fenced_old.role_epoch,
-        new_primary_seq,
-        true,
-    );
-
-    Ok(FencedSwapOutcome {
-        previous_primary: old_primary,
-        new_primary: candidate,
-        new_primary_epoch: promoted.role_epoch,
-        new_shadow_epoch: fenced_old.role_epoch,
-        parity_verified: true,
-    })
+            Ok(other) => {
+                ctx.runtime.mark_parity_dirty();
+                ctx.runtime
+                    .update_role_epochs(ctx.fenced_old_epoch, other.role_epoch);
+                Err(admin_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "ambiguous_promotion_degraded",
+                    format!(
+                        "candidate {candidate} promotion failed ({promo_err}) and reported unexpected role '{}'; refusing to re-promote {} to prevent split-brain",
+                        other.slot_role.as_str(),
+                        ctx.old_primary
+                    ),
+                ))
+            }
+            Err(probe_err) => {
+                ctx.runtime.mark_parity_dirty();
+                ctx.runtime
+                    .update_role_epochs(ctx.fenced_old_epoch, ctx.candidate_epoch);
+                Err(admin_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "ambiguous_promotion_degraded",
+                    format!(
+                        "candidate {candidate} promotion failed ({promo_err}) and health probe failed ({probe_err}); refusing to re-promote {} to prevent dual-Active split-brain",
+                        ctx.old_primary
+                    ),
+                ))
+            }
+        },
+    }
 }
 
 /// Compensate by restoring the fenced Primary (`Shadow -> Active`) and immediately updating
 /// cached role epochs so subsequent client writes succeed without stale `X-Membus-Role-Epoch`.
 /// If compensation itself fails, returns `503 double_fenced_degraded` explicitly.
 async fn compensate_restore_primary(
-    runtime: &RouterRuntime,
-    primary_client: &UpstreamClient,
-    fenced_primary_epoch: u64,
-    candidate_epoch: u64,
+    ctx: &PostFenceContext<'_>,
     original_err: AdminError,
-    timeout: Duration,
 ) -> AdminError {
-    match primary_client
-        .transition_role(SlotRole::Shadow, fenced_primary_epoch, SlotRole::Active, timeout)
+    match ctx
+        .primary_client
+        .transition_role(SlotRole::Shadow, ctx.fenced_old_epoch, SlotRole::Active, ctx.timeout)
         .await
     {
         Ok(restored) => {
-            runtime.update_role_epochs(restored.role_epoch, candidate_epoch);
+            ctx.runtime
+                .update_role_epochs(restored.role_epoch, ctx.candidate_epoch);
             original_err
         }
-        Err(comp_err) => {
-            // Probe Primary health first: if restoration actually committed before a transport
-            // error, reconcile its real `role_epoch` instead of falsely reporting double-fenced.
-            match primary_client.health(timeout).await {
-                Ok(h) if h.slot_role == SlotRole::Active => {
-                    runtime.update_role_epochs(h.role_epoch, candidate_epoch);
-                    original_err
-                }
-                Ok(h) => {
-                    runtime.mark_parity_dirty();
-                    runtime.update_role_epochs(h.role_epoch, candidate_epoch);
-                    admin_error(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "double_fenced_degraded",
-                        format!(
-                            "swap failed ({}) AND primary restoration failed ({comp_err}): primary is '{}', candidate is 'shadow'; manual operator recovery required",
-                            original_err.message,
-                            h.slot_role.as_str()
-                        ),
-                    )
-                }
-                Err(probe_err) => {
-                    runtime.mark_parity_dirty();
-                    runtime.update_role_epochs(fenced_primary_epoch, candidate_epoch);
-                    admin_error(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "double_fenced_degraded",
-                        format!(
-                            "swap failed ({}) AND primary restoration failed ({comp_err}; health probe: {probe_err}): BOTH slots may be fenced in Shadow; manual operator recovery required",
-                            original_err.message
-                        ),
-                    )
-                }
+        Err(comp_err) => match ctx.primary_client.health(ctx.timeout).await {
+            Ok(h) if h.slot_role == SlotRole::Active => {
+                ctx.runtime
+                    .update_role_epochs(h.role_epoch, ctx.candidate_epoch);
+                original_err
             }
-        }
+            Ok(h) => {
+                ctx.runtime.mark_parity_dirty();
+                ctx.runtime
+                    .update_role_epochs(h.role_epoch, ctx.candidate_epoch);
+                admin_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "double_fenced_degraded",
+                    format!(
+                        "swap failed ({}) AND primary restoration failed ({comp_err}): primary is '{}', candidate is 'shadow'; manual operator recovery required",
+                        original_err.message,
+                        h.slot_role.as_str()
+                    ),
+                )
+            }
+            Err(probe_err) => {
+                ctx.runtime.mark_parity_dirty();
+                ctx.runtime
+                    .update_role_epochs(ctx.fenced_old_epoch, ctx.candidate_epoch);
+                admin_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "double_fenced_degraded",
+                    format!(
+                        "swap failed ({}) AND primary restoration failed ({comp_err}; health probe: {probe_err}): BOTH slots may be fenced in Shadow; manual operator recovery required",
+                        original_err.message
+                    ),
+                )
+            }
+        },
     }
 }
 

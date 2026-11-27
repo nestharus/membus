@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex as FastMutex;
 
-use crate::storage::SignalPublisher;
+use crate::storage::publisher::SignalPublisher;
 use crate::types::SignalEvent;
 
 struct SequencerState {
@@ -98,7 +98,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::PublishSequencer;
-    use crate::storage::SignalPublisher;
+    use crate::storage::publisher::SignalPublisher;
     use crate::types::{SignalEvent, SignalKind};
 
     struct VecPublisher(Mutex<Vec<u64>>);

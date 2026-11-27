@@ -1,0 +1,126 @@
+{
+  "schema_version": 1,
+  "domain_vocabulary": [
+    "RocksDbStorage",
+    "OptimisticTransactionDB",
+    "StorageEngine",
+    "OwnedSnapshot",
+    "CF_KV",
+    "CF_LOG",
+    "CF_BLOB",
+    "CF_IDX_ORD",
+    "CF_IDX_EDGE",
+    "CF_IDX_REV",
+    "CF_LEASE",
+    "CF_META",
+    "SignalRing",
+    "SignalBroker",
+    "SearchEngine",
+    "MeshNode",
+    "CollectionCatalog",
+    "LeaseManager",
+    "TieringManager",
+    "SlotRole",
+    "WriteCoord"
+  ],
+  "test_globs": [
+    "tests/**",
+    "scripts/test_*.py",
+    "clients/python/test_*.py"
+  ],
+  "layers": [
+    {
+      "name": "entry",
+      "globs": [
+        "src/main.rs",
+        "src/lib.rs",
+        "src/bin/**",
+        "src/cli/**",
+        "examples/**",
+        "scripts/**"
+      ]
+    },
+    {
+      "name": "clients_router",
+      "globs": [
+        "src/router/**",
+        "src/client/**",
+        "clients/**"
+      ]
+    },
+    {
+      "name": "transport",
+      "globs": [
+        "src/transport/**"
+      ]
+    },
+    {
+      "name": "services",
+      "globs": [
+        "src/mesh/**",
+        "src/backup/**",
+        "src/tiering/**",
+        "src/search/**",
+        "src/signals/**",
+        "src/auth/**",
+        "src/catalog/**",
+        "src/storage/parity.rs"
+      ]
+    },
+    {
+      "name": "storage",
+      "globs": [
+        "src/storage/**"
+      ]
+    },
+    {
+      "name": "foundation",
+      "globs": [
+        "src/protocol/**",
+        "src/index/**",
+        "src/types/**"
+      ]
+    }
+  ],
+  "allowed_edges": [
+    { "from": "entry", "to": "clients_router" },
+    { "from": "entry", "to": "transport" },
+    { "from": "entry", "to": "services" },
+    { "from": "entry", "to": "storage" },
+    { "from": "entry", "to": "foundation" },
+    { "from": "clients_router", "to": "transport" },
+    { "from": "clients_router", "to": "services" },
+    { "from": "clients_router", "to": "foundation" },
+    { "from": "transport", "to": "services" },
+    { "from": "transport", "to": "storage" },
+    { "from": "transport", "to": "foundation" },
+    { "from": "services", "to": "storage" },
+    { "from": "services", "to": "foundation" },
+    { "from": "storage", "to": "foundation" }
+  ],
+  "forbidden_bypasses": [
+    { "from": "foundation", "to": "storage" },
+    { "from": "foundation", "to": "services" },
+    { "from": "foundation", "to": "transport" },
+    { "from": "foundation", "to": "clients_router" },
+    { "from": "foundation", "to": "entry" },
+    { "from": "storage", "to": "transport" },
+    { "from": "storage", "to": "clients_router" },
+    { "from": "storage", "to": "entry" },
+    { "from": "services", "to": "transport" },
+    { "from": "services", "to": "clients_router" },
+    { "from": "services", "to": "entry" },
+    { "from": "transport", "to": "clients_router" },
+    { "from": "transport", "to": "entry" },
+    { "from": "clients_router", "to": "entry" }
+  ],
+  "budgets": {
+    "max_hotspot_score": 480.0,
+    "max_prod_fn_loc": 220,
+    "max_blanket_suppressions": 0,
+    "max_scc_count": 0,
+    "max_bypass_count": 35,
+    "max_smeared_write_count": 0,
+    "max_phantom_coupling_count": 70
+  }
+}

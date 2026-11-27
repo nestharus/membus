@@ -344,6 +344,18 @@ impl LeaseManager {
             let prev = decode_lease_record(bytes)?;
             let now = self.monotonic_now_ms();
 
+            if prev.released {
+                return Err(MembusError::NotFound(format!(
+                    "lease '{resource}' is inactive (already released at generation {})",
+                    prev.generation
+                )));
+            }
+            if prev.expires_at_ms <= now {
+                return Err(MembusError::NotFound(format!(
+                    "lease '{resource}' is inactive (expired at generation {})",
+                    prev.generation
+                )));
+            }
             if !lease_matches_active(&prev, holder, generation, token, now) {
                 return Err(MembusError::LeaseHeld {
                     resource: resource.to_owned(),
@@ -408,6 +420,18 @@ impl LeaseManager {
             let prev = decode_lease_record(bytes)?;
             let now = self.monotonic_now_ms();
 
+            if prev.released {
+                return Err(MembusError::NotFound(format!(
+                    "lease '{resource}' is inactive (already released at generation {})",
+                    prev.generation
+                )));
+            }
+            if prev.expires_at_ms <= now {
+                return Err(MembusError::NotFound(format!(
+                    "lease '{resource}' is inactive (expired at generation {})",
+                    prev.generation
+                )));
+            }
             if !lease_matches_active(&prev, holder, generation, token, now) {
                 return Err(MembusError::LeaseHeld {
                     resource: resource.to_owned(),

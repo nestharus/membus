@@ -4,23 +4,14 @@ use sha2::{Digest, Sha256};
 
 use crate::catalog::CollectionCatalog;
 use crate::mesh::DigestResponse;
-use crate::storage::StorageEngine;
+use crate::storage::contract::StorageEngine;
 use crate::tiering::TieringManager;
 use crate::types::{
     validate_namespace, MembusError, NamespaceParityDigest, ParityDigestMode, ScanOptions,
     MAX_KEY_BYTES,
 };
 
-/// Encode a 32-byte SHA-256 digest as a 64-character lowercase hexadecimal string.
-pub fn encode_sha256_hex(digest: &[u8; 32]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(64);
-    for &b in digest {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0x0f) as usize] as char);
-    }
-    out
-}
+pub use crate::types::encode_sha256_hex;
 
 /// Compute a deterministic 32-byte XOR support-digest over all keys in `(namespace, key_prefix)`
 /// under a single O(1) MVCC snapshot using the selected [`ParityDigestMode`] and optional overall

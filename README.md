@@ -81,7 +81,7 @@ configured, or `--allow-insecure-non-loopback` is explicitly supplied.
 
 ## Modules
 
-- `src/types.rs` — Core domain types (`Ack`, `ExpectedVersion`, `StoredRecord`,
+- `src/types/` — Core domain types (`Ack`, `ExpectedVersion`, `StoredRecord`,
   `ReadMode`, `ColdRef`, `WriteMutation`, `VersionGuard`, `IndexMutations`,
   `SearchDocument`, `SearchQuery`, `LeaseGrant`, `LeaseInfo`,
   `CollectionDescriptor`, `SignalEvent`, `ReplicatedDelta`, `ReplicationStamp`,
@@ -195,4 +195,18 @@ client.put("app", "greeting", "hello")
 rec = client.get("app", "greeting")
 for msg in client.stream_signals("app", mode="each"):
     print(msg.event, msg.data)
+```
+
+## Longitudinal Architecture & Semantic Profiling
+
+Membus tracks architectural health (zero circular dependency clusters, bounded function size and
+hotspot scores, layer boundaries, and suppression budgets) using
+[semantic-profiler](https://github.com/nestharus/semantic-profiler) configured via
+[`semantic-profile.json`](semantic-profile.json) and locked against
+[`semantic-baseline.json`](semantic-baseline.json).
+
+Run the profile and budget check locally from the repository root:
+
+```bash
+semantic-profiler check . --require-profile --base semantic-baseline.json
 ```

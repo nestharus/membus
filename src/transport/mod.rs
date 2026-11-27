@@ -1,4 +1,5 @@
 pub mod connection;
+pub(crate) mod helpers;
 pub mod http;
 pub mod named_pipe;
 pub mod tcp;

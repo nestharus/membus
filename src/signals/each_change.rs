@@ -3,8 +3,20 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::signals::ring::{NamespaceChannel, RingRead, WILDCARD_NAMESPACE};
-use crate::storage::StorageEngine;
+use crate::storage::contract::StorageEngine;
 use crate::types::{MembusError, SignalEvent};
+
+pub(crate) struct EachChangeInit {
+    pub(crate) storage: Arc<dyn StorageEngine>,
+    pub(crate) channel: Arc<NamespaceChannel>,
+    pub(crate) namespace: String,
+    pub(crate) key_prefix: Vec<u8>,
+    pub(crate) epoch: u64,
+    pub(crate) since_seq: u64,
+    pub(crate) startup_floor_seq: u64,
+    pub(crate) batch_size: usize,
+    pub(crate) active_counter: Arc<AtomicUsize>,
+}
 
 /// Lossless ordered subscription stream reading fast-path events from the RAM ring
 /// and seamlessly catching up lagging cursors from the durable `log` column family.
@@ -23,31 +35,20 @@ pub struct EachChangeSubscription {
 }
 
 impl EachChangeSubscription {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        storage: Arc<dyn StorageEngine>,
-        channel: Arc<NamespaceChannel>,
-        namespace: String,
-        key_prefix: Vec<u8>,
-        epoch: u64,
-        since_seq: u64,
-        startup_floor_seq: u64,
-        batch_size: usize,
-        active_counter: Arc<AtomicUsize>,
-    ) -> Self {
-        active_counter.fetch_add(1, Ordering::AcqRel);
+    pub(crate) fn new(init: EachChangeInit) -> Self {
+        init.active_counter.fetch_add(1, Ordering::AcqRel);
         Self {
-            storage,
-            channel,
-            namespace,
-            key_prefix,
-            epoch,
-            delivered_seq: since_seq,
-            fetched_seq: since_seq,
-            startup_floor_seq,
-            batch_size: batch_size.max(1),
+            storage: init.storage,
+            channel: init.channel,
+            namespace: init.namespace,
+            key_prefix: init.key_prefix,
+            epoch: init.epoch,
+            delivered_seq: init.since_seq,
+            fetched_seq: init.since_seq,
+            startup_floor_seq: init.startup_floor_seq,
+            batch_size: init.batch_size.max(1),
             buffered: VecDeque::new(),
-            active_counter,
+            active_counter: init.active_counter,
         }
     }
 

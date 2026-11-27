@@ -4,8 +4,9 @@ pub mod ring;
 
 use std::sync::Arc;
 
+use crate::signals::each_change::EachChangeInit;
 use crate::signals::live_coalesced::CoalescingInbox;
-use crate::storage::StorageEngine;
+use crate::storage::contract::StorageEngine;
 use crate::types::{validate_namespace, MembusError};
 
 pub use each_change::EachChangeSubscription;
@@ -76,17 +77,17 @@ impl SignalBroker {
         }
 
         let channel = self.ring.channel_for(namespace);
-        Ok(EachChangeSubscription::new(
-            Arc::clone(&self.storage),
+        Ok(EachChangeSubscription::new(EachChangeInit {
+            storage: Arc::clone(&self.storage),
             channel,
-            namespace.to_owned(),
+            namespace: namespace.to_owned(),
             key_prefix,
-            current_epoch,
+            epoch: current_epoch,
             since_seq,
-            self.startup_seq,
-            self.config.log_catchup_batch_size,
-            self.ring.subscription_counter(),
-        ))
+            startup_floor_seq: self.startup_seq,
+            batch_size: self.config.log_catchup_batch_size,
+            active_counter: self.ring.subscription_counter(),
+        }))
     }
 
     /// Open a `LiveCoalesced` subscription coalescing bursts per `(namespace, key)`
