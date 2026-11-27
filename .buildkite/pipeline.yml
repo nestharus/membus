@@ -1,0 +1,156 @@
+# Buildkite CI/CD pipeline for Membus v2 + membus-ab-router.
+#
+# Tiered gates prevent image spam and unverified rollouts:
+# 1. Fast static, clippy, zero-SQLite, Rust unit/integration, Python client, Flux pin,
+#    and Registry GC tests must pass BEFORE any container image is built (`wait` barrier).
+# 2. Content-hash skip-build checks whether an immutable digest matching the exact full
+#    SHA-256 content hash already exists in the registry before invoking BuildKit.
+# 3. Flux GitOps overlay pins ONLY the inactive slot (`slot-a` or `slot-b`) with a
+#    validated immutable `@sha256:` digest via `scripts/update_flux_digest.py`.
+# 4. Dual-slot anti-spam registry GC retains Slot A, Slot B, ab-router, last-known-good
+#    rollback digest, and last N releases (dry-run by default; fails closed on missing pins).
+
+env:
+  OCI_REGISTRY_URL: "https://ghcr.io"
+  OCI_REPOSITORY: "oulipoly/membus"
+  OCI_REGISTRY_REPO: "ghcr.io/oulipoly/membus"
+  RETAIN_RELEASES: "5"
+
+steps:
+  - label: ":shield: Static Gate — Zero SQLite & Lockfile Integrity"
+    key: "static-gate"
+    command: |
+      set -euo pipefail
+      rc=0
+      rg -i '\b(rusqlite|libsqlite3|sqlite3|sqlx::sqlite)\b' Cargo.toml Cargo.lock src/ || rc=$?
+      if [ "$rc" -eq 0 ]; then
+        echo "ERROR: prohibited SQLite reference detected"
+        exit 1
+      elif [ "$rc" -ne 1 ]; then
+        echo "ERROR: rg static gate failed with exit code ${rc}"
+        exit 1
+      fi
+      cargo metadata --locked --format-version 1 > /dev/null
+
+  - label: ":rust: Clippy & Full Rust Test Suite"
+    key: "rust-tests"
+    command: |
+      set -euo pipefail
+      cargo clippy --locked --all-targets -- -D warnings
+      cargo test --locked
+
+  - label: ":python: Python Client & Delivery Script Unit Tests"
+    key: "python-tests"
+    depends_on: "rust-tests"
+    command: |
+      set -euo pipefail
+      python3 -m unittest discover -s clients/python -p 'test_*.py' -v
+      python3 -m unittest scripts/test_registry_gc.py -v
+
+  - wait
+
+  - label: ":docker: Content-Hash Skip-Build & Digest-Pinned Publish"
+    key: "publish-image"
+    branches: "main"
+    command: |
+      set -euo pipefail
+      TMPDIR_BUILD="$(mktemp -d)"
+      trap 'rm -rf "${TMPDIR_BUILD}"' EXIT
+
+      CONTENT_HASH="$(
+        (
+          sha256sum -- Containerfile Cargo.toml Cargo.lock
+          find src -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum --
+        ) | sha256sum | awk '{print $1}'
+      )"
+      CONTENT_TAG="content-${CONTENT_HASH:0:16}"
+      echo "Computed build input content hash: ${CONTENT_HASH} (tag: ${CONTENT_TAG})"
+
+      CACHE_HIT=false
+      if EXISTING_DIGEST="$(oras resolve "${OCI_REGISTRY_REPO}:${CONTENT_TAG}" 2>/dev/null)"; then
+        if [[ "${EXISTING_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+          EXISTING_HASH="$(
+            oras manifest fetch-config "${OCI_REGISTRY_REPO}@${EXISTING_DIGEST}" 2>/dev/null \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin).get("config",{}).get("Labels",{}).get("io.oulipoly.membus.content_sha256",""))' \
+              || true
+          )"
+          if [ "${EXISTING_HASH}" = "${CONTENT_HASH}" ]; then
+            echo "Verified full content-hash cache hit: skipping rebuild; reusing ${EXISTING_DIGEST}"
+            IMAGE_DIGEST="${EXISTING_DIGEST}"
+            CACHE_HIT=true
+          else
+            echo "Tag prefix collision or missing content_sha256 label; rebuilding."
+          fi
+        fi
+      fi
+
+      if [ "${CACHE_HIT}" != "true" ]; then
+        docker buildx build \
+          --file Containerfile \
+          --platform linux/amd64 \
+          --tag "${OCI_REGISTRY_REPO}:${CONTENT_TAG}" \
+          --tag "${OCI_REGISTRY_REPO}:sha-${BUILDKITE_COMMIT:0:12}" \
+          --label "org.opencontainers.image.revision=${BUILDKITE_COMMIT}" \
+          --label "io.oulipoly.membus.content_sha256=${CONTENT_HASH}" \
+          --label "io.oulipoly.membus.supports_versions=1,2" \
+          --iidfile "${TMPDIR_BUILD}/image.iid" \
+          --metadata-file "${TMPDIR_BUILD}/build-meta.json" \
+          --push \
+          .
+        IMAGE_DIGEST="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["containerimage.digest"])' "${TMPDIR_BUILD}/build-meta.json")"
+      fi
+
+      if [[ ! "${IMAGE_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+        echo "ERROR: resolved digest '${IMAGE_DIGEST}' is not a valid sha256 digest"
+        exit 1
+      fi
+
+      echo "Resolved immutable digest: ${OCI_REGISTRY_REPO}@${IMAGE_DIGEST}"
+      buildkite-agent meta-data set "membus-image-digest" "${IMAGE_DIGEST}"
+      buildkite-agent meta-data set "membus-content-hash" "${CONTENT_HASH}"
+
+  - label: ":flux: Update Inactive Slot Digest Pin (GitOps Overlay)"
+    key: "flux-digest-update"
+    depends_on: "publish-image"
+    branches: "main"
+    command: |
+      set -euo pipefail
+      : "${FLUX_OVERLAY_KUSTOMIZATION:?set FLUX_OVERLAY_KUSTOMIZATION to the target environment overlay kustomization.yaml}"
+      IMAGE_DIGEST="$(buildkite-agent meta-data get "membus-image-digest")"
+      TARGET_SLOT="${FLUX_TARGET_SLOT:-slot-b}"
+      python3 scripts/update_flux_digest.py \
+        --kustomization "${FLUX_OVERLAY_KUSTOMIZATION}" \
+        --slot "${TARGET_SLOT}" \
+        --digest "${IMAGE_DIGEST}"
+      echo "Updated ${TARGET_SLOT} pin in ${FLUX_OVERLAY_KUSTOMIZATION} to ${IMAGE_DIGEST}."
+      echo "NOTE: Traffic cutover remains gated by ab-router /admin/parity + /admin/cutover."
+
+  - label: ":broom: Dual-Slot Anti-Spam Registry GC"
+    key: "registry-gc"
+    depends_on: "flux-digest-update"
+    branches: "main"
+    command: |
+      set -euo pipefail
+      : "${FLUX_OVERLAY_KUSTOMIZATION:?set FLUX_OVERLAY_KUSTOMIZATION to the target environment overlay kustomization.yaml}"
+      GC_FLAGS=(
+        --kustomization "${FLUX_OVERLAY_KUSTOMIZATION}"
+        --retain-releases "${RETAIN_RELEASES}"
+        --require-dual-slot-pins
+      )
+      if [ -n "${ROLLBACK_DIGEST_FILE:-}" ]; then
+        if [ ! -f "${ROLLBACK_DIGEST_FILE}" ]; then
+          echo "ERROR: ROLLBACK_DIGEST_FILE='${ROLLBACK_DIGEST_FILE}' does not exist"
+          exit 1
+        fi
+        GC_FLAGS+=(--rollback-digest-file "${ROLLBACK_DIGEST_FILE}")
+      fi
+      if [ -n "${REGISTRY_INVENTORY_JSON:-}" ]; then
+        GC_FLAGS+=(--inventory-json "${REGISTRY_INVENTORY_JSON}")
+      else
+        GC_FLAGS+=(--registry-url "${OCI_REGISTRY_URL}" --repository "${OCI_REPOSITORY}")
+      fi
+      # Dry-run by default; set REGISTRY_GC_EXECUTE=true explicitly to delete unreferenced digests.
+      if [ "${REGISTRY_GC_EXECUTE:-false}" = "true" ]; then
+        GC_FLAGS+=(--execute)
+      fi
+      python3 scripts/registry_gc.py "${GC_FLAGS[@]}"

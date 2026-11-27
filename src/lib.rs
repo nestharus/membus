@@ -12,6 +12,7 @@ pub mod client;
 pub mod index;
 pub mod mesh;
 pub mod protocol;
+pub mod router;
 pub mod search;
 pub mod signals;
 pub mod storage;

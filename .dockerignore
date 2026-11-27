@@ -1,0 +1,12 @@
+target/
+.git/
+.tmp/
+infra/
+gitops/
+deploy/
+docs/
+clients/
+scripts/
+tests/
+*.log
+*.bak

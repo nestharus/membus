@@ -1,0 +1,167 @@
+# Production dual-slot A/B gateway Deployment and stable Services for Flux GitOps.
+#
+# Architectural & security invariants:
+# - Runs a single active gateway (`replicas: 1`, `strategy: Recreate`, matching slot-a/slot-b)
+#   while routing/parity/shadow-queue state is held in-memory, preventing split-brain state
+#   divergence across replicas.
+# - Passes `--primary auto` so pod restarts automatically reconcile the live `Active` slot
+#   and `role_epoch` from both slots' `/v2/health` endpoints instead of reverting to `slot-a`.
+# - Inbound `:8080` (data) and `:8081` (admin) serve plaintext HTTP inside the cluster network
+#   and MUST sit behind cluster ingress or a mutual-TLS service mesh for external/cross-node
+#   transport encryption; outbound slot connections verify TLS using 0440-mounted CA bundles.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ab-router
+  labels:
+    app.kubernetes.io/name: ab-router
+    app.kubernetes.io/component: ab-gateway
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ab-router
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ab-router
+        app.kubernetes.io/component: ab-gateway
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: ab-router
+          image: ghcr.io/oulipoly/membus-ab-router:v2.0.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - /usr/local/bin/membus-ab-router
+          args:
+            - --data-listen
+            - 0.0.0.0:8080
+            - --admin-listen
+            - 0.0.0.0:8081
+            - --slot-a-url
+            - https://membus-slot-a:8443
+            - --slot-b-url
+            - https://membus-slot-b:8443
+            - --primary
+            - auto
+            - --shadow-enabled=true
+            - --slot-a-token-file
+            - /etc/ab-router/tokens/slot-a.token
+            - --slot-b-token-file
+            - /etc/ab-router/tokens/slot-b.token
+            - --admin-token-file
+            - /etc/ab-router/tokens/admin.token
+            - --slot-a-tls-ca
+            - /etc/ab-router/tls/slot-a-ca.crt
+            - --slot-b-tls-ca
+            - /etc/ab-router/tls/slot-b-ca.crt
+            - --shadow-max-ops
+            - "4096"
+            - --shadow-max-bytes
+            - "67108864"
+            - --shadow-timeout-ms
+            - "2000"
+          ports:
+            - name: data
+              containerPort: 8080
+              protocol: TCP
+            - name: admin
+              containerPort: 8081
+              protocol: TCP
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          livenessProbe:
+            httpGet:
+              path: /admin/health
+              port: admin
+              scheme: HTTP
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /admin/health
+              port: admin
+              scheme: HTTP
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          volumeMounts:
+            - name: tokens
+              mountPath: /etc/ab-router/tokens
+              readOnly: true
+            - name: tls-ca
+              mountPath: /etc/ab-router/tls
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tokens
+          secret:
+            secretName: ab-router-tokens
+            defaultMode: 0440
+        - name: tls-ca
+          secret:
+            secretName: ab-router-tls-ca
+            defaultMode: 0440
+        - name: tmp
+          emptyDir:
+            sizeLimit: 32Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: membus
+  labels:
+    app.kubernetes.io/name: ab-router
+    app.kubernetes.io/component: ab-gateway
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: ab-router
+  ports:
+    - name: data
+      port: 8080
+      targetPort: data
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ab-router-admin
+  labels:
+    app.kubernetes.io/name: ab-router
+    app.kubernetes.io/component: ab-gateway-admin
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: ab-router
+  ports:
+    - name: admin
+      port: 8081
+      targetPort: admin
+      protocol: TCP

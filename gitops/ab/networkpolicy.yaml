@@ -1,10 +1,13 @@
-# Default-deny NetworkPolicies isolating both A/B storage slots.
+# Default-deny NetworkPolicies isolating both A/B storage slots and the `ab-router` gateway.
 #
 # - Ingress to `membus-slot-a` and `membus-slot-b` is permitted ONLY from `ab-router`
 #   on port 8443/TCP (kubelet node-level probes reach pod IPs directly outside pod-to-pod
 #   NetworkPolicy selectors).
 # - All egress from storage slots is denied by default, preventing direct cross-slot
 #   mesh bypass or unguarded replication loops during A/B rollout.
+# - `ab-router` accepts client data ingress on 8080/TCP and operator admin ingress on
+#   8081/TCP (restricted to labeled operator/control-plane pods), and restricts egress
+#   strictly to `membus-slot-a` (8443/TCP), `membus-slot-b` (8443/TCP), and cluster DNS.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -54,3 +57,62 @@ spec:
         - protocol: TCP
           port: 8443
   egress: []
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ab-router-isolation
+  labels:
+    app.kubernetes.io/name: ab-router
+    app.kubernetes.io/component: ab-gateway
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ab-router
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              membus.oulipoly.io/client: "true"
+      ports:
+        - protocol: TCP
+          port: 8080
+    - from:
+        - podSelector:
+            matchLabels:
+              membus.oulipoly.io/operator: "true"
+      ports:
+        - protocol: TCP
+          port: 8081
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: membus
+              membus.oulipoly.io/slot: slot-a
+      ports:
+        - protocol: TCP
+          port: 8443
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: membus
+              membus.oulipoly.io/slot: slot-b
+      ports:
+        - protocol: TCP
+          port: 8443
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53

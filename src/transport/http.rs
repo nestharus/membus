@@ -43,17 +43,19 @@ use crate::transport::write_coord::{
 };
 use crate::transport::{Endpoint, ServerContext, ServerHandle, TlsServerConfig};
 use crate::types::{
-    Ack, AuthMode, CollectionDescriptor, CommitResult, ExpectedVersion, GraphDirection,
-    HealthStatus, IdempotencyContext, IndexMutations, IndexedMutation, MembusError,
-    NamespaceParityDigest, ParityDigestMode, Permission, Principal, ReplicatedApplyResult,
-    ReplicatedDelta, ScanOptions, SearchDocument, SearchLogOp, SearchQuery, SearchSyncStatus,
-    SignalEvent, SlotRole, SlotRoleState, VersionGuard, MAX_IDEMPOTENCY_KEY_BYTES,
+    Ack, AuthMode, CollectionDescriptor, CommitResult, DeltaLogPage, ExpectedVersion,
+    GraphDirection, HealthStatus, IdempotencyContext, IndexMutations, IndexedMutation,
+    MembusError, NamespaceParityDigest, ParityDigestMode, Permission, Principal,
+    ReplicatedApplyResult, ReplicatedDelta, ScanOptions, SearchDocument, SearchLogOp, SearchQuery,
+    SearchSyncStatus, SignalEvent, SlotRole, SlotRoleState, VersionGuard,
+    MAX_IDEMPOTENCY_KEY_BYTES,
 };
 
 const HEADER_SEARCH_SYNC: HeaderName = HeaderName::from_static("x-membus-search-sync");
 const HEADER_ROLE_EPOCH: HeaderName = HeaderName::from_static("x-membus-role-epoch");
 const HEADER_IDEMPOTENCY_KEY: HeaderName = HeaderName::from_static("x-membus-idempotency-key");
 const HEADER_IDEMPOTENT_REPLAY: HeaderName = HeaderName::from_static("x-membus-idempotent-replay");
+const HEADER_COMMIT_TS_MS: HeaderName = HeaderName::from_static("x-membus-commit-ts-ms");
 const HEADER_ROUTE_ORIGIN: HeaderName = HeaderName::from_static("x-membus-route-origin");
 const HEADER_ECHO_LOOP: HeaderName = HeaderName::from_static("x-membus-echo-loop");
 
@@ -309,6 +311,7 @@ pub(crate) fn build_router(state: HttpState) -> Router {
         .route("/v2/namespaces/{ns}/digest", post(handle_namespace_digest))
         .route("/v2/admin/role", post(handle_admin_role_transition))
         .route("/v2/replication/apply", post(handle_replication_apply))
+        .route("/v2/updates", get(handle_updates_scan))
         .route("/v2/search/documents", post(handle_search_index_doc))
         .route(
             "/v2/search/documents/{ns}/{*doc_id}",
@@ -336,6 +339,13 @@ struct HttpCommitResp {
 }
 
 fn coordinated_commit_response(res: CoordinatedCommit) -> AxumResponse {
+    coordinated_commit_response_with_ts(res, None)
+}
+
+fn coordinated_commit_response_with_ts(
+    res: CoordinatedCommit,
+    commit_ts_ms: Option<u64>,
+) -> AxumResponse {
     let header_val = HeaderValue::from_static(res.search_sync.as_str());
     let replayed = res.idempotent_replay;
     let body = HttpCommitResp {
@@ -344,11 +354,27 @@ fn coordinated_commit_response(res: CoordinatedCommit) -> AxumResponse {
     };
     let mut resp = (StatusCode::OK, Json(body)).into_response();
     resp.headers_mut().insert(HEADER_SEARCH_SYNC, header_val);
+    if let Some(ts_ms) = commit_ts_ms {
+        if let Ok(val) = HeaderValue::from_str(&ts_ms.to_string()) {
+            resp.headers_mut().insert(HEADER_COMMIT_TS_MS, val);
+        }
+    }
     if replayed {
         resp.headers_mut()
             .insert(HEADER_IDEMPOTENT_REPLAY, HeaderValue::from_static("true"));
     }
     resp
+}
+
+fn lookup_commit_ts_ms(storage: &dyn crate::storage::StorageEngine, seq: u64) -> Option<u64> {
+    if seq == 0 {
+        return None;
+    }
+    let page = storage.scan_deltas_after(seq.saturating_sub(1), 1).ok()?;
+    page.entries
+        .first()
+        .filter(|e| e.seq == seq)
+        .map(|e| e.ts_ms)
 }
 
 #[derive(Serialize)]
@@ -783,9 +809,9 @@ async fn handle_kv_put(
     let ctx = state.ctx.clone();
     let storage = Arc::clone(&state.ctx.storage);
     let search = state.ctx.search.clone();
-    let coord = tokio::task::spawn_blocking(move || {
+    let (coord, commit_ts_ms) = tokio::task::spawn_blocking(move || {
         let _fence = ctx.acquire_client_write_fence(role_epoch)?;
-        coordinated_put_indexed_idempotent(
+        let coord = coordinated_put_indexed_idempotent(
             &storage,
             search.as_ref(),
             &ns,
@@ -796,11 +822,13 @@ async fn handle_kv_put(
             req.indexes.as_ref(),
             req.search_op,
             idempotency.as_ref(),
-        )
+        )?;
+        let ts_ms = lookup_commit_ts_ms(storage.as_ref(), coord.commit.seq);
+        Ok::<_, MembusError>((coord, ts_ms))
     })
     .await
     .map_err(|e| MembusError::Storage(format!("kv put failed: {e}")))??;
-    Ok(coordinated_commit_response(coord))
+    Ok(coordinated_commit_response_with_ts(coord, commit_ts_ms))
 }
 
 #[derive(Deserialize)]
@@ -869,9 +897,9 @@ async fn handle_kv_delete(
     let ctx = state.ctx.clone();
     let storage = Arc::clone(&state.ctx.storage);
     let search = state.ctx.search.clone();
-    let coord = tokio::task::spawn_blocking(move || {
+    let (coord, commit_ts_ms) = tokio::task::spawn_blocking(move || {
         let _fence = ctx.acquire_client_write_fence(role_epoch)?;
-        coordinated_remove_indexed_idempotent(
+        let coord = coordinated_remove_indexed_idempotent(
             &storage,
             search.as_ref(),
             &ns,
@@ -880,11 +908,13 @@ async fn handle_kv_delete(
             req.expected,
             req.search_op,
             idempotency.as_ref(),
-        )
+        )?;
+        let ts_ms = lookup_commit_ts_ms(storage.as_ref(), coord.commit.seq);
+        Ok::<_, MembusError>((coord, ts_ms))
     })
     .await
     .map_err(|e| MembusError::Storage(format!("kv delete failed: {e}")))??;
-    Ok(coordinated_commit_response(coord))
+    Ok(coordinated_commit_response_with_ts(coord, commit_ts_ms))
 }
 
 #[derive(Deserialize)]
@@ -949,20 +979,22 @@ async fn handle_tx(
     let ctx = state.ctx.clone();
     let storage = Arc::clone(&state.ctx.storage);
     let search = state.ctx.search.clone();
-    let coord = tokio::task::spawn_blocking(move || {
+    let (coord, commit_ts_ms) = tokio::task::spawn_blocking(move || {
         let _fence = ctx.acquire_client_write_fence(role_epoch)?;
-        coordinated_commit_indexed_tx_idempotent(
+        let coord = coordinated_commit_indexed_tx_idempotent(
             &storage,
             search.as_ref(),
             &req.guards,
             req.mutations,
             req.ack,
             idempotency.as_ref(),
-        )
+        )?;
+        let ts_ms = lookup_commit_ts_ms(storage.as_ref(), coord.commit.seq);
+        Ok::<_, MembusError>((coord, ts_ms))
     })
     .await
     .map_err(|e| MembusError::Storage(format!("tx task failed: {e}")))??;
-    Ok(coordinated_commit_response(coord))
+    Ok(coordinated_commit_response_with_ts(coord, commit_ts_ms))
 }
 
 #[derive(Deserialize)]
@@ -1941,6 +1973,59 @@ async fn handle_replication_apply(
     .await
     .map_err(|e| MembusError::Storage(format!("replication_apply failed: {e}")))??;
     Ok(coordinated_replicated_apply_response(coord))
+}
+
+#[derive(Deserialize)]
+struct UpdatesQuery {
+    since_seq: Option<u64>,
+    limit: Option<usize>,
+}
+
+async fn handle_updates_scan(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Query(q): Query<UpdatesQuery>,
+) -> Result<Json<DeltaLogPage>, HttpError> {
+    let principal = authenticate_http(&state, &headers)?;
+    state.ctx.auth.authorize_admin(principal.as_ref(), None)?;
+    if q.limit == Some(0) {
+        return Err(HttpError(MembusError::InvalidArgument(
+            "updates query limit must be greater than 0".to_owned(),
+        )));
+    }
+    let since_seq = q.since_seq.unwrap_or(0);
+    let limit = q.limit.unwrap_or(256).min(1024);
+    let byte_budget = (state.ctx.config.max_frame_body / 4).max(4096);
+    let storage = Arc::clone(&state.ctx.storage);
+    let page = run_blocking_query(state.ctx.config.query_timeout, "updates_scan", move || {
+        let raw = storage.scan_deltas_after(since_seq, limit)?;
+        if raw.entries.is_empty() {
+            return Ok(raw);
+        }
+        let mut kept = Vec::with_capacity(raw.entries.len());
+        let mut used_bytes = 0usize;
+        let mut truncated = false;
+        for entry in raw.entries {
+            let entry_bytes = serde_json::to_vec(&entry).map(|v| v.len()).unwrap_or(0);
+            if !kept.is_empty() && used_bytes.saturating_add(entry_bytes) > byte_budget {
+                truncated = true;
+                break;
+            }
+            used_bytes = used_bytes.saturating_add(entry_bytes);
+            kept.push(entry);
+        }
+        let scanned_through_seq = if truncated {
+            kept.last().map(|e| e.seq).unwrap_or(since_seq)
+        } else {
+            raw.scanned_through_seq
+        };
+        Ok(DeltaLogPage {
+            entries: kept,
+            scanned_through_seq,
+        })
+    })
+    .await?;
+    Ok(Json(page))
 }
 
 #[derive(Deserialize)]

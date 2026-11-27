@@ -1,17 +1,19 @@
-# Local dual-slot A/B deployment topology for Membus v2.
+# Local dual-slot A/B deployment topology for Membus v2 using the real `membus-ab-router` binary.
 #
 # Architectural invariants:
 # - `membus-slot-a` and `membus-slot-b` are completely isolated storage residents on
 #   separate `internal: true` bridge networks (`membus_slot_a_net`, `membus_slot_b_net`)
 #   with independent persistent volumes and ZERO host port publications.
 # - Neither slot can communicate directly with the other; container IPs stay private.
-# - All routing, traffic splitting, async write-teeing, backfill orchestration, and
-#   cutover state transitions live OUTSIDE `membus` in the parameterized `ab-router`
-#   gateway, which exposes one loopback data surface and one loopback admin surface.
+# - All routing, primary-first async write-teeing, bounded shadow queueing, CF_LOG catch-up,
+#   and fenced cutover transitions live OUTSIDE `membus` in the real `membus-ab-router`
+#   gateway built from the repository `Containerfile`.
+# - Host exposure is strictly loopback-only (`127.0.0.1`) with parameterized ports so
+#   multiple local stacks run concurrently with zero port collisions.
 #
-# NOTE: `--allow-insecure-non-loopback` is used strictly because each slot binds on its
-# isolated `internal: true` container network with zero host ports. Production deployments
-# MUST use mutual TLS + enforced auth (see `gitops/ab/`).
+# NOTE: `--allow-insecure-non-loopback` is used strictly inside the private container bridge
+# networks where only `ab-router` publishes loopback host ports. Production deployments MUST
+# use verified TLS + enforced bearer authentication via `--auth-config <JSON>` (see `gitops/ab/`).
 
 services:
   membus-slot-a:
@@ -97,7 +99,30 @@ services:
     restart: unless-stopped
 
   ab-router:
-    image: ${AB_ROUTER_IMAGE:?set AB_ROUTER_IMAGE to an immutable A/B gateway image reference}
+    build:
+      context: ../..
+      dockerfile: Containerfile
+    image: ${AB_ROUTER_IMAGE:-membus:local}
+    entrypoint: ["/usr/local/bin/membus-ab-router"]
+    command:
+      - --data-listen
+      - 0.0.0.0:8080
+      - --admin-listen
+      - 0.0.0.0:8081
+      - --slot-a-url
+      - http://membus-slot-a:8080
+      - --slot-b-url
+      - http://membus-slot-b:8080
+      - --primary
+      - ${AB_PRIMARY_SLOT:-slot-a}
+      - --shadow-enabled=${AB_SHADOW_ENABLED:-true}
+      - --shadow-max-ops
+      - ${AB_SHADOW_MAX_QUEUE_OPS:-4096}
+      - --shadow-max-bytes
+      - ${AB_SHADOW_MAX_QUEUE_BYTES:-67108864}
+      - --shadow-timeout-ms
+      - ${AB_SHADOW_TIMEOUT_MS:-2000}
+      - --allow-insecure-non-loopback
     user: "10001:10001"
     read_only: true
     security_opt:
@@ -112,17 +137,10 @@ services:
       membus-slot-b:
         condition: service_healthy
     environment:
-      AB_PRIMARY_SLOT: ${AB_PRIMARY_SLOT:-slot-a}
-      AB_SHADOW_SLOT: ${AB_SHADOW_SLOT:-slot-b}
-      AB_SLOT_A_URL: http://membus-slot-a:8080
-      AB_SLOT_B_URL: http://membus-slot-b:8080
-      # Optional bearer token secret files; mount matching secret files and set these
-      # variables when running slots with `--auth-mode enforced`.
+      # Optional bearer token secret files when running slots with `--auth-config <JSON>`.
       AB_SLOT_A_TOKEN_FILE: ${AB_SLOT_A_TOKEN_FILE:-}
       AB_SLOT_B_TOKEN_FILE: ${AB_SLOT_B_TOKEN_FILE:-}
-      AB_SHADOW_MAX_QUEUE_OPS: ${AB_SHADOW_MAX_QUEUE_OPS:-4096}
-      AB_SHADOW_MAX_QUEUE_BYTES: ${AB_SHADOW_MAX_QUEUE_BYTES:-67108864}
-      AB_SHADOW_TIMEOUT_MS: ${AB_SHADOW_TIMEOUT_MS:-2000}
+      AB_ADMIN_TOKEN_FILE: ${AB_ADMIN_TOKEN_FILE:-}
     ports:
       - "127.0.0.1:${AB_DATA_PORT:-8080}:8080"
       - "127.0.0.1:${AB_ADMIN_PORT:-8081}:8081"
@@ -132,6 +150,12 @@ services:
       - membus_slot_b_net
     stop_signal: SIGTERM
     stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8081/admin/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
     restart: unless-stopped
 
 networks:
