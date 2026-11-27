@@ -8,11 +8,12 @@ use hyper::header::{AUTHORIZATION, CONTENT_TYPE};
 use hyper::{Method, Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use membus::{
-    Ack, AclGrant, AuthConfig, Client, CollectionDescriptor, Endpoint, ExpectedVersion, IndexKind,
-    IndexSpec, MembusError, MembusServer, MigrationState, Permission, Principal, RetentionPolicy,
-    RocksDbStorage, SearchConfig, SearchDocument, SearchEngine, SearchLogOp, SearchMode,
-    SearchQuery, SearchVisibility, ServerConfig, SignalBroker, SignalConfig, SignalPublisher,
-    SignalRing, StorageConfig, StorageEngine, StoreProfile, TokenBinding,
+    Ack, AclGrant, AuthConfig, Client, CollectionDescriptor, CompatibilityMode, Endpoint,
+    ExpectedVersion, IndexKind, IndexSpec, MembusError, MembusServer, MigrationState, Permission,
+    Principal, RetentionPolicy, RocksDbStorage, SearchConfig, SearchDocument, SearchEngine,
+    SearchLogOp, SearchMode, SearchQuery, SearchVisibility, ServerConfig, SignalBroker,
+    SignalConfig, SignalPublisher, SignalRing, StorageConfig, StorageEngine, StoreProfile,
+    TokenBinding,
 };
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -469,6 +470,8 @@ async fn collection_catalog_versioning_history_and_migration_state_machine() {
             max_entries: Some(1_000_000),
         },
         migration_state: MigrationState::Active,
+        compatible_versions: Vec::new(),
+        compatibility_mode: CompatibilityMode::Strict,
     };
 
     {
@@ -892,6 +895,8 @@ fn catalog_migration_verified_through_monotonicity_base64_and_meta_limits() {
         declared_indexes: Vec::new(),
         retention_policy: RetentionPolicy::default(),
         migration_state: MigrationState::Active,
+        compatible_versions: Vec::new(),
+        compatibility_mode: CompatibilityMode::Strict,
     };
     // Verify schema_bytes serializes compactly as a base64 string in JSON.
     let json_val = serde_json::to_value(&desc).expect("to_value");
@@ -1037,6 +1042,8 @@ async fn same_id_narrower_grant_reauth_revokes_streams_and_pending_migration_use
                 declared_indexes: Vec::new(),
                 retention_policy: RetentionPolicy::default(),
                 migration_state: MigrationState::Active,
+                compatible_versions: Vec::new(),
+                compatibility_mode: CompatibilityMode::Strict,
             },
         )
         .expect("reg");

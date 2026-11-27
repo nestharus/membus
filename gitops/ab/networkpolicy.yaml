@@ -1,0 +1,56 @@
+# Default-deny NetworkPolicies isolating both A/B storage slots.
+#
+# - Ingress to `membus-slot-a` and `membus-slot-b` is permitted ONLY from `ab-router`
+#   on port 8443/TCP (kubelet node-level probes reach pod IPs directly outside pod-to-pod
+#   NetworkPolicy selectors).
+# - All egress from storage slots is denied by default, preventing direct cross-slot
+#   mesh bypass or unguarded replication loops during A/B rollout.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: membus-slot-a-isolation
+  labels:
+    app.kubernetes.io/name: membus
+    membus.oulipoly.io/slot: slot-a
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: membus
+      membus.oulipoly.io/slot: slot-a
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ab-router
+      ports:
+        - protocol: TCP
+          port: 8443
+  egress: []
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: membus-slot-b-isolation
+  labels:
+    app.kubernetes.io/name: membus
+    membus.oulipoly.io/slot: slot-b
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: membus
+      membus.oulipoly.io/slot: slot-b
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ab-router
+      ports:
+        - protocol: TCP
+          port: 8443
+  egress: []

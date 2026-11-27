@@ -4,10 +4,10 @@ use membus::cli::diag::{inspect_data_dir, run_diag, verify_data_dir, DiagCommand
 use membus::cli::{parse_args, Command};
 use membus::storage::{ALL_COLUMN_FAMILIES, CF_BLOB, CF_IDX_ORD};
 use membus::{
-    create_full_backup, Ack, CollectionCatalog, CollectionDescriptor, ExpectedVersion,
-    IndexMutations, LeaseManager, MembusError, MigrationState, NoopPublisher, OrderedIndexEntry,
-    RetentionPolicy, RocksDbStorage, SearchConfig, SearchDocument, SearchEngine, SearchVisibility,
-    StorageConfig, StorageEngine, StoreProfile,
+    create_full_backup, Ack, CollectionCatalog, CollectionDescriptor, CompatibilityMode,
+    ExpectedVersion, IndexMutations, LeaseManager, MembusError, MigrationState, NoopPublisher,
+    OrderedIndexEntry, RetentionPolicy, RocksDbStorage, SearchConfig, SearchDocument, SearchEngine,
+    SearchVisibility, StorageConfig, StorageEngine, StoreProfile,
 };
 use rocksdb::{Options, DB, DEFAULT_COLUMN_FAMILY_NAME};
 use sha2::{Digest, Sha256};
@@ -47,6 +47,8 @@ fn diag_inspect_works_against_live_open_and_closed_primary_without_secret_tokens
                 declared_indexes: Vec::new(),
                 retention_policy: RetentionPolicy::default(),
                 migration_state: MigrationState::Active,
+                compatible_versions: Vec::new(),
+                compatibility_mode: CompatibilityMode::Strict,
             },
         )
         .unwrap();

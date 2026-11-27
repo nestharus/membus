@@ -17,7 +17,7 @@ use crate::transport::{
     validate_listener_bind_security, Endpoint, MembusServer, ServerConfig, ServerHandle,
     TlsClientConfig, TlsServerConfig,
 };
-use crate::types::{AuthMode, MembusError};
+use crate::types::{AuthMode, MembusError, SlotRole};
 
 /// Default bounded drain timeout during graceful resident shutdown (leaves headroom
 /// beneath standard 30s container/Kubernetes `terminationGracePeriodSeconds`).
@@ -67,6 +67,8 @@ pub struct ServeArgs {
     pub query_timeout_ms: Option<u64>,
     pub allow_insecure_non_loopback: bool,
     pub public_health_probe: bool,
+    pub slot_role: SlotRole,
+    pub node_id: Option<String>,
     pub mesh_node_id: Option<String>,
     pub mesh_cluster: Option<String>,
     pub mesh_listen: Vec<String>,
@@ -319,6 +321,8 @@ async fn run_serve(args: ServeArgs) -> Result<(), MembusError> {
     server_cfg.checkpoint_root = args.checkpoint_root;
     server_cfg.allow_insecure_non_loopback = args.allow_insecure_non_loopback;
     server_cfg.public_health_probe = args.public_health_probe;
+    server_cfg.initial_slot_role = args.slot_role;
+    server_cfg.node_id = args.node_id.clone().or_else(|| args.mesh_node_id.clone());
 
     let auth_cfg = if let Some(path) = &args.auth_config {
         let raw = std::fs::read(path)?;
@@ -504,7 +508,7 @@ async fn run_health(connect: ClientConnectArgs) -> Result<(), MembusError> {
         Err(err) => return Err(err),
     };
     println!(
-        "ok epoch={} latest_seq={} log_horizon_seq={} in_flight_ops={} in_flight_bytes={} active_connections={} active_subscriptions={} active_snapshots={} active_streams={} search_ingest_deferred_total={} search_dirty={}",
+        "ok epoch={} latest_seq={} log_horizon_seq={} in_flight_ops={} in_flight_bytes={} active_connections={} active_subscriptions={} active_snapshots={} active_streams={} search_ingest_deferred_total={} search_dirty={} slot_role={} role_epoch={}",
         status.epoch,
         status.latest_seq,
         status.log_horizon_seq,
@@ -516,6 +520,8 @@ async fn run_health(connect: ClientConnectArgs) -> Result<(), MembusError> {
         status.active_streams,
         status.search_ingest_deferred_total,
         status.search_dirty,
+        status.slot_role.as_str(),
+        status.role_epoch,
     );
     Ok(())
 }
@@ -553,6 +559,8 @@ fn parse_serve(args: &[String]) -> Result<Command, MembusError> {
     let mut query_timeout_ms: Option<u64> = None;
     let mut allow_insecure_non_loopback = false;
     let mut public_health_probe = false;
+    let mut slot_role = SlotRole::Active;
+    let mut node_id: Option<String> = None;
     let mut mesh_node_id: Option<String> = None;
     let mut mesh_cluster: Option<String> = None;
     let mut mesh_listen: Vec<String> = Vec::new();
@@ -673,6 +681,14 @@ fn parse_serve(args: &[String]) -> Result<Command, MembusError> {
             "--public-health-probe" => {
                 public_health_probe = true;
             }
+            "--slot-role" => {
+                idx += 1;
+                slot_role = SlotRole::parse(require_arg(args, idx, "--slot-role")?)?;
+            }
+            "--node-id" => {
+                idx += 1;
+                node_id = Some(require_arg(args, idx, "--node-id")?.to_owned());
+            }
             "--mesh-node-id" => {
                 idx += 1;
                 mesh_node_id = Some(require_arg(args, idx, "--mesh-node-id")?.to_owned());
@@ -760,6 +776,8 @@ fn parse_serve(args: &[String]) -> Result<Command, MembusError> {
         query_timeout_ms,
         allow_insecure_non_loopback,
         public_health_probe,
+        slot_role,
+        node_id,
         mesh_node_id,
         mesh_cluster,
         mesh_listen,
@@ -954,11 +972,11 @@ fn parse_u64(val: &str, flag: &str) -> Result<u64, MembusError> {
 }
 
 fn usage_text() -> &'static str {
-    "Usage:\n  membus serve --data-dir <PATH> [--http-listen <ADDR> [--http-tls-cert <PEM> --http-tls-key <PEM> [--http-tls-client-ca <PEM>]]] [--tcp <ADDR> [--tls-cert <PEM> --tls-key <PEM> [--tls-client-ca <PEM>]]] [--pipe <PIPE_NAME>] [--auth-config <JSON>] [--allow-insecure-non-loopback] [--public-health-probe] [--checkpoint-root <DIR>] [--mesh-node-id <ID> [--mesh-cluster <PREFIX>] [--mesh-listen <ENDPOINT>] [--mesh-connect <ENDPOINT>]] [--max-in-flight-ops <N>] [--max-in-flight-bytes <N>] [--max-in-flight-per-conn <N>] [--max-http-in-flight <N>] [--max-active-streams <N>] [--max-active-snapshots <N>] [--query-timeout-ms <N>]\n  membus health (--tcp <ADDR> | --pipe <PIPE_NAME>) [--token <TOKEN>] [--tls-ca <PEM> [--tls-server-name <NAME>] [--tls-cert <PEM> --tls-key <PEM>]]\n  membus checkpoint (--tcp <ADDR> | --pipe <PIPE_NAME>) --dest <RELATIVE_DIR> [--token <TOKEN>] [--tls-ca <PEM> [--tls-server-name <NAME>] [--tls-cert <PEM> --tls-key <PEM>]]\n  membus diag inspect --data-dir <PATH>\n  membus diag verify --data-dir <PATH>\n  membus diag restore --backup-dir <DIR> --target-dir <DIR> [--delta <FILE>...]\n  membus --help | -h | help"
+    "Usage:\n  membus serve --data-dir <PATH> [--http-listen <ADDR> [--http-tls-cert <PEM> --http-tls-key <PEM> [--http-tls-client-ca <PEM>]]] [--tcp <ADDR> [--tls-cert <PEM> --tls-key <PEM> [--tls-client-ca <PEM>]]] [--pipe <PIPE_NAME>] [--auth-config <JSON>] [--allow-insecure-non-loopback] [--public-health-probe] [--slot-role <active|shadow|read_only|draining>] [--node-id <ID>] [--checkpoint-root <DIR>] [--mesh-node-id <ID> [--mesh-cluster <PREFIX>] [--mesh-listen <ENDPOINT>] [--mesh-connect <ENDPOINT>]] [--max-in-flight-ops <N>] [--max-in-flight-bytes <N>] [--max-in-flight-per-conn <N>] [--max-http-in-flight <N>] [--max-active-streams <N>] [--max-active-snapshots <N>] [--query-timeout-ms <N>]\n  membus health (--tcp <ADDR> | --pipe <PIPE_NAME>) [--token <TOKEN>] [--tls-ca <PEM> [--tls-server-name <NAME>] [--tls-cert <PEM> --tls-key <PEM>]]\n  membus checkpoint (--tcp <ADDR> | --pipe <PIPE_NAME>) --dest <RELATIVE_DIR> [--token <TOKEN>] [--tls-ca <PEM> [--tls-server-name <NAME>] [--tls-cert <PEM> --tls-key <PEM>]]\n  membus diag inspect --data-dir <PATH>\n  membus diag verify --data-dir <PATH>\n  membus diag restore --backup-dir <DIR> --target-dir <DIR> [--delta <FILE>...]\n  membus --help | -h | help"
 }
 
 fn serve_usage_text() -> &'static str {
-    "Usage:\n  membus serve --data-dir <PATH> [--http-listen <ADDR> [--http-tls-cert <PEM> --http-tls-key <PEM> [--http-tls-client-ca <PEM>]]] [--tcp <ADDR> [--tls-cert <PEM> --tls-key <PEM> [--tls-client-ca <PEM>]]] [--pipe <PIPE_NAME>] [--auth-config <JSON>] [--allow-insecure-non-loopback] [--public-health-probe] [--checkpoint-root <DIR>] [--mesh-node-id <ID> [--mesh-cluster <PREFIX>] [--mesh-listen <ENDPOINT>] [--mesh-connect <ENDPOINT>]] [--max-in-flight-ops <N>] [--max-in-flight-bytes <N>] [--max-in-flight-per-conn <N>] [--max-http-in-flight <N>] [--max-active-streams <N>] [--max-active-snapshots <N>] [--query-timeout-ms <N>]"
+    "Usage:\n  membus serve --data-dir <PATH> [--http-listen <ADDR> [--http-tls-cert <PEM> --http-tls-key <PEM> [--http-tls-client-ca <PEM>]]] [--tcp <ADDR> [--tls-cert <PEM> --tls-key <PEM> [--tls-client-ca <PEM>]]] [--pipe <PIPE_NAME>] [--auth-config <JSON>] [--allow-insecure-non-loopback] [--public-health-probe] [--slot-role <active|shadow|read_only|draining>] [--node-id <ID>] [--checkpoint-root <DIR>] [--mesh-node-id <ID> [--mesh-cluster <PREFIX>] [--mesh-listen <ENDPOINT>] [--mesh-connect <ENDPOINT>]] [--max-in-flight-ops <N>] [--max-in-flight-bytes <N>] [--max-in-flight-per-conn <N>] [--max-http-in-flight <N>] [--max-active-streams <N>] [--max-active-snapshots <N>] [--query-timeout-ms <N>]"
 }
 
 fn health_usage_text() -> &'static str {

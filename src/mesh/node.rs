@@ -16,10 +16,9 @@ use crate::mesh::protocol::{
 };
 use crate::search::SearchEngine;
 use crate::storage::{MetaCasGuard, StorageEngine};
-use crate::tiering::TieringManager;
 use crate::types::{
     now_unix_ms, sanitize_search_log_op, validate_namespace, Ack, LogDeltaEntry, MembusError,
-    MutationOp, ReplicatedDelta, ReplicationStamp, ScanOptions, SearchLogOp, MAX_KEY_BYTES,
+    MutationOp, ReplicatedDelta, ReplicationStamp, SearchLogOp, MAX_KEY_BYTES,
 };
 
 const MAX_CATCHUP_ENTRIES: usize = 512;
@@ -1113,65 +1112,7 @@ fn apply_envelope_blocking(
 
 /// Compute a deterministic 32-byte XOR support-digest over `(key, value_sha256)` for all
 /// keys in `(namespace, key_prefix)` under an O(1) MVCC snapshot.
-pub fn compute_namespace_xor_digest(
-    storage: &dyn StorageEngine,
-    node_id: &str,
-    namespace: &str,
-    key_prefix: &[u8],
-) -> Result<DigestResponse, MembusError> {
-    validate_namespace(namespace)?;
-    let snap = storage.open_snapshot()?;
-    let mut after_key: Option<Vec<u8>> = None;
-    let mut xor_digest = [0u8; 32];
-    let mut entry_count = 0u64;
-
-    loop {
-        let page = storage.scan_prefix(
-            &snap,
-            namespace,
-            key_prefix,
-            &ScanOptions {
-                after_key: after_key.clone(),
-                limit: 512,
-                max_bytes: 4 * 1024 * 1024,
-            },
-        )?;
-        if page.records.is_empty() {
-            break;
-        }
-        for rec in &page.records {
-            let value_sha256: [u8; 32] = if TieringManager::is_cold_ref(rec) {
-                TieringManager::decode_cold_ref(rec)?.cold_sha256
-            } else {
-                Sha256::digest(&rec.value).into()
-            };
-            let mut hasher = Sha256::new();
-            hasher.update((rec.key.len() as u32).to_be_bytes());
-            hasher.update(&rec.key);
-            hasher.update(value_sha256);
-            let item_hash: [u8; 32] = hasher.finalize().into();
-            for i in 0..32 {
-                xor_digest[i] ^= item_hash[i];
-            }
-            entry_count = entry_count.saturating_add(1);
-        }
-        if !page.truncated {
-            break;
-        }
-        after_key = page.next_cursor;
-        if after_key.is_none() {
-            break;
-        }
-    }
-
-    Ok(DigestResponse {
-        node_id: node_id.to_owned(),
-        epoch: storage.epoch(),
-        latest_seq: snap.snapshot_seq(),
-        entry_count,
-        xor_digest,
-    })
-}
+pub use crate::storage::parity::compute_namespace_xor_digest;
 
 fn read_or_init_published_seq(storage: &dyn StorageEngine) -> Result<u64, MembusError> {
     let current_epoch = storage.epoch();

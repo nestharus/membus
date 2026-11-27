@@ -12,6 +12,12 @@ pub const MAX_KEY_BYTES: usize = 64 * 1024;
 /// Default maximum permitted value payload in bytes (16 MiB).
 pub const DEFAULT_MAX_VALUE_BYTES: usize = 16 * 1024 * 1024;
 
+/// Maximum permitted client `X-Membus-Idempotency-Key` length in bytes.
+pub const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
+
+/// Default upper bound on retained transactional idempotency records in `CF_META`.
+pub const DEFAULT_MAX_IDEMPOTENCY_ENTRIES: usize = 16_384;
+
 /// Durability contract requested by a write operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
@@ -568,6 +574,18 @@ pub struct RetentionPolicy {
     pub max_entries: Option<u64>,
 }
 
+/// Schema compatibility policy active for a collection during normal operation or A/B rollout.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CompatibilityMode {
+    /// Single active schema version (`[schema_version]`).
+    #[default]
+    Strict,
+    /// Expand phase accepting both current (`vN`) and target (`vN+1`) schema versions.
+    ExpandDual,
+    /// Reverse-shadow rollback window accepting both promoted (`vN+1`) and rollback (`vN`) versions.
+    ReverseShadow,
+}
+
 /// Explicit schema migration lifecycle state for a collection.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MigrationState {
@@ -575,6 +593,11 @@ pub enum MigrationState {
     Migrating {
         target_version: u32,
         target_sha256: [u8; 32],
+        verified_through: u64,
+    },
+    ReverseShadow {
+        rollback_version: u32,
+        rollback_sha256: [u8; 32],
         verified_through: u64,
     },
 }
@@ -612,6 +635,109 @@ pub struct CollectionDescriptor {
     pub declared_indexes: Vec<IndexSpec>,
     pub retention_policy: RetentionPolicy,
     pub migration_state: MigrationState,
+    #[serde(default)]
+    pub compatible_versions: Vec<u32>,
+    #[serde(default)]
+    pub compatibility_mode: CompatibilityMode,
+}
+
+/// Hashing mode for namespace parity digests.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParityDigestMode {
+    /// Hash `key_len_be4 || key || value_sha256` (resolving `ColdRef`s to `cold_sha256`).
+    #[default]
+    Full,
+    /// Hash `key_len_be4 || key` only for additive `vN+1` expand-phase key-set parity.
+    KeysOnly,
+}
+
+/// First-class namespace parity digest returned by `POST /v2/namespaces/{ns}/digest`
+/// and binary `Request::NamespaceDigest`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamespaceParityDigest {
+    pub node_id: String,
+    pub epoch: u64,
+    pub latest_seq: u64,
+    pub log_horizon_seq: u64,
+    pub entry_count: u64,
+    pub xor_digest_hex: String,
+    pub catalog_schema_version: Option<u32>,
+}
+
+/// Explicit runtime slot role controlling write fencing during live A/B deployments.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlotRole {
+    #[default]
+    Active,
+    Shadow,
+    ReadOnly,
+    Draining,
+}
+
+impl SlotRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Shadow => "shadow",
+            Self::ReadOnly => "read_only",
+            Self::Draining => "draining",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Result<Self, MembusError> {
+        if raw.eq_ignore_ascii_case("active") {
+            Ok(Self::Active)
+        } else if raw.eq_ignore_ascii_case("shadow") {
+            Ok(Self::Shadow)
+        } else if raw.eq_ignore_ascii_case("read_only") || raw.eq_ignore_ascii_case("readonly") {
+            Ok(Self::ReadOnly)
+        } else if raw.eq_ignore_ascii_case("draining") {
+            Ok(Self::Draining)
+        } else {
+            Err(MembusError::InvalidArgument(format!(
+                "unknown slot role '{raw}' (expected active, shadow, read_only, or draining)"
+            )))
+        }
+    }
+
+    pub(crate) fn as_u8(self) -> u8 {
+        match self {
+            Self::Active => 0,
+            Self::Shadow => 1,
+            Self::ReadOnly => 2,
+            Self::Draining => 3,
+        }
+    }
+
+    pub(crate) fn from_u8(raw: u8) -> Result<Self, MembusError> {
+        match raw {
+            0 => Ok(Self::Active),
+            1 => Ok(Self::Shadow),
+            2 => Ok(Self::ReadOnly),
+            3 => Ok(Self::Draining),
+            other => Err(MembusError::Protocol(format!("unknown slot role: {other}"))),
+        }
+    }
+}
+
+/// Persisted slot role and monotonic fencing epoch stored in `CF_META` (`sys:slot_role`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlotRoleState {
+    pub role: SlotRole,
+    pub role_epoch: u64,
+}
+
+/// Caller-supplied idempotency key and canonical request fingerprint enforced atomically
+/// inside a single storage transaction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IdempotencyContext {
+    pub scope_namespace: String,
+    pub principal_id: Option<String>,
+    pub is_tx: bool,
+    pub key: String,
+    pub request_fingerprint_sha256: [u8; 32],
 }
 
 /// Raw WAL batch returned by `read_wal_since`.
@@ -661,6 +787,10 @@ pub struct HealthStatus {
     pub search_ingest_deferred_total: u64,
     #[serde(default)]
     pub search_dirty: bool,
+    #[serde(default)]
+    pub slot_role: SlotRole,
+    #[serde(default)]
+    pub role_epoch: u64,
 }
 
 /// Unified error type across storage, index, auth, catalog, search, signals, protocol, transport, and client boundaries.
@@ -690,6 +820,16 @@ pub enum MembusError {
 
     #[error("optimistic transaction conflict: {0}")]
     TxConflict(String),
+
+    #[error("slot role fenced (role={role:?}, role_epoch={role_epoch}): {reason}")]
+    RoleFenced {
+        role: SlotRole,
+        role_epoch: u64,
+        reason: String,
+    },
+
+    #[error("idempotency key conflict: {0}")]
+    IdempotencyConflict(String),
 
     #[error("server busy (retry after {retry_after_ms}ms): {reason}")]
     Busy { retry_after_ms: u32, reason: String },

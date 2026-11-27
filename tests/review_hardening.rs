@@ -378,6 +378,8 @@ fn binary_resp_health_preserves_legacy_7_u64_wire_format_and_health_v2_roundtrip
         active_streams: 4,
         search_ingest_deferred_total: 2,
         search_dirty: true,
+        slot_role: membus::SlotRole::Shadow,
+        role_epoch: 7,
     };
 
     // Legacy RESP_HEALTH MUST stay strictly 1 tag byte + 7 * 8 bytes = 57 bytes.
@@ -402,6 +404,8 @@ fn binary_resp_health_preserves_legacy_7_u64_wire_format_and_health_v2_roundtrip
             active_streams: 0,
             search_ingest_deferred_total: 0,
             search_dirty: false,
+            slot_role: membus::SlotRole::Active,
+            role_epoch: 0,
         })
     );
 

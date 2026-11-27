@@ -1,0 +1,31 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: membus-ab
+      app.kubernetes.io/managed-by: kustomize
+    includeSelectors: false
+
+resources:
+  - slot-a.yaml
+  - slot-b.yaml
+  - networkpolicy.yaml
+
+# Base Kustomize template for dual-slot A/B deployments (NOT directly deployable as-is).
+# Each environment overlay MUST populate immutable `@sha256:` `digest:` pins for BOTH
+# `membus-slot-a` and `membus-slot-b` before deployment so Flux / GitOps release automation
+# can advance Slot B independently while pinning BOTH live slot digests AND the last-known-good
+# rollback digest simultaneously (preventing registry GC from reaping the rollback image during
+# the Stage 4 reverse-shadow window).
+images:
+  - name: ghcr.io/oulipoly/membus-slot-a
+    newName: ghcr.io/oulipoly/membus
+    newTag: v2.0.0
+    # REQUIRED in environment overlays before deployment:
+    # digest: sha256:<slot-a-pinned-release-digest>
+  - name: ghcr.io/oulipoly/membus-slot-b
+    newName: ghcr.io/oulipoly/membus
+    newTag: v2.0.0
+    # REQUIRED in environment overlays before deployment:
+    # digest: sha256:<slot-b-pinned-release-digest>

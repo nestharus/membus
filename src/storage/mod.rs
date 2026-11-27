@@ -2,6 +2,7 @@ pub mod admission;
 pub mod codec;
 pub mod hlc;
 pub mod mesh_replication;
+pub mod parity;
 pub mod rocksdb_kv;
 pub mod sequencer;
 pub mod snapshot;
@@ -18,13 +19,18 @@ use std::time::Duration;
 
 use crate::index::{BfsOptions, NeighborQueryOptions, OrderedQueryOptions};
 use crate::types::{
-    Ack, BfsResult, CommitResult, DeltaLogPage, ExpectedVersion, IndexMutations, IndexedMutation,
-    LogScanPage, LogWatermark, MembusError, NeighborPage, OrderedIndexPage, ReplicatedApplyResult,
-    ReplicatedDelta, ReplicationStamp, ScanOptions, ScanPage, SearchLogOp, SearchLogPage,
-    SignalEvent, StoredRecord, VersionGuard, WalBatch, WriteMutation, DEFAULT_MAX_VALUE_BYTES,
+    Ack, BfsResult, CommitResult, DeltaLogPage, ExpectedVersion, IdempotencyContext,
+    IndexMutations, IndexedMutation, LogScanPage, LogWatermark, MembusError, NeighborPage,
+    OrderedIndexPage, ReplicatedApplyResult, ReplicatedDelta, ReplicationStamp, ScanOptions,
+    ScanPage, SearchLogOp, SearchLogPage, SignalEvent, StoredRecord, VersionGuard, WalBatch,
+    WriteMutation, DEFAULT_MAX_IDEMPOTENCY_ENTRIES, DEFAULT_MAX_VALUE_BYTES,
 };
 
 pub use admission::{AdmissionConfig, AdmissionGate, AdmissionPermit};
+pub use parity::{
+    compute_namespace_parity_digest, compute_namespace_parity_digest_with_timeout,
+    compute_namespace_xor_digest, compute_namespace_xor_digest_with_mode, encode_sha256_hex,
+};
 pub use rocksdb_kv::RocksDbStorage;
 pub use snapshot::OwnedSnapshot;
 
@@ -94,6 +100,8 @@ pub struct StorageConfig {
     pub max_scan_limit: usize,
     /// Optional cooperative execution deadline for scan, index query, and graph traversal loops.
     pub query_timeout: Option<Duration>,
+    /// Maximum retained transactional idempotency dedup records in `CF_META` before pruning oldest.
+    pub max_idempotency_entries: usize,
 }
 
 impl Default for StorageConfig {
@@ -115,6 +123,7 @@ impl Default for StorageConfig {
             max_active_snapshots: 1024,
             max_scan_limit: 10_000,
             query_timeout: Some(Duration::from_secs(30)),
+            max_idempotency_entries: DEFAULT_MAX_IDEMPOTENCY_ENTRIES,
         }
     }
 }
@@ -243,6 +252,69 @@ pub trait StorageEngine: Send + Sync {
         mutations: &[IndexedMutation],
         ack: Ack,
     ) -> Result<CommitResult, MembusError>;
+
+    /// Atomically commit an indexed `PUT` with optional transactional idempotency enforcement.
+    /// Returns `(commit, replayed)` where `replayed == true` indicates an idempotent replay.
+    #[allow(clippy::too_many_arguments)]
+    fn put_indexed_idempotent(
+        &self,
+        namespace: &str,
+        key: &[u8],
+        value: &[u8],
+        ack: Ack,
+        expected: ExpectedVersion,
+        indexes: Option<&IndexMutations>,
+        search_op: Option<&SearchLogOp>,
+        idempotency: Option<&IdempotencyContext>,
+    ) -> Result<(CommitResult, bool), MembusError> {
+        if idempotency.is_some() {
+            return Err(MembusError::InvalidArgument(
+                "idempotent writes are not supported by this storage backend".to_owned(),
+            ));
+        }
+        Ok((
+            self.put_indexed(namespace, key, value, ack, expected, indexes, search_op)?,
+            false,
+        ))
+    }
+
+    /// Atomically commit an indexed `REMOVE` with optional transactional idempotency enforcement.
+    #[allow(clippy::too_many_arguments)]
+    fn remove_indexed_idempotent(
+        &self,
+        namespace: &str,
+        key: &[u8],
+        ack: Ack,
+        expected: ExpectedVersion,
+        search_op: Option<&SearchLogOp>,
+        idempotency: Option<&IdempotencyContext>,
+    ) -> Result<(CommitResult, bool), MembusError> {
+        if idempotency.is_some() {
+            return Err(MembusError::InvalidArgument(
+                "idempotent writes are not supported by this storage backend".to_owned(),
+            ));
+        }
+        Ok((
+            self.remove_indexed(namespace, key, ack, expected, search_op)?,
+            false,
+        ))
+    }
+
+    /// Atomically commit a multi-key indexed transaction with optional transactional idempotency enforcement.
+    fn commit_indexed_tx_idempotent(
+        &self,
+        guards: &[VersionGuard],
+        mutations: &[IndexedMutation],
+        ack: Ack,
+        idempotency: Option<&IdempotencyContext>,
+    ) -> Result<(CommitResult, bool), MembusError> {
+        if idempotency.is_some() {
+            return Err(MembusError::InvalidArgument(
+                "idempotent writes are not supported by this storage backend".to_owned(),
+            ));
+        }
+        Ok((self.commit_indexed_tx(guards, mutations, ack)?, false))
+    }
 
     fn open_snapshot(&self) -> Result<OwnedSnapshot, MembusError>;
 

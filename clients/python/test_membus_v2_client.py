@@ -345,6 +345,163 @@ class MembusPythonClientEndToEndTest(unittest.TestCase):
         self.assertEqual(msgs[0].event_id, "42")
         self.assertEqual(msgs[0].data["raw"], "  indented line\nno-space")
 
+    def test_07_catalog_blob_head_search_revoke_and_ab_primitives(self) -> None:
+        import base64
+        import hashlib
+
+        # 1. HEAD /v2/blobs/{ns}/{sha256}
+        blob = b"head-probe-blob-bytes"
+        sha_hex = self.client.put_cas_blob("py_blobs_head", blob, ack="flush")
+        self.assertTrue(self.client.has_cas_blob("py_blobs_head", sha_hex))
+        self.assertFalse(self.client.has_cas_blob("py_blobs_head", "0" * 64))
+        with self.assertRaises(MembusError) as bad_head:
+            self.client.has_cas_blob("py_blobs_head", "not-hex")
+        self.assertEqual(bad_head.exception.status, 400)
+
+        # 2. Collection catalog & expand-contract lifecycle
+        s1 = b'{"version":1}'
+        s2 = b'{"version":2}'
+        s1_sha = list(hashlib.sha256(s1).digest())
+        s2_sha = list(hashlib.sha256(s2).digest())
+        reg = self.client.register_collection(
+            {
+                "namespace": "py_cat",
+                "store_profile": "Kv",
+                "schema_version": 1,
+                "schema_sha256": s1_sha,
+                "schema_bytes": base64.b64encode(s1).decode("ascii"),
+                "declared_indexes": [],
+                "retention_policy": {
+                    "max_age_secs": None,
+                    "max_entries": None,
+                },
+                "migration_state": "Active",
+            }
+        )
+        self.assertEqual(reg["namespace"], "py_cat")
+        self.assertEqual(reg["schema_version"], 1)
+        self.assertIsNotNone(self.client.get_collection("py_cat"))
+        self.assertIsNone(self.client.get_collection("py_cat_missing"))
+        self.assertTrue(any(c["namespace"] == "py_cat" for c in self.client.list_collections()))
+        v1 = self.client.get_collection_version("py_cat", 1)
+        self.assertIsNotNone(v1)
+        self.assertIsNone(self.client.get_collection_version("py_cat", 99))
+
+        begun = self.client.begin_migration(
+            "py_cat",
+            expected_version=1,
+            target_version=2,
+            target_sha256=s2_sha,
+            target_schema_bytes=s2,
+        )
+        self.assertEqual(begun["compatibility_mode"], "ExpandDual")
+        adv = self.client.advance_migration("py_cat", target_version=2, verified_through=10)
+        self.assertEqual(adv["migration_state"]["Migrating"]["verified_through"], 10)
+        rev = self.client.enter_reverse_shadow("py_cat", target_version=2, verified_through=10)
+        self.assertEqual(rev["compatibility_mode"], "ReverseShadow")
+        rolled = self.client.rollback_migration("py_cat", rollback_version=1)
+        self.assertEqual(rolled["schema_version"], 1)
+        self.client.begin_migration(
+            "py_cat",
+            expected_version=1,
+            target_version=2,
+            target_sha256=s2_sha,
+            target_schema_bytes=s2,
+        )
+        self.client.enter_reverse_shadow("py_cat", target_version=2, verified_through=12)
+        contracted = self.client.contract_migration("py_cat", expected_version=2)
+        self.assertEqual(contracted["compatibility_mode"], "Strict")
+        self.assertEqual(contracted["schema_version"], 2)
+
+        # 3. POST /v2/search/revoke-prefix
+        self.client.index_search_document(
+            namespace="py_rev",
+            doc_id="drop/1",
+            kind="note",
+            title="Revocable Entry",
+            body="RevokeToken_7711",
+        )
+        self.client.index_search_document(
+            namespace="py_rev",
+            doc_id="keep/1",
+            kind="note",
+            title="Kept Entry",
+            body="RevokeToken_7711",
+        )
+        self.client.revoke_search_prefix("py_rev", "drop/", ack="Flush")
+        hits = self.client.search(
+            "RevokeToken_7711",
+            mode="LiteralSubstring",
+            namespace="py_rev",
+        )["hits"]
+        self.assertEqual([h["doc_id"] for h in hits], ["keep/1"])
+
+        # 4. Idempotent PUT + Parity Digest + Slot Role Transition + Replicated Apply
+        h = self.client.health()
+        cur_epoch = int(h["role_epoch"])
+        c_a = self.client.put(
+            "py_ab",
+            "item/1",
+            "v1",
+            ack="Flush",
+            idempotency_key="py-idem-1",
+            role_epoch=cur_epoch,
+        )
+        c_b = self.client.put(
+            "py_ab",
+            "item/1",
+            "v1",
+            ack="Flush",
+            idempotency_key="py-idem-1",
+            role_epoch=cur_epoch,
+        )
+        self.assertEqual(c_a.seq, c_b.seq)
+
+        dig_full = self.client.namespace_digest("py_ab", mode="full", prefix="item/")
+        dig_keys = self.client.namespace_digest("py_ab", mode="keys_only", prefix="item/")
+        self.assertEqual(dig_full["entry_count"], 1)
+        self.assertEqual(dig_keys["entry_count"], 1)
+        self.assertNotEqual(dig_full["xor_digest_hex"], dig_keys["xor_digest_hex"])
+
+        shadow_state = self.client.transition_slot_role(
+            expected_role="active",
+            expected_role_epoch=cur_epoch,
+            new_role="shadow",
+        )
+        self.assertEqual(shadow_state["role"], "shadow")
+        shadow_epoch = int(shadow_state["role_epoch"])
+        try:
+            repl = self.client.apply_replicated_delta(
+                {
+                    "namespace": "py_ab",
+                    "key": list(b"item/2"),
+                    "op": {"Put": {"value": list(b"from-peer")}},
+                    "stamp": {
+                        "timestamp_ms": 1_700_000_000_001,
+                        "origin_node_id": "remote-peer-slot",
+                        "origin_seq": 1,
+                        "value_sha256": list(hashlib.sha256(b"from-peer").digest()),
+                    },
+                    "indexes": None,
+                    "search_op": None,
+                },
+                ack="Flush",
+                route_origin="remote-peer-slot",
+                role_epoch=shadow_epoch,
+            )
+            self.assertTrue(repl["applied"])
+            self.assertFalse(repl["echo_rejected"])
+            rec = self.client.get("py_ab", "item/2")
+            self.assertIsNotNone(rec)
+            assert rec is not None
+            self.assertEqual(rec.value_text, "from-peer")
+        finally:
+            self.client.transition_slot_role(
+                expected_role="shadow",
+                expected_role_epoch=shadow_epoch,
+                new_role="active",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

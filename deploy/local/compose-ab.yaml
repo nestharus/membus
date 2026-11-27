@@ -1,0 +1,149 @@
+# Local dual-slot A/B deployment topology for Membus v2.
+#
+# Architectural invariants:
+# - `membus-slot-a` and `membus-slot-b` are completely isolated storage residents on
+#   separate `internal: true` bridge networks (`membus_slot_a_net`, `membus_slot_b_net`)
+#   with independent persistent volumes and ZERO host port publications.
+# - Neither slot can communicate directly with the other; container IPs stay private.
+# - All routing, traffic splitting, async write-teeing, backfill orchestration, and
+#   cutover state transitions live OUTSIDE `membus` in the parameterized `ab-router`
+#   gateway, which exposes one loopback data surface and one loopback admin surface.
+#
+# NOTE: `--allow-insecure-non-loopback` is used strictly because each slot binds on its
+# isolated `internal: true` container network with zero host ports. Production deployments
+# MUST use mutual TLS + enforced auth (see `gitops/ab/`).
+
+services:
+  membus-slot-a:
+    build:
+      context: ../..
+      dockerfile: Containerfile
+    image: ${MEMBUS_SLOT_A_IMAGE:-membus:local}
+    user: "10001:10001"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:size=64m,noexec,nosuid
+    command:
+      - serve
+      - --data-dir
+      - /var/lib/membus
+      - --checkpoint-root
+      - /var/lib/membus/checkpoints
+      - --http-listen
+      - 0.0.0.0:8080
+      - --node-id
+      - slot-a
+      - --slot-role
+      - active
+      - --public-health-probe
+      - --allow-insecure-non-loopback
+    volumes:
+      - membus_slot_a_data:/var/lib/membus
+    networks:
+      - membus_slot_a_net
+    stop_signal: SIGTERM
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/v2/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+
+  membus-slot-b:
+    build:
+      context: ../..
+      dockerfile: Containerfile
+    image: ${MEMBUS_SLOT_B_IMAGE:-membus:local}
+    user: "10001:10001"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:size=64m,noexec,nosuid
+    command:
+      - serve
+      - --data-dir
+      - /var/lib/membus
+      - --checkpoint-root
+      - /var/lib/membus/checkpoints
+      - --http-listen
+      - 0.0.0.0:8080
+      - --node-id
+      - slot-b
+      - --slot-role
+      - shadow
+      - --public-health-probe
+      - --allow-insecure-non-loopback
+    volumes:
+      - membus_slot_b_data:/var/lib/membus
+    networks:
+      - membus_slot_b_net
+    stop_signal: SIGTERM
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/v2/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+
+  ab-router:
+    image: ${AB_ROUTER_IMAGE:?set AB_ROUTER_IMAGE to an immutable A/B gateway image reference}
+    user: "10001:10001"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:size=32m,noexec,nosuid
+    depends_on:
+      membus-slot-a:
+        condition: service_healthy
+      membus-slot-b:
+        condition: service_healthy
+    environment:
+      AB_PRIMARY_SLOT: ${AB_PRIMARY_SLOT:-slot-a}
+      AB_SHADOW_SLOT: ${AB_SHADOW_SLOT:-slot-b}
+      AB_SLOT_A_URL: http://membus-slot-a:8080
+      AB_SLOT_B_URL: http://membus-slot-b:8080
+      # Optional bearer token secret files; mount matching secret files and set these
+      # variables when running slots with `--auth-mode enforced`.
+      AB_SLOT_A_TOKEN_FILE: ${AB_SLOT_A_TOKEN_FILE:-}
+      AB_SLOT_B_TOKEN_FILE: ${AB_SLOT_B_TOKEN_FILE:-}
+      AB_SHADOW_MAX_QUEUE_OPS: ${AB_SHADOW_MAX_QUEUE_OPS:-4096}
+      AB_SHADOW_MAX_QUEUE_BYTES: ${AB_SHADOW_MAX_QUEUE_BYTES:-67108864}
+      AB_SHADOW_TIMEOUT_MS: ${AB_SHADOW_TIMEOUT_MS:-2000}
+    ports:
+      - "127.0.0.1:${AB_DATA_PORT:-8080}:8080"
+      - "127.0.0.1:${AB_ADMIN_PORT:-8081}:8081"
+    networks:
+      - ab_ingress_net
+      - membus_slot_a_net
+      - membus_slot_b_net
+    stop_signal: SIGTERM
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+networks:
+  ab_ingress_net:
+    driver: bridge
+  membus_slot_a_net:
+    driver: bridge
+    internal: true
+  membus_slot_b_net:
+    driver: bridge
+    internal: true
+
+volumes:
+  membus_slot_a_data:
+  membus_slot_b_data:

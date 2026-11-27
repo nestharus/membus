@@ -19,6 +19,7 @@ use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot, watch, Semaphore};
@@ -27,24 +28,34 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::index::{BfsOptions, NeighborQueryOptions, OrderedKeyFilter, OrderedQueryOptions};
 use crate::signals::{EachChangeSubscription, LiveCoalescedSubscription};
+use crate::storage::{compute_namespace_parity_digest_with_timeout, encode_sha256_hex};
 use crate::transport::connection::{
     authorize_index_mutations, authorize_search_op, resolve_checkpoint_path, run_blocking_query,
     ConnectionGuard,
 };
 use crate::transport::tls::{build_http_tls_acceptor, MAX_CONCURRENT_TLS_HANDSHAKES};
 use crate::transport::write_coord::{
-    coordinated_commit_indexed_tx, coordinated_delete_search_document, coordinated_index_document,
-    coordinated_put_indexed, coordinated_remove_indexed, coordinated_revoke_search_prefix,
-    CoordinatedCommit,
+    coordinated_apply_replicated_delta, coordinated_commit_indexed_tx_idempotent,
+    coordinated_delete_search_document, coordinated_index_document,
+    coordinated_put_indexed, coordinated_put_indexed_idempotent, coordinated_remove_indexed,
+    coordinated_remove_indexed_idempotent, coordinated_revoke_search_prefix, CoordinatedCommit,
+    CoordinatedReplicatedApply,
 };
 use crate::transport::{Endpoint, ServerContext, ServerHandle, TlsServerConfig};
 use crate::types::{
     Ack, AuthMode, CollectionDescriptor, CommitResult, ExpectedVersion, GraphDirection,
-    HealthStatus, IndexMutations, IndexedMutation, MembusError, Permission, Principal, ScanOptions,
-    SearchDocument, SearchLogOp, SearchQuery, SearchSyncStatus, SignalEvent, VersionGuard,
+    HealthStatus, IdempotencyContext, IndexMutations, IndexedMutation, MembusError,
+    NamespaceParityDigest, ParityDigestMode, Permission, Principal, ReplicatedApplyResult,
+    ReplicatedDelta, ScanOptions, SearchDocument, SearchLogOp, SearchQuery, SearchSyncStatus,
+    SignalEvent, SlotRole, SlotRoleState, VersionGuard, MAX_IDEMPOTENCY_KEY_BYTES,
 };
 
 const HEADER_SEARCH_SYNC: HeaderName = HeaderName::from_static("x-membus-search-sync");
+const HEADER_ROLE_EPOCH: HeaderName = HeaderName::from_static("x-membus-role-epoch");
+const HEADER_IDEMPOTENCY_KEY: HeaderName = HeaderName::from_static("x-membus-idempotency-key");
+const HEADER_IDEMPOTENT_REPLAY: HeaderName = HeaderName::from_static("x-membus-idempotent-replay");
+const HEADER_ROUTE_ORIGIN: HeaderName = HeaderName::from_static("x-membus-route-origin");
+const HEADER_ECHO_LOOP: HeaderName = HeaderName::from_static("x-membus-echo-loop");
 
 #[derive(Clone)]
 pub(crate) struct HttpState {
@@ -272,6 +283,22 @@ pub(crate) fn build_router(state: HttpState) -> Router {
             post(handle_migration_begin),
         )
         .route(
+            "/v2/catalog/collections/{ns}/migrations/advance",
+            post(handle_migration_advance),
+        )
+        .route(
+            "/v2/catalog/collections/{ns}/migrations/reverse-shadow",
+            post(handle_migration_reverse_shadow),
+        )
+        .route(
+            "/v2/catalog/collections/{ns}/migrations/rollback",
+            post(handle_migration_rollback),
+        )
+        .route(
+            "/v2/catalog/collections/{ns}/migrations/contract",
+            post(handle_migration_contract),
+        )
+        .route(
             "/v2/catalog/collections/{ns}/migrations/commit",
             post(handle_migration_commit),
         )
@@ -279,6 +306,9 @@ pub(crate) fn build_router(state: HttpState) -> Router {
             "/v2/catalog/collections/{ns}/migrations/abort",
             post(handle_migration_abort),
         )
+        .route("/v2/namespaces/{ns}/digest", post(handle_namespace_digest))
+        .route("/v2/admin/role", post(handle_admin_role_transition))
+        .route("/v2/replication/apply", post(handle_replication_apply))
         .route("/v2/search/documents", post(handle_search_index_doc))
         .route(
             "/v2/search/documents/{ns}/{*doc_id}",
@@ -307,12 +337,42 @@ struct HttpCommitResp {
 
 fn coordinated_commit_response(res: CoordinatedCommit) -> AxumResponse {
     let header_val = HeaderValue::from_static(res.search_sync.as_str());
+    let replayed = res.idempotent_replay;
     let body = HttpCommitResp {
         commit: res.commit,
         search_sync: res.search_sync,
     };
     let mut resp = (StatusCode::OK, Json(body)).into_response();
     resp.headers_mut().insert(HEADER_SEARCH_SYNC, header_val);
+    if replayed {
+        resp.headers_mut()
+            .insert(HEADER_IDEMPOTENT_REPLAY, HeaderValue::from_static("true"));
+    }
+    resp
+}
+
+#[derive(Serialize)]
+struct HttpReplicationApplyResp {
+    #[serde(flatten)]
+    result: ReplicatedApplyResult,
+    echo_rejected: bool,
+    search_sync: SearchSyncStatus,
+}
+
+fn coordinated_replicated_apply_response(res: CoordinatedReplicatedApply) -> AxumResponse {
+    let header_val = HeaderValue::from_static(res.search_sync.as_str());
+    let echo_rejected = res.echo_rejected;
+    let body = HttpReplicationApplyResp {
+        result: res.result,
+        echo_rejected,
+        search_sync: res.search_sync,
+    };
+    let mut resp = (StatusCode::OK, Json(body)).into_response();
+    resp.headers_mut().insert(HEADER_SEARCH_SYNC, header_val);
+    if echo_rejected {
+        resp.headers_mut()
+            .insert(HEADER_ECHO_LOOP, HeaderValue::from_static("rejected"));
+    }
     resp
 }
 
@@ -340,6 +400,15 @@ impl IntoResponse for HttpError {
             MembusError::Conflict { .. } => (StatusCode::CONFLICT, "conflict"),
             MembusError::TxConflict(_) => (StatusCode::CONFLICT, "tx_conflict"),
             MembusError::LeaseHeld { .. } => (StatusCode::CONFLICT, "lease_held"),
+            MembusError::RoleFenced { role, .. } => {
+                let st = if *role == SlotRole::Draining {
+                    StatusCode::SERVICE_UNAVAILABLE
+                } else {
+                    StatusCode::CONFLICT
+                };
+                (st, "role_fenced")
+            }
+            MembusError::IdempotencyConflict(_) => (StatusCode::CONFLICT, "idempotency_conflict"),
             MembusError::Busy { .. } => (StatusCode::SERVICE_UNAVAILABLE, "busy"),
             MembusError::Gap { .. } => (StatusCode::GONE, "gap"),
             MembusError::FrameTooLarge { .. } => {
@@ -359,6 +428,150 @@ impl IntoResponse for HttpError {
         )
             .into_response()
     }
+}
+
+fn extract_single_header<'a>(
+    headers: &'a HeaderMap,
+    name: &HeaderName,
+    display: &str,
+) -> Result<Option<&'a str>, MembusError> {
+    let mut iter = headers.get_all(name).iter();
+    let Some(first) = iter.next() else {
+        return Ok(None);
+    };
+    if iter.next().is_some() {
+        return Err(MembusError::InvalidArgument(format!(
+            "duplicate {display} header is not permitted"
+        )));
+    }
+    let s = first.to_str().map_err(|_| {
+        MembusError::InvalidArgument(format!("{display} header must be valid UTF-8"))
+    })?;
+    Ok(Some(s))
+}
+
+fn parse_role_epoch_header(headers: &HeaderMap) -> Result<Option<u64>, MembusError> {
+    let Some(s) = extract_single_header(headers, &HEADER_ROLE_EPOCH, "X-Membus-Role-Epoch")?
+    else {
+        return Ok(None);
+    };
+    let parsed = s.trim().parse::<u64>().map_err(|_| {
+        MembusError::InvalidArgument(format!(
+            "invalid X-Membus-Role-Epoch header '{s}' (expected unsigned 64-bit integer)"
+        ))
+    })?;
+    Ok(Some(parsed))
+}
+
+fn parse_idempotency_key_header(headers: &HeaderMap) -> Result<Option<String>, MembusError> {
+    let Some(s) =
+        extract_single_header(headers, &HEADER_IDEMPOTENCY_KEY, "X-Membus-Idempotency-Key")?
+    else {
+        return Ok(None);
+    };
+    if s.is_empty() || s.len() > MAX_IDEMPOTENCY_KEY_BYTES {
+        return Err(MembusError::InvalidArgument(format!(
+            "X-Membus-Idempotency-Key length must be 1..={MAX_IDEMPOTENCY_KEY_BYTES} bytes"
+        )));
+    }
+    if s.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return Err(MembusError::InvalidArgument(
+            "X-Membus-Idempotency-Key must not contain ASCII control characters".to_owned(),
+        ));
+    }
+    Ok(Some(s.to_owned()))
+}
+
+fn parse_route_origin_header(headers: &HeaderMap) -> Result<Option<String>, MembusError> {
+    let Some(s) = extract_single_header(headers, &HEADER_ROUTE_ORIGIN, "X-Membus-Route-Origin")?
+    else {
+        return Ok(None);
+    };
+    validate_route_origin_value(s, "X-Membus-Route-Origin header")
+}
+
+fn validate_route_origin_value(raw: &str, label: &str) -> Result<Option<String>, MembusError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > 128 || trimmed.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return Err(MembusError::InvalidArgument(format!("invalid {label}")));
+    }
+    Ok(Some(trimmed.to_owned()))
+}
+
+fn tx_namespace_scope(guards: &[VersionGuard], mutations: &[IndexedMutation]) -> String {
+    let mut namespaces: Vec<&str> = Vec::with_capacity(guards.len() + mutations.len());
+    for g in guards {
+        namespaces.push(g.namespace.as_str());
+    }
+    for m in mutations {
+        namespaces.push(m.mutation.namespace.as_str());
+    }
+    namespaces.sort_unstable();
+    namespaces.dedup();
+    let mut h = Sha256::new();
+    h.update(b"membus:idem:tx_scope:v1\0");
+    h.update((namespaces.len() as u32).to_be_bytes());
+    for ns in namespaces {
+        h.update((ns.len() as u32).to_be_bytes());
+        h.update(ns.as_bytes());
+    }
+    let digest: [u8; 32] = h.finalize().into();
+    encode_sha256_hex(&digest)
+}
+
+fn fingerprint_kv_put(
+    ns: &str,
+    key: &[u8],
+    value: &[u8],
+    expected: ExpectedVersion,
+    indexes: Option<&IndexMutations>,
+    search_op: Option<&SearchLogOp>,
+) -> Result<[u8; 32], MembusError> {
+    let mut h = Sha256::new();
+    h.update(b"membus:idem:kv_put:v1\0");
+    h.update((ns.len() as u32).to_be_bytes());
+    h.update(ns.as_bytes());
+    h.update((key.len() as u32).to_be_bytes());
+    h.update(key);
+    h.update((value.len() as u32).to_be_bytes());
+    h.update(value);
+    let aux = serde_json::to_vec(&(expected, indexes, search_op))
+        .map_err(|err| MembusError::Storage(format!("fingerprint encode failed: {err}")))?;
+    h.update((aux.len() as u32).to_be_bytes());
+    h.update(&aux);
+    Ok(h.finalize().into())
+}
+
+fn fingerprint_kv_delete(
+    ns: &str,
+    key: &[u8],
+    expected: ExpectedVersion,
+    search_op: Option<&SearchLogOp>,
+) -> Result<[u8; 32], MembusError> {
+    let mut h = Sha256::new();
+    h.update(b"membus:idem:kv_delete:v1\0");
+    h.update((ns.len() as u32).to_be_bytes());
+    h.update(ns.as_bytes());
+    h.update((key.len() as u32).to_be_bytes());
+    h.update(key);
+    let aux = serde_json::to_vec(&(expected, search_op))
+        .map_err(|err| MembusError::Storage(format!("fingerprint encode failed: {err}")))?;
+    h.update((aux.len() as u32).to_be_bytes());
+    h.update(&aux);
+    Ok(h.finalize().into())
+}
+
+fn fingerprint_tx(
+    guards: &[VersionGuard],
+    mutations: &[IndexedMutation],
+) -> Result<[u8; 32], MembusError> {
+    let mut h = Sha256::new();
+    h.update(b"membus:idem:tx:v1\0");
+    let body = serde_json::to_vec(&(guards, mutations))
+        .map_err(|err| MembusError::Storage(format!("fingerprint encode failed: {err}")))?;
+    h.update((body.len() as u32).to_be_bytes());
+    h.update(&body);
+    Ok(h.finalize().into())
 }
 
 fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -432,16 +645,6 @@ fn hex_nibble(b: u8) -> Result<u8, MembusError> {
             "invalid hex character in sha256 digest".to_owned(),
         )),
     }
-}
-
-fn encode_sha256_hex(digest: &[u8; 32]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(64);
-    for &b in digest {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0x0f) as usize] as char);
-    }
-    out
 }
 
 fn default_ack() -> Ack {
@@ -551,11 +754,38 @@ async fn handle_kv_put(
     if let Some(op) = &req.search_op {
         authorize_search_op(&state.ctx.auth, principal.as_ref(), op)?;
     }
+    let role_epoch = parse_role_epoch_header(&headers)?;
+    state.ctx.check_client_write_allowed(role_epoch)?;
+    let idem_key = parse_idempotency_key_header(&headers)?;
     let value = decode_bytes_field(req.value_utf8, req.value_b64, "value")?;
+    let principal_id = if state.ctx.auth.mode() == AuthMode::Enforced {
+        principal.as_ref().map(|p| p.id.clone())
+    } else {
+        None
+    };
+    let idempotency = match idem_key {
+        Some(k) => Some(IdempotencyContext {
+            scope_namespace: ns.clone(),
+            principal_id,
+            is_tx: false,
+            key: k,
+            request_fingerprint_sha256: fingerprint_kv_put(
+                &ns,
+                key.as_bytes(),
+                &value,
+                req.expected,
+                req.indexes.as_ref(),
+                req.search_op.as_ref(),
+            )?,
+        }),
+        None => None,
+    };
+    let ctx = state.ctx.clone();
     let storage = Arc::clone(&state.ctx.storage);
     let search = state.ctx.search.clone();
     let coord = tokio::task::spawn_blocking(move || {
-        coordinated_put_indexed(
+        let _fence = ctx.acquire_client_write_fence(role_epoch)?;
+        coordinated_put_indexed_idempotent(
             &storage,
             search.as_ref(),
             &ns,
@@ -565,6 +795,7 @@ async fn handle_kv_put(
             req.expected,
             req.indexes.as_ref(),
             req.search_op,
+            idempotency.as_ref(),
         )
     })
     .await
@@ -612,10 +843,35 @@ async fn handle_kv_delete(
     if let Some(op) = &req.search_op {
         authorize_search_op(&state.ctx.auth, principal.as_ref(), op)?;
     }
+    let role_epoch = parse_role_epoch_header(&headers)?;
+    state.ctx.check_client_write_allowed(role_epoch)?;
+    let idem_key = parse_idempotency_key_header(&headers)?;
+    let principal_id = if state.ctx.auth.mode() == AuthMode::Enforced {
+        principal.as_ref().map(|p| p.id.clone())
+    } else {
+        None
+    };
+    let idempotency = match idem_key {
+        Some(k) => Some(IdempotencyContext {
+            scope_namespace: ns.clone(),
+            principal_id,
+            is_tx: false,
+            key: k,
+            request_fingerprint_sha256: fingerprint_kv_delete(
+                &ns,
+                key.as_bytes(),
+                req.expected,
+                req.search_op.as_ref(),
+            )?,
+        }),
+        None => None,
+    };
+    let ctx = state.ctx.clone();
     let storage = Arc::clone(&state.ctx.storage);
     let search = state.ctx.search.clone();
     let coord = tokio::task::spawn_blocking(move || {
-        coordinated_remove_indexed(
+        let _fence = ctx.acquire_client_write_fence(role_epoch)?;
+        coordinated_remove_indexed_idempotent(
             &storage,
             search.as_ref(),
             &ns,
@@ -623,6 +879,7 @@ async fn handle_kv_delete(
             req.ack,
             req.expected,
             req.search_op,
+            idempotency.as_ref(),
         )
     })
     .await
@@ -671,10 +928,37 @@ async fn handle_tx(
             authorize_search_op(&state.ctx.auth, principal.as_ref(), op)?;
         }
     }
+    let role_epoch = parse_role_epoch_header(&headers)?;
+    state.ctx.check_client_write_allowed(role_epoch)?;
+    let idem_key = parse_idempotency_key_header(&headers)?;
+    let principal_id = if state.ctx.auth.mode() == AuthMode::Enforced {
+        principal.as_ref().map(|p| p.id.clone())
+    } else {
+        None
+    };
+    let idempotency = match idem_key {
+        Some(k) => Some(IdempotencyContext {
+            scope_namespace: tx_namespace_scope(&req.guards, &req.mutations),
+            principal_id,
+            is_tx: true,
+            key: k,
+            request_fingerprint_sha256: fingerprint_tx(&req.guards, &req.mutations)?,
+        }),
+        None => None,
+    };
+    let ctx = state.ctx.clone();
     let storage = Arc::clone(&state.ctx.storage);
     let search = state.ctx.search.clone();
     let coord = tokio::task::spawn_blocking(move || {
-        coordinated_commit_indexed_tx(&storage, search.as_ref(), &req.guards, req.mutations, req.ack)
+        let _fence = ctx.acquire_client_write_fence(role_epoch)?;
+        coordinated_commit_indexed_tx_idempotent(
+            &storage,
+            search.as_ref(),
+            &req.guards,
+            req.mutations,
+            req.ack,
+            idempotency.as_ref(),
+        )
     })
     .await
     .map_err(|e| MembusError::Storage(format!("tx task failed: {e}")))??;
@@ -974,12 +1258,18 @@ async fn handle_blob_put(
         .ctx
         .auth
         .authorize(principal.as_ref(), &ns, b"", Permission::Write)?;
+    let role_epoch = parse_role_epoch_header(&headers)?;
+    state.ctx.check_client_write_allowed(role_epoch)?;
     let ack = parse_ack_param(q.ack.as_deref())?;
+    let ctx = state.ctx.clone();
     let storage = Arc::clone(&state.ctx.storage);
     let data = body.to_vec();
-    let digest = tokio::task::spawn_blocking(move || storage.put_cas_blob(&ns, &data, ack))
-        .await
-        .map_err(|e| MembusError::Storage(format!("put_cas_blob failed: {e}")))??;
+    let digest = tokio::task::spawn_blocking(move || {
+        let _fence = ctx.acquire_client_write_fence(role_epoch)?;
+        storage.put_cas_blob(&ns, &data, ack)
+    })
+    .await
+    .map_err(|e| MembusError::Storage(format!("put_cas_blob failed: {e}")))??;
     Ok(Json(BlobPutResp {
         sha256_hex: encode_sha256_hex(&digest),
     }))
@@ -1053,8 +1343,12 @@ async fn handle_lease_acquire(
         req.resource.as_bytes(),
         Permission::Write,
     )?;
+    let role_epoch = parse_role_epoch_header(&headers)?;
+    state.ctx.check_client_write_allowed(role_epoch)?;
+    let ctx = state.ctx.clone();
     let leases = Arc::clone(&state.ctx.leases);
     let grant = tokio::task::spawn_blocking(move || {
+        let _fence = ctx.acquire_client_write_fence(role_epoch)?;
         leases.acquire_lease(&req.namespace, &req.resource, &req.holder, req.ttl_ms)
     })
     .await
@@ -1084,8 +1378,12 @@ async fn handle_lease_renew(
         req.resource.as_bytes(),
         Permission::Write,
     )?;
+    let role_epoch = parse_role_epoch_header(&headers)?;
+    state.ctx.check_client_write_allowed(role_epoch)?;
+    let ctx = state.ctx.clone();
     let leases = Arc::clone(&state.ctx.leases);
     let grant = tokio::task::spawn_blocking(move || {
+        let _fence = ctx.acquire_client_write_fence(role_epoch)?;
         leases.renew_lease(
             &req.namespace,
             &req.resource,
@@ -1126,8 +1424,12 @@ async fn handle_lease_release(
         req.resource.as_bytes(),
         Permission::Write,
     )?;
+    let role_epoch = parse_role_epoch_header(&headers)?;
+    state.ctx.check_client_write_allowed(role_epoch)?;
+    let ctx = state.ctx.clone();
     let leases = Arc::clone(&state.ctx.leases);
     tokio::task::spawn_blocking(move || {
+        let _fence = ctx.acquire_client_write_fence(role_epoch)?;
         leases.release_lease(
             &req.namespace,
             &req.resource,
@@ -1208,8 +1510,12 @@ async fn handle_catalog_register(
         .ctx
         .auth
         .authorize_admin(principal.as_ref(), Some(&req.descriptor.namespace))?;
+    let role_epoch = parse_role_epoch_header(&headers)?;
+    state.ctx.check_catalog_write_allowed(role_epoch)?;
+    let ctx = state.ctx.clone();
     let catalog = Arc::clone(&state.ctx.catalog);
     let desc = tokio::task::spawn_blocking(move || {
+        let _fence = ctx.acquire_catalog_write_fence(role_epoch)?;
         catalog.register_collection(req.expected_version, req.descriptor)
     })
     .await
@@ -1302,8 +1608,12 @@ async fn handle_migration_begin(
         .ctx
         .auth
         .authorize_admin(principal.as_ref(), Some(&ns))?;
+    let role_epoch = parse_role_epoch_header(&headers)?;
+    state.ctx.check_catalog_write_allowed(role_epoch)?;
+    let ctx = state.ctx.clone();
     let catalog = Arc::clone(&state.ctx.catalog);
     let desc = tokio::task::spawn_blocking(move || {
+        let _fence = ctx.acquire_catalog_write_fence(role_epoch)?;
         catalog.begin_migration(
             &ns,
             req.expected_version,
@@ -1334,8 +1644,12 @@ async fn handle_migration_commit(
         .ctx
         .auth
         .authorize_admin(principal.as_ref(), Some(&ns))?;
+    let role_epoch = parse_role_epoch_header(&headers)?;
+    state.ctx.check_catalog_write_allowed(role_epoch)?;
+    let ctx = state.ctx.clone();
     let catalog = Arc::clone(&state.ctx.catalog);
     let desc = tokio::task::spawn_blocking(move || {
+        let _fence = ctx.acquire_catalog_write_fence(role_epoch)?;
         catalog.commit_migration(&ns, req.target_version, req.verified_through)
     })
     .await
@@ -1359,11 +1673,274 @@ async fn handle_migration_abort(
         .ctx
         .auth
         .authorize_admin(principal.as_ref(), Some(&ns))?;
+    let role_epoch = parse_role_epoch_header(&headers)?;
+    state.ctx.check_catalog_write_allowed(role_epoch)?;
+    let ctx = state.ctx.clone();
     let catalog = Arc::clone(&state.ctx.catalog);
-    let desc = tokio::task::spawn_blocking(move || catalog.abort_migration(&ns, req.target_version))
-        .await
-        .map_err(|e| MembusError::Storage(format!("abort_migration failed: {e}")))??;
+    let desc = tokio::task::spawn_blocking(move || {
+        let _fence = ctx.acquire_catalog_write_fence(role_epoch)?;
+        catalog.abort_migration(&ns, req.target_version)
+    })
+    .await
+    .map_err(|e| MembusError::Storage(format!("abort_migration failed: {e}")))??;
     Ok(Json(desc))
+}
+
+#[derive(Deserialize)]
+struct AdvanceMigrationReq {
+    target_version: u32,
+    verified_through: u64,
+}
+
+async fn handle_migration_advance(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Path(ns): Path<String>,
+    Json(req): Json<AdvanceMigrationReq>,
+) -> Result<Json<CollectionDescriptor>, HttpError> {
+    let principal = authenticate_http(&state, &headers)?;
+    state
+        .ctx
+        .auth
+        .authorize_admin(principal.as_ref(), Some(&ns))?;
+    let role_epoch = parse_role_epoch_header(&headers)?;
+    state.ctx.check_catalog_write_allowed(role_epoch)?;
+    let ctx = state.ctx.clone();
+    let catalog = Arc::clone(&state.ctx.catalog);
+    let desc = tokio::task::spawn_blocking(move || {
+        let _fence = ctx.acquire_catalog_write_fence(role_epoch)?;
+        catalog.advance_migration_verification(&ns, req.target_version, req.verified_through)
+    })
+    .await
+    .map_err(|e| MembusError::Storage(format!("advance_migration_verification failed: {e}")))??;
+    Ok(Json(desc))
+}
+
+#[derive(Deserialize)]
+struct ReverseShadowReq {
+    target_version: u32,
+    verified_through: u64,
+}
+
+async fn handle_migration_reverse_shadow(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Path(ns): Path<String>,
+    Json(req): Json<ReverseShadowReq>,
+) -> Result<Json<CollectionDescriptor>, HttpError> {
+    let principal = authenticate_http(&state, &headers)?;
+    state
+        .ctx
+        .auth
+        .authorize_admin(principal.as_ref(), Some(&ns))?;
+    let role_epoch = parse_role_epoch_header(&headers)?;
+    state.ctx.check_catalog_write_allowed(role_epoch)?;
+    let ctx = state.ctx.clone();
+    let catalog = Arc::clone(&state.ctx.catalog);
+    let desc = tokio::task::spawn_blocking(move || {
+        let _fence = ctx.acquire_catalog_write_fence(role_epoch)?;
+        catalog.enter_reverse_shadow(&ns, req.target_version, req.verified_through)
+    })
+    .await
+    .map_err(|e| MembusError::Storage(format!("enter_reverse_shadow failed: {e}")))??;
+    Ok(Json(desc))
+}
+
+#[derive(Deserialize)]
+struct RollbackMigrationReq {
+    rollback_version: u32,
+}
+
+async fn handle_migration_rollback(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Path(ns): Path<String>,
+    Json(req): Json<RollbackMigrationReq>,
+) -> Result<Json<CollectionDescriptor>, HttpError> {
+    let principal = authenticate_http(&state, &headers)?;
+    state
+        .ctx
+        .auth
+        .authorize_admin(principal.as_ref(), Some(&ns))?;
+    let role_epoch = parse_role_epoch_header(&headers)?;
+    state.ctx.check_catalog_write_allowed(role_epoch)?;
+    let ctx = state.ctx.clone();
+    let catalog = Arc::clone(&state.ctx.catalog);
+    let desc = tokio::task::spawn_blocking(move || {
+        let _fence = ctx.acquire_catalog_write_fence(role_epoch)?;
+        catalog.rollback_migration(&ns, req.rollback_version)
+    })
+    .await
+    .map_err(|e| MembusError::Storage(format!("rollback_migration failed: {e}")))??;
+    Ok(Json(desc))
+}
+
+#[derive(Deserialize)]
+struct ContractMigrationReq {
+    expected_version: u32,
+}
+
+async fn handle_migration_contract(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Path(ns): Path<String>,
+    Json(req): Json<ContractMigrationReq>,
+) -> Result<Json<CollectionDescriptor>, HttpError> {
+    let principal = authenticate_http(&state, &headers)?;
+    state
+        .ctx
+        .auth
+        .authorize_admin(principal.as_ref(), Some(&ns))?;
+    let role_epoch = parse_role_epoch_header(&headers)?;
+    state.ctx.check_catalog_write_allowed(role_epoch)?;
+    let ctx = state.ctx.clone();
+    let catalog = Arc::clone(&state.ctx.catalog);
+    let desc = tokio::task::spawn_blocking(move || {
+        let _fence = ctx.acquire_catalog_write_fence(role_epoch)?;
+        catalog.contract_migration(&ns, req.expected_version)
+    })
+    .await
+    .map_err(|e| MembusError::Storage(format!("contract_migration failed: {e}")))??;
+    Ok(Json(desc))
+}
+
+#[derive(Default, Deserialize)]
+struct HttpNamespaceDigestReq {
+    #[serde(default)]
+    mode: ParityDigestMode,
+    prefix_utf8: Option<String>,
+    prefix_b64: Option<String>,
+}
+
+async fn handle_namespace_digest(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Path(ns): Path<String>,
+    body: Bytes,
+) -> Result<Json<NamespaceParityDigest>, HttpError> {
+    let principal = authenticate_http(&state, &headers)?;
+    let req: HttpNamespaceDigestReq = if body.is_empty() {
+        HttpNamespaceDigestReq::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|err| {
+            MembusError::InvalidArgument(format!("invalid digest request JSON: {err}"))
+        })?
+    };
+    let key_prefix = decode_bytes_field(req.prefix_utf8, req.prefix_b64, "prefix")?;
+    state
+        .ctx
+        .auth
+        .authorize(principal.as_ref(), &ns, &key_prefix, Permission::Read)?;
+    let storage = Arc::clone(&state.ctx.storage);
+    let catalog = Arc::clone(&state.ctx.catalog);
+    let node_id = state.ctx.node_id().to_owned();
+    let mode = req.mode;
+    let timeout = state.ctx.config.query_timeout;
+    let digest = run_blocking_query(timeout, "namespace_digest", move || {
+        compute_namespace_parity_digest_with_timeout(
+            storage.as_ref(),
+            catalog.as_ref(),
+            &node_id,
+            &ns,
+            &key_prefix,
+            mode,
+            timeout,
+        )
+    })
+    .await?;
+    Ok(Json(digest))
+}
+
+#[derive(Deserialize)]
+struct AdminRoleTransitionReq {
+    expected_role: SlotRole,
+    expected_role_epoch: u64,
+    new_role: SlotRole,
+}
+
+async fn handle_admin_role_transition(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Json(req): Json<AdminRoleTransitionReq>,
+) -> Result<Json<SlotRoleState>, HttpError> {
+    let principal = authenticate_http(&state, &headers)?;
+    state.ctx.auth.authorize_admin(principal.as_ref(), None)?;
+    let ctx = state.ctx.clone();
+    let next = tokio::task::spawn_blocking(move || {
+        ctx.transition_slot_role(req.expected_role, req.expected_role_epoch, req.new_role)
+    })
+    .await
+    .map_err(|e| MembusError::Storage(format!("transition_slot_role failed: {e}")))??;
+    Ok(Json(next))
+}
+
+#[derive(Deserialize)]
+struct HttpReplicationApplyReq {
+    delta: ReplicatedDelta,
+    #[serde(default = "default_ack")]
+    ack: Ack,
+    #[serde(default)]
+    route_origin: Option<String>,
+}
+
+async fn handle_replication_apply(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Json(req): Json<HttpReplicationApplyReq>,
+) -> Result<AxumResponse, HttpError> {
+    let principal = authenticate_http(&state, &headers)?;
+    state.ctx.auth.authorize(
+        principal.as_ref(),
+        &req.delta.namespace,
+        &req.delta.key,
+        Permission::Write,
+    )?;
+    if let Some(idx) = &req.delta.indexes {
+        authorize_index_mutations(
+            &state.ctx.auth,
+            principal.as_ref(),
+            &req.delta.namespace,
+            idx,
+        )?;
+    }
+    if let Some(op) = &req.delta.search_op {
+        authorize_search_op(&state.ctx.auth, principal.as_ref(), op)?;
+    }
+    let role_epoch = parse_role_epoch_header(&headers)?;
+    state.ctx.check_replicated_apply_allowed(role_epoch)?;
+    let header_origin = parse_route_origin_header(&headers)?;
+    let body_origin = match req.route_origin.as_deref() {
+        Some(raw) => validate_route_origin_value(raw, "route_origin field")?,
+        None => None,
+    };
+    let route_origin = match (header_origin, body_origin) {
+        (Some(h), Some(b)) if h != b => {
+            return Err(HttpError(MembusError::InvalidArgument(format!(
+                "conflicting X-Membus-Route-Origin header '{h}' and body route_origin '{b}'"
+            ))));
+        }
+        (Some(h), _) => Some(h),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
+    let ctx = state.ctx.clone();
+    let storage = Arc::clone(&state.ctx.storage);
+    let search = state.ctx.search.clone();
+    let local_node_id = state.ctx.node_id().to_owned();
+    let coord = tokio::task::spawn_blocking(move || {
+        let _fence = ctx.acquire_replicated_apply_fence(role_epoch)?;
+        coordinated_apply_replicated_delta(
+            &storage,
+            search.as_ref(),
+            &local_node_id,
+            route_origin.as_deref(),
+            &req.delta,
+            req.ack,
+        )
+    })
+    .await
+    .map_err(|e| MembusError::Storage(format!("replication_apply failed: {e}")))??;
+    Ok(coordinated_replicated_apply_response(coord))
 }
 
 #[derive(Deserialize)]
@@ -1385,10 +1962,14 @@ async fn handle_search_index_doc(
         req.doc.doc_id.as_bytes(),
         Permission::Write,
     )?;
+    let role_epoch = parse_role_epoch_header(&headers)?;
+    state.ctx.check_client_write_allowed(role_epoch)?;
+    let ctx = state.ctx.clone();
     let search = state.ctx.search.clone().ok_or_else(|| {
         MembusError::InvalidArgument("search engine is not enabled on this server".to_owned())
     })?;
     let coord = tokio::task::spawn_blocking(move || {
+        let _fence = ctx.acquire_client_write_fence(role_epoch)?;
         coordinated_index_document(&search, req.doc, req.ack)
     })
     .await
@@ -1414,11 +1995,15 @@ async fn handle_search_delete_doc(
         doc_id.as_bytes(),
         Permission::Write,
     )?;
+    let role_epoch = parse_role_epoch_header(&headers)?;
+    state.ctx.check_client_write_allowed(role_epoch)?;
     let ack = parse_ack_param(q.ack.as_deref())?;
+    let ctx = state.ctx.clone();
     let search = state.ctx.search.clone().ok_or_else(|| {
         MembusError::InvalidArgument("search engine is not enabled on this server".to_owned())
     })?;
     let coord = tokio::task::spawn_blocking(move || {
+        let _fence = ctx.acquire_client_write_fence(role_epoch)?;
         coordinated_delete_search_document(&search, &ns, &doc_id, ack)
     })
     .await
@@ -1444,10 +2029,14 @@ async fn handle_search_revoke_prefix(
         .ctx
         .auth
         .authorize_admin(principal.as_ref(), Some(&req.namespace))?;
+    let role_epoch = parse_role_epoch_header(&headers)?;
+    state.ctx.check_client_write_allowed(role_epoch)?;
+    let ctx = state.ctx.clone();
     let search = state.ctx.search.clone().ok_or_else(|| {
         MembusError::InvalidArgument("search engine is not enabled on this server".to_owned())
     })?;
     let coord = tokio::task::spawn_blocking(move || {
+        let _fence = ctx.acquire_client_write_fence(role_epoch)?;
         coordinated_revoke_search_prefix(&search, &req.namespace, &req.prefix, req.ack)
     })
     .await
@@ -2117,9 +2706,11 @@ async fn handle_ws_envelope(
                     return;
                 }
             }
+            let ctx = conn.ctx.clone();
             let storage = Arc::clone(&conn.ctx.storage);
             let search = conn.ctx.search.clone();
             let res = tokio::task::spawn_blocking(move || {
+                let _fence = ctx.acquire_client_write_fence(None)?;
                 coordinated_put_indexed(
                     &storage,
                     search.as_ref(),
@@ -2201,9 +2792,11 @@ async fn handle_ws_envelope(
                     return;
                 }
             }
+            let ctx = conn.ctx.clone();
             let storage = Arc::clone(&conn.ctx.storage);
             let search = conn.ctx.search.clone();
             let res = tokio::task::spawn_blocking(move || {
+                let _fence = ctx.acquire_client_write_fence(None)?;
                 coordinated_remove_indexed(
                     &storage,
                     search.as_ref(),

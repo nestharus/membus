@@ -9,11 +9,12 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use parking_lot::{RwLock, RwLockReadGuard};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
@@ -24,11 +25,27 @@ use crate::catalog::CollectionCatalog;
 use crate::protocol::DEFAULT_MAX_FRAME_BODY;
 use crate::search::SearchEngine;
 use crate::signals::SignalBroker;
-use crate::storage::StorageEngine;
-use crate::types::{AuthMode, HealthStatus, MembusError};
+use crate::storage::{MetaCasGuard, StorageEngine};
+use crate::types::{AuthMode, ExpectedVersion, HealthStatus, MembusError, SlotRole, SlotRoleState};
 
 pub use tls::{TlsClientConfig, TlsServerConfig};
 pub use write_coord::CoordinatedCommit;
+
+/// `CF_META` key persisting the resident's [`SlotRoleState`] (`role` + monotonic `role_epoch`).
+pub const META_KEY_SLOT_ROLE: &[u8] = b"sys:slot_role";
+
+const ROLE_EPOCH_MASK: u64 = (1u64 << 60) - 1;
+
+fn pack_slot_role(state: SlotRoleState) -> u64 {
+    ((u64::from(state.role.as_u8())) << 60) | (state.role_epoch & ROLE_EPOCH_MASK)
+}
+
+fn unpack_slot_role(packed: u64) -> SlotRoleState {
+    let role_bits = (packed >> 60) as u8;
+    let role = SlotRole::from_u8(role_bits).unwrap_or(SlotRole::Active);
+    let role_epoch = packed & ROLE_EPOCH_MASK;
+    SlotRoleState { role, role_epoch }
+}
 
 /// Concrete transport endpoint for serving or connecting.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -62,6 +79,11 @@ pub struct ServerConfig {
     pub allow_insecure_non_loopback: bool,
     /// Allow unauthenticated `GET /v2/health` liveness/readiness probes even when `AuthMode::Enforced`.
     pub public_health_probe: bool,
+    /// Default runtime slot role initialized on fresh storage (`Active` by default).
+    /// Existing storage preserves its persisted `CF_META` (`sys:slot_role`) state across restarts.
+    pub initial_slot_role: SlotRole,
+    /// Optional explicit node/slot identifier used for parity digests and replication echo-loop guards.
+    pub node_id: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -79,6 +101,8 @@ impl Default for ServerConfig {
             query_timeout: Some(Duration::from_secs(30)),
             allow_insecure_non_loopback: false,
             public_health_probe: false,
+            initial_slot_role: SlotRole::Active,
+            node_id: None,
         }
     }
 }
@@ -105,6 +129,11 @@ pub struct ServerContext {
     pub(crate) catalog: Arc<CollectionCatalog>,
     pub(crate) search: Option<Arc<SearchEngine>>,
     pub(crate) config: ServerConfig,
+    pub(crate) node_id: Arc<String>,
+    pub(crate) slot_role_packed: Arc<AtomicU64>,
+    /// Linearizes slot-role transitions (`write`) against all storage/catalog mutations (`read`)
+    /// so no write queued in `spawn_blocking` can commit after a fence transition returns.
+    pub(crate) role_fence_gate: Arc<RwLock<()>>,
     pub(crate) active_connections: Arc<AtomicUsize>,
     pub(crate) active_streams: Arc<AtomicUsize>,
     pub(crate) stream_sem: Arc<Semaphore>,
@@ -121,6 +150,12 @@ impl ServerContext {
         let catalog = Arc::new(CollectionCatalog::new(Arc::clone(&storage)));
         let stream_sem = Arc::new(Semaphore::new(config.max_active_streams.max(1)));
         let http_in_flight_sem = Arc::new(Semaphore::new(config.max_http_in_flight.max(1)));
+        let node_id = config
+            .node_id
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| format!("node-{:016x}", storage.epoch()));
+        let initial_state = load_or_init_slot_role(storage.as_ref(), config.initial_slot_role);
         Self {
             storage,
             broker,
@@ -129,6 +164,9 @@ impl ServerContext {
             catalog,
             search: None,
             config,
+            node_id: Arc::new(node_id),
+            slot_role_packed: Arc::new(AtomicU64::new(pack_slot_role(initial_state))),
+            role_fence_gate: Arc::new(RwLock::new(())),
             active_connections: Arc::new(AtomicUsize::new(0)),
             active_streams: Arc::new(AtomicUsize::new(0)),
             stream_sem,
@@ -144,6 +182,220 @@ impl ServerContext {
     pub fn with_search(mut self, search: Arc<SearchEngine>) -> Self {
         self.search = Some(search);
         self
+    }
+
+    pub fn with_node_id(mut self, node_id: impl Into<String>) -> Self {
+        let id = node_id.into();
+        if !id.is_empty() {
+            self.node_id = Arc::new(id);
+        }
+        self
+    }
+
+    pub fn node_id(&self) -> &str {
+        self.node_id.as_str()
+    }
+
+    pub fn slot_role_state(&self) -> SlotRoleState {
+        unpack_slot_role(self.slot_role_packed.load(Ordering::Acquire))
+    }
+
+    /// CAS-transition the resident's [`SlotRole`], monotonically incrementing `role_epoch`
+    /// and persisting atomically to `CF_META` (`sys:slot_role`).
+    ///
+    /// Acquires the exclusive `role_fence_gate` write guard so all in-flight mutations complete
+    /// before the transition commits and returns, preventing post-fence writes.
+    pub fn transition_slot_role(
+        &self,
+        expected_role: SlotRole,
+        expected_role_epoch: u64,
+        new_role: SlotRole,
+    ) -> Result<SlotRoleState, MembusError> {
+        let _write_gate = self.role_fence_gate.write();
+        let prev_raw = self.storage.meta_get(META_KEY_SLOT_ROLE)?;
+        let current = match &prev_raw {
+            Some(bytes) => {
+                let state = serde_json::from_slice::<SlotRoleState>(bytes).map_err(|err| {
+                    MembusError::Corruption(format!("corrupt sys:slot_role metadata: {err}"))
+                })?;
+                if state.role_epoch == 0 || state.role_epoch > ROLE_EPOCH_MASK {
+                    return Err(MembusError::Corruption(format!(
+                        "corrupt sys:slot_role role_epoch {}",
+                        state.role_epoch
+                    )));
+                }
+                state
+            }
+            None => self.slot_role_state(),
+        };
+        if current.role != expected_role || current.role_epoch != expected_role_epoch {
+            // Return `Conflict` (always HTTP 409) rather than `RoleFenced` (which maps `Draining` to 503).
+            return Err(MembusError::Conflict {
+                namespace: "_admin:slot_role".to_owned(),
+                key: format!(
+                    "expected={}:{},actual={}:{}",
+                    expected_role.as_str(),
+                    expected_role_epoch,
+                    current.role.as_str(),
+                    current.role_epoch
+                )
+                .into_bytes(),
+                expected: ExpectedVersion::Version(expected_role_epoch),
+                actual: Some(current.role_epoch),
+            });
+        }
+        let next_epoch = current
+            .role_epoch
+            .checked_add(1)
+            .ok_or_else(|| MembusError::Storage("role_epoch overflow".to_owned()))?;
+        if next_epoch > ROLE_EPOCH_MASK {
+            return Err(MembusError::Storage(
+                "role_epoch exceeds maximum".to_owned(),
+            ));
+        }
+        let next = SlotRoleState {
+            role: new_role,
+            role_epoch: next_epoch,
+        };
+        let encoded = serde_json::to_vec(&next)
+            .map_err(|err| MembusError::Storage(format!("encode sys:slot_role failed: {err}")))?;
+        self.storage.meta_cas_batch(
+            &[MetaCasGuard {
+                key: META_KEY_SLOT_ROLE.to_vec(),
+                expected: prev_raw,
+            }],
+            &[(META_KEY_SLOT_ROLE.to_vec(), encoded)],
+            &[],
+            true,
+        )?;
+        self.slot_role_packed
+            .store(pack_slot_role(next), Ordering::Release);
+        Ok(next)
+    }
+
+    /// Enforce slot-role write fencing for normal client data-plane mutations.
+    pub fn check_client_write_allowed(
+        &self,
+        supplied_role_epoch: Option<u64>,
+    ) -> Result<SlotRoleState, MembusError> {
+        let state = self.slot_role_state();
+        if state.role != SlotRole::Active {
+            return Err(MembusError::RoleFenced {
+                role: state.role,
+                role_epoch: state.role_epoch,
+                reason: format!(
+                    "client writes are rejected while slot role is '{}'",
+                    state.role.as_str()
+                ),
+            });
+        }
+        if let Some(req_epoch) = supplied_role_epoch {
+            if req_epoch < state.role_epoch {
+                return Err(MembusError::RoleFenced {
+                    role: state.role,
+                    role_epoch: state.role_epoch,
+                    reason: format!(
+                        "stale X-Membus-Role-Epoch {req_epoch} < current role_epoch {}",
+                        state.role_epoch
+                    ),
+                });
+            }
+        }
+        Ok(state)
+    }
+
+    /// Acquire the linearizable read fence guard and verify client write eligibility inside
+    /// `spawn_blocking` across the entire storage commit.
+    pub(crate) fn acquire_client_write_fence(
+        &self,
+        supplied_role_epoch: Option<u64>,
+    ) -> Result<RwLockReadGuard<'_, ()>, MembusError> {
+        let guard = self.role_fence_gate.read();
+        self.check_client_write_allowed(supplied_role_epoch)?;
+        Ok(guard)
+    }
+
+    /// Enforce slot-role fencing for authenticated replicated delta application.
+    pub fn check_replicated_apply_allowed(
+        &self,
+        supplied_role_epoch: Option<u64>,
+    ) -> Result<SlotRoleState, MembusError> {
+        let state = self.slot_role_state();
+        if !matches!(state.role, SlotRole::Active | SlotRole::Shadow) {
+            return Err(MembusError::RoleFenced {
+                role: state.role,
+                role_epoch: state.role_epoch,
+                reason: format!(
+                    "replicated apply is rejected while slot role is '{}'",
+                    state.role.as_str()
+                ),
+            });
+        }
+        if let Some(req_epoch) = supplied_role_epoch {
+            if req_epoch < state.role_epoch {
+                return Err(MembusError::RoleFenced {
+                    role: state.role,
+                    role_epoch: state.role_epoch,
+                    reason: format!(
+                        "stale X-Membus-Role-Epoch {req_epoch} < current role_epoch {}",
+                        state.role_epoch
+                    ),
+                });
+            }
+        }
+        Ok(state)
+    }
+
+    /// Acquire the linearizable read fence guard and verify replicated-apply eligibility.
+    pub(crate) fn acquire_replicated_apply_fence(
+        &self,
+        supplied_role_epoch: Option<u64>,
+    ) -> Result<RwLockReadGuard<'_, ()>, MembusError> {
+        let guard = self.role_fence_gate.read();
+        self.check_replicated_apply_allowed(supplied_role_epoch)?;
+        Ok(guard)
+    }
+
+    /// Enforce slot-role fencing for catalog registration and migration metadata writes.
+    /// Permits `Active` and `Shadow`; rejects `ReadOnly` (409), `Draining` (503), and stale epochs.
+    pub fn check_catalog_write_allowed(
+        &self,
+        supplied_role_epoch: Option<u64>,
+    ) -> Result<SlotRoleState, MembusError> {
+        let state = self.slot_role_state();
+        if !matches!(state.role, SlotRole::Active | SlotRole::Shadow) {
+            return Err(MembusError::RoleFenced {
+                role: state.role,
+                role_epoch: state.role_epoch,
+                reason: format!(
+                    "catalog writes are rejected while slot role is '{}'",
+                    state.role.as_str()
+                ),
+            });
+        }
+        if let Some(req_epoch) = supplied_role_epoch {
+            if req_epoch < state.role_epoch {
+                return Err(MembusError::RoleFenced {
+                    role: state.role,
+                    role_epoch: state.role_epoch,
+                    reason: format!(
+                        "stale X-Membus-Role-Epoch {req_epoch} < current role_epoch {}",
+                        state.role_epoch
+                    ),
+                });
+            }
+        }
+        Ok(state)
+    }
+
+    /// Acquire the linearizable read fence guard and verify catalog write eligibility.
+    pub(crate) fn acquire_catalog_write_fence(
+        &self,
+        supplied_role_epoch: Option<u64>,
+    ) -> Result<RwLockReadGuard<'_, ()>, MembusError> {
+        let guard = self.role_fence_gate.read();
+        self.check_catalog_write_allowed(supplied_role_epoch)?;
+        Ok(guard)
     }
 
     pub fn active_connections(&self) -> usize {
@@ -176,6 +428,7 @@ impl ServerContext {
             .search
             .as_ref()
             .map_or((0, false), |s| (s.deferred_ingest_total(), s.is_dirty()));
+        let role_state = self.slot_role_state();
         HealthStatus {
             epoch: self.storage.epoch(),
             latest_seq: self.storage.latest_seq(),
@@ -188,6 +441,87 @@ impl ServerContext {
             active_streams: self.active_streams(),
             search_ingest_deferred_total,
             search_dirty,
+            slot_role: role_state.role,
+            role_epoch: role_state.role_epoch,
+        }
+    }
+}
+
+fn decode_persisted_slot_role(raw: &[u8]) -> Result<SlotRoleState, String> {
+    let state = serde_json::from_slice::<SlotRoleState>(raw).map_err(|err| err.to_string())?;
+    if state.role_epoch == 0 || state.role_epoch > ROLE_EPOCH_MASK {
+        return Err(format!(
+            "persisted role_epoch {} out of valid range 1..={ROLE_EPOCH_MASK}",
+            state.role_epoch
+        ));
+    }
+    Ok(state)
+}
+
+fn load_or_init_slot_role(storage: &dyn StorageEngine, initial_role: SlotRole) -> SlotRoleState {
+    let fail_closed = SlotRoleState {
+        role: SlotRole::ReadOnly,
+        role_epoch: 0,
+    };
+    match storage.meta_get(META_KEY_SLOT_ROLE) {
+        Ok(Some(raw)) => match decode_persisted_slot_role(&raw) {
+            Ok(state) => state,
+            Err(err) => {
+                eprintln!(
+                    "ERROR: corrupt persisted sys:slot_role metadata ({err}); failing closed into read_only"
+                );
+                fail_closed
+            }
+        },
+        Err(err) => {
+            eprintln!(
+                "ERROR: failed to read sys:slot_role metadata ({err}); failing closed into read_only"
+            );
+            fail_closed
+        }
+        Ok(None) => {
+            let initial = SlotRoleState {
+                role: initial_role,
+                role_epoch: 1,
+            };
+            let Ok(encoded) = serde_json::to_vec(&initial) else {
+                eprintln!("ERROR: failed to serialize initial sys:slot_role; failing closed into read_only");
+                return fail_closed;
+            };
+            match storage.meta_cas_batch(
+                &[MetaCasGuard {
+                    key: META_KEY_SLOT_ROLE.to_vec(),
+                    expected: None,
+                }],
+                &[(META_KEY_SLOT_ROLE.to_vec(), encoded)],
+                &[],
+                true,
+            ) {
+                Ok(()) => initial,
+                Err(cas_err) => match storage.meta_get(META_KEY_SLOT_ROLE) {
+                    Ok(Some(raw)) => match decode_persisted_slot_role(&raw) {
+                        Ok(state) => state,
+                        Err(err) => {
+                            eprintln!(
+                                "ERROR: corrupt sys:slot_role after concurrent init ({err}); failing closed into read_only"
+                            );
+                            fail_closed
+                        }
+                    },
+                    Ok(None) => {
+                        eprintln!(
+                            "ERROR: failed to persist initial sys:slot_role ({cas_err}); failing closed into read_only"
+                        );
+                        fail_closed
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "ERROR: failed to re-read sys:slot_role ({err}); failing closed into read_only"
+                        );
+                        fail_closed
+                    }
+                },
+            }
         }
     }
 }
@@ -325,6 +659,11 @@ impl MembusServer {
 
     pub fn with_search(mut self, search: Arc<SearchEngine>) -> Self {
         self.ctx = self.ctx.with_search(search);
+        self
+    }
+
+    pub fn with_node_id(mut self, node_id: impl Into<String>) -> Self {
+        self.ctx = self.ctx.with_node_id(node_id);
         self
     }
 

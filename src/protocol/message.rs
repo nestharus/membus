@@ -5,8 +5,10 @@ use crate::index::{BfsOptions, NeighborQueryOptions, OrderedQueryOptions};
 use crate::types::{
     sanitize_score, Ack, BfsResult, CollectionDescriptor, CommitResult, ExpectedVersion,
     HealthStatus, IndexMutations, IndexedMutation, LeaseGrant, LeaseInfo, MembusError, MutationOp,
-    NeighborPage, OrderedIndexPage, RecordMeta, ScanOptions, ScanPage, SearchDocument, SearchLogOp,
-    SearchPage, SearchQuery, SignalEvent, SignalKind, StoredRecord, VersionGuard, WriteMutation,
+    NamespaceParityDigest, NeighborPage, OrderedIndexPage, ParityDigestMode, RecordMeta,
+    ReplicatedApplyResult, ReplicatedDelta, ScanOptions, ScanPage, SearchDocument, SearchLogOp,
+    SearchPage, SearchQuery, SignalEvent, SignalKind, SlotRole, SlotRoleState, StoredRecord,
+    VersionGuard, WriteMutation,
 };
 
 const OP_GET: u8 = 1;
@@ -51,6 +53,13 @@ const OP_DELETE_SEARCH_DOCUMENT: u8 = 39;
 const OP_REVOKE_SEARCH_PREFIX: u8 = 40;
 const OP_SEARCH: u8 = 41;
 const OP_HEALTH_V2: u8 = 42;
+const OP_ADVANCE_MIGRATION: u8 = 43;
+const OP_ENTER_REVERSE_SHADOW: u8 = 44;
+const OP_ROLLBACK_MIGRATION: u8 = 45;
+const OP_CONTRACT_MIGRATION: u8 = 46;
+const OP_NAMESPACE_DIGEST: u8 = 47;
+const OP_TRANSITION_SLOT_ROLE: u8 = 48;
+const OP_APPLY_REPLICATED_DELTA: u8 = 49;
 
 const RESP_GET: u8 = 1;
 const RESP_GET_MANY: u8 = 2;
@@ -75,6 +84,9 @@ const RESP_OPT_COLLECTION: u8 = 20;
 const RESP_COLLECTIONS: u8 = 21;
 const RESP_SEARCH: u8 = 22;
 const RESP_HEALTH_V2: u8 = 23;
+const RESP_NAMESPACE_DIGEST: u8 = 24;
+const RESP_SLOT_ROLE: u8 = 25;
+const RESP_REPLICATED_APPLY: u8 = 26;
 const RESP_ERROR: u8 = 255;
 
 const ERR_INVALID_ARG: u8 = 1;
@@ -91,6 +103,8 @@ const ERR_CLOSED: u8 = 11;
 const ERR_FRAME_TOO_LARGE: u8 = 12;
 const ERR_UNAUTHORIZED: u8 = 13;
 const ERR_LEASE_HELD: u8 = 14;
+const ERR_ROLE_FENCED: u8 = 15;
+const ERR_IDEMPOTENCY_CONFLICT: u8 = 16;
 
 const MAX_BATCH_ITEMS: usize = 65_536;
 
@@ -298,6 +312,39 @@ pub enum Request {
     },
     Search(SearchQuery),
     HealthV2,
+    AdvanceMigrationVerification {
+        namespace: String,
+        target_version: u32,
+        verified_through: u64,
+    },
+    EnterReverseShadow {
+        namespace: String,
+        target_version: u32,
+        verified_through: u64,
+    },
+    RollbackMigration {
+        namespace: String,
+        rollback_version: u32,
+    },
+    ContractMigration {
+        namespace: String,
+        expected_version: u32,
+    },
+    NamespaceDigest {
+        namespace: String,
+        key_prefix: Vec<u8>,
+        mode: ParityDigestMode,
+    },
+    TransitionSlotRole {
+        expected_role: SlotRole,
+        expected_role_epoch: u64,
+        new_role: SlotRole,
+    },
+    ApplyReplicatedDelta {
+        delta: ReplicatedDelta,
+        ack: Ack,
+        route_origin: Option<String>,
+    },
 }
 
 /// Strongly-typed RPC response carried in `FrameKind::Response`.
@@ -326,6 +373,9 @@ pub enum Response {
     OptCollection(Option<CollectionDescriptor>),
     Collections(Vec<CollectionDescriptor>),
     Search(SearchPage),
+    NamespaceDigest(NamespaceParityDigest),
+    SlotRole(SlotRoleState),
+    ReplicatedApply(ReplicatedApplyResult),
     Error(MembusError),
 }
 
@@ -755,6 +805,71 @@ pub fn encode_request(req: &Request) -> Result<Bytes, MembusError> {
         Request::HealthV2 => {
             buf.put_u8(OP_HEALTH_V2);
         }
+        Request::AdvanceMigrationVerification {
+            namespace,
+            target_version,
+            verified_through,
+        } => {
+            buf.put_u8(OP_ADVANCE_MIGRATION);
+            put_str(&mut buf, namespace);
+            buf.put_u32(*target_version);
+            buf.put_u64(*verified_through);
+        }
+        Request::EnterReverseShadow {
+            namespace,
+            target_version,
+            verified_through,
+        } => {
+            buf.put_u8(OP_ENTER_REVERSE_SHADOW);
+            put_str(&mut buf, namespace);
+            buf.put_u32(*target_version);
+            buf.put_u64(*verified_through);
+        }
+        Request::RollbackMigration {
+            namespace,
+            rollback_version,
+        } => {
+            buf.put_u8(OP_ROLLBACK_MIGRATION);
+            put_str(&mut buf, namespace);
+            buf.put_u32(*rollback_version);
+        }
+        Request::ContractMigration {
+            namespace,
+            expected_version,
+        } => {
+            buf.put_u8(OP_CONTRACT_MIGRATION);
+            put_str(&mut buf, namespace);
+            buf.put_u32(*expected_version);
+        }
+        Request::NamespaceDigest {
+            namespace,
+            key_prefix,
+            mode,
+        } => {
+            buf.put_u8(OP_NAMESPACE_DIGEST);
+            put_str(&mut buf, namespace);
+            put_bytes(&mut buf, key_prefix);
+            put_json(&mut buf, mode)?;
+        }
+        Request::TransitionSlotRole {
+            expected_role,
+            expected_role_epoch,
+            new_role,
+        } => {
+            buf.put_u8(OP_TRANSITION_SLOT_ROLE);
+            buf.put_u8(expected_role.as_u8());
+            buf.put_u64(*expected_role_epoch);
+            buf.put_u8(new_role.as_u8());
+        }
+        Request::ApplyReplicatedDelta {
+            delta,
+            ack,
+            route_origin,
+        } => {
+            buf.put_u8(OP_APPLY_REPLICATED_DELTA);
+            buf.put_u8(*ack as u8);
+            put_json(&mut buf, &(delta, route_origin))?;
+        }
     }
     Ok(buf.freeze())
 }
@@ -1116,6 +1231,43 @@ pub fn decode_request(raw: &[u8]) -> Result<Request, MembusError> {
         },
         OP_SEARCH => Request::Search(take_json(&mut cur)?),
         OP_HEALTH_V2 => Request::HealthV2,
+        OP_ADVANCE_MIGRATION => Request::AdvanceMigrationVerification {
+            namespace: take_string(&mut cur)?,
+            target_version: take_u32(&mut cur)?,
+            verified_through: take_u64(&mut cur)?,
+        },
+        OP_ENTER_REVERSE_SHADOW => Request::EnterReverseShadow {
+            namespace: take_string(&mut cur)?,
+            target_version: take_u32(&mut cur)?,
+            verified_through: take_u64(&mut cur)?,
+        },
+        OP_ROLLBACK_MIGRATION => Request::RollbackMigration {
+            namespace: take_string(&mut cur)?,
+            rollback_version: take_u32(&mut cur)?,
+        },
+        OP_CONTRACT_MIGRATION => Request::ContractMigration {
+            namespace: take_string(&mut cur)?,
+            expected_version: take_u32(&mut cur)?,
+        },
+        OP_NAMESPACE_DIGEST => Request::NamespaceDigest {
+            namespace: take_string(&mut cur)?,
+            key_prefix: take_bytes(&mut cur)?,
+            mode: take_json(&mut cur)?,
+        },
+        OP_TRANSITION_SLOT_ROLE => Request::TransitionSlotRole {
+            expected_role: SlotRole::from_u8(take_u8(&mut cur)?)?,
+            expected_role_epoch: take_u64(&mut cur)?,
+            new_role: SlotRole::from_u8(take_u8(&mut cur)?)?,
+        },
+        OP_APPLY_REPLICATED_DELTA => {
+            let ack = Ack::from_u8(take_u8(&mut cur)?)?;
+            let (delta, route_origin): (ReplicatedDelta, Option<String>) = take_json(&mut cur)?;
+            Request::ApplyReplicatedDelta {
+                delta,
+                ack,
+                route_origin,
+            }
+        }
         other => {
             return Err(MembusError::Protocol(format!(
                 "unknown request opcode: {other}"
@@ -1261,6 +1413,18 @@ pub fn encode_response(resp: &Response) -> Bytes {
             }
             put_json_infallible(&mut buf, &clean);
         }
+        Response::NamespaceDigest(digest) => {
+            buf.put_u8(RESP_NAMESPACE_DIGEST);
+            put_json_infallible(&mut buf, digest);
+        }
+        Response::SlotRole(state) => {
+            buf.put_u8(RESP_SLOT_ROLE);
+            put_json_infallible(&mut buf, state);
+        }
+        Response::ReplicatedApply(res) => {
+            buf.put_u8(RESP_REPLICATED_APPLY);
+            put_json_infallible(&mut buf, res);
+        }
         Response::Error(err) => {
             buf.put_u8(RESP_ERROR);
             put_error(&mut buf, err);
@@ -1369,6 +1533,9 @@ pub fn decode_response(raw: &[u8]) -> Result<Response, MembusError> {
         RESP_OPT_COLLECTION => Response::OptCollection(take_json(&mut cur)?),
         RESP_COLLECTIONS => Response::Collections(take_json(&mut cur)?),
         RESP_SEARCH => Response::Search(take_json(&mut cur)?),
+        RESP_NAMESPACE_DIGEST => Response::NamespaceDigest(take_json(&mut cur)?),
+        RESP_SLOT_ROLE => Response::SlotRole(take_json(&mut cur)?),
+        RESP_REPLICATED_APPLY => Response::ReplicatedApply(take_json(&mut cur)?),
         RESP_ERROR => Response::Error(take_error(&mut cur)?),
         other => {
             return Err(MembusError::Protocol(format!(
@@ -1559,6 +1726,20 @@ fn put_error(buf: &mut BytesMut, err: &MembusError) {
         }
         MembusError::TxConflict(msg) => {
             buf.put_u8(ERR_TX_CONFLICT);
+            put_str(buf, msg);
+        }
+        MembusError::RoleFenced {
+            role,
+            role_epoch,
+            reason,
+        } => {
+            buf.put_u8(ERR_ROLE_FENCED);
+            buf.put_u8(role.as_u8());
+            buf.put_u64(*role_epoch);
+            put_str(buf, reason);
+        }
+        MembusError::IdempotencyConflict(msg) => {
+            buf.put_u8(ERR_IDEMPOTENCY_CONFLICT);
             put_str(buf, msg);
         }
         MembusError::Busy {
@@ -1752,6 +1933,12 @@ fn take_error(cur: &mut &[u8]) -> Result<MembusError, MembusError> {
             expires_at_ms: take_u64(cur)?,
         }),
         ERR_TX_CONFLICT => Ok(MembusError::TxConflict(take_string(cur)?)),
+        ERR_ROLE_FENCED => Ok(MembusError::RoleFenced {
+            role: SlotRole::from_u8(take_u8(cur)?)?,
+            role_epoch: take_u64(cur)?,
+            reason: take_string(cur)?,
+        }),
+        ERR_IDEMPOTENCY_CONFLICT => Ok(MembusError::IdempotencyConflict(take_string(cur)?)),
         ERR_BUSY => Ok(MembusError::Busy {
             retry_after_ms: take_u32(cur)?,
             reason: take_string(cur)?,

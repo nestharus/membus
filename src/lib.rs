@@ -38,22 +38,27 @@ pub use signals::{
     WILDCARD_NAMESPACE,
 };
 pub use storage::{
-    AdmissionConfig, AdmissionGate, MetaCasGuard, NoopPublisher, OwnedSnapshot, RocksDbStorage,
-    SignalPublisher, StorageConfig, StorageEngine,
+    compute_namespace_parity_digest, compute_namespace_parity_digest_with_timeout,
+    compute_namespace_xor_digest, compute_namespace_xor_digest_with_mode, AdmissionConfig,
+    AdmissionGate, MetaCasGuard, NoopPublisher, OwnedSnapshot, RocksDbStorage, SignalPublisher,
+    StorageConfig, StorageEngine,
 };
 pub use tiering::{ArchiveReport, ColdStore, FileColdStore, TieringManager, TieringPolicy};
 pub use transport::{
     validate_listener_bind_security, CoordinatedCommit, Endpoint, MembusServer, ServerConfig,
-    ServerHandle, TlsClientConfig, TlsServerConfig,
+    ServerHandle, TlsClientConfig, TlsServerConfig, META_KEY_SLOT_ROLE,
 };
 pub use types::{
     sanitize_search_log_op, Ack, AclGrant, AuthMode, BfsResult, ColdRef, CollectionDescriptor,
-    CommitResult, DeltaLogPage, ExpectedVersion, GraphDirection, GraphEdgeEntry, GraphEdgeRecord,
-    HealthStatus, IndexKind, IndexMutations, IndexSpec, IndexedMutation, LeaseGrant, LeaseInfo,
-    LogDeltaEntry, LogMutationDelta, LogScanPage, LogWatermark, MembusError, MigrationState,
-    MutationOp, NeighborPage, OrderedIndexEntry, OrderedIndexHit, OrderedIndexPage, Permission,
-    Principal, ReadMode, RecordMeta, ReplicatedApplyResult, ReplicatedDelta, ReplicationStamp,
-    RetentionPolicy, ScanOptions, ScanPage, SearchDocument, SearchHit, SearchLogOp, SearchLogPage,
-    SearchLogRecord, SearchMode, SearchPage, SearchQuery, SearchSyncStatus, SearchVisibility,
-    SignalEvent, SignalKind, StoreProfile, StoredRecord, VersionGuard, WalBatch, WriteMutation,
+    CommitResult, CompatibilityMode, DeltaLogPage, ExpectedVersion, GraphDirection,
+    GraphEdgeEntry, GraphEdgeRecord, HealthStatus, IdempotencyContext, IndexKind, IndexMutations,
+    IndexSpec, IndexedMutation, LeaseGrant, LeaseInfo, LogDeltaEntry, LogMutationDelta,
+    LogScanPage, LogWatermark, MembusError, MigrationState, MutationOp, NamespaceParityDigest,
+    NeighborPage, OrderedIndexEntry, OrderedIndexHit, OrderedIndexPage, ParityDigestMode,
+    Permission, Principal, ReadMode, RecordMeta, ReplicatedApplyResult, ReplicatedDelta,
+    ReplicationStamp, RetentionPolicy, ScanOptions, ScanPage, SearchDocument, SearchHit,
+    SearchLogOp, SearchLogPage, SearchLogRecord, SearchMode, SearchPage, SearchQuery,
+    SearchSyncStatus, SearchVisibility, SignalEvent, SignalKind, SlotRole, SlotRoleState,
+    StoreProfile, StoredRecord, VersionGuard, WalBatch, WriteMutation,
+    DEFAULT_MAX_IDEMPOTENCY_ENTRIES, MAX_IDEMPOTENCY_KEY_BYTES,
 };

@@ -1,6 +1,6 @@
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -10,8 +10,10 @@ use rocksdb::checkpoint::Checkpoint;
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamilyDescriptor, DBCompressionType, Direction, ErrorKind,
     IteratorMode, OptimisticTransactionDB, OptimisticTransactionOptions, Options, ReadOptions,
-    SliceTransform, Transaction, WriteBufferManager, WriteOptions, DEFAULT_COLUMN_FAMILY_NAME,
+    SliceTransform, Transaction, WriteBatchWithTransaction, WriteBufferManager, WriteOptions,
+    DEFAULT_COLUMN_FAMILY_NAME,
 };
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::index::{
@@ -38,11 +40,12 @@ use crate::storage::{
 };
 use crate::types::{
     sanitize_search_log_op, validate_key, validate_namespace, validate_value, Ack, BfsResult,
-    CommitResult, DeltaLogPage, ExpectedVersion, GraphDirection, GraphEdgeRecord, IndexMutations,
-    IndexedMutation, LogMutationDelta, LogScanPage, LogWatermark, MembusError, MutationOp,
-    NeighborPage, OrderedIndexHit, OrderedIndexPage, ReplicatedApplyResult, ReplicatedDelta,
-    ReplicationStamp, ScanOptions, ScanPage, SearchLogOp, SearchLogPage, SearchLogRecord,
-    SignalEvent, SignalKind, StoredRecord, VersionGuard, WalBatch, WriteMutation,
+    CommitResult, DeltaLogPage, ExpectedVersion, GraphDirection, GraphEdgeRecord,
+    IdempotencyContext, IndexMutations, IndexedMutation, LogMutationDelta, LogScanPage,
+    LogWatermark, MembusError, MutationOp, NeighborPage, OrderedIndexHit, OrderedIndexPage,
+    ReplicatedApplyResult, ReplicatedDelta, ReplicationStamp, ScanOptions, ScanPage, SearchLogOp,
+    SearchLogPage, SearchLogRecord, SignalEvent, SignalKind, StoredRecord, VersionGuard, WalBatch,
+    WriteMutation, MAX_IDEMPOTENCY_KEY_BYTES,
 };
 
 const META_KEY_EPOCH: &[u8] = b"db_epoch";
@@ -50,7 +53,18 @@ const META_KEY_LOG_HORIZON: &[u8] = b"log_horizon_seq";
 const META_KEY_SEARCH_CHECKPOINT: &[u8] = b"search:checkpoint";
 const META_KEY_BACKUP_LAST_SEQ: &[u8] = b"backup:last_seq";
 const META_KEY_MESH_PUB_SEQ: &[u8] = b"mesh:pub_seq";
+const META_PREFIX_IDEM_KEY: &[u8] = b"idem:k:";
+const META_PREFIX_IDEM_ORD: &[u8] = b"idem:ord:";
 static EPOCH_ENTROPY_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct StoredIdempotencyRecord {
+    request_fingerprint_sha256: [u8; 32],
+    committed_seq: u64,
+    committed_epoch: u64,
+    committed_version: u64,
+    committed_versions: Vec<u64>,
+}
 
 /// Multi-threaded RocksDB storage engine backed by `OptimisticTransactionDB`.
 pub struct RocksDbStorage {
@@ -60,6 +74,8 @@ pub struct RocksDbStorage {
     pub(crate) epoch: u64,
     log_horizon: AtomicU64,
     trim_lock: FastMutex<()>,
+    idem_prune_lock: FastMutex<()>,
+    idempotency_entry_count: AtomicUsize,
     pub(crate) hlc: HlcClock,
     pub(crate) sequencer: Arc<PublishSequencer>,
     pub(crate) admission: AdmissionGate,
@@ -121,7 +137,7 @@ impl RocksDbStorage {
                 .map_err(|err| MembusError::Storage(format!("rocksdb open failed: {err}")))?;
         let db = Arc::new(db);
 
-        let (epoch, log_horizon_seq, last_log_seq, last_log_ts) = {
+        let (epoch, log_horizon_seq, last_log_seq, last_log_ts, initial_idem_count) = {
             let meta_cf = db
                 .cf_handle(CF_META)
                 .ok_or_else(|| MembusError::Storage("missing meta column family".to_owned()))?;
@@ -148,11 +164,26 @@ impl RocksDbStorage {
                 None => 0u64,
             };
 
+            let mut idem_count = 0usize;
+            let mut idem_ro = ReadOptions::default();
+            idem_ro.fill_cache(false);
+            for item in db.iterator_cf_opt(
+                &meta_cf,
+                idem_ro,
+                IteratorMode::From(META_PREFIX_IDEM_ORD, Direction::Forward),
+            ) {
+                let (k, _) = item.map_err(map_rocksdb_err)?;
+                if !k.starts_with(META_PREFIX_IDEM_ORD) {
+                    break;
+                }
+                idem_count = idem_count.saturating_add(1);
+            }
+
             let log_cf = db
                 .cf_handle(CF_LOG)
                 .ok_or_else(|| MembusError::Storage("missing log column family".to_owned()))?;
             let (last_log_seq, last_log_ts) = read_last_log_seq_and_ts(&db, &log_cf)?;
-            (epoch, log_horizon_seq, last_log_seq, last_log_ts)
+            (epoch, log_horizon_seq, last_log_seq, last_log_ts, idem_count)
         };
         let initial_seq = last_log_seq.max(log_horizon_seq);
 
@@ -172,6 +203,8 @@ impl RocksDbStorage {
             epoch,
             log_horizon: AtomicU64::new(log_horizon_seq),
             trim_lock: FastMutex::new(()),
+            idem_prune_lock: FastMutex::new(()),
+            idempotency_entry_count: AtomicUsize::new(initial_idem_count),
             hlc: HlcClock::new(last_log_ts),
             sequencer,
             admission,
@@ -311,6 +344,69 @@ impl RocksDbStorage {
         })
     }
 
+    fn prune_idempotency_records(&self) {
+        let _guard = self.idem_prune_lock.lock();
+        let max_entries = self.config.max_idempotency_entries;
+        let current = self.idempotency_entry_count.load(Ordering::Acquire);
+        if current <= max_entries {
+            return;
+        }
+        let Ok(meta_cf) = self.cf(CF_META) else {
+            return;
+        };
+        let to_remove = current.saturating_sub(max_entries);
+        let mut ro = ReadOptions::default();
+        ro.fill_cache(false);
+        let iter = self.db.iterator_cf_opt(
+            &meta_cf,
+            ro,
+            IteratorMode::From(META_PREFIX_IDEM_ORD, Direction::Forward),
+        );
+        let mut batch = WriteBatchWithTransaction::<true>::default();
+        let mut removed = 0usize;
+        for item in iter {
+            if removed >= to_remove {
+                break;
+            }
+            let Ok((ord_k, lookup_k)) = item else {
+                break;
+            };
+            if !ord_k.starts_with(META_PREFIX_IDEM_ORD) {
+                break;
+            }
+            let ord_seq = if ord_k.len() == META_PREFIX_IDEM_ORD.len() + 8 {
+                Some(u64::from_be_bytes(
+                    ord_k[META_PREFIX_IDEM_ORD.len()..].try_into().unwrap(),
+                ))
+            } else {
+                None
+            };
+            batch.delete_cf(&meta_cf, &ord_k);
+            // Only remove the lookup record if it still points to this exact sequence number.
+            if let (Some(seq), Ok(Some(raw_rec))) = (ord_seq, self.db.get_cf(&meta_cf, &lookup_k)) {
+                if let Ok(rec) = serde_json::from_slice::<StoredIdempotencyRecord>(&raw_rec) {
+                    if rec.committed_seq == seq {
+                        batch.delete_cf(&meta_cf, &lookup_k);
+                    }
+                } else {
+                    batch.delete_cf(&meta_cf, &lookup_k);
+                }
+            }
+            removed += 1;
+        }
+        if removed > 0 && self.db.write(batch).is_ok() {
+            let mut cur = self.idempotency_entry_count.load(Ordering::Acquire);
+            while let Err(next) = self.idempotency_entry_count.compare_exchange_weak(
+                cur,
+                cur.saturating_sub(removed),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                cur = next;
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn execute_single_mutation(
         &self,
@@ -323,9 +419,13 @@ impl RocksDbStorage {
         expected: ExpectedVersion,
         indexes: Option<&IndexMutations>,
         search_op: Option<&SearchLogOp>,
-    ) -> Result<CommitResult, MembusError> {
+        idempotency: Option<&IdempotencyContext>,
+    ) -> Result<(CommitResult, bool), MembusError> {
         validate_namespace(namespace)?;
         validate_key(key)?;
+        if let Some(idem) = idempotency {
+            validate_idempotency_context(idem)?;
+        }
         if let Some(idx_muts) = indexes {
             validate_index_mutations(idx_muts, self.config.max_value_bytes)?;
         }
@@ -360,6 +460,7 @@ impl RocksDbStorage {
         let idx_edge_cf = self.cf(CF_IDX_EDGE)?;
         let idx_rev_cf = self.cf(CF_IDX_REV)?;
         let enc_key = encode_kv_key(namespace, key);
+        let idem_lookup_key = idempotency.map(encode_idempotency_key);
 
         let mut write_opts = WriteOptions::default();
         write_opts.set_sync(ack == Ack::Flush);
@@ -368,7 +469,11 @@ impl RocksDbStorage {
         tx_opts.set_snapshot(true);
 
         let needs_check = !matches!(expected, ExpectedVersion::Any);
-        let max_attempts = if needs_check { 1 } else { 32 };
+        let max_attempts = if !needs_check || idempotency.is_some() {
+            32
+        } else {
+            1
+        };
 
         for attempt in 0..max_attempts {
             let tx = self.db.transaction_opt(&write_opts, &tx_opts);
@@ -377,6 +482,37 @@ impl RocksDbStorage {
                 let tx_snap = tx.snapshot();
                 let mut read_opts = ReadOptions::default();
                 read_opts.set_snapshot(&tx_snap);
+
+                if let (Some(idem), Some(ik)) = (idempotency, idem_lookup_key.as_ref()) {
+                    if let Some(raw) = tx
+                        .get_pinned_for_update_cf_opt(&meta_cf, ik, true, &read_opts)
+                        .map_err(map_tx_err)?
+                    {
+                        let stored: StoredIdempotencyRecord =
+                            serde_json::from_slice(raw.as_ref()).map_err(|err| {
+                                MembusError::Corruption(format!(
+                                    "corrupt idempotency dedup record: {err}"
+                                ))
+                            })?;
+                        if stored.request_fingerprint_sha256 == idem.request_fingerprint_sha256 {
+                            if ack == Ack::Flush {
+                                self.db.flush_wal(true).map_err(map_rocksdb_err)?;
+                            }
+                            return Ok((
+                                CommitResult {
+                                    seq: stored.committed_seq,
+                                    epoch: stored.committed_epoch,
+                                    versions: stored.committed_versions,
+                                },
+                                true,
+                            ));
+                        }
+                        return Err(MembusError::IdempotencyConflict(format!(
+                            "idempotency key '{}' was already committed for a different payload (seq {})",
+                            idem.key, stored.committed_seq
+                        )));
+                    }
+                }
 
                 if needs_check {
                     let current = tx
@@ -468,16 +604,46 @@ impl RocksDbStorage {
             tx.put_cf(&log_cf, encode_log_seq(seq), &encoded_log)
                 .map_err(map_tx_err)?;
 
+            if let (Some(idem), Some(ik)) = (idempotency, idem_lookup_key.as_ref()) {
+                let rec = StoredIdempotencyRecord {
+                    request_fingerprint_sha256: idem.request_fingerprint_sha256,
+                    committed_seq: seq,
+                    committed_epoch: self.epoch,
+                    committed_version: seq,
+                    committed_versions: vec![seq],
+                };
+                let rec_bytes = serde_json::to_vec(&rec).map_err(|err| {
+                    MembusError::Storage(format!("encode idempotency record failed: {err}"))
+                })?;
+                tx.put_cf(&meta_cf, ik, &rec_bytes).map_err(map_tx_err)?;
+                tx.put_cf(&meta_cf, encode_idempotency_ord_key(seq), ik)
+                    .map_err(map_tx_err)?;
+            }
+
             match tx.commit().map_err(map_tx_err) {
                 Ok(()) => {
                     ticket.commit(events);
-                    return Ok(CommitResult {
-                        seq,
-                        epoch: self.epoch,
-                        versions: vec![seq],
-                    });
+                    if idempotency.is_some() {
+                        let new_count = self
+                            .idempotency_entry_count
+                            .fetch_add(1, Ordering::AcqRel)
+                            .saturating_add(1);
+                        if new_count > self.config.max_idempotency_entries {
+                            self.prune_idempotency_records();
+                        }
+                    }
+                    return Ok((
+                        CommitResult {
+                            seq,
+                            epoch: self.epoch,
+                            versions: vec![seq],
+                        },
+                        false,
+                    ));
                 }
-                Err(MembusError::TxConflict(_)) if !needs_check && attempt + 1 < max_attempts => {
+                Err(MembusError::TxConflict(_))
+                    if (!needs_check || idempotency.is_some()) && attempt + 1 < max_attempts =>
+                {
                     // `ticket` drops here and aborts cleanly before retrying.
                     continue;
                 }
@@ -638,7 +804,9 @@ impl StorageEngine for RocksDbStorage {
             expected,
             None,
             None,
+            None,
         )
+        .map(|(res, _)| res)
     }
 
     fn tier_swap_record(
@@ -690,6 +858,21 @@ impl StorageEngine for RocksDbStorage {
         indexes: Option<&IndexMutations>,
         search_op: Option<&SearchLogOp>,
     ) -> Result<CommitResult, MembusError> {
+        self.put_indexed_idempotent(namespace, key, value, ack, expected, indexes, search_op, None)
+            .map(|(res, _)| res)
+    }
+
+    fn put_indexed_idempotent(
+        &self,
+        namespace: &str,
+        key: &[u8],
+        value: &[u8],
+        ack: Ack,
+        expected: ExpectedVersion,
+        indexes: Option<&IndexMutations>,
+        search_op: Option<&SearchLogOp>,
+        idempotency: Option<&IdempotencyContext>,
+    ) -> Result<(CommitResult, bool), MembusError> {
         self.execute_single_mutation(
             namespace,
             key,
@@ -702,6 +885,7 @@ impl StorageEngine for RocksDbStorage {
             expected,
             indexes,
             search_op,
+            idempotency,
         )
     }
 
@@ -723,6 +907,19 @@ impl StorageEngine for RocksDbStorage {
         expected: ExpectedVersion,
         search_op: Option<&SearchLogOp>,
     ) -> Result<CommitResult, MembusError> {
+        self.remove_indexed_idempotent(namespace, key, ack, expected, search_op, None)
+            .map(|(res, _)| res)
+    }
+
+    fn remove_indexed_idempotent(
+        &self,
+        namespace: &str,
+        key: &[u8],
+        ack: Ack,
+        expected: ExpectedVersion,
+        search_op: Option<&SearchLogOp>,
+        idempotency: Option<&IdempotencyContext>,
+    ) -> Result<(CommitResult, bool), MembusError> {
         self.execute_single_mutation(
             namespace,
             key,
@@ -733,6 +930,7 @@ impl StorageEngine for RocksDbStorage {
             expected,
             None,
             search_op,
+            idempotency,
         )
     }
 
@@ -760,10 +958,24 @@ impl StorageEngine for RocksDbStorage {
         mutations: &[IndexedMutation],
         ack: Ack,
     ) -> Result<CommitResult, MembusError> {
+        self.commit_indexed_tx_idempotent(guards, mutations, ack, None)
+            .map(|(res, _)| res)
+    }
+
+    fn commit_indexed_tx_idempotent(
+        &self,
+        guards: &[VersionGuard],
+        mutations: &[IndexedMutation],
+        ack: Ack,
+        idempotency: Option<&IdempotencyContext>,
+    ) -> Result<(CommitResult, bool), MembusError> {
         if mutations.is_empty() {
             return Err(MembusError::InvalidArgument(
                 "commit_tx requires at least one mutation".to_owned(),
             ));
+        }
+        if let Some(idem) = idempotency {
+            validate_idempotency_context(idem)?;
         }
 
         // Validate all guards, mutations, and index entries cleanly before entering RocksDB.
@@ -819,6 +1031,7 @@ impl StorageEngine for RocksDbStorage {
         let idx_ord_cf = self.cf(CF_IDX_ORD)?;
         let idx_edge_cf = self.cf(CF_IDX_EDGE)?;
         let idx_rev_cf = self.cf(CF_IDX_REV)?;
+        let idem_lookup_key = idempotency.map(encode_idempotency_key);
 
         let mut write_opts = WriteOptions::default();
         write_opts.set_sync(ack == Ack::Flush);
@@ -826,127 +1039,202 @@ impl StorageEngine for RocksDbStorage {
         let mut tx_opts = OptimisticTransactionOptions::default();
         tx_opts.set_snapshot(true);
 
-        let tx = self.db.transaction_opt(&write_opts, &tx_opts);
+        let max_attempts = if idempotency.is_some() { 16 } else { 1 };
+        for attempt in 0..max_attempts {
+            let tx = self.db.transaction_opt(&write_opts, &tx_opts);
 
-        // Register & verify guards and retract/apply secondary indexes against the tx snapshot.
-        {
-            let tx_snap = tx.snapshot();
-            let mut read_opts = ReadOptions::default();
-            read_opts.set_snapshot(&tx_snap);
-            for guard in guards {
-                let enc_key = encode_kv_key(&guard.namespace, &guard.key);
-                let current = tx
-                    .get_pinned_for_update_cf_opt(&kv_cf, &enc_key, true, &read_opts)
-                    .map_err(map_tx_err)?;
-                let actual_version = match current {
-                    Some(raw) => Some(decode_record_parts(raw.as_ref())?.0.version),
-                    None => None,
-                };
-                verify_expected_version(
-                    &guard.namespace,
-                    &guard.key,
-                    guard.expected,
-                    actual_version,
-                )?;
+            // Register & verify idempotency + guards and retract/apply secondary indexes against the tx snapshot.
+            {
+                let tx_snap = tx.snapshot();
+                let mut read_opts = ReadOptions::default();
+                read_opts.set_snapshot(&tx_snap);
+
+                if let (Some(idem), Some(ik)) = (idempotency, idem_lookup_key.as_ref()) {
+                    if let Some(raw) = tx
+                        .get_pinned_for_update_cf_opt(&meta_cf, ik, true, &read_opts)
+                        .map_err(map_tx_err)?
+                    {
+                        let stored: StoredIdempotencyRecord =
+                            serde_json::from_slice(raw.as_ref()).map_err(|err| {
+                                MembusError::Corruption(format!(
+                                    "corrupt idempotency dedup record: {err}"
+                                ))
+                            })?;
+                        if stored.request_fingerprint_sha256 == idem.request_fingerprint_sha256 {
+                            if ack == Ack::Flush {
+                                self.db.flush_wal(true).map_err(map_rocksdb_err)?;
+                            }
+                            return Ok((
+                                CommitResult {
+                                    seq: stored.committed_seq,
+                                    epoch: stored.committed_epoch,
+                                    versions: stored.committed_versions,
+                                },
+                                true,
+                            ));
+                        }
+                        return Err(MembusError::IdempotencyConflict(format!(
+                            "idempotency key '{}' was already committed for a different payload (seq {})",
+                            idem.key, stored.committed_seq
+                        )));
+                    }
+                }
+
+                for guard in guards {
+                    let enc_key = encode_kv_key(&guard.namespace, &guard.key);
+                    let current = tx
+                        .get_pinned_for_update_cf_opt(&kv_cf, &enc_key, true, &read_opts)
+                        .map_err(map_tx_err)?;
+                    let actual_version = match current {
+                        Some(raw) => Some(decode_record_parts(raw.as_ref())?.0.version),
+                        None => None,
+                    };
+                    verify_expected_version(
+                        &guard.namespace,
+                        &guard.key,
+                        guard.expected,
+                        actual_version,
+                    )?;
+                }
+
+                for item in mutations {
+                    let mutation = &item.mutation;
+                    let enc_key = encode_kv_key(&mutation.namespace, &mutation.key);
+                    let applied_indexes = match &mutation.op {
+                        MutationOp::Put { .. } => item.indexes.as_ref(),
+                        MutationOp::Remove => None,
+                    };
+                    apply_index_mutations_in_tx(
+                        &tx,
+                        &read_opts,
+                        &idx_ord_cf,
+                        &idx_edge_cf,
+                        &idx_rev_cf,
+                        &mutation.namespace,
+                        &mutation.key,
+                        &enc_key,
+                        applied_indexes,
+                    )?;
+                }
             }
 
-            for item in mutations {
+            let ticket = self.sequencer.reserve();
+            let seq = ticket.seq();
+            let ts_ms = self.hlc.tick();
+
+            let mut events = Vec::with_capacity(mutations.len());
+            let mut versions = Vec::with_capacity(mutations.len());
+            let mut delta_mutations = Vec::with_capacity(mutations.len());
+
+            for (item, sanitized_op) in mutations.iter().zip(sanitized_per_mutation.iter()) {
                 let mutation = &item.mutation;
                 let enc_key = encode_kv_key(&mutation.namespace, &mutation.key);
-                let applied_indexes = match &mutation.op {
-                    MutationOp::Put { .. } => item.indexes.as_ref(),
-                    MutationOp::Remove => None,
+                let (kind, value_hint) = match &mutation.op {
+                    MutationOp::Put { value } => {
+                        let encoded_val = encode_record(seq, 0, ts_ms, value);
+                        tx.put_cf(&kv_cf, &enc_key, &encoded_val)
+                            .map_err(map_tx_err)?;
+                        (SignalKind::Put, self.build_value_hint(value))
+                    }
+                    MutationOp::Remove => {
+                        tx.delete_cf(&kv_cf, &enc_key).map_err(map_tx_err)?;
+                        let tomb_key = encode_prefixed_key(META_PREFIX_MESH_TOMB, &enc_key);
+                        let mut tomb_val = [0u8; 16];
+                        tomb_val[..8].copy_from_slice(&seq.to_be_bytes());
+                        tomb_val[8..16].copy_from_slice(&ts_ms.to_be_bytes());
+                        tx.put_cf(&meta_cf, &tomb_key, tomb_val)
+                            .map_err(map_tx_err)?;
+                        (SignalKind::Delete, None)
+                    }
                 };
-                apply_index_mutations_in_tx(
-                    &tx,
-                    &read_opts,
-                    &idx_ord_cf,
-                    &idx_edge_cf,
-                    &idx_rev_cf,
-                    &mutation.namespace,
-                    &mutation.key,
-                    &enc_key,
-                    applied_indexes,
-                )?;
+                versions.push(seq);
+                events.push(SignalEvent {
+                    seq,
+                    epoch: self.epoch,
+                    namespace: mutation.namespace.clone(),
+                    key: mutation.key.clone(),
+                    version: seq,
+                    kind,
+                    value_hint,
+                });
+                delta_mutations.push(LogMutationDelta {
+                    namespace: mutation.namespace.clone(),
+                    key: mutation.key.clone(),
+                    op: mutation.op.clone(),
+                    flags: 0,
+                    preserve_indexes: false,
+                    is_tier_swap: false,
+                    indexes: match &mutation.op {
+                        MutationOp::Put { .. } => item.indexes.clone(),
+                        MutationOp::Remove => None,
+                    },
+                    search_op: sanitized_op.clone(),
+                    origin_stamp: None,
+                });
+            }
+
+            let encoded_log = encode_log_entry_v4(
+                self.epoch,
+                seq,
+                ts_ms,
+                false,
+                &events,
+                &[],
+                &delta_mutations,
+                None,
+            );
+            tx.put_cf(&log_cf, encode_log_seq(seq), &encoded_log)
+                .map_err(map_tx_err)?;
+
+            if let (Some(idem), Some(ik)) = (idempotency, idem_lookup_key.as_ref()) {
+                let rec = StoredIdempotencyRecord {
+                    request_fingerprint_sha256: idem.request_fingerprint_sha256,
+                    committed_seq: seq,
+                    committed_epoch: self.epoch,
+                    committed_version: seq,
+                    committed_versions: versions.clone(),
+                };
+                let rec_bytes = serde_json::to_vec(&rec).map_err(|err| {
+                    MembusError::Storage(format!("encode idempotency record failed: {err}"))
+                })?;
+                tx.put_cf(&meta_cf, ik, &rec_bytes).map_err(map_tx_err)?;
+                tx.put_cf(&meta_cf, encode_idempotency_ord_key(seq), ik)
+                    .map_err(map_tx_err)?;
+            }
+
+            match tx.commit().map_err(map_tx_err) {
+                Ok(()) => {
+                    ticket.commit(events);
+                    if idempotency.is_some() {
+                        let new_count = self
+                            .idempotency_entry_count
+                            .fetch_add(1, Ordering::AcqRel)
+                            .saturating_add(1);
+                        if new_count > self.config.max_idempotency_entries {
+                            self.prune_idempotency_records();
+                        }
+                    }
+                    return Ok((
+                        CommitResult {
+                            seq,
+                            epoch: self.epoch,
+                            versions,
+                        },
+                        false,
+                    ));
+                }
+                Err(MembusError::TxConflict(_))
+                    if idempotency.is_some() && attempt + 1 < max_attempts =>
+                {
+                    continue;
+                }
+                Err(err) => return Err(err),
             }
         }
 
-        let ticket = self.sequencer.reserve();
-        let seq = ticket.seq();
-        let ts_ms = self.hlc.tick();
-
-        let mut events = Vec::with_capacity(mutations.len());
-        let mut versions = Vec::with_capacity(mutations.len());
-        let mut delta_mutations = Vec::with_capacity(mutations.len());
-
-        for (item, sanitized_op) in mutations.iter().zip(sanitized_per_mutation) {
-            let mutation = &item.mutation;
-            let enc_key = encode_kv_key(&mutation.namespace, &mutation.key);
-            let (kind, value_hint) = match &mutation.op {
-                MutationOp::Put { value } => {
-                    let encoded_val = encode_record(seq, 0, ts_ms, value);
-                    tx.put_cf(&kv_cf, &enc_key, &encoded_val)
-                        .map_err(map_tx_err)?;
-                    (SignalKind::Put, self.build_value_hint(value))
-                }
-                MutationOp::Remove => {
-                    tx.delete_cf(&kv_cf, &enc_key).map_err(map_tx_err)?;
-                    let tomb_key = encode_prefixed_key(META_PREFIX_MESH_TOMB, &enc_key);
-                    let mut tomb_val = [0u8; 16];
-                    tomb_val[..8].copy_from_slice(&seq.to_be_bytes());
-                    tomb_val[8..16].copy_from_slice(&ts_ms.to_be_bytes());
-                    tx.put_cf(&meta_cf, &tomb_key, tomb_val)
-                        .map_err(map_tx_err)?;
-                    (SignalKind::Delete, None)
-                }
-            };
-            versions.push(seq);
-            events.push(SignalEvent {
-                seq,
-                epoch: self.epoch,
-                namespace: mutation.namespace.clone(),
-                key: mutation.key.clone(),
-                version: seq,
-                kind,
-                value_hint,
-            });
-            delta_mutations.push(LogMutationDelta {
-                namespace: mutation.namespace.clone(),
-                key: mutation.key.clone(),
-                op: mutation.op.clone(),
-                flags: 0,
-                preserve_indexes: false,
-                is_tier_swap: false,
-                indexes: match &mutation.op {
-                    MutationOp::Put { .. } => item.indexes.clone(),
-                    MutationOp::Remove => None,
-                },
-                search_op: sanitized_op,
-                origin_stamp: None,
-            });
-        }
-
-        let encoded_log = encode_log_entry_v4(
-            self.epoch,
-            seq,
-            ts_ms,
-            false,
-            &events,
-            &[],
-            &delta_mutations,
-            None,
-        );
-        tx.put_cf(&log_cf, encode_log_seq(seq), &encoded_log)
-            .map_err(map_tx_err)?;
-
-        tx.commit().map_err(map_tx_err)?;
-        ticket.commit(events);
-
-        Ok(CommitResult {
-            seq,
-            epoch: self.epoch,
-            versions,
-        })
+        Err(MembusError::TxConflict(
+            "idempotent transaction exceeded optimistic retry limit under contention".to_owned(),
+        ))
     }
 
     fn open_snapshot(&self) -> Result<OwnedSnapshot, MembusError> {
@@ -2236,12 +2524,63 @@ fn validate_config(config: &StorageConfig) -> Result<(), MembusError> {
             "admission limits must be positive".to_owned(),
         ));
     }
-    if config.max_active_snapshots == 0 || config.max_scan_limit == 0 {
+    if config.max_active_snapshots == 0
+        || config.max_scan_limit == 0
+        || config.max_idempotency_entries == 0
+    {
         return Err(MembusError::InvalidArgument(
-            "max_active_snapshots and max_scan_limit must be positive".to_owned(),
+            "max_active_snapshots, max_scan_limit, and max_idempotency_entries must be positive"
+                .to_owned(),
         ));
     }
     Ok(())
+}
+
+fn validate_idempotency_context(ctx: &IdempotencyContext) -> Result<(), MembusError> {
+    validate_namespace(&ctx.scope_namespace)?;
+    if let Some(pid) = &ctx.principal_id {
+        if pid.len() > MAX_IDEMPOTENCY_KEY_BYTES || pid.bytes().any(|b| b < 0x20 || b == 0x7f) {
+            return Err(MembusError::InvalidArgument(
+                "invalid principal_id for idempotency context".to_owned(),
+            ));
+        }
+    }
+    if ctx.key.is_empty() || ctx.key.len() > MAX_IDEMPOTENCY_KEY_BYTES {
+        return Err(MembusError::InvalidArgument(format!(
+            "idempotency key length must be 1..={MAX_IDEMPOTENCY_KEY_BYTES} bytes"
+        )));
+    }
+    if ctx.key.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return Err(MembusError::InvalidArgument(
+            "idempotency key must not contain ASCII control characters".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn encode_idempotency_key(ctx: &IdempotencyContext) -> Vec<u8> {
+    let domain_tag: u8 = if ctx.is_tx { 0x02 } else { 0x01 };
+    let scope_sha: [u8; 32] = Sha256::digest(ctx.scope_namespace.as_bytes()).into();
+    let key_sha: [u8; 32] = Sha256::digest(ctx.key.as_bytes()).into();
+    let principal_bytes = ctx.principal_id.as_deref().unwrap_or("").as_bytes();
+    let mut out = Vec::with_capacity(
+        META_PREFIX_IDEM_KEY.len() + 1 + 1 + 4 + principal_bytes.len() + 32 + 32,
+    );
+    out.extend_from_slice(META_PREFIX_IDEM_KEY);
+    out.push(domain_tag);
+    out.push(u8::from(ctx.principal_id.is_some()));
+    out.extend_from_slice(&(principal_bytes.len() as u32).to_be_bytes());
+    out.extend_from_slice(principal_bytes);
+    out.extend_from_slice(&scope_sha);
+    out.extend_from_slice(&key_sha);
+    out
+}
+
+fn encode_idempotency_ord_key(seq: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(META_PREFIX_IDEM_ORD.len() + 8);
+    out.extend_from_slice(META_PREFIX_IDEM_ORD);
+    out.extend_from_slice(&seq.to_be_bytes());
+    out
 }
 
 fn validate_scan_options(options: &ScanOptions, max_scan_limit: usize) -> Result<(), MembusError> {

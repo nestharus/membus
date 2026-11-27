@@ -16,10 +16,11 @@ use crate::protocol::{
     run_batched_frame_writer, Frame, FrameFlags, FrameKind, Request, Response,
 };
 use crate::signals::{EachChangeSubscription, LiveCoalescedSubscription};
-use crate::storage::OwnedSnapshot;
+use crate::storage::{compute_namespace_parity_digest_with_timeout, OwnedSnapshot};
 use crate::transport::write_coord::{
-    coordinated_commit_indexed_tx, coordinated_delete_search_document, coordinated_index_document,
-    coordinated_put_indexed, coordinated_remove_indexed, coordinated_revoke_search_prefix,
+    coordinated_apply_replicated_delta, coordinated_commit_indexed_tx,
+    coordinated_delete_search_document, coordinated_index_document, coordinated_put_indexed,
+    coordinated_remove_indexed, coordinated_revoke_search_prefix,
 };
 use crate::transport::ServerContext;
 use crate::types::{
@@ -574,10 +575,30 @@ fn authorize_request(
             auth.authorize_admin(principal, Some(&descriptor.namespace))
         }
         Request::BeginMigration { namespace, .. }
+        | Request::AdvanceMigrationVerification { namespace, .. }
+        | Request::EnterReverseShadow { namespace, .. }
+        | Request::RollbackMigration { namespace, .. }
+        | Request::ContractMigration { namespace, .. }
         | Request::CommitMigration { namespace, .. }
         | Request::AbortMigration { namespace, .. }
         | Request::RevokeSearchPrefix { namespace, .. } => {
             auth.authorize_admin(principal, Some(namespace))
+        }
+        Request::NamespaceDigest {
+            namespace,
+            key_prefix,
+            ..
+        } => auth.authorize(principal, namespace, key_prefix, Permission::Read),
+        Request::TransitionSlotRole { .. } => auth.authorize_admin(principal, None),
+        Request::ApplyReplicatedDelta { delta, .. } => {
+            auth.authorize(principal, &delta.namespace, &delta.key, Permission::Write)?;
+            if let Some(idx) = &delta.indexes {
+                authorize_index_mutations(auth, principal, &delta.namespace, idx)?;
+            }
+            if let Some(op) = &delta.search_op {
+                authorize_search_op(auth, principal, op)?;
+            }
+            Ok(())
         }
         Request::IndexDocument { doc, .. } => {
             auth.authorize(principal, &doc.namespace, doc.doc_id.as_bytes(), Permission::Write)
@@ -647,7 +668,9 @@ async fn dispatch_unary(
             ack,
             expected,
         } => {
+            let ctx = conn.ctx.clone();
             let result = tokio::task::spawn_blocking(move || {
+                let _fence = ctx.acquire_client_write_fence(None)?;
                 storage.put(&namespace, &key, &value, ack, expected)
             })
             .await
@@ -666,8 +689,10 @@ async fn dispatch_unary(
             indexes,
             search_op,
         } => {
+            let ctx = conn.ctx.clone();
             let search = conn.ctx.search.clone();
             let result = tokio::task::spawn_blocking(move || {
+                let _fence = ctx.acquire_client_write_fence(None)?;
                 coordinated_put_indexed(
                     &storage,
                     search.as_ref(),
@@ -693,7 +718,9 @@ async fn dispatch_unary(
             ack,
             expected,
         } => {
+            let ctx = conn.ctx.clone();
             let result = tokio::task::spawn_blocking(move || {
+                let _fence = ctx.acquire_client_write_fence(None)?;
                 storage.remove(&namespace, &key, ack, expected)
             })
             .await
@@ -710,8 +737,10 @@ async fn dispatch_unary(
             expected,
             search_op,
         } => {
+            let ctx = conn.ctx.clone();
             let search = conn.ctx.search.clone();
             let result = tokio::task::spawn_blocking(move || {
+                let _fence = ctx.acquire_client_write_fence(None)?;
                 coordinated_remove_indexed(
                     &storage,
                     search.as_ref(),
@@ -734,12 +763,13 @@ async fn dispatch_unary(
             guards,
             mutations,
         } => {
-            let result =
-                tokio::task::spawn_blocking(move || storage.commit_tx(&guards, &mutations, ack))
-                    .await
-                    .unwrap_or_else(|e| {
-                        Err(MembusError::Storage(format!("commit_tx task failed: {e}")))
-                    });
+            let ctx = conn.ctx.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let _fence = ctx.acquire_client_write_fence(None)?;
+                storage.commit_tx(&guards, &mutations, ack)
+            })
+            .await
+            .unwrap_or_else(|e| Err(MembusError::Storage(format!("commit_tx task failed: {e}"))));
             match result {
                 Ok(commit) => Response::Commit(commit),
                 Err(e) => Response::Error(e),
@@ -750,8 +780,10 @@ async fn dispatch_unary(
             guards,
             mutations,
         } => {
+            let ctx = conn.ctx.clone();
             let search = conn.ctx.search.clone();
             let result = tokio::task::spawn_blocking(move || {
+                let _fence = ctx.acquire_client_write_fence(None)?;
                 coordinated_commit_indexed_tx(&storage, search.as_ref(), &guards, mutations, ack)
             })
             .await
@@ -970,9 +1002,13 @@ async fn dispatch_unary(
         Request::Health => Response::Health(conn.ctx.health_status()),
         Request::HealthV2 => Response::HealthV2(conn.ctx.health_status()),
         Request::PutBlob { digest, data, ack } => {
-            let result = tokio::task::spawn_blocking(move || storage.put_blob(&digest, &data, ack))
-                .await
-                .unwrap_or_else(|e| Err(MembusError::Storage(format!("put_blob failed: {e}"))));
+            let ctx = conn.ctx.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let _fence = ctx.acquire_client_write_fence(None)?;
+                storage.put_blob(&digest, &data, ack)
+            })
+            .await
+            .unwrap_or_else(|e| Err(MembusError::Storage(format!("put_blob failed: {e}"))));
             match result {
                 Ok(()) => Response::Unit,
                 Err(e) => Response::Error(e),
@@ -992,12 +1028,13 @@ async fn dispatch_unary(
             data,
             ack,
         } => {
-            let result =
-                tokio::task::spawn_blocking(move || storage.put_cas_blob(&namespace, &data, ack))
-                    .await
-                    .unwrap_or_else(|e| {
-                        Err(MembusError::Storage(format!("put_cas_blob failed: {e}")))
-                    });
+            let ctx = conn.ctx.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let _fence = ctx.acquire_client_write_fence(None)?;
+                storage.put_cas_blob(&namespace, &data, ack)
+            })
+            .await
+            .unwrap_or_else(|e| Err(MembusError::Storage(format!("put_cas_blob failed: {e}"))));
             match result {
                 Ok(digest) => Response::CasBlobDigest(digest),
                 Err(e) => Response::Error(e),
@@ -1033,8 +1070,10 @@ async fn dispatch_unary(
             holder,
             ttl_ms,
         } => {
+            let ctx = conn.ctx.clone();
             let leases = Arc::clone(&conn.ctx.leases);
             let result = tokio::task::spawn_blocking(move || {
+                let _fence = ctx.acquire_client_write_fence(None)?;
                 leases.acquire_lease(&namespace, &resource, &holder, ttl_ms)
             })
             .await
@@ -1052,8 +1091,10 @@ async fn dispatch_unary(
             token,
             ttl_ms,
         } => {
+            let ctx = conn.ctx.clone();
             let leases = Arc::clone(&conn.ctx.leases);
             let result = tokio::task::spawn_blocking(move || {
+                let _fence = ctx.acquire_client_write_fence(None)?;
                 leases.renew_lease(&namespace, &resource, &holder, generation, &token, ttl_ms)
             })
             .await
@@ -1070,8 +1111,10 @@ async fn dispatch_unary(
             generation,
             token,
         } => {
+            let ctx = conn.ctx.clone();
             let leases = Arc::clone(&conn.ctx.leases);
             let result = tokio::task::spawn_blocking(move || {
+                let _fence = ctx.acquire_client_write_fence(None)?;
                 leases.release_lease(&namespace, &resource, &holder, generation, &token)
             })
             .await
@@ -1119,8 +1162,10 @@ async fn dispatch_unary(
             expected_version,
             descriptor,
         } => {
+            let ctx = conn.ctx.clone();
             let catalog = Arc::clone(&conn.ctx.catalog);
             let result = tokio::task::spawn_blocking(move || {
+                let _fence = ctx.acquire_catalog_write_fence(None)?;
                 catalog.register_collection(expected_version, descriptor)
             })
             .await
@@ -1193,8 +1238,10 @@ async fn dispatch_unary(
             target_sha256,
             target_schema_bytes,
         } => {
+            let ctx = conn.ctx.clone();
             let catalog = Arc::clone(&conn.ctx.catalog);
             let result = tokio::task::spawn_blocking(move || {
+                let _fence = ctx.acquire_catalog_write_fence(None)?;
                 catalog.begin_migration(
                     &namespace,
                     expected_version,
@@ -1215,8 +1262,10 @@ async fn dispatch_unary(
             target_version,
             verified_through,
         } => {
+            let ctx = conn.ctx.clone();
             let catalog = Arc::clone(&conn.ctx.catalog);
             let result = tokio::task::spawn_blocking(move || {
+                let _fence = ctx.acquire_catalog_write_fence(None)?;
                 catalog.commit_migration(&namespace, target_version, verified_through)
             })
             .await
@@ -1234,8 +1283,10 @@ async fn dispatch_unary(
             namespace,
             target_version,
         } => {
+            let ctx = conn.ctx.clone();
             let catalog = Arc::clone(&conn.ctx.catalog);
             let result = tokio::task::spawn_blocking(move || {
+                let _fence = ctx.acquire_catalog_write_fence(None)?;
                 catalog.abort_migration(&namespace, target_version)
             })
             .await
@@ -1245,13 +1296,176 @@ async fn dispatch_unary(
                 Err(e) => Response::Error(e),
             }
         }
+        Request::AdvanceMigrationVerification {
+            namespace,
+            target_version,
+            verified_through,
+        } => {
+            let ctx = conn.ctx.clone();
+            let catalog = Arc::clone(&conn.ctx.catalog);
+            let result = tokio::task::spawn_blocking(move || {
+                let _fence = ctx.acquire_catalog_write_fence(None)?;
+                catalog.advance_migration_verification(&namespace, target_version, verified_through)
+            })
+            .await
+            .unwrap_or_else(|e| {
+                Err(MembusError::Storage(format!(
+                    "advance_migration_verification failed: {e}"
+                )))
+            });
+            match result {
+                Ok(desc) => Response::Collection(desc),
+                Err(e) => Response::Error(e),
+            }
+        }
+        Request::EnterReverseShadow {
+            namespace,
+            target_version,
+            verified_through,
+        } => {
+            let ctx = conn.ctx.clone();
+            let catalog = Arc::clone(&conn.ctx.catalog);
+            let result = tokio::task::spawn_blocking(move || {
+                let _fence = ctx.acquire_catalog_write_fence(None)?;
+                catalog.enter_reverse_shadow(&namespace, target_version, verified_through)
+            })
+            .await
+            .unwrap_or_else(|e| {
+                Err(MembusError::Storage(format!(
+                    "enter_reverse_shadow failed: {e}"
+                )))
+            });
+            match result {
+                Ok(desc) => Response::Collection(desc),
+                Err(e) => Response::Error(e),
+            }
+        }
+        Request::RollbackMigration {
+            namespace,
+            rollback_version,
+        } => {
+            let ctx = conn.ctx.clone();
+            let catalog = Arc::clone(&conn.ctx.catalog);
+            let result = tokio::task::spawn_blocking(move || {
+                let _fence = ctx.acquire_catalog_write_fence(None)?;
+                catalog.rollback_migration(&namespace, rollback_version)
+            })
+            .await
+            .unwrap_or_else(|e| {
+                Err(MembusError::Storage(format!(
+                    "rollback_migration failed: {e}"
+                )))
+            });
+            match result {
+                Ok(desc) => Response::Collection(desc),
+                Err(e) => Response::Error(e),
+            }
+        }
+        Request::ContractMigration {
+            namespace,
+            expected_version,
+        } => {
+            let ctx = conn.ctx.clone();
+            let catalog = Arc::clone(&conn.ctx.catalog);
+            let result = tokio::task::spawn_blocking(move || {
+                let _fence = ctx.acquire_catalog_write_fence(None)?;
+                catalog.contract_migration(&namespace, expected_version)
+            })
+            .await
+            .unwrap_or_else(|e| {
+                Err(MembusError::Storage(format!(
+                    "contract_migration failed: {e}"
+                )))
+            });
+            match result {
+                Ok(desc) => Response::Collection(desc),
+                Err(e) => Response::Error(e),
+            }
+        }
+        Request::NamespaceDigest {
+            namespace,
+            key_prefix,
+            mode,
+        } => {
+            let catalog = Arc::clone(&conn.ctx.catalog);
+            let node_id = conn.ctx.node_id().to_owned();
+            let timeout = conn.ctx.config.query_timeout;
+            let result = run_blocking_query(timeout, "namespace_digest", move || {
+                compute_namespace_parity_digest_with_timeout(
+                    storage.as_ref(),
+                    catalog.as_ref(),
+                    &node_id,
+                    &namespace,
+                    &key_prefix,
+                    mode,
+                    timeout,
+                )
+            })
+            .await;
+            match result {
+                Ok(digest) => Response::NamespaceDigest(digest),
+                Err(e) => Response::Error(e),
+            }
+        }
+        Request::TransitionSlotRole {
+            expected_role,
+            expected_role_epoch,
+            new_role,
+        } => {
+            let ctx = conn.ctx.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                ctx.transition_slot_role(expected_role, expected_role_epoch, new_role)
+            })
+            .await
+            .unwrap_or_else(|e| {
+                Err(MembusError::Storage(format!(
+                    "transition_slot_role failed: {e}"
+                )))
+            });
+            match result {
+                Ok(state) => Response::SlotRole(state),
+                Err(e) => Response::Error(e),
+            }
+        }
+        Request::ApplyReplicatedDelta {
+            delta,
+            ack,
+            route_origin,
+        } => {
+            let ctx = conn.ctx.clone();
+            let search = conn.ctx.search.clone();
+            let local_node_id = conn.ctx.node_id().to_owned();
+            let result = tokio::task::spawn_blocking(move || {
+                let _fence = ctx.acquire_replicated_apply_fence(None)?;
+                coordinated_apply_replicated_delta(
+                    &storage,
+                    search.as_ref(),
+                    &local_node_id,
+                    route_origin.as_deref(),
+                    &delta,
+                    ack,
+                )
+            })
+            .await
+            .unwrap_or_else(|e| {
+                Err(MembusError::Storage(format!(
+                    "apply_replicated_delta failed: {e}"
+                )))
+            });
+            match result {
+                Ok(coord) => Response::ReplicatedApply(coord.result),
+                Err(e) => Response::Error(e),
+            }
+        }
         Request::IndexDocument { doc, ack } => {
+            let ctx = conn.ctx.clone();
             let Some(search) = conn.ctx.search.clone() else {
                 return Response::Error(MembusError::InvalidArgument(
                     "search engine is not enabled on this server".to_owned(),
                 ));
             };
             let result = tokio::task::spawn_blocking(move || {
+                let _fence = ctx.acquire_client_write_fence(None)?;
                 coordinated_index_document(&search, doc, ack)
             })
             .await
@@ -1266,12 +1480,14 @@ async fn dispatch_unary(
             doc_id,
             ack,
         } => {
+            let ctx = conn.ctx.clone();
             let Some(search) = conn.ctx.search.clone() else {
                 return Response::Error(MembusError::InvalidArgument(
                     "search engine is not enabled on this server".to_owned(),
                 ));
             };
             let result = tokio::task::spawn_blocking(move || {
+                let _fence = ctx.acquire_client_write_fence(None)?;
                 coordinated_delete_search_document(&search, &namespace, &doc_id, ack)
             })
             .await
@@ -1290,12 +1506,14 @@ async fn dispatch_unary(
             prefix,
             ack,
         } => {
+            let ctx = conn.ctx.clone();
             let Some(search) = conn.ctx.search.clone() else {
                 return Response::Error(MembusError::InvalidArgument(
                     "search engine is not enabled on this server".to_owned(),
                 ));
             };
             let result = tokio::task::spawn_blocking(move || {
+                let _fence = ctx.acquire_client_write_fence(None)?;
                 coordinated_revoke_search_prefix(&search, &namespace, &prefix, ack)
             })
             .await

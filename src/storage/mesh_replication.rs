@@ -197,10 +197,14 @@ impl RocksDbStorage {
         delta: &ReplicatedDelta,
         ack: Ack,
     ) -> Result<ReplicatedApplyResult, MembusError> {
-        if local_node_id.is_empty() || delta.stamp.origin_node_id.is_empty() {
-            return Err(MembusError::InvalidArgument(
-                "replication node_id must not be empty".to_owned(),
-            ));
+        validate_replication_node_id(local_node_id, "local_node_id")?;
+        validate_replication_node_id(&delta.stamp.origin_node_id, "origin_node_id")?;
+        // Never apply an echo loop originating from this local node/slot.
+        if delta.stamp.origin_node_id == local_node_id {
+            return Ok(ReplicatedApplyResult {
+                applied: false,
+                local_seq: None,
+            });
         }
         validate_namespace(&delta.namespace)?;
         validate_key(&delta.key)?;
@@ -560,4 +564,23 @@ impl RocksDbStorage {
             "replicated search ops exceeded optimistic retry limit".to_owned(),
         ))
     }
+}
+
+pub(crate) fn validate_replication_node_id(node_id: &str, field: &str) -> Result<(), MembusError> {
+    if node_id.is_empty() || node_id.len() > 128 {
+        return Err(MembusError::InvalidArgument(format!(
+            "replication {field} length must be 1..=128 bytes"
+        )));
+    }
+    if node_id.trim() != node_id {
+        return Err(MembusError::InvalidArgument(format!(
+            "replication {field} must not have leading or trailing whitespace"
+        )));
+    }
+    if node_id.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return Err(MembusError::InvalidArgument(format!(
+            "replication {field} must not contain ASCII control characters"
+        )));
+    }
+    Ok(())
 }

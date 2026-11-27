@@ -169,9 +169,10 @@ class MembusClient:
         *,
         body: bytes | None = None,
         content_type: str | None = None,
+        extra_headers: Mapping[str, str] | None = None,
     ) -> tuple[int, bytes]:
         url = f"{self.base_url}{path}"
-        extra: dict[str, str] = {}
+        extra: dict[str, str] = dict(extra_headers) if extra_headers else {}
         if content_type is not None:
             extra["Content-Type"] = content_type
         req = urllib.request.Request(
@@ -198,6 +199,8 @@ class MembusClient:
         method: str,
         path: str,
         payload: Any | None = None,
+        *,
+        extra_headers: Mapping[str, str] | None = None,
     ) -> Any:
         body: bytes | None = None
         content_type: str | None = None
@@ -209,6 +212,7 @@ class MembusClient:
             path,
             body=body,
             content_type=content_type,
+            extra_headers=extra_headers,
         )
         if not raw:
             return None
@@ -216,6 +220,22 @@ class MembusClient:
             return json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as err:
             raise MembusError(500, "protocol", f"invalid JSON response: {err}") from None
+
+    @staticmethod
+    def _ab_headers(
+        *,
+        role_epoch: int | None = None,
+        idempotency_key: str | None = None,
+        route_origin: str | None = None,
+    ) -> dict[str, str] | None:
+        hdrs: dict[str, str] = {}
+        if role_epoch is not None:
+            hdrs["X-Membus-Role-Epoch"] = str(role_epoch)
+        if idempotency_key is not None:
+            hdrs["X-Membus-Idempotency-Key"] = idempotency_key
+        if route_origin is not None:
+            hdrs["X-Membus-Route-Origin"] = route_origin
+        return hdrs or None
 
     # --- Health & Checkpoint ---
 
@@ -239,6 +259,8 @@ class MembusClient:
         ordered_indexes: Sequence[Mapping[str, Any]] | None = None,
         graph_edges: Sequence[Mapping[str, Any]] | None = None,
         search_op: Mapping[str, Any] | None = None,
+        idempotency_key: str | None = None,
+        role_epoch: int | None = None,
     ) -> CommitResult:
         ns_enc = _quote_segment(namespace)
         key_enc = _quote_segment(key)
@@ -273,7 +295,15 @@ class MembusClient:
             }
         if search_op is not None:
             body["search_op"] = dict(search_op)
-        res = self._request_json("PUT", f"/v2/kv/{ns_enc}/{key_enc}", body)
+        res = self._request_json(
+            "PUT",
+            f"/v2/kv/{ns_enc}/{key_enc}",
+            body,
+            extra_headers=self._ab_headers(
+                role_epoch=role_epoch,
+                idempotency_key=idempotency_key,
+            ),
+        )
         return CommitResult(
             seq=int(res["seq"]),
             epoch=int(res["epoch"]),
@@ -309,6 +339,8 @@ class MembusClient:
         ack: str = "Fast",
         expected: str | int | Mapping[str, Any] = "Any",
         search_op: Mapping[str, Any] | None = None,
+        idempotency_key: str | None = None,
+        role_epoch: int | None = None,
     ) -> CommitResult:
         ns_enc = _quote_segment(namespace)
         key_enc = _quote_segment(key)
@@ -318,7 +350,15 @@ class MembusClient:
         }
         if search_op is not None:
             body["search_op"] = dict(search_op)
-        res = self._request_json("DELETE", f"/v2/kv/{ns_enc}/{key_enc}", body)
+        res = self._request_json(
+            "DELETE",
+            f"/v2/kv/{ns_enc}/{key_enc}",
+            body,
+            extra_headers=self._ab_headers(
+                role_epoch=role_epoch,
+                idempotency_key=idempotency_key,
+            ),
+        )
         return CommitResult(
             seq=int(res["seq"]),
             epoch=int(res["epoch"]),
@@ -331,6 +371,8 @@ class MembusClient:
         guards: Sequence[Mapping[str, Any]] = (),
         mutations: Sequence[Mapping[str, Any]],
         ack: str = "Fast",
+        idempotency_key: str | None = None,
+        role_epoch: int | None = None,
     ) -> CommitResult:
         enc_guards = [
             {
@@ -383,6 +425,10 @@ class MembusClient:
             "POST",
             "/v2/tx",
             {"ack": ack, "guards": enc_guards, "mutations": enc_mutations},
+            extra_headers=self._ab_headers(
+                role_epoch=role_epoch,
+                idempotency_key=idempotency_key,
+            ),
         )
         return CommitResult(
             seq=int(res["seq"]),
@@ -542,6 +588,237 @@ class MembusClient:
                 return None
             raise
 
+    def has_cas_blob(self, namespace: str, sha256_hex: str) -> bool:
+        ns_enc = _quote_segment(namespace)
+        sha_enc = _quote_segment(sha256_hex)
+        try:
+            status, _raw = self._request_raw("HEAD", f"/v2/blobs/{ns_enc}/{sha_enc}")
+            return status == 200
+        except MembusError as err:
+            if err.status == 404:
+                return False
+            raise
+
+    # --- Collection Schema Catalog & Expand-Contract Migrations ---
+
+    def register_collection(
+        self,
+        descriptor: Mapping[str, Any],
+        *,
+        expected_version: int | None = None,
+        role_epoch: int | None = None,
+    ) -> dict[str, Any]:
+        return self._request_json(
+            "POST",
+            "/v2/catalog/collections",
+            {
+                "expected_version": expected_version,
+                "descriptor": dict(descriptor),
+            },
+            extra_headers=self._ab_headers(role_epoch=role_epoch),
+        )
+
+    def list_collections(self) -> list[dict[str, Any]]:
+        res = self._request_json("GET", "/v2/catalog/collections")
+        return list(res)
+
+    def get_collection(self, namespace: str) -> dict[str, Any] | None:
+        ns_enc = _quote_segment(namespace)
+        try:
+            return self._request_json("GET", f"/v2/catalog/collections/{ns_enc}")
+        except MembusError as err:
+            if err.status == 404:
+                return None
+            raise
+
+    def get_collection_version(self, namespace: str, version: int) -> dict[str, Any] | None:
+        ns_enc = _quote_segment(namespace)
+        try:
+            return self._request_json(
+                "GET", f"/v2/catalog/collections/{ns_enc}/versions/{int(version)}"
+            )
+        except MembusError as err:
+            if err.status == 404:
+                return None
+            raise
+
+    def begin_migration(
+        self,
+        namespace: str,
+        *,
+        expected_version: int,
+        target_version: int,
+        target_sha256: Sequence[int] | bytes,
+        target_schema_bytes: bytes | str,
+        role_epoch: int | None = None,
+    ) -> dict[str, Any]:
+        ns_enc = _quote_segment(namespace)
+        return self._request_json(
+            "POST",
+            f"/v2/catalog/collections/{ns_enc}/migrations/begin",
+            {
+                "expected_version": expected_version,
+                "target_version": target_version,
+                "target_sha256": list(target_sha256),
+                "target_schema_bytes": _to_byte_list(target_schema_bytes),
+            },
+            extra_headers=self._ab_headers(role_epoch=role_epoch),
+        )
+
+    def advance_migration(
+        self,
+        namespace: str,
+        *,
+        target_version: int,
+        verified_through: int,
+        role_epoch: int | None = None,
+    ) -> dict[str, Any]:
+        ns_enc = _quote_segment(namespace)
+        return self._request_json(
+            "POST",
+            f"/v2/catalog/collections/{ns_enc}/migrations/advance",
+            {
+                "target_version": target_version,
+                "verified_through": verified_through,
+            },
+            extra_headers=self._ab_headers(role_epoch=role_epoch),
+        )
+
+    def enter_reverse_shadow(
+        self,
+        namespace: str,
+        *,
+        target_version: int,
+        verified_through: int,
+        role_epoch: int | None = None,
+    ) -> dict[str, Any]:
+        ns_enc = _quote_segment(namespace)
+        return self._request_json(
+            "POST",
+            f"/v2/catalog/collections/{ns_enc}/migrations/reverse-shadow",
+            {
+                "target_version": target_version,
+                "verified_through": verified_through,
+            },
+            extra_headers=self._ab_headers(role_epoch=role_epoch),
+        )
+
+    def rollback_migration(
+        self,
+        namespace: str,
+        *,
+        rollback_version: int,
+        role_epoch: int | None = None,
+    ) -> dict[str, Any]:
+        ns_enc = _quote_segment(namespace)
+        return self._request_json(
+            "POST",
+            f"/v2/catalog/collections/{ns_enc}/migrations/rollback",
+            {"rollback_version": rollback_version},
+            extra_headers=self._ab_headers(role_epoch=role_epoch),
+        )
+
+    def contract_migration(
+        self,
+        namespace: str,
+        *,
+        expected_version: int,
+        role_epoch: int | None = None,
+    ) -> dict[str, Any]:
+        ns_enc = _quote_segment(namespace)
+        return self._request_json(
+            "POST",
+            f"/v2/catalog/collections/{ns_enc}/migrations/contract",
+            {"expected_version": expected_version},
+            extra_headers=self._ab_headers(role_epoch=role_epoch),
+        )
+
+    def commit_migration(
+        self,
+        namespace: str,
+        *,
+        target_version: int,
+        verified_through: int,
+        role_epoch: int | None = None,
+    ) -> dict[str, Any]:
+        ns_enc = _quote_segment(namespace)
+        return self._request_json(
+            "POST",
+            f"/v2/catalog/collections/{ns_enc}/migrations/commit",
+            {
+                "target_version": target_version,
+                "verified_through": verified_through,
+            },
+            extra_headers=self._ab_headers(role_epoch=role_epoch),
+        )
+
+    def abort_migration(
+        self,
+        namespace: str,
+        *,
+        target_version: int,
+        role_epoch: int | None = None,
+    ) -> dict[str, Any]:
+        ns_enc = _quote_segment(namespace)
+        return self._request_json(
+            "POST",
+            f"/v2/catalog/collections/{ns_enc}/migrations/abort",
+            {"target_version": target_version},
+            extra_headers=self._ab_headers(role_epoch=role_epoch),
+        )
+
+    # --- A/B Substrate Primitives (Parity Digest, Slot Role, Replication Apply) ---
+
+    def namespace_digest(
+        self,
+        namespace: str,
+        *,
+        mode: str = "full",
+        prefix: bytes | str | None = None,
+    ) -> dict[str, Any]:
+        ns_enc = _quote_segment(namespace)
+        body: dict[str, Any] = {"mode": mode}
+        if isinstance(prefix, str):
+            body["prefix_utf8"] = prefix
+        elif isinstance(prefix, bytes):
+            body["prefix_b64"] = base64.b64encode(prefix).decode("ascii")
+        return self._request_json("POST", f"/v2/namespaces/{ns_enc}/digest", body)
+
+    def transition_slot_role(
+        self,
+        *,
+        expected_role: str,
+        expected_role_epoch: int,
+        new_role: str,
+    ) -> dict[str, Any]:
+        return self._request_json(
+            "POST",
+            "/v2/admin/role",
+            {
+                "expected_role": expected_role,
+                "expected_role_epoch": expected_role_epoch,
+                "new_role": new_role,
+            },
+        )
+
+    def apply_replicated_delta(
+        self,
+        delta: Mapping[str, Any],
+        *,
+        ack: str = "Fast",
+        route_origin: str | None = None,
+        role_epoch: int | None = None,
+    ) -> dict[str, Any]:
+        return self._request_json(
+            "POST",
+            "/v2/replication/apply",
+            {"delta": dict(delta), "ack": ack},
+            extra_headers=self._ab_headers(
+                role_epoch=role_epoch,
+                route_origin=route_origin,
+            ),
+        )
+
     # --- Fenced Leases (`LeaseGrant` vs `LeaseInfo`) ---
 
     def acquire_lease(
@@ -686,6 +963,26 @@ class MembusClient:
         doc_enc = _quote_segment(doc_id)
         qs = urllib.parse.urlencode({"ack": ack})
         res = self._request_json("DELETE", f"/v2/search/documents/{ns_enc}/{doc_enc}?{qs}")
+        return CommitResult(
+            seq=int(res["seq"]),
+            epoch=int(res["epoch"]),
+            versions=tuple(int(v) for v in res["versions"]),
+        )
+
+    def revoke_search_prefix(
+        self,
+        namespace: str,
+        prefix: str,
+        *,
+        ack: str = "Fast",
+        role_epoch: int | None = None,
+    ) -> CommitResult:
+        res = self._request_json(
+            "POST",
+            "/v2/search/revoke-prefix",
+            {"namespace": namespace, "prefix": prefix, "ack": ack},
+            extra_headers=self._ab_headers(role_epoch=role_epoch),
+        )
         return CommitResult(
             seq=int(res["seq"]),
             epoch=int(res["epoch"]),
