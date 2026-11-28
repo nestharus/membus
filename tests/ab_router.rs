@@ -57,12 +57,8 @@ impl EphemeralSlot {
             node_id: Some(node_id.to_owned()),
             ..ServerConfig::default()
         };
-        let server = MembusServer::new(
-            Arc::clone(&storage) as Arc<dyn StorageEngine>,
-            broker,
-            cfg,
-        )
-        .with_auth(auth);
+        let server = MembusServer::new(Arc::clone(&storage) as Arc<dyn StorageEngine>, broker, cfg)
+            .with_auth(auth);
 
         let http_handle = server
             .bind_http("127.0.0.1:0".parse::<SocketAddr>().unwrap())
@@ -146,7 +142,11 @@ async fn http_json(
             .expect("req")
     } else {
         builder
-            .body(Empty::<Bytes>::new().map_err(|never| match never {}).boxed())
+            .body(
+                Empty::<Bytes>::new()
+                    .map_err(|never| match never {})
+                    .boxed(),
+            )
             .expect("req")
     };
 
@@ -157,8 +157,9 @@ async fn http_json(
     let parsed = if raw.is_empty() {
         serde_json::Value::Null
     } else {
-        serde_json::from_slice(&raw)
-            .unwrap_or_else(|_| serde_json::Value::String(String::from_utf8_lossy(&raw).into_owned()))
+        serde_json::from_slice(&raw).unwrap_or_else(|_| {
+            serde_json::Value::String(String::from_utf8_lossy(&raw).into_owned())
+        })
     };
     (status, headers, parsed)
 }
@@ -344,7 +345,11 @@ async fn ab_router_auth_isolation_control_plane_blocking_updates_acl_and_limits(
             None,
         )
         .await;
-        assert_eq!(st, StatusCode::BAD_REQUEST, "expected 400 on {bad_path}: {body}");
+        assert_eq!(
+            st,
+            StatusCode::BAD_REQUEST,
+            "expected 400 on {bad_path}: {body}"
+        );
         assert_eq!(body["error"], "invalid_argument");
     }
 
@@ -383,7 +388,11 @@ async fn ab_router_auth_isolation_control_plane_blocking_updates_acl_and_limits(
             None,
         )
         .await;
-        assert_eq!(st, StatusCode::NOT_IMPLEMENTED, "path={stream_path}: {body}");
+        assert_eq!(
+            st,
+            StatusCode::NOT_IMPLEMENTED,
+            "path={stream_path}: {body}"
+        );
     }
 
     // 5. Uppercase X-Membus-Route-Origin triggers 409 echo_loop_rejected; duplicate triggers 400.
@@ -634,7 +643,9 @@ async fn ab_router_stage4_promotion_failure_compensates_and_updates_primary_epoc
             .map(|p| p.as_str().to_owned())
             .unwrap_or_else(|| "/".to_owned());
         let headers = req.headers().clone();
-        let body = to_bytes(req.into_body(), 1024 * 1024).await.unwrap_or_default();
+        let body = to_bytes(req.into_body(), 1024 * 1024)
+            .await
+            .unwrap_or_default();
 
         let stream = TcpStream::connect(real_b_addr).await.unwrap();
         let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
@@ -710,7 +721,11 @@ async fn ab_router_stage4_promotion_failure_compensates_and_updates_primary_epoc
         Some(serde_json::json!({ "namespaces": ["orders"] })),
     )
     .await;
-    assert_eq!(st, StatusCode::BAD_GATEWAY, "expected 502 on injected error: {cut_err}");
+    assert_eq!(
+        st,
+        StatusCode::BAD_GATEWAY,
+        "expected 502 on injected error: {cut_err}"
+    );
 
     // Verify Slot A was restored to Active at epoch 3 and subsequent writes succeed (not bricked!).
     let (_, _, health_a) = http_json(
@@ -772,7 +787,9 @@ async fn ab_router_full_e2e_multi_ns_shadow_503_catchup_parity_cutover_auto_rest
     cfg.slot_a.inline_token = Some("tok-router-admin".to_owned());
     cfg.slot_b.inline_token = Some("tok-router-admin".to_owned());
 
-    let router = AbRouterServer::start(cfg.clone()).await.expect("start ab-router");
+    let router = AbRouterServer::start(cfg.clone())
+        .await
+        .expect("start ab-router");
 
     // Admin health probe works without auth; /admin/status enforces admin bearer token.
     let (st, _, health) = http_json(
@@ -1059,6 +1076,171 @@ async fn ab_router_full_e2e_multi_ns_shadow_503_catchup_parity_cutover_auto_rest
     )
     .await;
     assert_eq!(st, StatusCode::NOT_FOUND);
+
+    router.shutdown().await;
+    slot_a.shutdown().await;
+    slot_b.shutdown().await;
+}
+
+#[tokio::test]
+async fn ab_router_live_concurrent_writes_survive_cutover_and_rollback_with_zero_loss() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    let slot_a = EphemeralSlot::start("slot-a", SlotRole::Active, test_slot_auth()).await;
+    let slot_b = EphemeralSlot::start("slot-b", SlotRole::Shadow, test_slot_auth()).await;
+
+    let mut cfg = RouterConfig {
+        data_listen: "127.0.0.1:0".parse().unwrap(),
+        admin_listen: "127.0.0.1:0".parse().unwrap(),
+        slot_a: SlotEndpointConfig::new(format!("http://{}", slot_a.http_addr)),
+        slot_b: SlotEndpointConfig::new(format!("http://{}", slot_b.http_addr)),
+        initial_primary: SlotId::SlotA,
+        shadow_enabled: true,
+        admin_inline_token: Some("adm-live".to_owned()),
+        ..RouterConfig::default()
+    };
+    cfg.slot_a.inline_token = Some("tok-router-admin".to_owned());
+    cfg.slot_b.inline_token = Some("tok-router-admin".to_owned());
+
+    let router = AbRouterServer::start(cfg).await.expect("start router");
+    let data_addr = router.data_addr();
+    let stop = Arc::new(AtomicBool::new(false));
+    let seq = Arc::new(AtomicU64::new(0));
+    let acked = Arc::new(tokio::sync::Mutex::new(Vec::<u64>::new()));
+
+    let mut writers = Vec::new();
+    for _ in 0..4 {
+        let stop = Arc::clone(&stop);
+        let seq = Arc::clone(&seq);
+        let acked = Arc::clone(&acked);
+        writers.push(tokio::spawn(async move {
+            let mut sender: Option<hyper::client::conn::http1::SendRequest<Full<Bytes>>> = None;
+            while !stop.load(Ordering::Relaxed) {
+                let id = seq.fetch_add(1, Ordering::Relaxed) + 1;
+                let idem = format!("live-idem-{id}");
+                let body_bytes =
+                    Bytes::from(serde_json::json!({ "value_utf8": format!("v-{id}") }).to_string());
+                let path = format!("/v2/kv/orders/live-{id}");
+                for _ in 0..80 {
+                    if sender.as_ref().is_none_or(|s| s.is_closed()) {
+                        if let Ok(stream) = TcpStream::connect(data_addr).await {
+                            if let Ok((s, conn)) =
+                                hyper::client::conn::http1::handshake(TokioIo::new(stream)).await
+                            {
+                                tokio::spawn(async move {
+                                    let _ = conn.await;
+                                });
+                                sender = Some(s);
+                            }
+                        }
+                    }
+                    let req = Request::builder()
+                        .method(Method::PUT)
+                        .uri(&path)
+                        .header("host", data_addr.to_string())
+                        .header(AUTHORIZATION, "Bearer tok-client")
+                        .header(CONTENT_TYPE, "application/json")
+                        .header("X-Membus-Idempotency-Key", idem.as_str())
+                        .body(Full::new(body_bytes.clone()))
+                        .expect("req");
+                    let ok = match sender.as_mut() {
+                        Some(s) => match s.send_request(req).await {
+                            Ok(resp) => {
+                                let st = resp.status();
+                                let _ = resp.into_body().collect().await;
+                                st == StatusCode::OK
+                            }
+                            Err(_) => {
+                                sender = None;
+                                false
+                            }
+                        },
+                        None => false,
+                    };
+                    if ok {
+                        acked.lock().await.push(id);
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }));
+    }
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let (st, _, cut_body) = http_json(
+        router.admin_addr(),
+        Method::POST,
+        "/admin/cutover",
+        Some("adm-live"),
+        &[],
+        Some(serde_json::json!({ "namespaces": ["orders"] })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "live cutover failed: {cut_body}");
+    assert_eq!(cut_body["new_primary"], "slot-b");
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let (st, _, rb_body) = http_json(
+        router.admin_addr(),
+        Method::POST,
+        "/admin/rollback",
+        Some("adm-live"),
+        &[],
+        Some(serde_json::json!({ "namespaces": ["orders"] })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "live rollback failed: {rb_body}");
+    assert_eq!(rb_body["new_primary"], "slot-a");
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    stop.store(true, Ordering::Relaxed);
+    for w in writers {
+        w.await.expect("writer join");
+    }
+
+    wait_for_status(router.admin_addr(), "adm-live", |s| {
+        s["shadow_queue_depth"] == 0 && s["parity_dirty"] == false
+    })
+    .await;
+
+    let (st, _, parity) = http_json(
+        router.admin_addr(),
+        Method::POST,
+        "/admin/parity",
+        Some("adm-live"),
+        &[],
+        Some(serde_json::json!({ "namespaces": ["orders"], "mode": "full" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(parity["match"], true, "parity mismatch: {parity}");
+
+    let all_acked = acked.lock().await;
+    assert!(
+        all_acked.len() >= 20,
+        "expected >= 20 live acked writes, got {}",
+        all_acked.len()
+    );
+    for id in all_acked.iter() {
+        let key = format!("live-{id}");
+        let expected = format!("v-{id}");
+        let rec_a = slot_a
+            .storage
+            .get("orders", key.as_bytes())
+            .unwrap()
+            .expect("key on A");
+        let rec_b = slot_b
+            .storage
+            .get("orders", key.as_bytes())
+            .unwrap()
+            .expect("key on B");
+        assert_eq!(rec_a.value, expected.as_bytes());
+        assert_eq!(rec_b.value, expected.as_bytes());
+    }
 
     router.shutdown().await;
     slot_a.shutdown().await;

@@ -21,6 +21,13 @@ use crate::router::upstream::UpstreamClient;
 use crate::types::{MembusError, ParityDigestMode, SlotRole};
 
 const MAX_ADMIN_BODY_BYTES: usize = 64 * 1024;
+/// Conservative sequence rewind applied during post-fence `CF_LOG` tail catch-up so concurrent
+/// primary writes that finished returning HTTP responses slightly out of `seq` order are always
+/// replayed idempotently (LWW) before post-fence parity verification.
+const POST_FENCE_REWIND_WINDOW: u64 = 256;
+/// Maximum time to wait for already-admitted in-flight commits on the newly fenced primary to
+/// finish before reading the final `CF_LOG` tail.
+const POST_FENCE_IN_FLIGHT_DRAIN_MS: u64 = 100;
 
 #[derive(Clone)]
 struct AdminState {
@@ -210,12 +217,15 @@ async fn handle_admin_cutover(
         ));
     }
 
-    let depth = state.runtime.shadow_queue_depth();
-    if depth > 0 {
+    let drain_budget = Duration::from_millis(state.runtime.shadow_timeout().as_millis() as u64);
+    if !state.runtime.wait_shadow_queue_drain(drain_budget).await {
+        let depth = state.runtime.shadow_queue_depth();
         return Err(admin_error(
             StatusCode::CONFLICT,
             "shadow_queue_not_empty",
-            format!("cutover blocked: shadow_queue_depth is {depth} (must be 0)"),
+            format!(
+                "cutover blocked: shadow_queue_depth is {depth} (did not drain within timeout)"
+            ),
         ));
     }
 
@@ -233,20 +243,11 @@ async fn handle_admin_cutover(
         ));
     }
 
-    let pre_parity = state
-        .runtime
-        .verify_parity(&namespaces, req.mode, None)
-        .await
-        .map_err(map_membus_error)?;
-    if !pre_parity.matched {
-        state.runtime.mark_parity_dirty();
-        return Err(admin_error(
-            StatusCode::CONFLICT,
-            "parity_mismatch",
-            "cutover blocked: Slot A and Slot B parity digests do not match".to_owned(),
-        ));
-    }
-
+    // Do NOT run an unfenced `verify_parity` while the outgoing Primary is still `Active`: under
+    // live concurrent writes two unsynchronised snapshots across A and B will legitimately differ,
+    // which would spuriously mark `parity_dirty = true` and deadlock cutover. `execute_fenced_slot_swap`
+    // fences the outgoing Primary first, drains tail deltas, verifies quiescent parity digests,
+    // and compensates back to Active on any genuine mismatch.
     let swap = execute_fenced_slot_swap(&state.runtime, &namespaces, req.mode).await?;
 
     Ok((
@@ -350,9 +351,14 @@ async fn execute_fenced_slot_swap(
     let primary_client = runtime.client_for(old_primary);
     let candidate_client = runtime.client_for(candidate);
 
-    let (primary_health, candidate_health) =
-        verify_swap_preconditions(&primary_client, &candidate_client, old_primary, candidate, timeout)
-            .await?;
+    let (primary_health, candidate_health) = verify_swap_preconditions(
+        &primary_client,
+        &candidate_client,
+        old_primary,
+        candidate,
+        timeout,
+    )
+    .await?;
 
     let fenced_old = fence_outgoing_primary(
         runtime,
@@ -505,7 +511,27 @@ async fn drain_and_verify_post_fence_parity(
     namespaces: &[String],
     mode: ParityDigestMode,
 ) -> Result<(), AdminError> {
-    let start_seq = ctx.runtime.topology_snapshot().catchup_start_seq();
+    // Allow any write that passed the outgoing primary's role check microseconds before fencing
+    // to finish committing to `CF_LOG`, and let already-queued shadow deliveries finish draining.
+    let in_flight_deadline =
+        tokio::time::Instant::now() + Duration::from_millis(POST_FENCE_IN_FLIGHT_DRAIN_MS);
+    while tokio::time::Instant::now() < in_flight_deadline {
+        match ctx.primary_client.health(ctx.timeout).await {
+            Ok(h) if h.in_flight_ops == 0 => break,
+            Ok(_) => tokio::time::sleep(Duration::from_millis(5)).await,
+            Err(_) => break,
+        }
+    }
+    let _ = ctx
+        .runtime
+        .wait_shadow_queue_drain(Duration::from_millis(500))
+        .await;
+
+    let start_seq = ctx
+        .runtime
+        .topology_snapshot()
+        .catchup_start_seq()
+        .saturating_sub(POST_FENCE_REWIND_WINDOW);
     let (_, _, cursor, touched_tail, saw_standalone_search) = match ctx
         .runtime
         .replay_updates_until_caught_up(
@@ -555,7 +581,10 @@ async fn drain_and_verify_post_fence_parity(
         return Err(compensate_restore_primary(ctx, err).await);
     }
 
-    let all_namespaces = ctx.runtime.discover_namespaces(namespaces, &touched_tail).await;
+    let all_namespaces = ctx
+        .runtime
+        .discover_namespaces(namespaces, &touched_tail)
+        .await;
     match ctx.runtime.verify_parity(&all_namespaces, mode, None).await {
         Ok(report) if report.matched => Ok(()),
         Ok(_) => {
@@ -581,7 +610,12 @@ async fn promote_candidate_slot(
 ) -> Result<crate::types::SlotRoleState, AdminError> {
     match ctx
         .candidate_client
-        .transition_role(SlotRole::Shadow, ctx.candidate_epoch, SlotRole::Active, ctx.timeout)
+        .transition_role(
+            SlotRole::Shadow,
+            ctx.candidate_epoch,
+            SlotRole::Active,
+            ctx.timeout,
+        )
         .await
     {
         Ok(st) => Ok(st),
@@ -642,7 +676,12 @@ async fn compensate_restore_primary(
 ) -> AdminError {
     match ctx
         .primary_client
-        .transition_role(SlotRole::Shadow, ctx.fenced_old_epoch, SlotRole::Active, ctx.timeout)
+        .transition_role(
+            SlotRole::Shadow,
+            ctx.fenced_old_epoch,
+            SlotRole::Active,
+            ctx.timeout,
+        )
         .await
     {
         Ok(restored) => {

@@ -8,13 +8,15 @@
 use std::collections::HashSet;
 use std::io;
 use std::pin::Pin;
+use std::sync::Mutex;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::http::header::{self, HeaderMap, HeaderName, HeaderValue};
-use axum::http::{Method, StatusCode};
+use axum::http::{Method, StatusCode, Version};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
+use hyper::client::conn::http1::SendRequest;
 use hyper_util::rt::TokioIo;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -42,6 +44,21 @@ const HOP_BY_HOP_HEADERS: &[&str] = &[
     "host",
     "content-length",
 ];
+
+/// Upper bound on idle keep-alive connections retained per upstream slot.
+const MAX_IDLE_CONNS: usize = 128;
+/// Idle connections older than this are discarded instead of reused, so a peer-side idle timeout
+/// rarely turns into a stale-connection retry.
+const IDLE_CONN_TTL: Duration = Duration::from_secs(10);
+/// How long a pooled connection may take to report itself ready before it is discarded.
+const IDLE_READY_PROBE: Duration = Duration::from_millis(100);
+
+type UpstreamSender = SendRequest<Full<Bytes>>;
+
+struct IdleConn {
+    sender: UpstreamSender,
+    since: Instant,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Scheme {
@@ -237,6 +254,10 @@ pub struct UpstreamClient {
     control_bearer_token: Option<String>,
     tls: Option<(TlsConnector, rustls_pki_types::ServerName<'static>)>,
     max_body_bytes: usize,
+    /// Bounded LIFO pool of idle HTTP/1.1 keep-alive connections. Without reuse every upstream
+    /// request burns one ephemeral port (`TIME_WAIT`), which exhausts the range under sustained
+    /// load and surfaces as connect failures, dropped shadow writes and a stuck `parity_dirty`.
+    idle: Mutex<Vec<IdleConn>>,
 }
 
 impl UpstreamClient {
@@ -283,6 +304,7 @@ impl UpstreamClient {
             control_bearer_token,
             tls,
             max_body_bytes: max_body_bytes.max(1024),
+            idle: Mutex::new(Vec::new()),
         })
     }
 
@@ -330,16 +352,19 @@ impl UpstreamClient {
             })?;
             headers.insert(name, val);
         }
-        let body = match payload {
-            Some(p) => {
-                headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
-                Bytes::from(
-                    serde_json::to_vec(p)
-                        .map_err(|err| MembusError::Protocol(format!("JSON encode failed: {err}")))?,
-                )
-            }
-            None => Bytes::new(),
-        };
+        let body =
+            match payload {
+                Some(p) => {
+                    headers.insert(
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/json"),
+                    );
+                    Bytes::from(serde_json::to_vec(p).map_err(|err| {
+                        MembusError::Protocol(format!("JSON encode failed: {err}"))
+                    })?)
+                }
+                None => Bytes::new(),
+            };
         self.send_http_with_timeout(method, path_and_query, headers, body, true, timeout)
             .await
     }
@@ -367,14 +392,41 @@ impl UpstreamClient {
         })?
     }
 
-    async fn send_http_inner(
-        &self,
-        method: Method,
-        path_and_query: &str,
-        headers: HeaderMap,
-        body: Bytes,
-        attach_control_auth: bool,
-    ) -> Result<UpstreamResponse, MembusError> {
+    /// Pop the freshest usable idle connection, discarding expired or closed ones.
+    fn take_idle(&self) -> Option<UpstreamSender> {
+        let mut pool = self
+            .idle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while let Some(conn) = pool.pop() {
+            if conn.since.elapsed() < IDLE_CONN_TTL && !conn.sender.is_closed() {
+                return Some(conn.sender);
+            }
+        }
+        None
+    }
+
+    /// Return a connection whose response body was fully consumed to the idle pool.
+    fn put_idle(&self, sender: UpstreamSender) {
+        if sender.is_closed() {
+            return;
+        }
+        let mut pool = self
+            .idle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if pool.len() >= MAX_IDLE_CONNS {
+            pool.retain(|c| c.since.elapsed() < IDLE_CONN_TTL && !c.sender.is_closed());
+        }
+        if pool.len() < MAX_IDLE_CONNS {
+            pool.push(IdleConn {
+                sender,
+                since: Instant::now(),
+            });
+        }
+    }
+
+    async fn connect_new(&self) -> Result<UpstreamSender, MembusError> {
         let tcp = TcpStream::connect(self.url.connect_addr())
             .await
             .map_err(|err| {
@@ -387,37 +439,49 @@ impl UpstreamClient {
 
         let stream = match &self.tls {
             Some((connector, server_name)) => {
-                let tls_stream = connector
-                    .connect(server_name.clone(), tcp)
-                    .await
-                    .map_err(|err| {
-                        MembusError::Io(format!(
-                            "TLS handshake to {} ({}) failed: {err}",
-                            self.slot, self.url.authority
-                        ))
-                    })?;
+                let tls_stream =
+                    connector
+                        .connect(server_name.clone(), tcp)
+                        .await
+                        .map_err(|err| {
+                            MembusError::Io(format!(
+                                "TLS handshake to {} ({}) failed: {err}",
+                                self.slot, self.url.authority
+                            ))
+                        })?;
                 UpstreamStream::Tls(Box::new(tls_stream))
             }
             None => UpstreamStream::Plain(tcp),
         };
 
         let io = TokioIo::new(stream);
-        let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+        let (sender, conn) = hyper::client::conn::http1::handshake(io)
             .await
             .map_err(|err| {
                 MembusError::Io(format!("HTTP/1.1 handshake to {} failed: {err}", self.slot))
             })?;
+        // The driver task ends (closing the socket) once the `SendRequest` handle is dropped.
         tokio::spawn(async move {
             let _ = conn.await;
         });
+        Ok(sender)
+    }
 
+    fn build_request(
+        &self,
+        method: &Method,
+        path_and_query: &str,
+        headers: &HeaderMap,
+        body: &Bytes,
+        attach_control_auth: bool,
+    ) -> Result<hyper::Request<Full<Bytes>>, MembusError> {
         let target_uri = self.url.resolve_path(path_and_query);
         let mut builder = hyper::Request::builder()
-            .method(method)
+            .method(method.clone())
             .uri(&target_uri)
             .header(header::HOST, &self.url.authority);
 
-        for (name, value) in &headers {
+        for (name, value) in headers {
             if is_hop_by_hop(name) {
                 continue;
             }
@@ -432,22 +496,87 @@ impl UpstreamClient {
             }
         }
 
-        let req = builder
-            .body(Full::new(body))
-            .map_err(|err| MembusError::Protocol(format!("failed to build upstream request: {err}")))?;
-
-        let resp = sender.send_request(req).await.map_err(|err| {
-            MembusError::Io(format!("upstream {} request failed: {err}", self.slot))
-        })?;
-        let status = resp.status();
-        let resp_headers = strip_hop_by_hop_headers(resp.headers());
-        let body = read_bounded_body(resp.into_body(), self.max_body_bytes).await?;
-
-        Ok(UpstreamResponse {
-            status,
-            headers: resp_headers,
-            body,
+        builder.body(Full::new(body.clone())).map_err(|err| {
+            MembusError::Protocol(format!("failed to build upstream request: {err}"))
         })
+    }
+
+    async fn send_http_inner(
+        &self,
+        method: Method,
+        path_and_query: &str,
+        headers: HeaderMap,
+        body: Bytes,
+        attach_control_auth: bool,
+    ) -> Result<UpstreamResponse, MembusError> {
+        // A request that already reached a peer which then dropped a reused keep-alive socket is
+        // replayed only when replay cannot double-apply: methods that are idempotent by
+        // definition, requests carrying an idempotency key, and LWW replication deltas. A request
+        // that was never written (`is_canceled` / `is_closed`) is always safe to replay.
+        let replay_safe = matches!(
+            method,
+            Method::GET | Method::HEAD | Method::PUT | Method::DELETE | Method::OPTIONS
+        ) || headers.contains_key("x-membus-idempotency-key")
+            || path_and_query == "/v2/replication/apply";
+
+        let mut allow_pooled = true;
+        loop {
+            let pooled = if allow_pooled { self.take_idle() } else { None };
+            let reused = pooled.is_some();
+            let mut sender = match pooled {
+                Some(mut s) => {
+                    match tokio::time::timeout(IDLE_READY_PROBE, s.ready()).await {
+                        Ok(Ok(())) => s,
+                        // Not ready or closed underneath us: drop it and try the next one.
+                        _ => continue,
+                    }
+                }
+                None => self.connect_new().await?,
+            };
+
+            let req = self.build_request(
+                &method,
+                path_and_query,
+                &headers,
+                &body,
+                attach_control_auth,
+            )?;
+
+            let resp = match sender.send_request(req).await {
+                Ok(resp) => resp,
+                Err(err) => {
+                    let never_sent = err.is_canceled() || err.is_closed();
+                    if reused && (never_sent || replay_safe) {
+                        // Stale keep-alive socket: retry exactly once on a fresh connection.
+                        allow_pooled = false;
+                        continue;
+                    }
+                    return Err(MembusError::Io(format!(
+                        "upstream {} request failed: {err}",
+                        self.slot
+                    )));
+                }
+            };
+
+            let keep_alive = resp.version() != Version::HTTP_10
+                && !resp.headers().get_all(header::CONNECTION).iter().any(|v| {
+                    v.to_str()
+                        .map(|s| s.split(',').any(|t| t.trim().eq_ignore_ascii_case("close")))
+                        .unwrap_or(true)
+                });
+            let status = resp.status();
+            let resp_headers = strip_hop_by_hop_headers(resp.headers());
+            let body = read_bounded_body(resp.into_body(), self.max_body_bytes).await?;
+            if keep_alive {
+                self.put_idle(sender);
+            }
+
+            return Ok(UpstreamResponse {
+                status,
+                headers: resp_headers,
+                body,
+            });
+        }
     }
 
     /// Query `GET /v2/health` on this slot.
@@ -569,8 +698,7 @@ impl UpstreamClient {
         if let Some(ep) = role_epoch {
             extra.push(("X-Membus-Role-Epoch", ep.to_string()));
         }
-        let header_refs: Vec<(&str, &str)> =
-            extra.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let header_refs: Vec<(&str, &str)> = extra.iter().map(|(k, v)| (*k, v.as_str())).collect();
         self.send_json(
             Method::POST,
             "/v2/replication/apply",
@@ -600,9 +728,7 @@ fn decode_json_response<T: DeserializeOwned>(
         )));
     }
     serde_json::from_slice(&resp.body).map_err(|err| {
-        MembusError::Protocol(format!(
-            "failed to decode JSON from {slot} {op}: {err}"
-        ))
+        MembusError::Protocol(format!("failed to decode JSON from {slot} {op}: {err}"))
     })
 }
 
@@ -668,4 +794,155 @@ fn percent_encode_segment(raw: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    /// Minimal HTTP/1.1 peer that counts accepted TCP connections.
+    async fn spawn_peer(
+        close_after_response: bool,
+        announce_close: bool,
+    ) -> (SocketAddr, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepts);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf: Vec<u8> = Vec::new();
+                    let mut tmp = [0u8; 1024];
+                    loop {
+                        let n = match sock.read(&mut tmp).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        buf.extend_from_slice(&tmp[..n]);
+                        while let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            buf.drain(..pos + 4);
+                            let hdr = if announce_close {
+                                "connection: close\r\n"
+                            } else {
+                                ""
+                            };
+                            let resp =
+                                format!("HTTP/1.1 200 OK\r\ncontent-length: 2\r\n{hdr}\r\nok");
+                            if sock.write_all(resp.as_bytes()).await.is_err() {
+                                return;
+                            }
+                            if close_after_response {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        (addr, accepts)
+    }
+
+    fn client_for(addr: SocketAddr) -> UpstreamClient {
+        UpstreamClient::new(
+            SlotId::SlotA,
+            &SlotEndpointConfig::new(format!("http://{addr}")),
+            1 << 20,
+        )
+        .expect("client")
+    }
+
+    async fn get(client: &UpstreamClient) -> Result<UpstreamResponse, MembusError> {
+        client
+            .forward_client_raw(
+                Method::GET,
+                "/ping",
+                HeaderMap::new(),
+                Bytes::new(),
+                Duration::from_secs(5),
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn sequential_requests_reuse_one_keep_alive_connection() {
+        let (addr, accepts) = spawn_peer(false, false).await;
+        let client = client_for(addr);
+        for _ in 0..50 {
+            let resp = get(&client).await.expect("response");
+            assert_eq!(resp.status, StatusCode::OK);
+            assert_eq!(&resp.body[..], b"ok");
+        }
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            1,
+            "one TCP connection for 50 requests"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_requests_stay_bounded_and_pool_is_capped() {
+        let (addr, accepts) = spawn_peer(false, false).await;
+        let client = Arc::new(client_for(addr));
+        for _round in 0..3 {
+            let mut tasks = Vec::new();
+            for _ in 0..16 {
+                let c = Arc::clone(&client);
+                tasks.push(tokio::spawn(async move { get(&c).await.map(|r| r.status) }));
+            }
+            for t in tasks {
+                assert_eq!(t.await.expect("join").expect("response"), StatusCode::OK);
+            }
+        }
+        assert!(
+            accepts.load(Ordering::SeqCst) <= 16,
+            "rounds reuse pooled connections instead of opening 48 sockets"
+        );
+        let idle = client.idle.lock().expect("lock").len();
+        assert!(idle <= MAX_IDLE_CONNS);
+    }
+
+    #[tokio::test]
+    async fn connection_close_responses_are_not_pooled() {
+        let (addr, accepts) = spawn_peer(true, true).await;
+        let client = client_for(addr);
+        for _ in 0..5 {
+            assert_eq!(get(&client).await.expect("response").status, StatusCode::OK);
+        }
+        assert_eq!(accepts.load(Ordering::SeqCst), 5);
+        assert!(client.idle.lock().expect("lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_keep_alive_socket_is_replayed_once_on_a_fresh_connection() {
+        // The peer closes every socket right after answering, without announcing it, so each
+        // pooled connection is dead by the time it would be reused.
+        let (addr, accepts) = spawn_peer(true, false).await;
+        let client = client_for(addr);
+        for _ in 0..5 {
+            assert_eq!(get(&client).await.expect("response").status, StatusCode::OK);
+        }
+        assert_eq!(accepts.load(Ordering::SeqCst), 5);
+    }
+
+    #[tokio::test]
+    async fn unreachable_peer_reports_connect_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        drop(listener);
+        let client = client_for(addr);
+        let err = get(&client).await.expect_err("connect must fail");
+        assert!(err.to_string().contains("failed to connect"), "{err}");
+    }
 }
