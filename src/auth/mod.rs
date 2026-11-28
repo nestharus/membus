@@ -1,3 +1,11 @@
+pub mod tenant;
+
+pub use tenant::{
+    extract_tenant_id, tenant_grant, tenant_namespace, tenant_namespace_pattern,
+    tenant_token_binding, validate_tenant_id, validate_workspace_slug, AuthStore,
+    MAX_TENANT_ID_LEN, MAX_WORKSPACE_SLUG_LEN, MIN_TENANT_TOKEN_LEN, TENANT_NAMESPACE_PREFIX,
+};
+
 use std::sync::Arc;
 
 use ring::rand::{SecureRandom, SystemRandom};

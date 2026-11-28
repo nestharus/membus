@@ -1,10 +1,10 @@
-use crate::auth::AuthConfig;
+use crate::auth::AuthStore;
 use crate::protocol::Request;
 use crate::transport::helpers::{authorize_index_mutations, authorize_search_op};
 use crate::types::{AuthMode, MembusError, Permission, Principal};
 
 pub(super) fn authorize_request(
-    auth: &AuthConfig,
+    auth: &AuthStore,
     principal: Option<&Principal>,
     req: &Request,
 ) -> Result<(), MembusError> {
@@ -81,7 +81,7 @@ pub(super) fn authorize_request(
 }
 
 fn authorize_kv_tx_request(
-    auth: &AuthConfig,
+    auth: &AuthStore,
     principal: Option<&Principal>,
     req: &Request,
 ) -> Result<(), MembusError> {
@@ -208,7 +208,7 @@ fn authorize_kv_tx_request(
 }
 
 fn authorize_domain_request(
-    auth: &AuthConfig,
+    auth: &AuthStore,
     principal: Option<&Principal>,
     req: &Request,
 ) -> Result<(), MembusError> {

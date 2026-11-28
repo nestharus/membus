@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::auth::AuthConfig;
+use crate::auth::AuthStore;
 use crate::types::{AuthMode, IndexMutations, MembusError, Permission, Principal, SearchLogOp};
 
 /// RAII guard tracking one active transport connection (binary, WS, or SSE).
@@ -28,7 +28,7 @@ impl Drop for ConnectionGuard {
 
 /// Authorize write permissions on all graph edge endpoints referenced by `indexes`.
 pub(crate) fn authorize_index_mutations(
-    auth: &AuthConfig,
+    auth: &AuthStore,
     principal: Option<&Principal>,
     namespace: &str,
     indexes: &IndexMutations,
@@ -45,7 +45,7 @@ pub(crate) fn authorize_index_mutations(
 
 /// Authorize write/admin permissions required for a secondary search log operation.
 pub(crate) fn authorize_search_op(
-    auth: &AuthConfig,
+    auth: &AuthStore,
     principal: Option<&Principal>,
     op: &SearchLogOp,
 ) -> Result<(), MembusError> {

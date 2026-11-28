@@ -21,7 +21,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 
-use crate::auth::{AuthConfig, LeaseManager};
+use crate::auth::{AuthConfig, AuthStore, LeaseManager};
 use crate::catalog::CollectionCatalog;
 use crate::protocol::DEFAULT_MAX_FRAME_BODY;
 use crate::search::SearchEngine;
@@ -125,7 +125,7 @@ impl Drop for StreamGuard {
 pub struct ServerContext {
     pub(crate) storage: Arc<dyn StorageEngine>,
     pub(crate) broker: Arc<SignalBroker>,
-    pub(crate) auth: Arc<AuthConfig>,
+    pub(crate) auth: Arc<AuthStore>,
     pub(crate) leases: Arc<LeaseManager>,
     pub(crate) catalog: Arc<CollectionCatalog>,
     pub(crate) search: Option<Arc<SearchEngine>>,
@@ -160,7 +160,7 @@ impl ServerContext {
         Self {
             storage,
             broker,
-            auth: Arc::new(AuthConfig::disabled()),
+            auth: Arc::new(AuthStore::disabled()),
             leases,
             catalog,
             search: None,
@@ -176,8 +176,17 @@ impl ServerContext {
     }
 
     pub fn with_auth(mut self, auth: AuthConfig) -> Self {
-        self.auth = Arc::new(auth);
+        self.auth = Arc::new(AuthStore::new(auth));
         self
+    }
+
+    pub fn with_auth_store(mut self, auth: Arc<AuthStore>) -> Self {
+        self.auth = auth;
+        self
+    }
+
+    pub fn auth_store(&self) -> Arc<AuthStore> {
+        Arc::clone(&self.auth)
     }
 
     pub fn with_search(mut self, search: Arc<SearchEngine>) -> Self {
@@ -656,6 +665,15 @@ impl MembusServer {
     pub fn with_auth(mut self, auth: AuthConfig) -> Self {
         self.ctx = self.ctx.with_auth(auth);
         self
+    }
+
+    pub fn with_auth_store(mut self, auth: Arc<AuthStore>) -> Self {
+        self.ctx = self.ctx.with_auth_store(auth);
+        self
+    }
+
+    pub fn auth_store(&self) -> Arc<AuthStore> {
+        self.ctx.auth_store()
     }
 
     pub fn with_search(mut self, search: Arc<SearchEngine>) -> Self {

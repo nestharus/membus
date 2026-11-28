@@ -20,7 +20,11 @@ pub mod tiering;
 pub mod transport;
 pub mod types;
 
-pub use auth::{AuthConfig, LeaseManager, TokenBinding};
+pub use auth::{
+    extract_tenant_id, tenant_grant, tenant_namespace, tenant_namespace_pattern,
+    tenant_token_binding, validate_tenant_id, validate_workspace_slug, AuthConfig, AuthStore,
+    LeaseManager, TokenBinding,
+};
 pub use backup::{
     create_full_backup, create_full_backup_with_search, export_incremental_delta,
     restore_clean_room, verify_backup_dir, verify_delta_bundle, BackupCounts, BackupManifest,
