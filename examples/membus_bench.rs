@@ -299,6 +299,7 @@ async fn bench_cross_process_signal_wake(root: &std::path::Path) {
     };
 
     let dir = make_bench_dir(root, "xproc_sig");
+    #[cfg(windows)]
     let pipe_name = format!(r"\\.\pipe\membus-v2-xproc-bench-{}", std::process::id());
     let mut cmd = Command::new(&server_bin);
     cmd.args([
