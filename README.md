@@ -31,6 +31,29 @@ Verify CLI usage at any time with:
 ./target/release/membus --help
 ```
 
+## Container & Source-Build Deployment
+
+The repository ships a digest-pinned multi-stage [`Containerfile`](Containerfile) that compiles both
+`membus` and `membus-ab-router` directly from source with zero external registry credentials required:
+
+```bash
+# Build locally from source (no private registry access required)
+docker build -f Containerfile -t membus:local .
+
+# Or launch the hardened local Compose stack (builds from source automatically)
+docker compose -f deploy/local/compose.yaml up --build
+
+# Or launch the dual-slot A/B local Compose stack
+docker compose -f deploy/local/compose-ab.yaml up --build
+```
+
+Published container images are built and pushed from `main` and `v*` release tags via
+[`.github/workflows/container.yml`](.github/workflows/container.yml) to
+`ghcr.io/<owner>/membus`. The manifests under `gitops/` are Kustomize base templates whose
+placeholder image names are overridden with your registry image and immutable `@sha256:` digest
+in environment overlays (or pointed to a locally built `membus:local` image for air-gapped or
+source-built deployments).
+
 ## 2-Minute Verified Quickstart
 
 1. **Start a local resident** (loopback binds require zero TLS/auth ceremony for local dev):
